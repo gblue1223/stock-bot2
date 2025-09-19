@@ -225,6 +225,117 @@ def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame
     return merged_df
 
 
+def _signed_log1p(arr: pd.Series) -> pd.Series:
+    """Signed log1p that supports negative values: sign(x) * log1p(|x|)."""
+    x = pd.to_numeric(arr, errors="coerce").fillna(0)
+    return np.sign(x) * np.log1p(np.abs(x))
+
+
+def _standard_scale(series: pd.Series) -> pd.Series:
+    x = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
+    mean = float(x.mean())
+    std = float(x.std(ddof=0))
+    if std == 0:
+        return pd.Series(np.zeros(len(x)), index=series.index)
+    return (x - mean) / std
+
+
+def _minmax_scale(series: pd.Series) -> pd.Series:
+    x = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
+    min_v = float(x.min())
+    max_v = float(x.max())
+    rng = max_v - min_v
+    if rng == 0:
+        return pd.Series(np.zeros(len(x)), index=series.index)
+    return (x - min_v) / rng
+
+
+def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize columns per rules:
+    - Log + Standard: specified quantity and flow columns
+    - Standard only: *_총잔량직전대비
+    - Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
+    - Min-Max: remaining numeric columns (excluding '번호' and text columns and already-normalized columns)
+    """
+    out = df.copy()
+
+    # Define column groups
+    logstd_cols = set([
+        "거래량", "누적거래량", "누적거래대금", "거래회전율",
+        *[f"매도호가수량{i}" for i in range(1, 11)],
+        *[f"매수호가수량{i}" for i in range(1, 11)],
+        "매도호가총잔량", "매수호가총잔량",
+        *[f"매도거래원수량{i}" for i in range(1, 6)],
+        *[f"매수거래원수량{i}" for i in range(1, 6)],
+        *[f"매도거래원별증감{i}" for i in range(1, 6)],
+        *[f"매수거래원별증감{i}" for i in range(1, 6)],
+        # 외국계 추정 관련 (없으면 생성 후 0)
+        "외국계매도추정합", "외국계매수추정합", "외국계매도추정합변동", "외국계매수추정합변동",
+    ])
+
+    stdonly_cols = set(["매도호가총잔량직전대비", "매수호가총잔량직전대비"])
+
+    broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
+
+    # Ensure optional columns exist
+    for col in list(logstd_cols | stdonly_cols):
+        if col not in out.columns:
+            out[col] = 0
+
+    # Log + Standard scaling (signed log1p then z-score)
+    for col in sorted(logstd_cols):
+        if col in out.columns:
+            out[col] = _standard_scale(_signed_log1p(out[col]))
+
+    # Standard only
+    for col in sorted(stdonly_cols):
+        if col in out.columns:
+            out[col] = _standard_scale(out[col])
+
+    # Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
+    broker_scalar_cols: List[str] = []
+    for col in broker_cat_cols:
+        if col in out.columns:
+            cats = out[col].astype(str).replace({"nan": ""})
+            # Build per-column char dictionary
+            unique_chars = sorted(set("".join(cats.tolist())))
+            if len(unique_chars) == 0:
+                # empty column -> scalar zeros
+                out[f"{col}_scalar"] = 0.0
+                broker_scalar_cols.append(f"{col}_scalar")
+                continue
+            char_to_id = {ch: i + 1 for i, ch in enumerate(unique_chars)}  # 1..N
+            max_id = float(len(unique_chars))
+
+            def _encode_scalar(s: str) -> float:
+                if not s:
+                    return 0.0
+                ids = [char_to_id.get(ch, 0) for ch in s]
+                if not ids:
+                    return 0.0
+                # mean of ids normalized by max id -> [0,1]
+                return float(np.mean(ids)) / max_id
+
+            out[f"{col}_scalar"] = cats.apply(_encode_scalar).astype(float)
+            broker_scalar_cols.append(f"{col}_scalar")
+
+    # Min-Max for remaining numeric columns not already processed
+    processed = set(["번호"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
+    numeric_rest = [c for c in out.columns if c not in processed and pd.api.types.is_numeric_dtype(out[c])]
+    for col in numeric_rest:
+        out[col] = _minmax_scale(out[col])
+
+    # Final safety: fill any remaining NaNs
+    for col in out.columns:
+        if col in TEXT_COLUMNS:
+            out[col] = out[col].astype(str).replace({"nan": ""}).fillna("")
+        else:
+            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
+
+    return out
+
+
 def create_sqlite_table(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
     """
     SQLite 테이블 생성
@@ -261,7 +372,31 @@ def insert_data_to_sqlite(conn: sqlite3.Connection, table_name: str, df: pd.Data
         chunk.to_sql(table_name, conn, if_exists='append', index=True)
 
 
-def normalize_datasets(input_folder: str, output_db: str):
+def _apply_sqlite_pragmas(conn: sqlite3.Connection, *, page_size: int | None, journal_mode: str, synchronous: str, auto_vacuum: str):
+    """
+    Apply space/IO related PRAGMAs. These are built-in and do not require external modules.
+    Note: page_size and auto_vacuum must be set before creating tables to fully take effect.
+    """
+    cur = conn.cursor()
+    if page_size:
+        cur.execute(f"PRAGMA page_size={int(page_size)}")
+    if auto_vacuum.lower() in {"none", "full", "incremental"}:
+        # none(0), full(1), incremental(2)
+        mapping = {"none": 0, "full": 1, "incremental": 2}
+        cur.execute(f"PRAGMA auto_vacuum={mapping[auto_vacuum.lower()]}")
+    # journal_mode: DELETE|TRUNCATE|PERSIST|MEMORY|WAL|OFF
+    cur.execute(f"PRAGMA journal_mode={journal_mode}")
+    # synchronous: OFF(0)|NORMAL(1)|FULL(2)|EXTRA(3)
+    cur.execute(f"PRAGMA synchronous={synchronous}")
+    cur.close()
+
+def normalize_datasets(input_folder: str, output_db: str, *,
+                       compact: bool = False,
+                       page_size: int | None = None,
+                       journal_mode: str = "WAL",
+                       synchronous: str = "NORMAL",
+                       auto_vacuum: str = "full",
+                       vacuum_into: str | None = None):
     """
     메인 정규화 함수
     """
@@ -277,6 +412,13 @@ def normalize_datasets(input_folder: str, output_db: str):
     # SQLite 연결
     conn = sqlite3.connect(output_db)
     
+    # Apply PRAGMAs before creating any table for best effect
+    _apply_sqlite_pragmas(conn,
+                          page_size=page_size,
+                          journal_mode=journal_mode,
+                          synchronous=synchronous,
+                          auto_vacuum=auto_vacuum)
+    
     try:
         for group_key, files in csv_groups.items():
             print(f"처리 중: {group_key}")
@@ -289,6 +431,8 @@ def normalize_datasets(input_folder: str, output_db: str):
             
             # CSV 파일들 merge
             merged_df = merge_csv_files(files, code, name)
+            # 피처 정규화 적용
+            merged_df = apply_feature_normalization(merged_df)
             
             # 테이블명: date_code 형식
             table_name = f"data_{date}_{code}"
@@ -302,7 +446,18 @@ def normalize_datasets(input_folder: str, output_db: str):
             print(f"완료: {table_name} ({len(merged_df)} 행)")
     
     finally:
-        conn.close()
+        try:
+            # Analyze and optimize sqlite internal stats
+            conn.execute("ANALYZE")
+            conn.execute("PRAGMA optimize")
+            # VACUUM compacts the database; use when --compact is requested
+            if vacuum_into:
+                # If supported by this SQLite build, write compacted copy
+                conn.execute(f"VACUUM INTO '{vacuum_into}'")
+            elif compact:
+                conn.execute("VACUUM")
+        finally:
+            conn.close()
     
     print(f"정규화 완료: {output_db}")
 
@@ -311,6 +466,16 @@ def main():
     parser = argparse.ArgumentParser(description="CSV 데이터셋 정규화 스크립트")
     parser.add_argument("input_folder", help="입력 CSV 폴더 경로")
     parser.add_argument("-o", "--output", default="normalized.db", help="출력 SQLite DB 파일명")
+    # Built-in SQLite space/IO tuning (no external compression modules)
+    parser.add_argument("--compact", action="store_true", help="마지막에 VACUUM 실행으로 DB를 컴팩트하게 만듭니다")
+    parser.add_argument("--page-size", type=int, default=4096, help="페이지 크기 (바이트). 테이블 생성 전 설정 권장. 예: 4096, 8192, 16384")
+    parser.add_argument("--journal-mode", choices=["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"], default="WAL",
+                        help="저널 모드 설정")
+    parser.add_argument("--synchronous", choices=["OFF", "NORMAL", "FULL", "EXTRA"], default="NORMAL", help="동기화 수준 설정")
+    parser.add_argument("--auto-vacuum", choices=["none", "full", "incremental"], default="full",
+                        help="자동 VACUUM 모드 설정")
+    parser.add_argument("--vacuum-into", default=None,
+                        help="지원 시 VACUUM INTO 경로로 압축/컴팩트된 복사본을 생성합니다 (예: output_compact.db)")
     
     args = parser.parse_args()
     
@@ -318,8 +483,19 @@ def main():
         print(f"입력 폴더가 존재하지 않습니다: {args.input_folder}")
         return
     
-    normalize_datasets(args.input_folder, args.output)
+    normalize_datasets(
+        args.input_folder,
+        args.output,
+        compact=args.compact,
+        page_size=args.page_size,
+        journal_mode=args.journal_mode,
+        synchronous=args.synchronous,
+        auto_vacuum=args.auto_vacuum,
+        vacuum_into=args.vacuum_into,
+    )
 
 
+# python scripts/normalize_datasets.py models/test_datasets -o models/test_datasets.db
+# python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawler\data\20250905" -o models/datasets.db
 if __name__ == "__main__":
     main()
