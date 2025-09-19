@@ -1,0 +1,325 @@
+import argparse
+import os
+import re
+import sqlite3
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+
+FILENAME_PATTERN = re.compile(r"^(?P<code>\d{6})_(?P<name>.+?)_(?P<type>[^_]+)_(?P<date>\d{8})\.csv$")
+TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
+DROP_COLUMNS = {"종류", "씨리얼"}
+REQUIRED_TYPES = {"execution", "orderbook", "trader"}
+
+# Final column order required
+FINAL_COLUMNS: List[str] = [
+    "종목코드", "종목명", "시간", "현재가", "등락률", "거래량", "누적거래량", "누적거래대금", "시가", "고가", "저가",
+    "전일거래량대비", "전일거래량대비비율", "거래회전율", "체결강도",
+    # 매도호가/수량/직전대비 1~10
+    *[f"매도호가{i}" for i in range(1, 11)],
+    *[f"매도호가수량{i}" for i in range(1, 11)],
+    *[f"매도호가직전대비{i}" for i in range(1, 11)],
+    # 매수호가/수량/직전대비 1~10
+    *[f"매수호가{i}" for i in range(1, 11)],
+    *[f"매수호가수량{i}" for i in range(1, 11)],
+    *[f"매수호가직전대비{i}" for i in range(1, 11)],
+    "매도호가총잔량", "매도호가총잔량직전대비", "매수호가총잔량", "매수호가총잔량직전대비",
+    # 거래원 관련 (문자열 컬럼들)
+    *[f"매도거래원{i}" for i in range(1, 6)],
+    *[f"매도거래원수량{i}" for i in range(1, 6)],
+    *[f"매도거래원별증감{i}" for i in range(1, 6)],
+    *[f"매수거래원{i}" for i in range(1, 6)],
+    *[f"매수거래원수량{i}" for i in range(1, 6)],
+    *[f"매수거래원별증감{i}" for i in range(1, 6)],
+]
+
+
+def find_csv_files(folder_path: str) -> Dict[str, List[str]]:
+    """
+    폴더를 recursive하게 탐색하여 CSV 파일들을 찾고 그룹화
+    """
+    csv_files = {}
+    folder = Path(folder_path)
+    
+    for csv_file in folder.rglob("*.csv"):
+        match = FILENAME_PATTERN.match(csv_file.name)
+        if not match:
+            continue
+            
+        file_info = match.groupdict()
+        
+        # after_hours 타입은 무시
+        if file_info["type"] == "after_hours":
+            continue
+            
+        # 그룹 키: code_name_date
+        group_key = f"{file_info['code']}_{file_info['name']}_{file_info['date']}"
+        
+        if group_key not in csv_files:
+            csv_files[group_key] = {}
+            
+        csv_files[group_key][file_info["type"]] = str(csv_file)
+    
+    # 필요한 3개 타입이 모두 있는 그룹만 반환
+    complete_groups = {}
+    for group_key, files in csv_files.items():
+        if all(file_type in files for file_type in REQUIRED_TYPES):
+            complete_groups[group_key] = files
+            
+    return complete_groups
+
+
+def _clean_column_name(col: str) -> str:
+    # 내부 공백 제거 및 알려진 별칭 통일
+    c = re.sub(r"\s+", "", col)
+    if c == "스탬프":
+        return "시간"
+    return c
+
+
+def load_and_clean_csv(file_path: str) -> pd.DataFrame:
+    """
+    CSV 파일을 로드하고 기본 정리: 컬럼 이름 정규화 및 불필요 컬럼 제거
+    """
+    # 인코딩 이슈 대비 기본 옵션 적용
+    for enc in ("utf-8-sig", "utf-8", "cp949", "euc-kr"):
+        try:
+            df = pd.read_csv(file_path, encoding=enc, engine="python", on_bad_lines="skip")
+            break
+        except Exception:
+            df = None
+    if df is None:
+        df = pd.read_csv(file_path)
+
+    # 컬럼명 정규화
+    df = df.rename(columns={c: _clean_column_name(c) for c in df.columns})
+    
+    # 중복 컬럼명 처리: 동일 이름 컬럼이 여러 개면, 행 단위로 첫 번째 유효값을 선택해 단일 컬럼으로 축약
+    if df.columns.duplicated().any():
+        new_cols = {}
+        for col in dict.fromkeys(df.columns):  # preserve order, unique keys
+            same = [c for c in df.columns if c == col]
+            if len(same) == 1:
+                continue
+            # coalesce across duplicates
+            block = df[same]
+            new_col = block.bfill(axis=1).iloc[:, 0]
+            new_cols[col] = new_col
+        # assign coalesced
+        for col, series in new_cols.items():
+            df[col] = series
+        # drop duplicates keeping first
+        df = df.loc[:, ~df.columns.duplicated()]
+ 
+    # 불필요 컬럼 제거
+    df = df.drop(columns=[col for col in DROP_COLUMNS if col in df.columns], errors="ignore")
+    
+    # '번호' 숫자화 보정
+    if '번호' in df.columns:
+        df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
+    
+    return df
+
+
+def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    비어있는 데이터를 직전/직후 데이터로 채우기
+    """
+    # 최후 방어: 중복 컬럼 제거(이미 로드 시 처리했지만 합병 과정에서 생길 수 있음)
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()]
+    
+    # 번호 컬럼 기준으로 정렬
+    df = df.sort_values('번호').reset_index(drop=True)
+    
+    # 텍스트 컬럼과 숫자 컬럼 분리
+    text_cols = [col for col in df.columns if col in TEXT_COLUMNS]
+    numeric_cols = [col for col in df.columns if col not in TEXT_COLUMNS and col != '번호']
+    
+    # 텍스트 컬럼: forward fill 후 backward fill, 그래도 없으면 빈 문자열
+    for col in text_cols:
+        if col in df.columns:
+            df[col] = df[col].ffill().bfill().fillna('').infer_objects(copy=False)
+    
+    # 숫자 컬럼: forward fill 후 backward fill, 그래도 없으면 0
+    for col in numeric_cols:
+        if col in df.columns:
+            series = df[col]
+            if isinstance(series, pd.DataFrame):
+                # 안전장치: 만약 여전히 DataFrame이면 첫 열 사용
+                series = series.iloc[:, 0]
+            series = pd.to_numeric(series, errors='coerce')
+            series = series.ffill().bfill().fillna(0)
+            df[col] = series
+    
+    return df
+
+
+def _coalesce_into_base(base: pd.DataFrame, temp: pd.DataFrame, overlap_cols: List[str]) -> pd.DataFrame:
+    """
+    base와 temp(번호로 병합된 상태)에서 동일 컬럼이 있을 때 base의 NaN을 temp의 값으로 보완
+    overlap_cols에 대해 base[col] = base[col].combine_first(temp[f"{col}_new"]) 수행
+    """
+    for col in overlap_cols:
+        new_col = f"{col}_new"
+        if new_col in temp.columns:
+            # 숫자/문자 모두 지원되는 combine_first 사용
+            base[col] = base[col].combine_first(temp[new_col])
+            temp = temp.drop(columns=[new_col])
+    return base, temp
+
+
+def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame:
+    """
+    3개의 CSV 파일을 번호 컬럼 기준으로 merge
+    """
+    dfs = {}
+    
+    # 각 파일 로드
+    for file_type, file_path in files.items():
+        df = load_and_clean_csv(file_path)
+        df = fill_missing_values(df)
+        dfs[file_type] = df
+    
+    # 번호의 합집합 구성 (세 소스 모두 포함)
+    all_nums = sorted(set().union(*(df['번호'].dropna().astype(int).tolist() for df in dfs.values())))
+    merged_df = pd.DataFrame({"번호": all_nums})
+
+    # 세 소스 순차 병합: 겹치는 컬럼은 값 보완(coalesce), 새로운 컬럼은 추가
+    for key in ("execution", "orderbook", "trader"):
+        src = dfs.get(key)
+        if src is None:
+            continue
+        # 번호만 남기거나 전체를 준비
+        to_merge = src.copy()
+        # full outer를 흉내내기 위해 base 기준 left merge
+        temp = merged_df.merge(to_merge, on="번호", how="left", suffixes=("", "_new"))
+        # 겹치는 컬럼 목록 산출 (번호 제외, _new 붙은 대상만)
+        overlap = [c for c in to_merge.columns if c != "번호" and c in merged_df.columns]
+        merged_df, temp = _coalesce_into_base(merged_df, temp, overlap)
+        # non-overlap 신규 컬럼들을 merged_df에 반영
+        new_cols = [c for c in temp.columns if c not in merged_df.columns]
+        if new_cols:
+            merged_df = temp[[*merged_df.columns, *new_cols]]
+        else:
+            merged_df = temp[merged_df.columns]
+    
+    # 종목코드, 종목명 추가
+    merged_df['종목코드'] = merged_df.get('종목코드', pd.Series(index=merged_df.index, dtype=object)).fillna(code).replace({"": code})
+    merged_df['종목명'] = merged_df.get('종목명', pd.Series(index=merged_df.index, dtype=object)).fillna(name).replace({"": name})
+
+    # 누락 컬럼 생성 (최종 스키마 강제)
+    for col in FINAL_COLUMNS:
+        if col not in merged_df.columns:
+            merged_df[col] = "" if col in TEXT_COLUMNS else 0
+
+    # 채우기(직전/직후)로 결측 제거
+    merged_df = fill_missing_values(merged_df)
+
+    # 최종 컬럼 순서 맞추기 (정확히 스키마 강제)
+    merged_df = merged_df[["번호", *FINAL_COLUMNS]]
+    
+    return merged_df
+
+
+def create_sqlite_table(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
+    """
+    SQLite 테이블 생성
+    """
+    # 테이블이 이미 존재하면 삭제
+    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+    
+    # 컬럼 정의 생성
+    col_definitions = ["번호 INTEGER PRIMARY KEY"]
+    
+    for col in df.columns:
+        if col == '번호':
+            continue
+        elif col in TEXT_COLUMNS:
+            col_definitions.append(f'"{col}" TEXT')
+        else:
+            col_definitions.append(f'"{col}" REAL')
+    
+    create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_definitions)})"
+    conn.execute(create_sql)
+
+
+def insert_data_to_sqlite(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
+    """
+    데이터를 SQLite에 삽입 (중복 방지)
+    """
+    # 번호를 인덱스로 설정
+    df_indexed = df.set_index('번호')
+    
+    # 작은 청크로 나누어 삽입 (SQLite 변수 제한 회피)
+    chunk_size = 100
+    for i in range(0, len(df_indexed), chunk_size):
+        chunk = df_indexed.iloc[i:i+chunk_size]
+        chunk.to_sql(table_name, conn, if_exists='append', index=True)
+
+
+def normalize_datasets(input_folder: str, output_db: str):
+    """
+    메인 정규화 함수
+    """
+    print(f"CSV 파일 검색 중: {input_folder}")
+    csv_groups = find_csv_files(input_folder)
+    
+    if not csv_groups:
+        print("처리할 CSV 파일 그룹을 찾을 수 없습니다.")
+        return
+    
+    print(f"발견된 그룹 수: {len(csv_groups)}")
+    
+    # SQLite 연결
+    conn = sqlite3.connect(output_db)
+    
+    try:
+        for group_key, files in csv_groups.items():
+            print(f"처리 중: {group_key}")
+            
+            # 그룹 키에서 정보 추출
+            parts = group_key.split('_')
+            code = parts[0]
+            date = parts[-1]
+            name = '_'.join(parts[1:-1])
+            
+            # CSV 파일들 merge
+            merged_df = merge_csv_files(files, code, name)
+            
+            # 테이블명: date_code 형식
+            table_name = f"data_{date}_{code}"
+            
+            # SQLite 테이블 생성
+            create_sqlite_table(conn, table_name, merged_df)
+            
+            # 데이터 삽입
+            insert_data_to_sqlite(conn, table_name, merged_df)
+            
+            print(f"완료: {table_name} ({len(merged_df)} 행)")
+    
+    finally:
+        conn.close()
+    
+    print(f"정규화 완료: {output_db}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="CSV 데이터셋 정규화 스크립트")
+    parser.add_argument("input_folder", help="입력 CSV 폴더 경로")
+    parser.add_argument("-o", "--output", default="normalized.db", help="출력 SQLite DB 파일명")
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.input_folder):
+        print(f"입력 폴더가 존재하지 않습니다: {args.input_folder}")
+        return
+    
+    normalize_datasets(args.input_folder, args.output)
+
+
+if __name__ == "__main__":
+    main()
