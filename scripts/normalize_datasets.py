@@ -256,6 +256,8 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     - Log + Standard: specified quantity and flow columns
     - Standard only: *_총잔량직전대비
     - Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
+    - Character-level scalar encoding for '종목명' (append scalar, keep original)
+    - '시간' normalized to '시간_scalar' by dividing numeric value by 90000000.0 (keep original '시간')
     - Min-Max: remaining numeric columns (excluding '번호' and text columns and already-normalized columns)
     """
     out = df.copy()
@@ -319,6 +321,49 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
 
             out[f"{col}_scalar"] = cats.apply(_encode_scalar).astype(float)
             broker_scalar_cols.append(f"{col}_scalar")
+
+    # Character-level scalar encoding for '종목명'
+    if '종목명' in out.columns:
+        cats = out['종목명'].astype(str).replace({"nan": ""})
+        unique_chars = sorted(set("".join(cats.tolist())))
+        if len(unique_chars) == 0:
+            out["종목명_scalar"] = 0.0
+        else:
+            char_to_id = {ch: i + 1 for i, ch in enumerate(unique_chars)}
+            max_id = float(len(unique_chars))
+
+            def _encode_scalar_name(s: str) -> float:
+                if not s:
+                    return 0.0
+                ids = [char_to_id.get(ch, 0) for ch in s]
+                if not ids:
+                    return 0.0
+                return float(np.mean(ids)) / max_id
+
+            out["종목명_scalar"] = cats.apply(_encode_scalar_name).astype(float)
+        broker_scalar_cols.append("종목명_scalar")
+
+    # '시간' -> '시간_scalar' (numeric normalization by 90000000.0)
+    if '시간' in out.columns:
+        def _to_num_time(v) -> float:
+            try:
+                # fast path for numeric
+                val = float(v)
+                return val
+            except Exception:
+                s = str(v)
+                digits = re.sub(r"\D", "", s)
+                if not digits:
+                    return 0.0
+                try:
+                    return float(digits)
+                except Exception:
+                    return 0.0
+
+        num_time = out['시간'].apply(_to_num_time).astype(float)
+        denom = 90000000.0
+        out['시간_scalar'] = (num_time / denom).astype(float)
+        broker_scalar_cols.append('시간_scalar')
 
     # Min-Max for remaining numeric columns not already processed
     processed = set(["번호"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
@@ -409,6 +454,22 @@ def ensure_datasets_table(conn: sqlite3.Connection, df: pd.DataFrame):
     if pk_cols != desired:
         print("기존 'datasets' 테이블이 원하는 기본키와 다릅니다. 테이블을 마이그레이션합니다...")
         _recreate_table_with_pk(conn, table_name, df)
+    # 마이그레이션 후에도 컬럼 보강 절차 진행
+
+    # Ensure all needed columns exist (추가 생성)
+    existing_cols = [row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()]
+    for col in df.columns:
+        if col in existing_cols:
+            continue
+        # 타입 추론: 번호 -> INTEGER, 텍스트/날짜 -> TEXT, 그 외 REAL
+        if col == '번호':
+            col_type = 'INTEGER'
+        elif col in TEXT_COLUMNS or col == '날짜':
+            col_type = 'TEXT'
+        else:
+            col_type = 'REAL'
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN \"{col}\" {col_type}")
+
     # Optional: helpful index for queries by code/date
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
 
