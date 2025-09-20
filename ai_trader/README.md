@@ -220,6 +220,8 @@ python -m ai_trader.rl.train_rl \
   --priority-bonus 0.1 --activity-window 5 \
   --stoploss-wait 3 \
   --total-timesteps 200000 \
+  --tb-logdir runs/sb3 --tb-name ppo_scalp_cnn \
+  --log-interval 10 \
   --device cpu
 ```
 
@@ -233,6 +235,11 @@ python -m ai_trader.rl.infer_rl \
   --w-fast 0.5 --w-sticky 0.5 \
   --priority-bonus 0.1 --activity-window 5 \
   --stoploss-wait 3
+```
+
+- TensorBoard 로그 확인:
+```bash
+tensorboard --logdir runs/sb3
 ```
 
 ## 문제 해결(트러블슈팅)

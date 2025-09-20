@@ -54,6 +54,10 @@ def train(
     priority_bonus: float = 0.0,
     activity_window: int = 5,
     stoploss_wait: int = 3,
+    # TensorBoard logging
+    tensorboard_log: Optional[str] = None,
+    tb_log_name: Optional[str] = None,
+    log_interval: int = 10,
 ):
     """
     TradingEnv에서 PPO 또는 A2C 알고리즘을 학습합니다.
@@ -91,6 +95,9 @@ def train(
     - priority_bonus (float): 롱 포지션 오픈 시 우선순위 점수에 곱해지는 보너스 보상.
     - activity_window (int): 휴리스틱 계산에 사용하는 최근 관찰 윈도우(초 단위 스텝).
     - stoploss_wait (int): 진입 후 n초 내 상승 없으면 강제 손절.
+    - tensorboard_log (Optional[str]): TensorBoard 로그 디렉터리(예: "runs/sb3"). 지정 시 로깅 활성화.
+    - tb_log_name (Optional[str]): 학습 run 이름(model.learn의 tb_log_name).
+    - log_interval (int): 학습 로그 출력/기록 주기(step 단위).
     """
     algo = algo.lower()
     if algo not in ALGOS:
@@ -146,33 +153,35 @@ def train(
             },
         }
 
+    common_kwargs = dict(
+        learning_rate=lr,
+        gamma=gamma,
+        ent_coef=ent_coef,
+        vf_coef=vf_coef,
+        policy_kwargs=policy_kwargs,
+        verbose=1,
+        device=device,
+    )
+    # Pass tensorboard_log to model constructor if provided
+    if tensorboard_log:
+        common_kwargs["tensorboard_log"] = tensorboard_log
+
     if algo == "ppo":
         model = AlgoClass(
             policy_id,
             vec_env,
-            learning_rate=lr,
-            gamma=gamma,
             n_steps=n_steps,
-            ent_coef=ent_coef,
-            vf_coef=vf_coef,
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            device=device,
+            **common_kwargs,
         )
     else:  # a2c
         model = AlgoClass(
             policy_id,
             vec_env,
-            learning_rate=lr,
-            gamma=gamma,
-            ent_coef=ent_coef,
-            vf_coef=vf_coef,
-            policy_kwargs=policy_kwargs,
-            verbose=1,
-            device=device,
+            **common_kwargs,
         )
 
-    model.learn(total_timesteps=total_timesteps)
+    # tb_log_name is supported by SB3 learn; log_interval controls printing frequency
+    model.learn(total_timesteps=total_timesteps, tb_log_name=tb_log_name, log_interval=log_interval)
     save_path = os.path.join(out_dir, f"{algo}_model")
     model.save(save_path)
     print(f"Saved RL model to {save_path}.zip")
@@ -210,6 +219,10 @@ def main():
     p.add_argument("--priority-bonus", type=float, default=0.0, help="롱 포지션 오픈 시 우선순위 보상 스케일")
     p.add_argument("--activity-window", type=int, default=5, help="휴리스틱 계산을 위한 최근 윈도우 길이(스텝)")
     p.add_argument("--stoploss-wait", type=int, default=3, help="진입 후 n스텝 안 오르면 손절")
+    # TensorBoard
+    p.add_argument("--tb-logdir", default=None, help="TensorBoard 로그 디렉터리(예: runs/sb3). 지정 시 로깅 활성화")
+    p.add_argument("--tb-name", default=None, help="TensorBoard run 이름(tb_log_name)")
+    p.add_argument("--log-interval", type=int, default=10, help="학습 로그 출력/기록 주기")
     args = p.parse_args()
 
     train(
@@ -241,6 +254,9 @@ def main():
         priority_bonus=args.priority_bonus,
         activity_window=args.activity_window,
         stoploss_wait=args.stoploss_wait,
+        tensorboard_log=args.tb_logdir,
+        tb_log_name=args.tb_name,
+        log_interval=args.log_interval,
     )
 
 
