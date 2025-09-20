@@ -39,16 +39,20 @@ def run(
     env = DummyVecEnv([lambda: TradingEnv(env_cfg)])
 
     AlgoClass = ALGOS[algo]
-    model = AlgoClass.load(model_path, env=env)
+    model = AlgoClass.load(model_path, env=env, device="cpu")
 
+    # Note: DummyVecEnv.reset() returns only obs
     obs = env.reset()
-    done = False
     cum_reward = 0.0
     while True:
         action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, infos = env.step(action)
-        cum_reward += float(reward)
-        if bool(terminated) or bool(truncated):
+        # DummyVecEnv.step returns (obs, rewards, dones, infos)
+        obs, rewards, dones, infos = env.step(action)
+        # rewards/dones are vectorized (shape [n_envs])
+        r = float(rewards[0] if hasattr(rewards, "__len__") else rewards)
+        d = bool(dones[0] if hasattr(dones, "__len__") else dones)
+        cum_reward += r
+        if d:
             break
     print(f"Episode cumulative reward (approx PnL): {cum_reward:.6f}")
 
@@ -57,7 +61,7 @@ def main():
     p = argparse.ArgumentParser(description="Run RL inference on TradingEnv")
     p.add_argument("--algo", choices=["ppo", "a2c"], default="ppo")
     p.add_argument("--db", default="datasets/datasets.db")
-    p.add_argument("--model", default="models/rl/ppo_model.zip")
+    p.add_argument("--model", default="models/rl/ppo_model")
     p.add_argument("--table", default="datasets")
     p.add_argument("--code", default=None)
     p.add_argument("--date", default=None)
