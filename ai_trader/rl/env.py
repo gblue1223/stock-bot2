@@ -8,7 +8,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from ml.data import load_real_dataframe
+from ai_trader.ml.data import load_real_dataframe
 
 
 @dataclass
