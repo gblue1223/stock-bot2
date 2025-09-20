@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -21,6 +22,12 @@ class TradingEnvConfig:
     target_col: Optional[str] = None  # price-like column for reward
     max_steps: Optional[int] = None    # cap episode length
     scale_obs: bool = False            # optional standardization
+    # Reward customization
+    reward_mode: str = "delta"        # one of {"delta", "return", "log_return"}
+    transaction_cost_bps: float = 0.0  # cost per trade in basis points of price (e.g., 5 = 0.05%)
+    holding_cost_bps: float = 0.0      # per-step cost when holding a position (bps of price)
+    # Observation formatting
+    obs_format: str = "flat"          # "flat" -> (T*F,), "matrix" -> (T, F)
 
 
 class TradingEnv(gym.Env):
@@ -47,8 +54,12 @@ class TradingEnv(gym.Env):
         self.entry_price = 0.0
         self.realized_pnl = 0.0
 
-        obs_dim = self.seq_len * len(self.real_cols)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32)
+        n_features = len(self.real_cols)
+        if self.cfg.obs_format == "matrix":
+            obs_shape = (self.seq_len, n_features)
+        else:
+            obs_shape = (self.seq_len * n_features,)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=obs_shape, dtype=np.float32)
         self.action_space = spaces.Discrete(3)  # hold, long/open, flat/close
 
         self.max_ptr = len(self.features)
@@ -64,7 +75,44 @@ class TradingEnv(gym.Env):
         w = self.features[self.ptr - self.seq_len : self.ptr]
         if self.cfg.scale_obs:
             w = (w - self._feat_mean) / self._feat_std
+        if self.cfg.obs_format == "matrix":
+            return w.astype(np.float32)
         return w.reshape(-1).astype(np.float32)
+
+    def _trade_cost(self, price: float) -> float:
+        # basis points of price
+        return float(self.cfg.transaction_cost_bps) / 10000.0 * float(price)
+
+    def _hold_cost(self, price: float) -> float:
+        return float(self.cfg.holding_cost_bps) / 10000.0 * float(price)
+
+    def _reward_from_prices(self, px_t: float, px_next: float, action: int) -> float:
+        mode = self.cfg.reward_mode.lower()
+        if mode == "delta":
+            gain = (px_next - px_t)
+        elif mode == "return":
+            gain = (px_next / px_t - 1.0) if px_t != 0 else 0.0
+        elif mode == "log_return":
+            if px_t > 0 and px_next > 0:
+                gain = math.log(px_next) - math.log(px_t)
+            else:
+                gain = 0.0
+        else:
+            raise ValueError(f"Unsupported reward_mode: {self.cfg.reward_mode}")
+
+        reward = 0.0
+        # position-based reward accumulation
+        if self.position == 1:
+            reward += gain
+        # transaction cost on position change
+        if action == 1 and self.position == 0:  # open long
+            reward -= self._trade_cost(px_t)
+        if action == 2 and self.position == 1:  # close long
+            reward -= self._trade_cost(px_t)
+        # holding cost when in position
+        if self.position == 1:
+            reward -= self._hold_cost(px_t)
+        return float(reward)
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         super().reset(seed=seed)
@@ -89,24 +137,20 @@ class TradingEnv(gym.Env):
         self.ptr += 1
         px_next = float(self.prices[self.ptr - 1])
 
-        reward = 0.0
-        # Actions: 0=hold, 1=open/maintain long, 2=close/flat
-        if action == 1:  # long
-            if self.position == 0:  # open new
+        # Position transition logic
+        if action == 1:  # long/open or maintain
+            if self.position == 0:
                 self.position = 1
                 self.entry_price = px_t
-            # reward unrealized delta over step
-            reward = (px_next - px_t)
         elif action == 2:  # flat/close
             if self.position == 1:
-                pnl = px_t - self.entry_price
-                self.realized_pnl += pnl
-                reward = pnl  # bonus on close
+                # realize pnl at close
+                self.realized_pnl += (px_t - self.entry_price)
             self.position = 0
             self.entry_price = 0.0
-        else:  # hold
-            if self.position == 1:
-                reward = (px_next - px_t)
+        # else: hold -> no change of position
+
+        reward = self._reward_from_prices(px_t, px_next, action)
 
         self.steps_left -= 1
         terminated = self.ptr >= self.max_ptr - 1

@@ -8,6 +8,7 @@ from stable_baselines3 import PPO, A2C
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from .env import TradingEnv, TradingEnvConfig
+from .policies import TimeSeriesCNNExtractor
 
 
 ALGOS = {
@@ -37,6 +38,14 @@ def train(
     vf_coef: float = 0.5,
     max_steps: Optional[int] = None,
     scale_obs: bool = False,
+    # New: reward/obs customization
+    reward_mode: str = "delta",
+    transaction_cost_bps: float = 0.0,
+    holding_cost_bps: float = 0.0,
+    obs_format: str = "flat",
+    # Policy selection
+    policy: str = "mlp",
+    device: str = "cpu",
 ):
     """
     TradingEnv에서 PPO 또는 A2C 알고리즘을 학습합니다.
@@ -63,9 +72,12 @@ def train(
     - max_steps (Optional[int], default=None): 에피소드당 최대 스텝 수 또는
       데이터 순회 제한(환경 구현에 따라 의미가 달라질 수 있음).
     - scale_obs (bool, default=False): 관측치 스케일링/정규화 사용 여부.
-
-    Returns
-    - None. 학습된 모델을 디스크에 저장합니다.
+    - reward_mode (str): 보상 방식 {delta, return, log_return}.
+    - transaction_cost_bps (float): 거래 비용 (bp).
+    - holding_cost_bps (float): 보유 비용 (bp, per-step).
+    - obs_format (str): 관측 포맷 {flat, matrix}. matrix는 CNN extractor와 함께 권장.
+    - policy (str): "mlp" 또는 "cnn". cnn은 TimeSeriesCNNExtractor 사용.
+    - device (str): 학습 장치 (예: "cpu", "cuda").
     """
     algo = algo.lower()
     if algo not in ALGOS:
@@ -82,30 +94,62 @@ def train(
         target_col=target_col,
         max_steps=max_steps,
         scale_obs=scale_obs,
+        reward_mode=reward_mode,
+        transaction_cost_bps=transaction_cost_bps,
+        holding_cost_bps=holding_cost_bps,
+        obs_format=("matrix" if policy == "cnn" else obs_format),
     )
     vec_env = DummyVecEnv([make_env(env_cfg)])
 
     AlgoClass = ALGOS[algo]
+
+    policy_kwargs = {}
+    policy_id = "MlpPolicy"
+    if policy == "cnn":
+        # Use custom extractor. With DummyVecEnv and obs_format=matrix, obs space is (T, F)
+        # SB3 default ActorCriticPolicy (MlpPolicy) can still be used with custom extractor
+        policy_id = "MlpPolicy"
+        # Need seq_len and feature count for flat case; for matrix obs, extractor can infer from space
+        T, F = (seq_len, None)
+        if env_cfg.obs_format == "matrix":
+            # observation_space shape: (T, F)
+            T, F = vec_env.observation_space.shape
+        else:
+            # Flat: need to specify both explicitly
+            F = int(vec_env.observation_space.shape[0] // seq_len)
+        policy_kwargs = {
+            "features_extractor_class": TimeSeriesCNNExtractor,
+            "features_extractor_kwargs": {
+                "features_dim": 256,
+                "seq_len": T,
+                "num_features": F,
+            },
+        }
+
     if algo == "ppo":
         model = AlgoClass(
-            "MlpPolicy",
+            policy_id,
             vec_env,
             learning_rate=lr,
             gamma=gamma,
             n_steps=n_steps,
             ent_coef=ent_coef,
             vf_coef=vf_coef,
+            policy_kwargs=policy_kwargs,
             verbose=1,
+            device=device,
         )
     else:  # a2c
         model = AlgoClass(
-            "MlpPolicy",
+            policy_id,
             vec_env,
             learning_rate=lr,
             gamma=gamma,
             ent_coef=ent_coef,
             vf_coef=vf_coef,
+            policy_kwargs=policy_kwargs,
             verbose=1,
+            device=device,
         )
 
     model.learn(total_timesteps=total_timesteps)
@@ -117,7 +161,7 @@ def train(
 def main():
     p = argparse.ArgumentParser(description="TradingEnv에서 PPO/A2C 학습")
     p.add_argument("--algo", choices=["ppo", "a2c"], default="ppo", help="사용할 RL 알고리즘 ('ppo' 또는 'a2c'). 기본값: ppo")
-    p.add_argument("--db", default="datasets/datasets.db", help="데이터셋이 담긴 SQLite DB 경로. 기본값: datasets/datasets.db")
+    p.add_argument("--db", default="datasets/datasets.db", help="데이터셋이 담긴 SQLite DB 파일 경로. 기본값: datasets/datasets.db")
     p.add_argument("--out", default="models/rl", help="학습된 모델을 저장할 디렉터리({algo}_model.zip). 기본값: models/rl")
     p.add_argument("--table", default="datasets", help="DB에서 사용할 테이블명. 기본값: datasets")
     p.add_argument("--code", default=None, help="특정 종목 코드로 필터링 (예: 005930). 미지정 시 환경 로직에 따름")
@@ -132,6 +176,13 @@ def main():
     p.add_argument("--vf-coef", type=float, default=0.5, help="가치함수 손실 가중치. 기본값: 0.5")
     p.add_argument("--max-steps", type=int, default=None, help="에피소드 최대 스텝 수 또는 순회 제한(환경 의존). 기본값: None")
     p.add_argument("--scale-obs", action="store_true", help="관측치 스케일링/정규화 사용")
+    # New
+    p.add_argument("--reward-mode", choices=["delta", "return", "log_return"], default="delta", help="보상 방식 선택")
+    p.add_argument("--tc-bps", type=float, default=0.0, help="거래비용(bps). 예: 5 = 0.05%")
+    p.add_argument("--hc-bps", type=float, default=0.0, help="보유비용(bps per step)")
+    p.add_argument("--obs-format", choices=["flat", "matrix"], default="flat", help="관측 포맷: flat 또는 matrix")
+    p.add_argument("--policy", choices=["mlp", "cnn"], default="mlp", help="정책 네트워크 유형")
+    p.add_argument("--device", default="cpu", help="학습 장치: cpu/cuda")
     args = p.parse_args()
 
     train(
@@ -151,6 +202,12 @@ def main():
         vf_coef=args.vf_coef,
         max_steps=args.max_steps,
         scale_obs=args.scale_obs,
+        reward_mode=args.reward_mode,
+        transaction_cost_bps=args.tc_bps,
+        holding_cost_bps=args.hc_bps,
+        obs_format=args.obs_format,
+        policy=args.policy,
+        device=args.device,
     )
 
 
