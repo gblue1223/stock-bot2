@@ -110,7 +110,7 @@ python -m ai_trader.rl.train_rl \
   --out models/rl_ppo_scalp \
   --seq-len 60 --target-col 현재가 \
   --policy cnn --obs-format matrix \
-  --reward-mode return --tc-bps 5 --hc-bps 1 \
+  --reward-mode return --tc-bps 30 --hc-bps 1 \
   --w-fast 0.5 --w-sticky 0.5 \
   --priority-bonus 0.1 --activity-window 5 \
   --stoploss-wait 3 \
@@ -158,6 +158,82 @@ python -m ai_trader.rl.infer_rl \
 ```
 - 한 에피소드에 대한 누적 보상(대략적 PnL)을 출력합니다.
 - 로더는 기본적으로 REAL/숫자 컬럼만 사용합니다. `target_col`이 숫자형인지 확인하세요.
+
+## 옵션 상세
+
+- **reward_mode**: 보상 계산 방식 선택
+  - `delta`: px_next - px_t (가격 차이)
+  - `return`: (px_next / px_t - 1)
+  - `log_return`: log(px_next) - log(px_t)
+  - 스케일이 달라 비용/보너스의 상대적 영향이 달라지므로 주의
+
+- **transaction_cost_bps**: 거래 비용(bp)
+  - 1bp = 0.01%, 5bp = 0.05%
+  - 진입/청산 시 각각 1회 차감. 3초 강제 손절 시에도 1회 추가 차감
+  - 과도한 매매를 억제하고 스프레드/수수료를 근사
+
+- **holding_cost_bps**: 보유 비용(bp, per-step)
+  - 포지션 보유 중인 매 스텝(초)마다 가격에 비례해 차감
+  - 오래 들고 가는 전략을 억제하여 초단기 스캘핑을 유도
+
+- **seq_len / target_col / scale_obs**
+  - `seq_len`: 관측 윈도우 길이(T). 인코더 체크포인트와 반드시 동일해야 함
+  - `target_col`: 보상 계산의 기준이 되는 가격 유사 컬럼(예: 현재가)
+  - `scale_obs`: 관측 피처 표준화 사용 여부
+
+- **policy / obs_format / encoder_ckpt**
+  - `policy`: `mlp` 또는 `cnn`(커스텀 CNN 익스트랙터)
+  - `obs_format`: `flat`(T*F) 또는 `matrix`(T,F). `policy=cnn`이면 `matrix` 권장
+  - `encoder_ckpt`: CNN+LSTM+MHA 지도학습 인코더를 불러 관측을 상태벡터로 변환
+
+- **w_fast / w_sticky / priority_bonus / activity_window / stoploss_wait**
+  - `w_fast`: 최근 절대수익 합(활동성) 가중치. 활발한 테이프에서 매수 우선순위↑
+  - `w_sticky`: 하락 빈도 낮음(점착성) 가중치. 쉽게 안 떨어지는 종목 우선순위↑
+  - `priority_bonus`: 위 휴리스틱 가중합 점수에 곱해 롱 진입 시 보상 보너스
+  - `activity_window`: 휴리스틱 계산에 쓰는 최근 창 길이(스텝)
+  - `stoploss_wait`: 매수 후 n스텝 내 가격이 진입가 이상으로 오르지 않으면 강제 손절
+
+- **max_steps / total_timesteps / device**
+  - `max_steps`: 에피소드 당 최대 스텝(데이터 절단 또는 학습 안정화용)
+  - `total_timesteps`: SB3 학습 스텝 수
+  - `device`: `cpu` 또는 `cuda`
+
+### 튜닝 가이드(예시)
+
+- 거래 과다 → `transaction_cost_bps`를 올려 빈도 억제
+- 보유 시간 과다 → `holding_cost_bps`를 소폭 올려 단타 유도
+- 진입 타이밍 미흡 → `w_fast`, `w_sticky`와 `priority_bonus`를 소량 가중(0.05~0.2)
+- 3초 룰 강화/완화 → `stoploss_wait` 조정(1~5 사이 실험)
+
+### 옵션 예시 조합
+
+- 학습(train):
+```bash
+python -m ai_trader.rl.train_rl \
+  --algo ppo \
+  --db models/datasets.db \
+  --out models/rl_ppo_scalp \
+  --seq-len 60 --target-col 현재가 \
+  --policy cnn --obs-format matrix \
+  --reward-mode return --tc-bps 30 --hc-bps 1 \
+  --w-fast 0.5 --w-sticky 0.5 \
+  --priority-bonus 0.1 --activity-window 5 \
+  --stoploss-wait 3 \
+  --total-timesteps 200000 \
+  --device cpu
+```
+
+- 추론(infer):
+```bash
+python -m ai_trader.rl.infer_rl \
+  --algo ppo \
+  --db models/datasets.db \
+  --model models/rl_ppo_scalp/ppo_model \
+  --seq-len 60 --target-col 현재가 \
+  --w-fast 0.5 --w-sticky 0.5 \
+  --priority-bonus 0.1 --activity-window 5 \
+  --stoploss-wait 3
+```
 
 ## 문제 해결(트러블슈팅)
 - `no such table: datasets` 오류:
