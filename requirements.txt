@@ -6,3 +6,10 @@ scipy>=1.10
 scikit-learn>=1.4
 pytest>=8.0
 requests>=2.31
+# Deep Learning / RL
+torch>=2.2
+torchvision>=0.17
+tensorboard>=2.14
+# Gym and RL algorithms
+gymnasium>=0.29
+stable-baselines3>=2.3.0
