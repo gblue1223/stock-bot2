@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from .data import load_real_dataframe, make_sequences, train_val_split
+from .data import load_real_dataframe
 from .models import CNNLSTMAttn, ModelConfig
 
 
@@ -26,6 +26,7 @@ def train(
     epochs: int = 20,
     lr: float = 1e-3,
     device: Optional[str] = None,
+    aux_task: str = "regression",  # one of {"regression", "direction", "volatility"}
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -37,35 +38,83 @@ def train(
     - code (Optional[str], default=None): 특정 종목 코드로 데이터 필터링(예: "005930"). None이면 전체(환경/데이터 로직에 따름).
     - date (Optional[str], default=None): 특정 일자(YYYYMMDD)로 데이터 필터링. None이면 전체 사용.
     - seq_len (int, default=60): 모델 입력으로 사용할 시퀀스(윈도우) 길이.
-    - horizon (int, default=1): 예측 시점까지의 간격(타깃을 몇 스텝 뒤로 볼지).
+    - horizon (int, default=1): 예측 시점까지의 간격(몇 스텝 뒤를 예측할지). direction/volatility에서도 사용.
     - target_col (Optional[str], default=None): 예측 대상 컬럼명. None일 경우 첫 번째 feature를 사용합니다.
     - batch_size (int, default=128): 학습 배치 크기.
     - epochs (int, default=20): 최대 학습 에폭 수(얼리 스탑 적용).
     - lr (float, default=1e-3): AdamW 옵티마이저의 학습률.
     - device (Optional[str], default=None): "cuda"/"cpu" 등 장치 지정. None이면 가능 시 CUDA 사용, 아니면 CPU.
-
-    동작
-    - DB에서 시계열 데이터를 로드하고, `seq_len`과 `horizon`에 맞춰 시퀀스를 생성합니다.
-    - 학습/검증 세트로 분할하여 `CNNLSTMAttn` 모델을 학습합니다.
-    - 검증 손실(`val_loss`)이 개선될 때마다 `model.pt` 체크포인트를 저장합니다.
-    - 최종으로 구성/특징/최적 검증 손실 등을 `config.json`에 기록합니다.
+    - aux_task (str, default="regression"): 보조 학습 목표. {regression, direction, volatility}
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     df, real_cols = load_real_dataframe(db_path, table=table, code=code, date=date)
-    seq = make_sequences(df, real_cols, seq_len=seq_len, horizon=horizon, target_col=target_col)
-    train_seq, val_seq = train_val_split(seq, val_ratio=0.2)
+    # Target setup
+    tgt_col = target_col or ("현재가" if "현재가" in real_cols else real_cols[0])
+    if tgt_col not in real_cols:
+        raise ValueError(f"target_col '{tgt_col}' not in REAL columns")
 
-    train_ds = TensorDataset(torch.from_numpy(train_seq.X), torch.from_numpy(train_seq.y))
-    val_ds = TensorDataset(torch.from_numpy(val_seq.X), torch.from_numpy(val_seq.y))
+    feats = df[real_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    feat_vals = feats.to_numpy(dtype=np.float32)
+    prices = feats[tgt_col].to_numpy(dtype=np.float32)
+    T = len(feats)
+
+    X_list: list[np.ndarray] = []
+    y_list: list[float] = []
+    for i in range(T - seq_len - horizon + 1):
+        xw = feat_vals[i : i + seq_len]
+        # Compute targets depending on aux_task
+        if aux_task == "regression":
+            yv = float(prices[i + seq_len + horizon - 1])
+        elif aux_task == "direction":
+            p_now = float(prices[i + seq_len - 1])
+            p_future = float(prices[i + seq_len + horizon - 1])
+            yv = 1.0 if (p_future - p_now) > 0 else 0.0
+        elif aux_task == "volatility":
+            # std of simple returns over future horizon window
+            p0 = float(prices[i + seq_len - 1])
+            if p0 <= 0:
+                yv = 0.0
+            else:
+                future = prices[i + seq_len : i + seq_len + horizon]
+                # simple returns relative to previous step to avoid div by zero
+                rets = []
+                prev = p0
+                for p in future:
+                    rets.append((float(p) / float(prev) - 1.0) if prev != 0 else 0.0)
+                    prev = float(p)
+                yv = float(np.std(rets, dtype=np.float32)) if len(rets) > 0 else 0.0
+        else:
+            raise ValueError(f"Unknown aux_task: {aux_task}")
+        X_list.append(xw)
+        y_list.append(yv)
+
+    if not X_list:
+        raise ValueError("Not enough rows to create sequences. Reduce seq_len/horizon or load more data.")
+
+    X = np.stack(X_list, axis=0).astype(np.float32)  # [N, T, F]
+    y = np.array(y_list, dtype=np.float32)           # [N]
+
+    # train/val split (time-ordered)
+    n = len(X)
+    n_val = max(1, int(n * 0.2))
+    n_tr = n - n_val
+    X_tr, y_tr = X[:n_tr], y[:n_tr]
+    X_va, y_va = X[n_tr:], y[n_tr:]
+
+    train_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+    val_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(y_va))
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
 
-    cfg = ModelConfig(input_features=len(seq.feature_names), seq_len=seq_len)
+    cfg = ModelConfig(input_features=len(real_cols), seq_len=seq_len)
     model = CNNLSTMAttn(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    loss_fn = nn.MSELoss()
+    if aux_task == "direction":
+        loss_fn = nn.BCEWithLogitsLoss()
+    else:
+        loss_fn = nn.MSELoss()
 
     best_val = float("inf")
     patience = 5
@@ -110,9 +159,10 @@ def train(
             torch.save({
                 "state_dict": model.state_dict(),
                 "config": cfg.__dict__,
-                "feature_names": seq.feature_names,
-                "target_col": target_col or seq.feature_names[0],
+                "feature_names": list(real_cols),
+                "target_col": tgt_col,
                 "horizon": horizon,
+                "aux_task": aux_task,
             }, ckpt_path)
         else:
             no_improve += 1
@@ -128,9 +178,10 @@ def train(
         "date": date,
         "seq_len": seq_len,
         "horizon": horizon,
-        "target_col": target_col or seq.feature_names[0],
-        "feature_names": seq.feature_names,
+        "target_col": tgt_col,
+        "feature_names": list(real_cols),
         "best_val_mse": best_val,
+        "aux_task": aux_task,
     }
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -150,6 +201,7 @@ def main():
     p.add_argument("--epochs", type=int, default=20, help="최대 학습 에폭 수(얼리 스탑 적용). 기본값: 20")
     p.add_argument("--lr", type=float, default=1e-3, help="학습률(AdamW). 기본값: 1e-3")
     p.add_argument("--device", default=None, help="장치 지정: cuda/cpu. 미지정 시 가능하면 CUDA 사용, 아니면 CPU")
+    p.add_argument("--aux-task", choices=["regression", "direction", "volatility"], default="regression", help="보조 학습 목표")
     args = p.parse_args()
 
     train(
@@ -165,6 +217,7 @@ def main():
         epochs=args.epochs,
         lr=args.lr,
         device=args.device,
+        aux_task=args.aux_task,
     )
 
 

@@ -46,6 +46,14 @@ def train(
     # Policy selection
     policy: str = "mlp",
     device: str = "cpu",
+    # Analysis encoder
+    encoder_ckpt: Optional[str] = None,
+    # Scalping heuristics
+    w_fast: float = 0.0,
+    w_sticky: float = 0.0,
+    priority_bonus: float = 0.0,
+    activity_window: int = 5,
+    stoploss_wait: int = 3,
 ):
     """
     TradingEnv에서 PPO 또는 A2C 알고리즘을 학습합니다.
@@ -78,6 +86,11 @@ def train(
     - obs_format (str): 관측 포맷 {flat, matrix}. matrix는 CNN extractor와 함께 권장.
     - policy (str): "mlp" 또는 "cnn". cnn은 TimeSeriesCNNExtractor 사용.
     - device (str): 학습 장치 (예: "cpu", "cuda").
+    - encoder_ckpt (Optional[str]): 사전학습 분석모델 체크포인트 경로(디렉터리 또는 model.pt). 제공 시 상태 벡터를 관측으로 사용.
+    - w_fast, w_sticky (float): 매수 우선순위 휴리스틱 가중치(활동성/점착성).
+    - priority_bonus (float): 롱 포지션 오픈 시 우선순위 점수에 곱해지는 보너스 보상.
+    - activity_window (int): 휴리스틱 계산에 사용하는 최근 관찰 윈도우(초 단위 스텝).
+    - stoploss_wait (int): 진입 후 n초 내 상승 없으면 강제 손절.
     """
     algo = algo.lower()
     if algo not in ALGOS:
@@ -98,6 +111,12 @@ def train(
         transaction_cost_bps=transaction_cost_bps,
         holding_cost_bps=holding_cost_bps,
         obs_format=("matrix" if policy == "cnn" else obs_format),
+        encoder_ckpt=encoder_ckpt,
+        w_fast=w_fast,
+        w_sticky=w_sticky,
+        priority_bonus=priority_bonus,
+        activity_window=activity_window,
+        stoploss_wait=stoploss_wait,
     )
     vec_env = DummyVecEnv([make_env(env_cfg)])
 
@@ -105,8 +124,9 @@ def train(
 
     policy_kwargs = {}
     policy_id = "MlpPolicy"
-    if policy == "cnn":
-        # Use custom extractor. With DummyVecEnv and obs_format=matrix, obs space is (T, F)
+    if policy == "cnn" and encoder_ckpt is None:
+        # Use custom extractor only when we are using raw windows (no encoder)
+        # With DummyVecEnv and obs_format=matrix, obs space is (T, F)
         # SB3 default ActorCriticPolicy (MlpPolicy) can still be used with custom extractor
         policy_id = "MlpPolicy"
         # Need seq_len and feature count for flat case; for matrix obs, extractor can infer from space
@@ -183,6 +203,13 @@ def main():
     p.add_argument("--obs-format", choices=["flat", "matrix"], default="flat", help="관측 포맷: flat 또는 matrix")
     p.add_argument("--policy", choices=["mlp", "cnn"], default="mlp", help="정책 네트워크 유형")
     p.add_argument("--device", default="cpu", help="학습 장치: cpu/cuda")
+    p.add_argument("--encoder-ckpt", default=None, help="사전학습 분석모델 체크포인트 경로(디렉터리 또는 model.pt). 제공 시 상태벡터 관측 사용")
+    # Scalping heuristics
+    p.add_argument("--w-fast", type=float, default=0.0, help="빠른 체결/활동성 휴리스틱 가중치")
+    p.add_argument("--w-sticky", type=float, default=0.0, help="가격 점착성(하락 드뭄) 휴리스틱 가중치")
+    p.add_argument("--priority-bonus", type=float, default=0.0, help="롱 포지션 오픈 시 우선순위 보상 스케일")
+    p.add_argument("--activity-window", type=int, default=5, help="휴리스틱 계산을 위한 최근 윈도우 길이(스텝)")
+    p.add_argument("--stoploss-wait", type=int, default=3, help="진입 후 n스텝 안 오르면 손절")
     args = p.parse_args()
 
     train(
@@ -208,6 +235,12 @@ def main():
         obs_format=args.obs_format,
         policy=args.policy,
         device=args.device,
+        encoder_ckpt=args.encoder_ckpt,
+        w_fast=args.w_fast,
+        w_sticky=args.w_sticky,
+        priority_bonus=args.priority_bonus,
+        activity_window=args.activity_window,
+        stoploss_wait=args.stoploss_wait,
     )
 
 

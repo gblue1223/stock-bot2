@@ -68,7 +68,7 @@ class CNNLSTMAttn(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _forward_features(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
         b, t, f = x.shape
         # Conv over time: need [B, C=F, T]
@@ -85,5 +85,18 @@ class CNNLSTMAttn(nn.Module):
         out, _ = self.attn(seq, seq, seq)  # [B, 1+T, 2H]
         out = self.norm(out)
         cls_out = out[:, 0]  # [B, 2H]
+        return cls_out
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Return compressed state vector [B, D]."""
+        return self._forward_features(x)
+
+    @property
+    def state_dim(self) -> int:
+        return self.cfg.lstm_hidden * 2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, F]
+        cls_out = self._forward_features(x)
         y = self.head(cls_out).squeeze(-1)  # [B]
         return y
