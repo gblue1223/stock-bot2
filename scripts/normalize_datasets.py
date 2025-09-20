@@ -339,37 +339,107 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
 def create_sqlite_table(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
     """
     SQLite 테이블 생성
+    - 단일 테이블 사용을 가정하고, 존재하지 않으면 생성합니다.
+    - 복합 기본키: (날짜, 종목코드, 번호)
     """
-    # 테이블이 이미 존재하면 삭제
-    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-    
     # 컬럼 정의 생성
-    col_definitions = ["번호 INTEGER PRIMARY KEY"]
-    
+    col_definitions = []
+
+    # 스키마 기준 타입 결정
     for col in df.columns:
         if col == '번호':
-            continue
-        elif col in TEXT_COLUMNS:
+            col_definitions.append(f'"{col}" INTEGER')
+        elif col in TEXT_COLUMNS or col == '날짜':
             col_definitions.append(f'"{col}" TEXT')
         else:
             col_definitions.append(f'"{col}" REAL')
-    
-    create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_definitions)})"
+
+    # 복합 PK 추가
+    col_definitions.append('PRIMARY KEY("날짜", "종목코드", "번호")')
+
+    create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_definitions)}) WITHOUT ROWID"
     conn.execute(create_sql)
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
+    row = cur.fetchone()
+    return row is not None
+
+
+def _get_pk_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
+    cols = []
+    for cid, name, ctype, notnull, dflt, pk in conn.execute(f"PRAGMA table_info('{table_name}')"):
+        if pk:
+            cols.append((pk, name))
+    # pk value indicates order (1..N)
+    cols_sorted = [name for _, name in sorted(cols, key=lambda x: x[0])]
+    return cols_sorted
+
+
+def _recreate_table_with_pk(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
+    temp_name = f"{table_name}__new"
+    # 1) Create temp with desired schema
+    create_sqlite_table(conn, temp_name, df)
+
+    # 2) If old exists, migrate data (column intersection)
+    if _table_exists(conn, table_name):
+        # existing columns
+        existing_cols = [row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()]
+        new_cols = list(df.columns)
+        common = [c for c in new_cols if c in existing_cols]
+        if common:
+            cols_list = ", ".join([f'"{c}"' for c in common])
+            conn.execute(f"INSERT OR IGNORE INTO {temp_name} ({cols_list}) SELECT {cols_list} FROM {table_name}")
+
+        # drop old and rename
+        conn.execute(f"DROP TABLE {table_name}")
+    # 3) rename new -> final
+    conn.execute(f"ALTER TABLE {temp_name} RENAME TO {table_name}")
+
+
+def ensure_datasets_table(conn: sqlite3.Connection, df: pd.DataFrame):
+    table_name = "datasets"
+    if not _table_exists(conn, table_name):
+        create_sqlite_table(conn, table_name, df)
+        return
+    # Check PK
+    pk_cols = _get_pk_columns(conn, table_name)
+    desired = ["날짜", "종목코드", "번호"]
+    if pk_cols != desired:
+        print("기존 'datasets' 테이블이 원하는 기본키와 다릅니다. 테이블을 마이그레이션합니다...")
+        _recreate_table_with_pk(conn, table_name, df)
+    # Optional: helpful index for queries by code/date
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
 
 
 def insert_data_to_sqlite(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
     """
-    데이터를 SQLite에 삽입 (중복 방지)
+    데이터를 SQLite에 삽입 (중복 시 갱신: INSERT OR REPLACE)
     """
-    # 번호를 인덱스로 설정
-    df_indexed = df.set_index('번호')
-    
-    # 작은 청크로 나누어 삽입 (SQLite 변수 제한 회피)
-    chunk_size = 100
-    for i in range(0, len(df_indexed), chunk_size):
-        chunk = df_indexed.iloc[i:i+chunk_size]
-        chunk.to_sql(table_name, conn, if_exists='append', index=True)
+    # 필수 컬럼 체크
+    required_cols = {'날짜', '종목코드', '번호'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"필수 컬럼 누락: {missing}")
+
+    # 작은 청크로 나눠 upsert (큰 청크가 더 빠름)
+    chunk_size = 1000
+    cols = list(df.columns)
+    placeholders = ", ".join(["?"] * len(cols))
+    col_list = ", ".join([f'"{c}"' for c in cols])
+    sql = f"INSERT OR REPLACE INTO {table_name} ({col_list}) VALUES ({placeholders})"
+
+    # 단일 트랜잭션으로 일괄 처리 (큰 성능 향상)
+    try:
+        conn.execute("BEGIN")
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i+chunk_size]
+            conn.executemany(sql, [tuple(row) for row in chunk.itertuples(index=False, name=None)])
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _apply_sqlite_pragmas(conn: sqlite3.Connection, *, page_size: int | None, journal_mode: str, synchronous: str, auto_vacuum: str):
@@ -388,7 +458,14 @@ def _apply_sqlite_pragmas(conn: sqlite3.Connection, *, page_size: int | None, jo
     cur.execute(f"PRAGMA journal_mode={journal_mode}")
     # synchronous: OFF(0)|NORMAL(1)|FULL(2)|EXTRA(3)
     cur.execute(f"PRAGMA synchronous={synchronous}")
+    # 추가 성능 튜닝 (안전 범위 내)
+    cur.execute("PRAGMA temp_store=MEMORY")
+    # 음수면 KB 단위의 페이지 수를 의미 (예: -200000 ~= 200MB)
+    cur.execute("PRAGMA cache_size=-200000")
+    # 메모리 매핑 (일부 빌드에서만 영향)
+    cur.execute("PRAGMA mmap_size=134217728")  # 128MB
     cur.close()
+
 
 def normalize_datasets(input_folder: str, output_db: str, *,
                        compact: bool = False,
@@ -434,16 +511,18 @@ def normalize_datasets(input_folder: str, output_db: str, *,
             # 피처 정규화 적용
             merged_df = apply_feature_normalization(merged_df)
             
-            # 테이블명: date_code 형식
-            table_name = f"data_{date}_{code}"
+            # 날짜 컬럼 추가 (그룹 키의 날짜 사용) - 사본을 만들어 단편화 방지
+            merged_df = merged_df.copy()
+            merged_df['날짜'] = date
+            merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
+
+            # SQLite 테이블 생성/보장 (+ 필요 시 PK 스키마로 마이그레이션)
+            ensure_datasets_table(conn, merged_df)
+
+            # 데이터 삽입 (upsert)
+            insert_data_to_sqlite(conn, "datasets", merged_df)
             
-            # SQLite 테이블 생성
-            create_sqlite_table(conn, table_name, merged_df)
-            
-            # 데이터 삽입
-            insert_data_to_sqlite(conn, table_name, merged_df)
-            
-            print(f"완료: {table_name} ({len(merged_df)} 행)")
+            print(f"완료: {len(merged_df)} 행")
     
     finally:
         try:
@@ -496,6 +575,6 @@ def main():
 
 
 # python scripts/normalize_datasets.py models/test_datasets -o models/test_datasets.db
-# python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawler\data\20250905" -o models/datasets.db
+# python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawler\data" -o models/datasets.db
 if __name__ == "__main__":
     main()
