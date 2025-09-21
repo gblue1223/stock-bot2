@@ -83,6 +83,23 @@ python -m ai_trader.ml.train_supervised \
   --db models/datasets.db --table datasets \
   --out models/supervised --seq-len 60 --horizon 1 --target-col 현재가
 
+# horizon 10
+python -m ai_trader.ml.train_supervised \
+  --db models/datasets.db --table datasets \
+  --out models/supervised_h10 --seq-len 60 --horizon 10 --target-col 현재가
+
+# horizon 30 (샘플 감소 시 batch-size 조정 예)
+python -m ai_trader.ml.train_supervised \
+  --db models/datasets.db --table datasets \
+  --out models/supervised_h30 --seq-len 60 --horizon 30 --target-col 현재가 \
+  --batch-size 64
+
+# horizon 100, 방향 분류로 변경 예
+python -m ai_trader.ml.train_supervised \
+  --db models/datasets.db --table datasets \
+  --out models/supervised_h100_dir --seq-len 60 --horizon 100 --target-col 현재가 \
+  --aux-task direction
+  
 # 2) PPO 학습 시 인코더 결합
 python -m ai_trader.rl.train_rl \
   --algo ppo \
@@ -259,4 +276,4 @@ tensorboard --logdir runs/sb3
 ## 확장 아이디어
 - `ai_trader/rl/env.py`에 슬리피지, 포지션 사이징, 숏 포지션 등을 추가
 - `TimeSeriesCNNExtractor`를 1D Temporal CNN 또는 Transformer 기반 익스트랙터로 대체
-- SB3 학습에 TensorBoard 콜백을 추가하여 지표 로깅
+- __SB3 학습에 TensorBoard 콜백을 추가하여 지표 로깅__
