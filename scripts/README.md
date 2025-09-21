@@ -47,6 +47,13 @@ python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawle
   --page-size 32768 --journal-mode WAL --synchronous NORMAL --auto-vacuum none \
   --vacuum-into models/datasets_compact.db
 ```
+- 컴팩트화
+```bash
+python scripts/normalize_datasets.py "D:\anything" -o "C:\path\to\datasets.db" --compact-only --compact
+
+python scripts/normalize_datasets.py "D:\anything" -o "C:\path\to\datasets.db" ^
+  --compact-only --vacuum-into "C:\path\to\datasets_compact.db"
+```
 
 ### 출력
 - SQLite DB 테이블: `datasets`

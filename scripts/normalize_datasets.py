@@ -535,10 +535,36 @@ def normalize_datasets(input_folder: str, output_db: str, *,
                        synchronous: str = "NORMAL",
                        auto_vacuum: str = "full",
                        vacuum_into: str | None = None,
-                       skip_existing: bool = True):
+                       skip_existing: bool = True,
+                       compact_only: bool = False):
     """
     메인 정규화 함수
     """
+    # compact-only 모드: CSV 처리 없이 DB 유지보수만 수행
+    if compact_only:
+        print("compact-only 모드: CSV 처리 없이 DB 최적화/컴팩트만 수행합니다.")
+        conn = sqlite3.connect(output_db)
+        _apply_sqlite_pragmas(conn,
+                              page_size=page_size,
+                              journal_mode=journal_mode,
+                              synchronous=synchronous,
+                              auto_vacuum=auto_vacuum)
+        try:
+            conn.execute("ANALYZE")
+            conn.execute("PRAGMA optimize")
+            if vacuum_into:
+                conn.execute(f"VACUUM INTO '{vacuum_into}'")
+                print(f"VACUUM INTO 완료: {vacuum_into}")
+            elif compact:
+                conn.execute("VACUUM")
+                print("VACUUM 완료 (in-place)")
+            else:
+                print("참고: --compact 또는 --vacuum-into가 지정되지 않아 VACUUM은 생략되었습니다.")
+        finally:
+            conn.close()
+        print(f"DB 유지보수 완료: {output_db}")
+        return
+
     print(f"CSV 파일 검색 중: {input_folder}")
     csv_groups = find_csv_files(input_folder)
     
@@ -633,12 +659,17 @@ def main():
                         help="이미 DB에 해당 (종목코드, 날짜) 그룹이 존재하면 스킵합니다 (기본: 활성화)")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
                         help="이미 존재하는 그룹도 다시 처리합니다")
+    # Compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화/컴팩트만 수행
+    parser.add_argument("--compact-only", action="store_true",
+                        help="CSV 처리 없이 지정한 DB에 대해 ANALYZE/PRAGMA optimize 및 VACUUM/VACUUM INTO만 수행합니다")
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.input_folder):
-        print(f"입력 폴더가 존재하지 않습니다: {args.input_folder}")
-        return
+    # compact-only인 경우 입력 폴더 존재 여부는 체크하지 않음
+    if not args.compact_only:
+        if not os.path.exists(args.input_folder):
+            print(f"입력 폴더가 존재하지 않습니다: {args.input_folder}")
+            return
     
     normalize_datasets(
         args.input_folder,
@@ -650,6 +681,7 @@ def main():
         auto_vacuum=args.auto_vacuum,
         vacuum_into=args.vacuum_into,
         skip_existing=args.skip_existing,
+        compact_only=args.compact_only,
     )
 
 
