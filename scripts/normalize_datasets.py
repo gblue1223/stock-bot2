@@ -393,7 +393,10 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
         conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _schema_df")
         conn.unregister("_schema_df")
     else:
-        existing_cols = [row[0] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
+        # Use correct indices from PRAGMA table_info: (cid, name, type, null, default, pk)
+        existing_info = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
+        existing_cols = [row[1] for row in existing_info]
+        existing_types = {row[1]: (row[2] or "").upper() for row in existing_info}
         for col in df.columns:
             if col not in existing_cols:
                 series = df[col]
@@ -404,6 +407,18 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
                 else:
                     col_type = 'DOUBLE'
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN \"{col}\" {col_type}")
+        # Enforce VARCHAR for known text columns if mismatched (e.g., '종목명' mistakenly INT)
+        text_like = set(TEXT_COLUMNS) | {"날짜", "종목명"}
+        # Drop dependent index before altering types to avoid catalog error
+        try:
+            conn.execute("DROP INDEX IF EXISTS idx_datasets_code_date")
+        except Exception:
+            pass
+        for col in (c for c in df.columns if c in text_like and c in existing_types):
+            ctype = existing_types.get(col, "")
+            if "CHAR" not in ctype and "STRING" not in ctype and "VARCHAR" not in ctype:
+                conn.execute(f"ALTER TABLE {table} ALTER COLUMN \"{col}\" TYPE VARCHAR")
+    # Helpful index (recreate if dropped)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
 
 
@@ -418,8 +433,7 @@ def normalize_datasets(input_folder: str, output_db: str, *,
         print("compact-only 모드: CSV 처리 없이 DB 최적화만 수행합니다.")
         conn = duckdb.connect(output_db)
         try:
-            conn.execute("PRAGMA optimize")
-            conn.execute("PRAGMA checkpoint")
+            conn.execute("CHECKPOINT")
         finally:
             conn.close()
         print(f"DB 유지보수 완료: {output_db}")
@@ -487,8 +501,7 @@ def normalize_datasets(input_folder: str, output_db: str, *,
     finally:
         try:
             # DuckDB maintenance
-            conn.execute("PRAGMA optimize")
-            conn.execute("PRAGMA checkpoint")
+            conn.execute("CHECKPOINT")
         finally:
             conn.close()
     
