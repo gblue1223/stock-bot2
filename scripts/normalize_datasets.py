@@ -1,13 +1,12 @@
 import argparse
 import os
 import re
-import sqlite3
+import duckdb
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
 
 FILENAME_PATTERN = re.compile(r"^(?P<code>\d{6})_(?P<name>.+?)_(?P<type>[^_]+)_(?P<date>\d{8})\.csv$")
 TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
@@ -381,185 +380,46 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def create_sqlite_table(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
-    """
-    SQLite 테이블 생성
-    - 단일 테이블 사용을 가정하고, 존재하지 않으면 생성합니다.
-    - 복합 기본키: (날짜, 종목코드, 번호)
-    """
-    # 컬럼 정의 생성
-    col_definitions = []
-
-    # 스키마 기준 타입 결정
-    for col in df.columns:
-        if col == '번호':
-            col_definitions.append(f'"{col}" INTEGER')
-        elif col in TEXT_COLUMNS or col == '날짜':
-            col_definitions.append(f'"{col}" TEXT')
-        else:
-            col_definitions.append(f'"{col}" REAL')
-
-    # 복합 PK 추가
-    col_definitions.append('PRIMARY KEY("날짜", "종목코드", "번호")')
-
-    create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_definitions)}) WITHOUT ROWID"
-    conn.execute(create_sql)
-
-
-def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
-    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table_name,))
-    row = cur.fetchone()
-    return row is not None
-
-
-def _get_pk_columns(conn: sqlite3.Connection, table_name: str) -> list[str]:
-    cols = []
-    for cid, name, ctype, notnull, dflt, pk in conn.execute(f"PRAGMA table_info('{table_name}')"):
-        if pk:
-            cols.append((pk, name))
-    # pk value indicates order (1..N)
-    cols_sorted = [name for _, name in sorted(cols, key=lambda x: x[0])]
-    return cols_sorted
-
-
-def _recreate_table_with_pk(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
-    temp_name = f"{table_name}__new"
-    # 1) Create temp with desired schema
-    create_sqlite_table(conn, temp_name, df)
-
-    # 2) If old exists, migrate data (column intersection)
-    if _table_exists(conn, table_name):
-        # existing columns
-        existing_cols = [row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()]
-        new_cols = list(df.columns)
-        common = [c for c in new_cols if c in existing_cols]
-        if common:
-            cols_list = ", ".join([f'"{c}"' for c in common])
-            conn.execute(f"INSERT OR IGNORE INTO {temp_name} ({cols_list}) SELECT {cols_list} FROM {table_name}")
-
-        # drop old and rename
-        conn.execute(f"DROP TABLE {table_name}")
-    # 3) rename new -> final
-    conn.execute(f"ALTER TABLE {temp_name} RENAME TO {table_name}")
-
-
-def ensure_datasets_table(conn: sqlite3.Connection, df: pd.DataFrame):
-    table_name = "datasets"
-    if not _table_exists(conn, table_name):
-        create_sqlite_table(conn, table_name, df)
-        return
-    # Check PK
-    pk_cols = _get_pk_columns(conn, table_name)
-    desired = ["날짜", "종목코드", "번호"]
-    if pk_cols != desired:
-        print("기존 'datasets' 테이블이 원하는 기본키와 다릅니다. 테이블을 마이그레이션합니다...")
-        _recreate_table_with_pk(conn, table_name, df)
-    # 마이그레이션 후에도 컬럼 보강 절차 진행
-
-    # Ensure all needed columns exist (추가 생성)
-    existing_cols = [row[1] for row in conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()]
-    for col in df.columns:
-        if col in existing_cols:
-            continue
-        # 타입 추론: 번호 -> INTEGER, 텍스트/날짜 -> TEXT, 그 외 REAL
-        if col == '번호':
-            col_type = 'INTEGER'
-        elif col in TEXT_COLUMNS or col == '날짜':
-            col_type = 'TEXT'
-        else:
-            col_type = 'REAL'
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN \"{col}\" {col_type}")
-
-    # Optional: helpful index for queries by code/date
+def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame):
+    table = "datasets"
+    # Create table if not exists
+    try:
+        conn.execute(f"DESCRIBE {table}")
+        exists = True
+    except Exception:
+        exists = False
+    if not exists:
+        conn.register("_schema_df", df.head(0))
+        conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _schema_df")
+        conn.unregister("_schema_df")
+    else:
+        existing_cols = [row[0] for row in conn.execute(f"PRAGMA table_info('{table}')").fetchall()]
+        for col in df.columns:
+            if col not in existing_cols:
+                series = df[col]
+                if col in TEXT_COLUMNS or col == '날짜' or series.dtype == object:
+                    col_type = 'VARCHAR'
+                elif pd.api.types.is_integer_dtype(series):
+                    col_type = 'BIGINT'
+                else:
+                    col_type = 'DOUBLE'
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN \"{col}\" {col_type}")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
 
 
-def insert_data_to_sqlite(conn: sqlite3.Connection, table_name: str, df: pd.DataFrame):
-    """
-    데이터를 SQLite에 삽입 (중복 시 갱신: INSERT OR REPLACE)
-    """
-    # 필수 컬럼 체크
-    required_cols = {'날짜', '종목코드', '번호'}
-    missing = required_cols - set(df.columns)
-    if missing:
-        raise ValueError(f"필수 컬럼 누락: {missing}")
-
-    # 작은 청크로 나눠 upsert (큰 청크가 더 빠름)
-    chunk_size = 1000
-    cols = list(df.columns)
-    placeholders = ", ".join(["?"] * len(cols))
-    col_list = ", ".join([f'"{c}"' for c in cols])
-    sql = f"INSERT OR REPLACE INTO {table_name} ({col_list}) VALUES ({placeholders})"
-
-    # 단일 트랜잭션으로 일괄 처리 (큰 성능 향상)
-    try:
-        conn.execute("BEGIN")
-        for i in range(0, len(df), chunk_size):
-            chunk = df.iloc[i:i+chunk_size]
-            conn.executemany(sql, [tuple(row) for row in chunk.itertuples(index=False, name=None)])
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-
-
-def _apply_sqlite_pragmas(conn: sqlite3.Connection, *, page_size: int | None, journal_mode: str, synchronous: str, auto_vacuum: str):
-    """
-    Apply space/IO related PRAGMAs. These are built-in and do not require external modules.
-    Note: page_size and auto_vacuum must be set before creating tables to fully take effect.
-    """
-    cur = conn.cursor()
-    if page_size:
-        cur.execute(f"PRAGMA page_size={int(page_size)}")
-    if auto_vacuum.lower() in {"none", "full", "incremental"}:
-        # none(0), full(1), incremental(2)
-        mapping = {"none": 0, "full": 1, "incremental": 2}
-        cur.execute(f"PRAGMA auto_vacuum={mapping[auto_vacuum.lower()]}")
-    # journal_mode: DELETE|TRUNCATE|PERSIST|MEMORY|WAL|OFF
-    cur.execute(f"PRAGMA journal_mode={journal_mode}")
-    # synchronous: OFF(0)|NORMAL(1)|FULL(2)|EXTRA(3)
-    cur.execute(f"PRAGMA synchronous={synchronous}")
-    # 추가 성능 튜닝 (안전 범위 내)
-    cur.execute("PRAGMA temp_store=MEMORY")
-    # 음수면 KB 단위의 페이지 수를 의미 (예: -200000 ~= 200MB)
-    cur.execute("PRAGMA cache_size=-200000")
-    # 메모리 매핑 (일부 빌드에서만 영향)
-    cur.execute("PRAGMA mmap_size=134217728")  # 128MB
-    cur.close()
-
-
 def normalize_datasets(input_folder: str, output_db: str, *,
-                       compact: bool = False,
-                       page_size: int | None = None,
-                       journal_mode: str = "WAL",
-                       synchronous: str = "NORMAL",
-                       auto_vacuum: str = "full",
-                       vacuum_into: str | None = None,
                        skip_existing: bool = True,
                        compact_only: bool = False):
     """
-    메인 정규화 함수
+    메인 정규화 함수 (DuckDB 전용)
     """
     # compact-only 모드: CSV 처리 없이 DB 유지보수만 수행
     if compact_only:
-        print("compact-only 모드: CSV 처리 없이 DB 최적화/컴팩트만 수행합니다.")
-        conn = sqlite3.connect(output_db)
-        _apply_sqlite_pragmas(conn,
-                              page_size=page_size,
-                              journal_mode=journal_mode,
-                              synchronous=synchronous,
-                              auto_vacuum=auto_vacuum)
+        print("compact-only 모드: CSV 처리 없이 DB 최적화만 수행합니다.")
+        conn = duckdb.connect(output_db)
         try:
-            conn.execute("ANALYZE")
             conn.execute("PRAGMA optimize")
-            if vacuum_into:
-                conn.execute(f"VACUUM INTO '{vacuum_into}'")
-                print(f"VACUUM INTO 완료: {vacuum_into}")
-            elif compact:
-                conn.execute("VACUUM")
-                print("VACUUM 완료 (in-place)")
-            else:
-                print("참고: --compact 또는 --vacuum-into가 지정되지 않아 VACUUM은 생략되었습니다.")
+            conn.execute("PRAGMA checkpoint")
         finally:
             conn.close()
         print(f"DB 유지보수 완료: {output_db}")
@@ -574,15 +434,8 @@ def normalize_datasets(input_folder: str, output_db: str, *,
     
     print(f"발견된 그룹 수: {len(csv_groups)}")
     
-    # SQLite 연결
-    conn = sqlite3.connect(output_db)
-    
-    # Apply PRAGMAs before creating any table for best effect
-    _apply_sqlite_pragmas(conn,
-                          page_size=page_size,
-                          journal_mode=journal_mode,
-                          synchronous=synchronous,
-                          auto_vacuum=auto_vacuum)
+    # DuckDB 연결
+    conn = duckdb.connect(output_db)
     
     try:
         for group_key, files in csv_groups.items():
@@ -595,14 +448,18 @@ def normalize_datasets(input_folder: str, output_db: str, *,
             name = '_'.join(parts[1:-1])
             
             # 이미 존재하는 그룹은 스킵 (옵션)
-            if skip_existing and _table_exists(conn, "datasets"):
+            if skip_existing:
                 try:
-                    cur = conn.execute('SELECT 1 FROM datasets WHERE "종목코드"=? AND "날짜"=? LIMIT 1', (code, date))
-                    if cur.fetchone():
+                    conn.execute("DESCRIBE datasets")
+                    exists = conn.execute(
+                        "SELECT 1 FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=? LIMIT 1",
+                        [code, date]
+                    ).fetchone()
+                    if exists:
                         print(f"스킵(이미 존재): {group_key}")
                         continue
                 except Exception:
-                    # 테이블 존재 체크 이후의 예외는 스킵 로직을 무시하고 계속 처리
+                    # 테이블이 없으면 계속 진행하여 생성
                     pass
             
             # CSV 파일들 merge
@@ -615,25 +472,23 @@ def normalize_datasets(input_folder: str, output_db: str, *,
             merged_df['날짜'] = date
             merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
 
-            # SQLite 테이블 생성/보장 (+ 필요 시 PK 스키마로 마이그레이션)
-            ensure_datasets_table(conn, merged_df)
-
-            # 데이터 삽입 (upsert)
-            insert_data_to_sqlite(conn, "datasets", merged_df)
+            # DuckDB: 테이블 보장 후, 그룹 단위 delete-then-insert
+            ensure_datasets_table_duckdb(conn, merged_df)
+            conn.register("_batch_df", merged_df)
+            try:
+                conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
+            except Exception:
+                pass
+            conn.execute("INSERT INTO datasets SELECT * FROM _batch_df")
+            conn.unregister("_batch_df")
             
             print(f"완료: {len(merged_df)} 행")
     
     finally:
         try:
-            # Analyze and optimize sqlite internal stats
-            conn.execute("ANALYZE")
+            # DuckDB maintenance
             conn.execute("PRAGMA optimize")
-            # VACUUM compacts the database; use when --compact is requested
-            if vacuum_into:
-                # If supported by this SQLite build, write compacted copy
-                conn.execute(f"VACUUM INTO '{vacuum_into}'")
-            elif compact:
-                conn.execute("VACUUM")
+            conn.execute("PRAGMA checkpoint")
         finally:
             conn.close()
     
@@ -641,27 +496,17 @@ def normalize_datasets(input_folder: str, output_db: str, *,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CSV 데이터셋 정규화 스크립트")
+    parser = argparse.ArgumentParser(description="CSV 데이터셋 정규화 스크립트 (DuckDB)")
     parser.add_argument("input_folder", help="입력 CSV 폴더 경로")
-    parser.add_argument("-o", "--output", default="normalized.db", help="출력 SQLite DB 파일명")
-    # Built-in SQLite space/IO tuning (no external compression modules)
-    parser.add_argument("--compact", action="store_true", help="마지막에 VACUUM 실행으로 DB를 컴팩트하게 만듭니다")
-    parser.add_argument("--page-size", type=int, default=4096, help="페이지 크기 (바이트). 테이블 생성 전 설정 권장. 예: 4096, 8192, 16384")
-    parser.add_argument("--journal-mode", choices=["DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"], default="WAL",
-                        help="저널 모드 설정")
-    parser.add_argument("--synchronous", choices=["OFF", "NORMAL", "FULL", "EXTRA"], default="NORMAL", help="동기화 수준 설정")
-    parser.add_argument("--auto-vacuum", choices=["none", "full", "incremental"], default="full",
-                        help="자동 VACUUM 모드 설정")
-    parser.add_argument("--vacuum-into", default=None,
-                        help="지원 시 VACUUM INTO 경로로 압축/컴팩트된 복사본을 생성합니다 (예: output_compact.db)")
+    parser.add_argument("-o", "--output", default="normalized.duckdb", help="출력 DuckDB 파일명")
     # Skip-existing 옵션 (기본 활성화). 비활성화하려면 --no-skip-existing 사용
     parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=True,
                         help="이미 DB에 해당 (종목코드, 날짜) 그룹이 존재하면 스킵합니다 (기본: 활성화)")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
                         help="이미 존재하는 그룹도 다시 처리합니다")
-    # Compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화/컴팩트만 수행
+    # Compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화만 수행
     parser.add_argument("--compact-only", action="store_true",
-                        help="CSV 처리 없이 지정한 DB에 대해 ANALYZE/PRAGMA optimize 및 VACUUM/VACUUM INTO만 수행합니다")
+                        help="CSV 처리 없이 지정한 DuckDB에 대해 PRAGMA optimize/checkpoint만 수행합니다")
     
     args = parser.parse_args()
     
@@ -674,18 +519,10 @@ def main():
     normalize_datasets(
         args.input_folder,
         args.output,
-        compact=args.compact,
-        page_size=args.page_size,
-        journal_mode=args.journal_mode,
-        synchronous=args.synchronous,
-        auto_vacuum=args.auto_vacuum,
-        vacuum_into=args.vacuum_into,
         skip_existing=args.skip_existing,
         compact_only=args.compact_only,
     )
 
 
-# python scripts/normalize_datasets.py models/test_datasets -o models/test_datasets.db
-# python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawler\data" -o models/datasets.db
 if __name__ == "__main__":
     main()

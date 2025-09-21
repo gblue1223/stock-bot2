@@ -13,3 +13,4 @@ tensorboard>=2.14
 # Gym and RL algorithms
 gymnasium>=0.29
 stable-baselines3>=2.3.0
+duckdb>=1.4.0

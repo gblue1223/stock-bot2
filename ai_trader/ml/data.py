@@ -1,4 +1,4 @@
-import sqlite3
+import duckdb
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Dict
 
@@ -9,32 +9,39 @@ import pandas as pd
 KEY_COLS = ["날짜", "종목코드", "번호"]
 
 
-def get_table_schema(conn: sqlite3.Connection, table: str) -> List[Tuple[int, str, str, int, Optional[str], int]]:
-    return list(conn.execute(f"PRAGMA table_info('{table}')"))
+def get_table_schema(conn, table: str) -> List[Tuple[int, str, str, int, Optional[str], int]]:
+    """DuckDB table schema via PRAGMA table_info.
+    Returns tuples approx: (column_id, column_name, data_type, null, default, primary_key)
+    """
+    return list(conn.execute(f"PRAGMA table_info('{table}')").fetchall())
 
 
-def list_tables(conn: sqlite3.Connection) -> List[str]:
-    return [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+def list_tables(conn) -> List[str]:
+    # SHOW TABLES returns rows with first column = table name
+    return [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
 
 
-def table_exists(conn: sqlite3.Connection, table: str) -> bool:
-    cur = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,))
-    return cur.fetchone() is not None
+def table_exists(conn, table: str) -> bool:
+    try:
+        conn.execute(f"DESCRIBE {table}")
+        return True
+    except Exception:
+        return False
 
 
-def get_real_columns(conn: sqlite3.Connection, table: str = "datasets") -> List[str]:
-    cols = []
-    for cid, name, ctype, notnull, dflt, pk in get_table_schema(conn, table):
+def get_real_columns(conn, table: str = "datasets") -> List[str]:
+    cols: List[str] = []
+    for cid, name, ctype, is_null, dflt, pk in get_table_schema(conn, table):
         t = (ctype or "").upper()
-        # Consider common numeric affinities in SQLite
-        if any(tok in t for tok in ("REAL", "DOUBLE", "FLOAT", "NUM")):
+        # Consider common floating-point types in DuckDB
+        if any(tok in t for tok in ("DOUBLE", "FLOAT", "REAL", "DECIMAL")):
             cols.append(name)
     return cols
 
 
-def get_integer_columns(conn: sqlite3.Connection, table: str = "datasets") -> List[str]:
-    cols = []
-    for cid, name, ctype, notnull, dflt, pk in get_table_schema(conn, table):
+def get_integer_columns(conn, table: str = "datasets") -> List[str]:
+    cols: List[str] = []
+    for cid, name, ctype, is_null, dflt, pk in get_table_schema(conn, table):
         t = (ctype or "").upper()
         if "INT" in t:
             cols.append(name)
@@ -50,10 +57,10 @@ def load_real_dataframe(
     order_asc: bool = True,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Load only REAL-typed (or numeric-like) columns from SQLite. Always includes keys if available for ordering and filtering.
+    Load only REAL-typed (or numeric-like) columns from DuckDB. Always includes keys if available for ordering and filtering.
     Returns (df, real_cols_in_df).
     """
-    conn = sqlite3.connect(db_path)
+    conn = duckdb.connect(db_path)
     try:
         if not table_exists(conn, table):
             available = list_tables(conn)
@@ -92,7 +99,7 @@ def load_real_dataframe(
         if limit:
             sql += f" LIMIT {int(limit)}"
 
-        df = pd.read_sql(sql, conn, params=params)
+        df = conn.execute(sql, params).df()
 
         # Determine usable REAL/numeric columns present in the DataFrame
         if select_cols:
