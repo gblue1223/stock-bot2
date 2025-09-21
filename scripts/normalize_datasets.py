@@ -534,7 +534,8 @@ def normalize_datasets(input_folder: str, output_db: str, *,
                        journal_mode: str = "WAL",
                        synchronous: str = "NORMAL",
                        auto_vacuum: str = "full",
-                       vacuum_into: str | None = None):
+                       vacuum_into: str | None = None,
+                       skip_existing: bool = True):
     """
     메인 정규화 함수
     """
@@ -566,6 +567,17 @@ def normalize_datasets(input_folder: str, output_db: str, *,
             code = parts[0]
             date = parts[-1]
             name = '_'.join(parts[1:-1])
+            
+            # 이미 존재하는 그룹은 스킵 (옵션)
+            if skip_existing and _table_exists(conn, "datasets"):
+                try:
+                    cur = conn.execute('SELECT 1 FROM datasets WHERE "종목코드"=? AND "날짜"=? LIMIT 1', (code, date))
+                    if cur.fetchone():
+                        print(f"스킵(이미 존재): {group_key}")
+                        continue
+                except Exception:
+                    # 테이블 존재 체크 이후의 예외는 스킵 로직을 무시하고 계속 처리
+                    pass
             
             # CSV 파일들 merge
             merged_df = merge_csv_files(files, code, name)
@@ -616,6 +628,11 @@ def main():
                         help="자동 VACUUM 모드 설정")
     parser.add_argument("--vacuum-into", default=None,
                         help="지원 시 VACUUM INTO 경로로 압축/컴팩트된 복사본을 생성합니다 (예: output_compact.db)")
+    # Skip-existing 옵션 (기본 활성화). 비활성화하려면 --no-skip-existing 사용
+    parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=True,
+                        help="이미 DB에 해당 (종목코드, 날짜) 그룹이 존재하면 스킵합니다 (기본: 활성화)")
+    parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
+                        help="이미 존재하는 그룹도 다시 처리합니다")
     
     args = parser.parse_args()
     
@@ -632,6 +649,7 @@ def main():
         synchronous=args.synchronous,
         auto_vacuum=args.auto_vacuum,
         vacuum_into=args.vacuum_into,
+        skip_existing=args.skip_existing,
     )
 
 
