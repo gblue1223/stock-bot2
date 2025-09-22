@@ -33,6 +33,8 @@ python scripts/normalize_datasets.py <input_folder> \
 - 기본 실행(DuckDB):
 ```bash
 python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawler\data" -o "C:\Users\user\Workspace\datasets\datasets.duckdb"
+
+python scripts/normalize_datasets.py models/test_datasets -o "C:\Users\user\Workspace\datasets\test_datasets.duckdb"
 ```
 - 이미 있는 그룹 스킵 해제:
 ```bash
