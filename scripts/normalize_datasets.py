@@ -436,6 +436,85 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
 
 
+def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
+    """Top-level helper: from a pickle file path, extract (group_key, code, date, pkl_path).
+    Returns None if filename doesn't match expected pattern. Using only built-in types for pickling safety.
+    """
+    try:
+        name = os.path.basename(pkl_path)
+        group_key = os.path.splitext(name)[0]
+        parts = group_key.split('_')
+        if len(parts) < 2:
+            return None
+        code = parts[0]
+        date = parts[-1]
+        return group_key, code, date, pkl_path
+    except Exception:
+        return None
+
+
+def _sweep_and_ingest_tmp(conn: duckdb.DuckDBPyConnection, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20):
+    """Scan tmp_root for any leftover .pkl files and ingest them in the current process.
+    This supports resume-on-start and graceful Ctrl+C handling.
+    """
+    if not tmp_root.exists():
+        return
+    pkls = sorted(p for p in tmp_root.glob("*.pkl"))
+    if not pkls:
+        return
+    print(f"임시 체크포인트 {len(pkls)}개를 DB에 반영합니다 (resume/cleanup)...")
+    prepared: list[tuple[str, str, str, str]] = []
+    max_workers = max(1, int(workers))
+    used_workers = min(max_workers, len(pkls))
+    if used_workers > 1:
+        print(f"- 메타데이터 병렬 준비: workers={used_workers}")
+        with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
+            futs = [ex.submit(_prep_pkl_metadata, str(p)) for p in pkls]
+            done = 0
+            for fut in _fut.as_completed(futs):
+                try:
+                    res = fut.result()
+                    if res is not None:
+                        prepared.append(res)
+                    else:
+                        # remove unknown naming
+                        pass
+                finally:
+                    done += 1
+    else:
+        print("- 메타데이터 직렬 준비 (workers=1)")
+        for p in pkls:
+            res = _prep_pkl_metadata(str(p))
+            if res is not None:
+                prepared.append(res)
+            else:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+ 
+    print("- DuckDB 반영: 순차 처리 (쓰기 경합 방지)")
+    for i, (group_key, code, date, pkl_path) in enumerate(prepared, 1):
+        try:
+            with open(pkl_path, 'rb') as f:
+                merged_df = _pickle.load(f)
+            ensure_datasets_table_duckdb(conn, merged_df)
+            conn.register("_batch_df", merged_df)
+            try:
+                conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
+            except Exception:
+                pass
+            conn.execute("INSERT INTO datasets SELECT * FROM _batch_df")
+            conn.unregister("_batch_df")
+            print(f"완료(즉시 반영): {group_key} - {len(merged_df)} 행")
+        finally:
+            # Always try to remove the pickle to free disk space
+            try:
+                os.remove(pkl_path)
+            except Exception:
+                pass
+
+
 def _worker_process(group_key: str, files: Dict[str, str], tmp_root: str, checkpoint_interval: int) -> Tuple[str, str, str, str]:
     """Top-level worker for multiprocessing: merge + normalize + pickle dump.
     Returns (group_key, code, date, out_pickle_path).
@@ -487,34 +566,6 @@ def _ingest_pickle_into_db(conn: duckdb.DuckDBPyConnection, pkl_path: str, code:
             os.remove(pkl_path)
         except Exception:
             pass
-
-
-def _sweep_and_ingest_tmp(conn: duckdb.DuckDBPyConnection, tmp_root: Path):
-    """Scan tmp_root for any leftover .pkl files and ingest them in the current process.
-    This supports resume-on-start and graceful Ctrl+C handling.
-    """
-    if not tmp_root.exists():
-        return
-    pkls = sorted(p for p in tmp_root.glob("*.pkl"))
-    if not pkls:
-        return
-    print(f"임시 체크포인트 {len(pkls)}개를 DB에 반영합니다 (resume/cleanup)...")
-    for pkl in pkls:
-        group_key = pkl.stem
-        parts = group_key.split('_')
-        if len(parts) < 2:
-            # Unknown naming; skip safely
-            try:
-                os.remove(pkl)
-            except Exception:
-                pass
-            continue
-        code = parts[0]
-        date = parts[-1]
-        try:
-            _ingest_pickle_into_db(conn, str(pkl), code, date, group_key)
-        except Exception as e:
-            print(f"경고: 임시 파일 반영 실패({pkl.name}): {type(e).__name__}: {e}")
 
 
 def normalize_datasets(input_folder: str, output_db: str, *,
@@ -602,7 +653,7 @@ def normalize_datasets(input_folder: str, output_db: str, *,
                     pass
  
         # 2.5) 재시작/이전 중단 시 임시 파일 먼저 반영(resume)
-        _sweep_and_ingest_tmp(conn, _tmp_base)
+        _sweep_and_ingest_tmp(conn, _tmp_base, workers=workers, checkpoint_interval=checkpoint_interval)
 
         # 3) 병렬 처리: 그룹 단위로 병합/정규화하고 피클로 기록 (대용량 DF IPC 회피)
         max_workers = max(1, int(workers))
@@ -641,7 +692,7 @@ def normalize_datasets(input_folder: str, output_db: str, *,
         except KeyboardInterrupt:
             print("사용자 중단 감지: 진행 중인 작업을 정리합니다...")
             # 남아 있는 임시 체크포인트를 최대한 반영
-            _sweep_and_ingest_tmp(conn, _tmp_base)
+            _sweep_and_ingest_tmp(conn, _tmp_base, workers=workers, checkpoint_interval=checkpoint_interval)
             raise
 
         # 5) 임시 디렉토리 정리
