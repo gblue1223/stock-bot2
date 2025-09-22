@@ -389,9 +389,19 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
     except Exception:
         exists = False
     if not exists:
-        conn.register("_schema_df", df.head(0))
-        conn.execute(f"CREATE TABLE {table} AS SELECT * FROM _schema_df")
-        conn.unregister("_schema_df")
+        # Build explicit schema to preserve types (avoid df.head(0) inference)
+        col_defs: list[str] = []
+        for col in df.columns:
+            series = df[col]
+            if col == '번호' or pd.api.types.is_integer_dtype(series):
+                duck_type = 'BIGINT'
+            elif col in TEXT_COLUMNS or col in {'날짜', '종목명'} or series.dtype == object:
+                duck_type = 'VARCHAR'
+            else:
+                duck_type = 'DOUBLE'
+            col_defs.append(f'"{col}" {duck_type}')
+        create_sql = f"CREATE TABLE {table} ({', '.join(col_defs)})"
+        conn.execute(create_sql)
     else:
         # Use correct indices from PRAGMA table_info: (cid, name, type, null, default, pk)
         existing_info = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
@@ -402,7 +412,7 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
                 series = df[col]
                 if col in TEXT_COLUMNS or col == '날짜' or series.dtype == object:
                     col_type = 'VARCHAR'
-                elif pd.api.types.is_integer_dtype(series):
+                elif pd.api.types.is_integer_dtype(series) or col == '번호':
                     col_type = 'BIGINT'
                 else:
                     col_type = 'DOUBLE'
@@ -424,7 +434,8 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
 
 def normalize_datasets(input_folder: str, output_db: str, *,
                        skip_existing: bool = True,
-                       compact_only: bool = False):
+                       compact_only: bool = False,
+                       force_recreate: bool = False):
     """
     메인 정규화 함수 (DuckDB 전용)
     """
@@ -449,7 +460,19 @@ def normalize_datasets(input_folder: str, output_db: str, *,
     print(f"발견된 그룹 수: {len(csv_groups)}")
     
     # DuckDB 연결
-    conn = duckdb.connect(output_db)
+    if force_recreate and os.path.exists(output_db):
+        try:
+            os.remove(output_db)
+            print(f"기존 DB 파일 삭제(재생성): {output_db}")
+        except Exception as e:
+            print(f"경고: 기존 DB 파일 삭제 실패: {e}")
+    try:
+        conn = duckdb.connect(output_db)
+    except Exception as e:
+        print(f"오류: DuckDB 파일을 열 수 없습니다: {output_db}")
+        print(f"오류 상세: {type(e).__name__}: {e}")
+        print(f"- 파일 손상 또는 DuckDB 버전 불일치일 수 있습니다. --force-recreate 옵션으로 새로 생성해보세요.")
+        return
     
     try:
         for group_key, files in csv_groups.items():
@@ -520,6 +543,9 @@ def main():
     # Compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화만 수행
     parser.add_argument("--compact-only", action="store_true",
                         help="CSV 처리 없이 지정한 DuckDB에 대해 PRAGMA optimize/checkpoint만 수행합니다")
+    # Force recreate DB if exists (useful when file is corrupted or version-mismatched)
+    parser.add_argument("--force-recreate", action="store_true",
+                        help="출력 DuckDB 파일이 존재하면 삭제 후 새로 생성합니다 (손상/버전 문제 해결용)")
     
     args = parser.parse_args()
     
@@ -534,6 +560,7 @@ def main():
         args.output,
         skip_existing=args.skip_existing,
         compact_only=args.compact_only,
+        force_recreate=args.force_recreate,
     )
 
 
