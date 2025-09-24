@@ -436,6 +436,49 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
     conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
 
 
+def _month_key_from_yyyymmdd(date_str: str) -> str:
+    """Extract YYYYMM from YYYYMMDD string."""
+    return date_str[:6] if len(date_str) >= 6 else date_str
+
+
+def _monthly_db_path(base_db_path: str, yyyymm: str) -> str:
+    """Return a per-month DuckDB path based on base path and yyyymm.
+    Example: base 'datasets.duckdb' -> 'datasets_YYYYMM.duckdb' in same directory.
+    """
+    p = Path(base_db_path)
+    stem = p.stem
+    suffix = p.suffix or ".duckdb"
+    return str(p.with_name(f"{stem}_{yyyymm}{suffix}"))
+
+
+def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: str, group_key: str):
+    """Open a DuckDB connection to db_path and ingest the pickle contents, then remove the pickle."""
+    try:
+        with open(pkl_path, 'rb') as f:
+            merged_df = _pickle.load(f)
+        conn = duckdb.connect(db_path)
+        try:
+            ensure_datasets_table_duckdb(conn, merged_df)
+            conn.register("_batch_df", merged_df)
+            try:
+                conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
+            except Exception:
+                pass
+            conn.execute("INSERT INTO datasets SELECT * FROM _batch_df")
+            conn.unregister("_batch_df")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        print(f"완료(즉시 반영): {group_key} - {len(merged_df)} 행 -> {db_path}")
+    finally:
+        try:
+            os.remove(pkl_path)
+        except Exception:
+            pass
+
+
 def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
     """Top-level helper: from a pickle file path, extract (group_key, code, date, pkl_path).
     Returns None if filename doesn't match expected pattern. Using only built-in types for pickling safety.
@@ -453,7 +496,161 @@ def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
         return None
 
 
-def _sweep_and_ingest_tmp(conn: duckdb.DuckDBPyConnection, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20):
+def _worker_process(group_key: str, files: Dict[str, str], tmp_root: str) -> Tuple[str, str, str, str]:
+    """Top-level worker for multiprocessing: merge + normalize + pickle dump.
+    Returns (group_key, code, date, out_pickle_path).
+    """
+    parts = group_key.split('_')
+    code = parts[0]
+    date = parts[-1]
+    name = '_'.join(parts[1:-1])
+    merged_df = merge_csv_files(files, code, name)
+    merged_df = apply_feature_normalization(merged_df)
+    merged_df = merged_df.copy()
+    merged_df['날짜'] = date
+    merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
+    out_path = Path(tmp_root) / f"{group_key}.pkl"
+    # Write to a temp file then atomically replace to avoid partial reads
+    out_tmp = out_path.with_suffix(out_path.suffix + ".part")
+    with open(out_tmp, 'wb') as f:
+        _pickle.dump(merged_df, f, protocol=_pickle.HIGHEST_PROTOCOL)
+    try:
+        os.replace(out_tmp, out_path)
+    except Exception:
+        # Best-effort fallback
+        try:
+            os.remove(out_tmp)
+        except Exception:
+            pass
+    return group_key, code, date, str(out_path)
+
+
+def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]], 
+                           db_path: str, tmp_root: str, yyyymm: str, 
+                           checkpoint_interval: int) -> int:
+    """Process all groups for a specific month and write to the monthly DB.
+    Returns the number of processed groups.
+    """
+    import duckdb
+    processed_count = 0
+    
+    # 각 그룹을 순차적으로 처리하고 즉시 DB에 반영
+    for group_key, files in month_groups:
+        try:
+            # 데이터 처리
+            parts = group_key.split('_')
+            code = parts[0]
+            date = parts[-1]
+            name = '_'.join(parts[1:-1])
+            
+            merged_df = merge_csv_files(files, code, name)
+            merged_df = apply_feature_normalization(merged_df)
+            merged_df = merged_df.copy()
+            merged_df['날짜'] = date
+            merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
+            
+            # DB에 직접 쓰기 (pickle 단계 생략)
+            conn = duckdb.connect(db_path)
+            try:
+                ensure_datasets_table_duckdb(conn, merged_df)
+                conn.register("_batch_df", merged_df)
+                try:
+                    conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
+                except Exception:
+                    pass
+                conn.execute("INSERT INTO datasets SELECT * FROM _batch_df")
+                conn.unregister("_batch_df")
+            finally:
+                conn.close()
+            
+            processed_count += 1
+            print(f"  {yyyymm}: [{processed_count}/{len(month_groups)}] {group_key} - {len(merged_df)} 행")
+            
+            # 주기적 체크포인트
+            if checkpoint_interval > 0 and processed_count % checkpoint_interval == 0:
+                try:
+                    conn_ck = duckdb.connect(db_path)
+                    try:
+                        conn_ck.execute("CHECKPOINT")
+                        print(f"  {yyyymm}: 체크포인트 실행 ({processed_count} 그룹 완료)")
+                    finally:
+                        conn_ck.close()
+                except Exception:
+                    pass
+                    
+        except Exception as e:
+            print(f"  경고: {yyyymm} 그룹 처리 실패({group_key}): {type(e).__name__}: {e}")
+    
+    # 최종 체크포인트
+    if processed_count > 0:
+        try:
+            conn_ck = duckdb.connect(db_path)
+            try:
+                conn_ck.execute("CHECKPOINT")
+                print(f"  {yyyymm}: 최종 체크포인트 실행 ({processed_count} 그룹 완료)")
+            finally:
+                conn_ck.close()
+        except Exception:
+            pass
+    
+    return processed_count
+
+
+def _checkpoint_db_once(db_path: str) -> Tuple[str, bool, str]:
+    """Run DuckDB CHECKPOINT once for the given DB file. Returns (path, ok, msg)."""
+    try:
+        conn = duckdb.connect(db_path)
+        try:
+            conn.execute("CHECKPOINT")
+        finally:
+            conn.close()
+        return db_path, True, ""
+    except Exception as e:
+        return db_path, False, f"{type(e).__name__}: {e}"
+
+
+def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: int) -> None:
+    """Run CHECKPOINT across the given months' DB shards in parallel using up to `workers` processes."""
+    if not months:
+        return
+    # Build existing paths only
+    month_paths = []
+    for m in months:
+        p = _monthly_db_path(base_db_path, m)
+        if os.path.exists(p):
+            month_paths.append(p)
+    if not month_paths:
+        return
+    max_workers = max(1, int(workers))
+    used_workers = min(max_workers, len(month_paths))
+    if used_workers > 1:
+        print(f"병렬 체크포인트 실행: {used_workers} workers, 대상 {len(month_paths)}개")
+        with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
+            futs = {ex.submit(_checkpoint_db_once, path): path for path in month_paths}
+            done = 0
+            for fut in _fut.as_completed(futs):
+                path = futs[fut]
+                try:
+                    _, ok, msg = fut.result()
+                    if ok:
+                        print(f"  CHECKPOINT 완료: {path}")
+                    else:
+                        print(f"  CHECKPOINT 실패: {path} -> {msg}")
+                except Exception as e:
+                    print(f"  CHECKPOINT 실패: {path} -> {type(e).__name__}: {e}")
+                finally:
+                    done += 1
+    else:
+        print("직렬 체크포인트 실행 (workers=1)")
+        for path in month_paths:
+            _, ok, msg = _checkpoint_db_once(path)
+            if ok:
+                print(f"  CHECKPOINT 완료: {path}")
+            else:
+                print(f"  CHECKPOINT 실패: {path} -> {msg}")
+
+
+def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20):
     """Scan tmp_root for any leftover .pkl files and ingest them in the current process.
     This supports resume-on-start and graceful Ctrl+C handling.
     """
@@ -494,78 +691,30 @@ def _sweep_and_ingest_tmp(conn: duckdb.DuckDBPyConnection, tmp_root: Path, worke
                     pass
  
     print("- DuckDB 반영: 순차 처리 (쓰기 경합 방지)")
+    month_counts: Dict[str, int] = {}
     for i, (group_key, code, date, pkl_path) in enumerate(prepared, 1):
         try:
-            with open(pkl_path, 'rb') as f:
-                merged_df = _pickle.load(f)
-            ensure_datasets_table_duckdb(conn, merged_df)
-            conn.register("_batch_df", merged_df)
-            try:
-                conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
-            except Exception:
-                pass
-            conn.execute("INSERT INTO datasets SELECT * FROM _batch_df")
-            conn.unregister("_batch_df")
-            print(f"완료(즉시 반영): {group_key} - {len(merged_df)} 행")
+            yyyymm = _month_key_from_yyyymmdd(date)
+            db_path = _monthly_db_path(base_db_path, yyyymm)
+            _ingest_pickle_into_db_path(db_path, pkl_path, code, date, group_key)
+            # per-month checkpoint interval
+            if checkpoint_interval > 0:
+                month_counts[yyyymm] = month_counts.get(yyyymm, 0) + 1
+                if month_counts[yyyymm] % checkpoint_interval == 0:
+                    try:
+                        conn_ck = duckdb.connect(db_path)
+                        try:
+                            conn_ck.execute("CHECKPOINT")
+                        finally:
+                            conn_ck.close()
+                    except Exception:
+                        pass
         finally:
             # Always try to remove the pickle to free disk space
             try:
                 os.remove(pkl_path)
             except Exception:
                 pass
-
-
-def _worker_process(group_key: str, files: Dict[str, str], tmp_root: str, checkpoint_interval: int) -> Tuple[str, str, str, str]:
-    """Top-level worker for multiprocessing: merge + normalize + pickle dump.
-    Returns (group_key, code, date, out_pickle_path).
-    """
-    parts = group_key.split('_')
-    code = parts[0]
-    date = parts[-1]
-    name = '_'.join(parts[1:-1])
-    merged_df = merge_csv_files(files, code, name)
-    merged_df = apply_feature_normalization(merged_df)
-    merged_df = merged_df.copy()
-    merged_df['날짜'] = date
-    merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
-    out_path = Path(tmp_root) / f"{group_key}.pkl"
-    # Write to a temp file then atomically replace to avoid partial reads
-    out_tmp = out_path.with_suffix(out_path.suffix + ".part")
-    with open(out_tmp, 'wb') as f:
-        _pickle.dump(merged_df, f, protocol=_pickle.HIGHEST_PROTOCOL)
-    try:
-        os.replace(out_tmp, out_path)
-    except Exception:
-        # Best-effort fallback
-        try:
-            os.remove(out_tmp)
-        except Exception:
-            pass
-    return group_key, code, date, str(out_path)
-
-
-def _ingest_pickle_into_db(conn: duckdb.DuckDBPyConnection, pkl_path: str, code: str, date: str, group_key: str):
-    """Load a pickled DataFrame from pkl_path, ensure table, delete-then-insert, and remove the pickle file.
-    This is executed in the main process to avoid DuckDB write contention.
-    """
-    try:
-        with open(pkl_path, 'rb') as f:
-            merged_df = _pickle.load(f)
-        ensure_datasets_table_duckdb(conn, merged_df)
-        conn.register("_batch_df", merged_df)
-        try:
-            conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
-        except Exception:
-            pass
-        conn.execute("INSERT INTO datasets SELECT * FROM _batch_df")
-        conn.unregister("_batch_df")
-        print(f"완료(즉시 반영): {group_key} - {len(merged_df)} 행")
-    finally:
-        # Always try to remove the pickle to free disk space
-        try:
-            os.remove(pkl_path)
-        except Exception:
-            pass
 
 
 def normalize_datasets(input_folder: str, output_db: str, *,
@@ -581,132 +730,49 @@ def normalize_datasets(input_folder: str, output_db: str, *,
     # compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화만 수행
     if compact_only:
         print("compact-only 모드: CSV 처리 없이 DB 최적화만 수행합니다.")
-        conn = duckdb.connect(output_db)
-        try:
-            conn.execute("CHECKPOINT")
-        finally:
-            conn.close()
-        print(f"DB 유지보수 완료: {output_db}")
-        return
-
-    print(f"CSV 파일 검색 중: {input_folder}")
-    csv_groups = find_csv_files(input_folder)
-    
-    if not csv_groups:
-        print("처리할 CSV 파일 그룹을 찾을 수 없습니다.")
-        return
-    
-    print(f"발견된 그룹 수: {len(csv_groups)}")
-    
-    # DuckDB 연결
-    if force_recreate and os.path.exists(output_db):
-        try:
-            os.remove(output_db)
-            print(f"기존 DB 파일 삭제(재생성): {output_db}")
-        except Exception as e:
-            print(f"경고: 기존 DB 파일 삭제 실패: {e}")
-    try:
-        conn = duckdb.connect(output_db)
-    except Exception as e:
-        print(f"오류: DuckDB 파일을 열 수 없습니다: {output_db}")
-        print(f"오류 상세: {type(e).__name__}: {e}")
-        print(f"- 파일 손상 또는 DuckDB 버전 불일치일 수 있습니다. --force-recreate 옵션으로 새로 생성해보세요.")
-        return
-    
-    try:
-        # 1) 스킵할 그룹 미리 필터링 (DB 조회는 싱글 스레드에서 수행)
-        groups_to_process: List[Tuple[str, Dict[str, str]]] = []
-        for group_key, files in csv_groups.items():
-            parts = group_key.split('_')
-            code = parts[0]
-            date = parts[-1]
-            if skip_existing:
+        # 기본 파일(stem.suffix)뿐 아니라 월별 샤드(stem_YYYYMM.suffix)에 대해서도 실행
+        p = Path(output_db)
+        stem = p.stem
+        suffix = p.suffix or ".duckdb"
+        parent = p.parent
+        # 발견된 월별 파일로부터 월 추출
+        month_files = sorted(parent.glob(f"{stem}_*{suffix}"))
+        months: List[str] = []
+        for f in month_files:
+            m = f.stem.replace(f"{stem}_", "")
+            if re.fullmatch(r"\d{6}", m):
+                months.append(m)
+        if not months and os.path.exists(output_db):
+            # 월별 샤드가 없고 단일 DB만 있는 경우 해당 파일에 대해 실행
+            _parallel_checkpoint_months(output_db, [], 1)  # no-op path; fall back to single file below
+            try:
+                conn = duckdb.connect(output_db)
                 try:
-                    conn.execute("DESCRIBE datasets")
-                    exists = conn.execute(
-                        "SELECT 1 FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=? LIMIT 1",
-                        [code, date]
-                    ).fetchone()
-                    if exists:
-                        print(f"스킵(이미 존재): {group_key}")
-                        continue
-                except Exception:
-                    # 테이블이 없거나 조회 실패 시 계속 처리
-                    pass
-            groups_to_process.append((group_key, files))
-
-        if not groups_to_process:
-            print("처리할 신규 그룹이 없습니다.")
+                    conn.execute("CHECKPOINT")
+                finally:
+                    conn.close()
+                print(f"DB 유지보수 완료: {output_db}")
+            except Exception as e:
+                print(f"경고: 단일 DB 체크포인트 실패: {type(e).__name__}: {e}")
             return
+        # 병렬로 월별 체크포인트 수행
+        _parallel_checkpoint_months(output_db, months, workers)
+        print("월별 DB 유지보수 완료")
+        return
+# removed stray template placeholder
+    # 4.5) 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행 (선택적, 안전성 향상)
+    try:
+        processed_months = list(monthly_groups.keys())
+        if processed_months:
+            _parallel_checkpoint_months(output_db, processed_months, max_workers)
+    except Exception:
+        pass
 
-        # 2) 임시 디렉토리 준비
-        _tmp_base = Path(tmp_dir) if tmp_dir else Path(output_db).with_suffix(Path(output_db).suffix + ".tmp")
-        # 기존 temp 폴더가 있으면 유지하여 남은 체크포인트를 먼저 반영(resume)
-        if not _tmp_base.exists():
-            _tmp_base.mkdir(parents=True, exist_ok=True)
-        else:
-            # 이전 실행에서 남은 부분 파일(.part)은 제거
-            for _part in _tmp_base.glob("*.pkl.part"):
-                try:
-                    os.remove(_part)
-                except Exception:
-                    pass
- 
-        # 2.5) 재시작/이전 중단 시 임시 파일 먼저 반영(resume)
-        _sweep_and_ingest_tmp(conn, _tmp_base, workers=workers, checkpoint_interval=checkpoint_interval)
-
-        # 3) 병렬 처리: 그룹 단위로 병합/정규화하고 피클로 기록 (대용량 DF IPC 회피)
-        max_workers = max(1, int(workers))
-        try:
-            if max_workers > 1:
-                print(f"병렬 처리 시작 (workers={max_workers})...")
-                with _fut.ProcessPoolExecutor(max_workers=max_workers) as ex:
-                    futs = [ex.submit(_worker_process, gk, fdict, str(_tmp_base), checkpoint_interval) for gk, fdict in groups_to_process]
-                    completed = 0
-                    for fut in _fut.as_completed(futs):
-                        try:
-                            group_key, code, date, pkl_path = fut.result()
-                            completed += 1
-                            print(f"병렬 완료 [{completed}/{len(futs)}]: {group_key}")
-                            _ingest_pickle_into_db(conn, pkl_path, code, date, group_key)
-                            if checkpoint_interval > 0 and completed % checkpoint_interval == 0:
-                                try:
-                                    conn.execute("CHECKPOINT")
-                                except Exception:
-                                    pass
-                        except Exception as e:
-                            print(f"경고: 병렬 처리 실패: {type(e).__name__}: {e}")
-            else:
-                for i, (gk, fdict) in enumerate(groups_to_process, 1):
-                    try:
-                        group_key, code, date, pkl_path = _worker_process(gk, fdict, str(_tmp_base), checkpoint_interval)
-                        print(f"단일 처리 [{i}/{len(groups_to_process)}]: {gk}")
-                        _ingest_pickle_into_db(conn, pkl_path, code, date, group_key)
-                        if checkpoint_interval > 0 and i % checkpoint_interval == 0:
-                            try:
-                                conn.execute("CHECKPOINT")
-                            except Exception:
-                                pass
-                    except Exception as e:
-                        print(f"경고: 처리 실패({gk}): {type(e).__name__}: {e}")
-        except KeyboardInterrupt:
-            print("사용자 중단 감지: 진행 중인 작업을 정리합니다...")
-            # 남아 있는 임시 체크포인트를 최대한 반영
-            _sweep_and_ingest_tmp(conn, _tmp_base, workers=workers, checkpoint_interval=checkpoint_interval)
-            raise
-
-        # 5) 임시 디렉토리 정리
-        try:
-            _shutil.rmtree(_tmp_base)
-        except Exception:
-            pass
-     
-    finally:
-        try:
-            # DuckDB maintenance
-            conn.execute("CHECKPOINT")
-        finally:
-            conn.close()
+    # 5) 임시 디렉토리 정리
+    try:
+        _shutil.rmtree(_tmp_base)
+    except Exception:
+        pass
      
     print(f"정규화 완료: {output_db}")
 

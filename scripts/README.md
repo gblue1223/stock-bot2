@@ -37,12 +37,20 @@ python scripts/normalize_datasets.py <input_folder> \
 - **--tmp-dir <path>**: 병렬 처리 중간 결과(피클) 저장 디렉토리. 기본은 `<output>.tmp` 폴더 생성
 - **--checkpoint-interval N**: N개 그룹 처리마다 DuckDB `CHECKPOINT` 수행. `0`이면 비활성화 (기본: `100`)
 
+### 월별 DB 샤딩(datasets_YYYYMM.duckdb)
+- 출력 DB는 월(YYYYMM) 단위로 분할 생성됩니다.
+  - 예: `-o C:\path\datasets.duckdb` 지정 시, `C:\path\datasets_202401.duckdb`, `C:\path\datasets_202402.duckdb` ... 형태로 생성/갱신됩니다.
+- `--skip-existing`/`--no-skip-existing`는 해당 월 DB 파일에서 (`종목코드`, `날짜`) 존재 여부를 검사합니다.
+- `--force-recreate`는 처리 중 처음 만나는 월 DB에 대해 그 월의 DB 파일만 삭제 후 재생성합니다(월별 개별 적용).
+
 ### 예시
 - 기본 실행(DuckDB):
 ```bash
 python scripts/normalize_datasets.py "D:\Workspace\Project\stock-bot\hoga-crawler\data" -o "C:\Users\user\Workspace\datasets\datasets.duckdb" --workers 8 --tmp-dir "C:\Users\user\Workspace\datasets\tmp" --checkpoint-interval 50
+# 결과: C:\Users\user\Workspace\datasets\datasets_202401.duckdb, datasets_202402.duckdb, ...
 
 python scripts/normalize_datasets.py models/test_datasets -o "C:\Users\user\Workspace\datasets\test_datasets.duckdb"
+# 결과: C:\Users\user\Workspace\datasets\test_datasets_YYYYMM.duckdb
 ```
 - 이미 있는 그룹 스킵 해제:
 ```bash
@@ -66,20 +74,21 @@ python scripts/normalize_datasets.py "D:\...\data" -o "C:\...\datasets.duckdb" -
 ```
 
 ### 동작 및 성능 노트
-- **병렬 처리**: 그룹 단위로 CSV 병합과 정규화를 멀티프로세스로 처리하여 CPU/I/O 병목을 완화합니다.
+- **병렬 처리(메인 파이프라인)**: 그룹 단위 CSV 병합/정규화는 멀티프로세스로 수행합니다(`--workers`). 완료된 그룹은 즉시 해당 월 DB로 반영됩니다.
+- **월별 DB 샤딩**: 각 그룹의 `날짜`를 기준으로 `datasets_YYYYMM.duckdb`에 저장합니다. DB 파일이 월별로 분리되어 I/O 경합이 줄고 파일 관리가 간편해집니다.
 - **즉시 반영과 임시 파일 정리**: 각 그룹의 처리가 끝나면 결과를 곧바로 DB에 반영하고, 해당 임시 피클 파일을 즉시 삭제하여 디스크 사용량을 최소화합니다.
-- **주기적 CHECKPOINT**: 설정한 간격(기본 100)마다 자동 `CHECKPOINT`를 수행합니다. `--checkpoint-interval 0`이면 주기적 체크포인트를 비활성화합니다.
-- **DB 쓰기 순차화**: DuckDB 파일 쓰기는 순차적으로 수행하여 동시 쓰기 경합을 방지합니다.
+- **주기적 CHECKPOINT**: 설정한 간격(기본 100)마다 각 월별 DB에 대해 `CHECKPOINT`를 수행할 수 있습니다. `--checkpoint-interval 0`이면 비활성화됩니다.
+- **DB 쓰기 모델**: DuckDB 쓰기는 안정성을 위해 메인 프로세스에서 순차적으로 수행합니다(월별 파일 간 병렬 쓰기까지 필요하면 별도 옵션으로 확장 가능).
 - **임시 파일**: 각 그룹 결과는 중간에 피클(`.pkl`)로 저장되며, 반영 후 삭제됩니다. 종료 시 임시 폴더도 정리됩니다.
-- **메모리/디스크 고려**: 워커 수를 늘리면 메모리 사용량이 증가합니다. 대용량 데이터는 임시 폴더에 충분한 디스크 공간이 필요합니다.
 - **Windows 호환**: 멀티프로세싱 워커는 모듈 최상위에 정의되어 Windows spawn 모드와 호환됩니다.
 
 ### 재시작/복구(Resume) 노트
 - **temp 폴더 유지**: 실행 시작 시 temp 폴더가 이미 존재하면 삭제하지 않고 유지합니다.
 - **미완료 파일 정리**: 이전 실행에서 남았을 수 있는 부분 파일(`*.pkl.part`)은 자동 삭제합니다.
 - **남은 체크포인트 반영**: temp 폴더에 완료된 체크포인트(`*.pkl`)가 있으면, 새로운 작업을 시작하기 전에 전부 DuckDB에 병합합니다.
+  - 메타데이터(파일명→code/date 추출)는 `--workers`에 맞춰 병렬로 준비하고, DuckDB 반영은 안정성을 위해 순차 처리합니다.
 - **Ctrl+C 처리**: 중단 시에도 완료된 체크포인트는 최대한 반영되며, 다음 실행 시 temp 폴더의 `.pkl`이 자동 병합되어 작업을 이어갑니다.
 
 ### 출력
-- DuckDB 파일(`.duckdb`) 내 `datasets` 테이블 생성/갱신
+- 월별 DuckDB 파일: `datasets_YYYYMM.duckdb` 내 `datasets` 테이블 생성/갱신
 - 컬럼: 기본 스키마 + 정규화/파생 피처(`*_scalar` 등) 포함
