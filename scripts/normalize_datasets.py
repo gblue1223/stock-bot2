@@ -525,31 +525,59 @@ def _worker_process(group_key: str, files: Dict[str, str], tmp_root: str) -> Tup
     return group_key, code, date, str(out_path)
 
 
-def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]], 
-                           db_path: str, tmp_root: str, yyyymm: str, 
-                           checkpoint_interval: int) -> int:
-    """Process all groups for a specific month and write to the monthly DB.
-    Returns the number of processed groups.
-    """
+def _process_single_group_to_pickle(group_key: str, files: Dict[str, str], tmp_root: str) -> Optional[str]:
+    """Process a single group and save to pickle file. Returns pickle path or None on error."""
+    try:
+        parts = group_key.split('_')
+        code = parts[0]
+        date = parts[-1]
+        name = '_'.join(parts[1:-1])
+        
+        merged_df = merge_csv_files(files, code, name)
+        merged_df = apply_feature_normalization(merged_df)
+        merged_df = merged_df.copy()
+        merged_df['날짜'] = date
+        merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
+        
+        # Save to pickle
+        out_path = Path(tmp_root) / f"{group_key}.pkl"
+        out_tmp = out_path.with_suffix(out_path.suffix + ".part")
+        with open(out_tmp, 'wb') as f:
+            _pickle.dump(merged_df, f, protocol=_pickle.HIGHEST_PROTOCOL)
+        try:
+            os.replace(out_tmp, out_path)
+        except Exception:
+            try:
+                os.remove(out_tmp)
+            except Exception:
+                pass
+            raise
+        return str(out_path)
+    except Exception as e:
+        print(f"  경고: 그룹 처리 실패({group_key}): {type(e).__name__}: {e}")
+        return None
+
+
+def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, checkpoint_interval: int) -> int:
+    """Ingest pickle files to DB sequentially with periodic checkpoints."""
     import duckdb
     processed_count = 0
     
-    # 각 그룹을 순차적으로 처리하고 즉시 DB에 반영
-    for group_key, files in month_groups:
+    for pkl_path in pickle_paths:
+        if not os.path.exists(pkl_path):
+            continue
+            
         try:
-            # 데이터 처리
+            # Load pickle and extract metadata
+            with open(pkl_path, 'rb') as f:
+                merged_df = _pickle.load(f)
+            
+            group_key = Path(pkl_path).stem
             parts = group_key.split('_')
             code = parts[0]
             date = parts[-1]
-            name = '_'.join(parts[1:-1])
             
-            merged_df = merge_csv_files(files, code, name)
-            merged_df = apply_feature_normalization(merged_df)
-            merged_df = merged_df.copy()
-            merged_df['날짜'] = date
-            merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
-            
-            # DB에 직접 쓰기 (pickle 단계 생략)
+            # Write to DB
             conn = duckdb.connect(db_path)
             try:
                 ensure_datasets_table_duckdb(conn, merged_df)
@@ -564,9 +592,15 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
                 conn.close()
             
             processed_count += 1
-            print(f"  {yyyymm}: [{processed_count}/{len(month_groups)}] {group_key} - {len(merged_df)} 행")
+            print(f"  {yyyymm}: [{processed_count}] {group_key} - {len(merged_df)} 행 -> DB")
             
-            # 주기적 체크포인트
+            # Remove pickle file after successful ingestion
+            try:
+                os.remove(pkl_path)
+            except Exception:
+                pass
+            
+            # Periodic checkpoint
             if checkpoint_interval > 0 and processed_count % checkpoint_interval == 0:
                 try:
                     conn_ck = duckdb.connect(db_path)
@@ -579,9 +613,9 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
                     pass
                     
         except Exception as e:
-            print(f"  경고: {yyyymm} 그룹 처리 실패({group_key}): {type(e).__name__}: {e}")
+            print(f"  경고: {yyyymm} pickle 처리 실패({pkl_path}): {type(e).__name__}: {e}")
     
-    # 최종 체크포인트
+    # Final checkpoint
     if processed_count > 0:
         try:
             conn_ck = duckdb.connect(db_path)
@@ -592,6 +626,60 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
                 conn_ck.close()
         except Exception:
             pass
+    
+    return processed_count
+
+
+def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]], 
+                           db_path: str, tmp_root: str, yyyymm: str, 
+                           checkpoint_interval: int, group_workers: int = 1) -> int:
+    """Process all groups for a specific month with parallel group processing.
+    Returns the number of processed groups.
+    """
+    if not month_groups:
+        return 0
+    
+    total_groups = len(month_groups)
+    print(f"  {yyyymm}: {total_groups} 그룹 처리 시작 (group_workers={group_workers})", flush=True)
+    
+    # Step 1: Process groups to pickle files in parallel
+    pickle_paths = []
+    max_group_workers = max(1, int(group_workers))
+    used_group_workers = min(max_group_workers, total_groups)
+    
+    if used_group_workers > 1:
+        print(f"  {yyyymm}: 병렬 그룹 처리 (workers={used_group_workers})", flush=True)
+        with _fut.ProcessPoolExecutor(max_workers=used_group_workers) as ex:
+            futs = []
+            for group_key, files in month_groups:
+                fut = ex.submit(_process_single_group_to_pickle, group_key, files, tmp_root)
+                futs.append(fut)
+            done = 0
+            for fut in _fut.as_completed(futs):
+                try:
+                    pkl_path = fut.result()
+                    if pkl_path:
+                        pickle_paths.append(pkl_path)
+                except Exception as e:
+                    print(f"  {yyyymm}: 그룹 처리 중 오류: {type(e).__name__}: {e}", flush=True)
+                finally:
+                    done += 1
+                    if done % 5 == 0 or done == total_groups:
+                        print(f"  {yyyymm}: pickle 생성 진행률 [{done}/{total_groups}]", flush=True)
+    else:
+        print(f"  {yyyymm}: 순차 그룹 처리", flush=True)
+        done = 0
+        for group_key, files in month_groups:
+            pkl_path = _process_single_group_to_pickle(group_key, files, tmp_root)
+            if pkl_path:
+                pickle_paths.append(pkl_path)
+            done += 1
+            if done % 5 == 0 or done == total_groups:
+                print(f"  {yyyymm}: pickle 생성 진행률 [{done}/{total_groups}]", flush=True)
+    
+    # Step 2: Ingest pickle files to DB sequentially (to avoid DB write conflicts)
+    print(f"  {yyyymm}: {len(pickle_paths)} pickle 파일을 DB에 순차 반영", flush=True)
+    processed_count = _ingest_pickles_to_db(pickle_paths, db_path, yyyymm, checkpoint_interval)
     
     return processed_count
 
@@ -623,31 +711,34 @@ def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: i
         return
     max_workers = max(1, int(workers))
     used_workers = min(max_workers, len(month_paths))
+    
+    print(f"최종 체크포인트 실행: {len(month_paths)}개 DB 파일")
+    
     if used_workers > 1:
-        print(f"병렬 체크포인트 실행: {used_workers} workers, 대상 {len(month_paths)}개")
+        print(f"  병렬 실행 (workers={used_workers})")
         with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
             futs = {ex.submit(_checkpoint_db_once, path): path for path in month_paths}
-            done = 0
+            completed = 0
             for fut in _fut.as_completed(futs):
                 path = futs[fut]
                 try:
                     _, ok, msg = fut.result()
+                    completed += 1
                     if ok:
-                        print(f"  CHECKPOINT 완료: {path}")
+                        print(f"  [{completed}/{len(month_paths)}] CHECKPOINT 완료: {os.path.basename(path)}")
                     else:
-                        print(f"  CHECKPOINT 실패: {path} -> {msg}")
+                        print(f"  [{completed}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {msg}")
                 except Exception as e:
-                    print(f"  CHECKPOINT 실패: {path} -> {type(e).__name__}: {e}")
-                finally:
-                    done += 1
+                    completed += 1
+                    print(f"  [{completed}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {type(e).__name__}: {e}")
     else:
-        print("직렬 체크포인트 실행 (workers=1)")
-        for path in month_paths:
+        print("  순차 실행")
+        for i, path in enumerate(month_paths, 1):
             _, ok, msg = _checkpoint_db_once(path)
             if ok:
-                print(f"  CHECKPOINT 완료: {path}")
+                print(f"  [{i}/{len(month_paths)}] CHECKPOINT 완료: {os.path.basename(path)}")
             else:
-                print(f"  CHECKPOINT 실패: {path} -> {msg}")
+                print(f"  [{i}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {msg}")
 
 
 def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20):
@@ -689,7 +780,7 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
                     os.remove(p)
                 except Exception:
                     pass
- 
+
     print("- DuckDB 반영: 순차 처리 (쓰기 경합 방지)")
     month_counts: Dict[str, int] = {}
     for i, (group_key, code, date, pkl_path) in enumerate(prepared, 1):
@@ -722,10 +813,17 @@ def normalize_datasets(input_folder: str, output_db: str, *,
                        compact_only: bool = False,
                        force_recreate: bool = False,
                        workers: int = 1,
+                       group_workers: int = 1,
                        tmp_dir: Optional[str] = None,
                        checkpoint_interval: int = 20):
     """
     메인 정규화 함수 (DuckDB 전용)
+    - 입력 폴더를 스캔하여 유효 CSV 그룹을 찾음
+    - 그룹을 날짜(YYYYMMDD)에서 월(YYYYMM)로 묶어 월별 DuckDB 샤드에 기록
+    - 최대 `workers`개의 월을 병렬로 처리
+    - 각 월 내부에서는 최대 `group_workers`개의 그룹을 병렬 처리
+    - `checkpoint-interval`마다 CHECKPOINT 실행
+    - 작업 중단 복구를 위해 temp 디렉토리에 단계별 체크포인트(.pkl)를 사용하고 시작 시 반영
     """
     # compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화만 수행
     if compact_only:
@@ -759,21 +857,154 @@ def normalize_datasets(input_folder: str, output_db: str, *,
         _parallel_checkpoint_months(output_db, months, workers)
         print("월별 DB 유지보수 완료")
         return
-# removed stray template placeholder
-    # 4.5) 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행 (선택적, 안전성 향상)
+
+    # 입력 폴더 검증
+    folder = Path(input_folder)
+    if not folder.exists():
+        print(f"입력 폴더가 존재하지 않습니다: {input_folder}")
+        return
+
+    # temp 디렉토리 준비 및 resume 처리
+    p = Path(output_db)
+    _tmp_base = Path(tmp_dir) if tmp_dir else p.with_suffix(p.suffix + ".tmp")
+    _tmp_base.mkdir(parents=True, exist_ok=True)
+    # 남은 부분 파일 정리
+    for part in _tmp_base.glob("*.pkl.part"):
+        try:
+            os.remove(part)
+        except Exception:
+            pass
+    # 이전 실행의 완료된 체크포인트 반영
+    _sweep_and_ingest_tmp(output_db, _tmp_base, workers=group_workers, checkpoint_interval=checkpoint_interval)
+
+    # CSV 그룹 스캔
+    print("CSV 파일 스캔 및 그룹화 중...")
+    complete_groups = find_csv_files(str(folder))
+    if not complete_groups:
+        print("처리할 유효 CSV 그룹을 찾지 못했습니다.")
+        return
+
+    # 그룹을 월별로 묶기
+    monthly_groups: Dict[str, List[Tuple[str, Dict[str, str]]]] = {}
+    for group_key, files in complete_groups.items():
+        parts = group_key.split("_")
+        date = parts[-1]
+        yyyymm = _month_key_from_yyyymmdd(date)
+        monthly_groups.setdefault(yyyymm, []).append((group_key, files))
+
+    # force-recreate: 대상 월 DB 삭제
+    if force_recreate:
+        for yyyymm in monthly_groups.keys():
+            db_path = _monthly_db_path(output_db, yyyymm)
+            if os.path.exists(db_path):
+                try:
+                    os.remove(db_path)
+                    print(f"삭제 후 재생성 예정: {db_path}")
+                except Exception as e:
+                    print(f"경고: DB 삭제 실패 {db_path}: {type(e).__name__}: {e}")
+
+    # skip-existing: 각 월 DB에서 이미 존재하는 (종목코드, 날짜) 그룹 제거
+    def _filter_skip_existing_for_month(yyyymm: str, groups: List[Tuple[str, Dict[str, str]]]) -> List[Tuple[str, Dict[str, str]]]:
+        if not skip_existing:
+            return groups
+        db_path = _monthly_db_path(output_db, yyyymm)
+        # DB가 없으면 전부 유지
+        if not os.path.exists(db_path):
+            return groups
+        try:
+            conn = duckdb.connect(db_path)
+            try:
+                try:
+                    conn.execute("DESCRIBE datasets")
+                    table_exists = True
+                except Exception:
+                    table_exists = False
+                if not table_exists:
+                    return groups
+                keep: List[Tuple[str, Dict[str, str]]] = []
+                # Batch existence check by date per code would be ideal; simple loop for clarity
+                for group_key, files in groups:
+                    parts = group_key.split('_')
+                    code = parts[0]
+                    date = parts[-1]
+                    try:
+                        q = conn.execute("SELECT 1 FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=? LIMIT 1", [code, date]).fetchone()
+                    except Exception:
+                        q = None
+                    if q is None:
+                        keep.append((group_key, files))
+                return keep
+            finally:
+                conn.close()
+        except Exception:
+            # 보수적으로 모두 처리
+            return groups
+
+    for yyyymm in list(monthly_groups.keys()):
+        orig_n = len(monthly_groups[yyyymm])
+        monthly_groups[yyyymm] = _filter_skip_existing_for_month(yyyymm, monthly_groups[yyyymm])
+        if len(monthly_groups[yyyymm]) == 0:
+            print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
+            del monthly_groups[yyyymm]
+
+    if not monthly_groups:
+        print("처리할 신규 그룹이 없습니다.")
+        # 임시 디렉토리 정리 후 종료
+        try:
+            _shutil.rmtree(_tmp_base)
+        except Exception:
+            pass
+        return
+
+    # 월 목록 및 병렬 처리 설정
+    months = sorted(monthly_groups.keys())
+    max_workers = max(1, int(workers))
+    used_workers = min(max_workers, len(months))
+
+    print(f"월별 처리 시작: 대상 {len(months)}개월, 병렬 workers={used_workers}")
+
+    # 병렬로 월별 처리 실행
+    if used_workers > 1:
+        with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
+            futs = {}
+            for yyyymm in months:
+                db_path = _monthly_db_path(output_db, yyyymm)
+                groups = monthly_groups[yyyymm]
+                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
+                futs[fut] = (yyyymm, len(groups), db_path)
+            done = 0
+            total = len(futs)
+            for fut in _fut.as_completed(futs):
+                yyyymm, n_groups, db_path = futs[fut]
+                try:
+                    processed = fut.result()
+                    print(f"월 처리 완료: {yyyymm} ({processed}/{n_groups}) -> {db_path}")
+                except Exception as e:
+                    print(f"경고: 월 처리 실패 {yyyymm}: {type(e).__name__}: {e}")
+                finally:
+                    done += 1
+    else:
+        # 직렬 처리
+        for yyyymm in months:
+            db_path = _monthly_db_path(output_db, yyyymm)
+            groups = monthly_groups[yyyymm]
+            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
+            print(f"월 처리 완료: {yyyymm} ({processed}/{len(groups)}) -> {db_path}")
+
+    # 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행 (선택적)
     try:
-        processed_months = list(monthly_groups.keys())
+        processed_months = months
         if processed_months:
             _parallel_checkpoint_months(output_db, processed_months, max_workers)
     except Exception:
         pass
 
-    # 5) 임시 디렉토리 정리
+    # 임시 디렉토리 정리
     try:
         _shutil.rmtree(_tmp_base)
     except Exception:
         pass
-     
+
     print(f"정규화 완료: {output_db}")
 
 
@@ -794,7 +1025,9 @@ def main():
                         help="출력 DuckDB 파일이 존재하면 삭제 후 새로 생성합니다 (손상/버전 문제 해결용)")
     # 병렬 처리 관련
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1,
-                        help="병렬 처리에 사용할 프로세스 수 (기본: CPU 코어 수)")
+                        help="월별 병렬 처리에 사용할 프로세스 수 (기본: CPU 코어 수)")
+    parser.add_argument("--group-workers", type=int, default=1,
+                        help="각 월 내에서 그룹 병렬 처리에 사용할 프로세스 수 (기본: 1)")
     parser.add_argument("--tmp-dir", default=None,
                         help="임시 결과 저장 디렉토리 (기본: <output>.tmp)")
     parser.add_argument("--checkpoint-interval", type=int, default=100,
@@ -815,6 +1048,7 @@ def main():
         compact_only=args.compact_only,
         force_recreate=args.force_recreate,
         workers=args.workers,
+        group_workers=args.group_workers,
         tmp_dir=args.tmp_dir,
         checkpoint_interval=args.checkpoint_interval,
     )
