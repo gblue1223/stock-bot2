@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
 
 from .data import load_real_dataframe
 from .models import CNNLSTMAttn, ModelConfig
@@ -20,7 +21,7 @@ def train(
     code: Optional[str] = None,
     date: Optional[str] = None,
     seq_len: int = 60,
-    horizon: int = 1,
+    horizon: int = 10,
     target_col: Optional[str] = None,
     batch_size: int = 128,
     epochs: int = 20,
@@ -38,7 +39,7 @@ def train(
     - code (Optional[str], default=None): 특정 종목 코드로 데이터 필터링(예: "005930"). None이면 전체(환경/데이터 로직에 따름).
     - date (Optional[str], default=None): 특정 일자(YYYYMMDD)로 데이터 필터링. None이면 전체 사용.
     - seq_len (int, default=60): 모델 입력으로 사용할 시퀀스(윈도우) 길이.
-    - horizon (int, default=1): 예측 시점까지의 간격(몇 스텝 뒤를 예측할지). direction/volatility에서도 사용.
+    - horizon (int, default=10): 예측 시점까지의 간격(몇 스텝 뒤를 예측할지). direction/volatility에서도 사용.
     - target_col (Optional[str], default=None): 예측 대상 컬럼명. None일 경우 첫 번째 feature를 사용합니다.
     - batch_size (int, default=128): 학습 배치 크기.
     - epochs (int, default=20): 최대 학습 에폭 수(얼리 스탑 적용).
@@ -49,13 +50,65 @@ def train(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    df, real_cols = load_real_dataframe(db_path, table=table, code=code, date=date)
-    # Target setup
+    # 1) db_path가 폴더라면 폴더 내의 모든 DuckDB 파일을 로드하여 concat
+    #    파일 기준: *.duckdb (필요 시 *.db 도 포함)
+    dfs = []
+    if os.path.isdir(db_path):
+        duckdb_files = []
+        for name in os.listdir(db_path):
+            if name.lower().endswith(".duckdb") or name.lower().endswith(".db"):
+                duckdb_files.append(os.path.join(db_path, name))
+        duckdb_files.sort()
+        if not duckdb_files:
+            raise ValueError(f"No DuckDB files (*.duckdb|*.db) found in directory: {db_path}")
+        for f in duckdb_files:
+            df_part, _ = load_real_dataframe(f, table=table, code=code, date=date)
+            if not df_part.empty:
+                dfs.append(df_part)
+        if not dfs:
+            raise ValueError("No data loaded from DuckDB files in the folder.")
+        df = pd.concat(dfs, axis=0, ignore_index=True)
+    else:
+        df, _ = load_real_dataframe(db_path, table=table, code=code, date=date)
+
+    # 2) 사용자 지정 feature 목록 구성 ('날짜'는 month만 사용)
+    requested_features = [
+        "날짜", "등락률", "누적거래대금", "거래회전율", "체결강도",
+        "매도호가수량1", "매도호가수량2", "매도호가수량3", "매도호가수량4", "매도호가수량5",
+        "매도호가수량6", "매도호가수량7", "매도호가수량8", "매도호가수량9", "매도호가수량10",
+        "매수호가수량1", "매수호가수량2", "매수호가수량3", "매수호가수량4", "매수호가수량5",
+        "매수호가수량6", "매수호가수량7", "매수호가수량8", "매수호가수량9", "매수호가수량10",
+        "매도호가총잔량", "매수호가총잔량",
+        "매도거래원수량1", "매도거래원수량2", "매도거래원수량3", "매도거래원수량4", "매도거래원수량5",
+        "매도거래원별증감1", "매도거래원별증감2", "매도거래원별증감3", "매도거래원별증감4", "매도거래원별증감5",
+        "매수거래원수량1", "매수거래원수량2", "매수거래원수량3", "매수거래원수량4", "매수거래원수량5",
+        "매수거래원별증감1", "매수거래원별증감2", "매수거래원별증감3", "매수거래원별증감4", "매수거래원별증감5",
+        "매도거래원1_scalar", "매도거래원2_scalar", "매도거래원3_scalar", "매도거래원4_scalar", "매도거래원5_scalar",
+        "매수거래원1_scalar", "매수거래원2_scalar", "매수거래원3_scalar", "매수거래원4_scalar", "매수거래원5_scalar",
+        "종목명_scalar", "시간_scalar",
+    ]
+
+    # '날짜'를 month(01~12) 정수로 변환하여 덮어쓰기
+    if "날짜" in df.columns:
+        # YYYYMMDD 형태 가정. 문자열로 변환 후 [4:6] 슬라이스.
+        month_series = df["날짜"].astype(str).str[4:6]
+        # 숫자로 안전 변환 (비정상 값은 0 처리)
+        month_vals = pd.to_numeric(month_series, errors="coerce").fillna(0).astype(np.int32)
+        df["날짜"] = month_vals
+
+    # 실제 존재하는 컬럼만 사용
+    available_features = [c for c in requested_features if c in df.columns]
+    if not available_features:
+        raise ValueError("None of the requested feature columns exist in the loaded DataFrame.")
+
+    feats = df[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    real_cols = list(feats.columns)
+
+    # Target setup (기존 로직 유지: 지정 없고 '현재가'가 없으면 첫 feature 사용됨)
     tgt_col = target_col or ("현재가" if "현재가" in real_cols else real_cols[0])
     if tgt_col not in real_cols:
-        raise ValueError(f"target_col '{tgt_col}' not in REAL columns")
+        raise ValueError(f"target_col '{tgt_col}' not in feature columns")
 
-    feats = df[real_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     feat_vals = feats.to_numpy(dtype=np.float32)
     prices = feats[tgt_col].to_numpy(dtype=np.float32)
     T = len(feats)
@@ -195,7 +248,7 @@ def main():
     p.add_argument("--date", default=None, help="특정 일자(YYYYMMDD)로 필터링. 미지정 시 전체/로직에 따름")
     p.add_argument("--out", default="models/supervised", help="출력 디렉터리(체크포인트와 설정 저장). 기본값: models/supervised")
     p.add_argument("--seq-len", type=int, default=60, help="입력 시퀀스(윈도우) 길이. 기본값: 60")
-    p.add_argument("--horizon", type=int, default=1, help="예측 시점까지의 간격(몇 스텝 뒤를 예측할지). 기본값: 1")
+    p.add_argument("--horizon", type=int, default=10, help="예측 시점까지의 간격(몇 스텝 뒤를 예측할지). 기본값: 1")
     p.add_argument("--target-col", default=None, help="예측 대상 컬럼명. 미지정 시 첫 번째 feature 사용")
     p.add_argument("--batch-size", type=int, default=128, help="학습 배치 크기. 기본값: 128")
     p.add_argument("--epochs", type=int, default=20, help="최대 학습 에폭 수(얼리 스탑 적용). 기본값: 20")
