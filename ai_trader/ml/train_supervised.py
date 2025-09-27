@@ -477,13 +477,21 @@ def train(
                             cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
                             model = CNNLSTMAttn(cfg).to(device)
                             opt = torch.optim.AdamW(model.parameters(), lr=lr)
+                            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                                opt, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-7
+                            )
                             
                             # Load model state if resuming (only once when model is first created)
                             if resume_from and os.path.exists(resume_from):
                                 try:
                                     checkpoint = load_checkpoint(resume_from, device)
                                     model.load_state_dict(checkpoint["state_dict"])
-                                    print("Model state loaded from checkpoint")
+                                    # Load scheduler state if available
+                                    if "scheduler_state" in checkpoint:
+                                        scheduler.load_state_dict(checkpoint["scheduler_state"])
+                                        print("Model and scheduler state loaded from checkpoint")
+                                    else:
+                                        print("Model state loaded from checkpoint (no scheduler state)")
                                 except Exception as e:
                                     print(f"Failed to load model state: {e}")
                                     print("Using fresh model...")
@@ -781,7 +789,14 @@ def train(
             # End of epoch: compute averages and handle checkpoints/early stopping
             tr_loss_avg = tr_loss_epoch_sum / max(1, tr_samples)
             va_loss_avg = va_loss_epoch_sum / max(1, va_samples)
-            print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f}")
+            
+            # Update learning rate scheduler
+            if 'scheduler' in locals():
+                scheduler.step(va_loss_avg)
+                current_lr = opt.param_groups[0]['lr']
+                print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f} lr={current_lr:.2e}")
+            else:
+                print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f}")
 
             # Log epoch-level metrics to TensorBoard
             if writer:
@@ -792,12 +807,17 @@ def train(
                 writer.add_scalar('Metrics/Trained_Chunks', global_trained_chunk_count, epoch)
                 writer.add_scalar('Metrics/Total_Samples_Trained', tr_samples, epoch)
                 writer.add_scalar('Metrics/Total_Samples_Validated', va_samples, epoch)
+                if 'scheduler' in locals():
+                    writer.add_scalar('Learning_Rate/Epoch', opt.param_groups[0]['lr'], epoch)
 
             if va_loss_avg + 1e-9 < best_val:
                 best_val = va_loss_avg
                 no_improve = 0
                 # save best checkpoint
                 ckpt_path = os.path.join(output_dir, "model.pt")
+                extra_data = {}
+                if 'scheduler' in locals():
+                    extra_data["scheduler_state"] = scheduler.state_dict()
                 save_checkpoint(
                     ckpt_path,
                     state_dict=model.state_dict(),
@@ -806,6 +826,7 @@ def train(
                     target_col=tgt_col,
                     horizon=horizon,
                     aux_task=aux_task,
+                    extra=extra_data,
                 )
                 if writer:
                     writer.add_scalar('Checkpoints/Best_Model_Saved', best_val, epoch)
@@ -822,6 +843,9 @@ def train(
             save_by_list = epoch in epoch_save_set
             if save_by_interval or save_by_list:
                 epoch_ckpt_path = os.path.join(ckpt_dir, f"model_epoch{epoch}.pt")
+                extra_data = {"epoch": epoch, "val_loss": va_loss_avg}
+                if 'scheduler' in locals():
+                    extra_data["scheduler_state"] = scheduler.state_dict()
                 save_checkpoint(
                     epoch_ckpt_path,
                     state_dict=model.state_dict(),
@@ -830,7 +854,7 @@ def train(
                     target_col=tgt_col,
                     horizon=horizon,
                     aux_task=aux_task,
-                    extra={"epoch": epoch, "val_loss": va_loss_avg},
+                    extra=extra_data,
                 )
                 print(f"Saved epoch checkpoint: {epoch_ckpt_path}")
 
@@ -951,6 +975,9 @@ def train(
     cfg = ModelConfig(input_features=len(real_cols), seq_len=seq_len)
     model = CNNLSTMAttn(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-7
+    )
     if aux_task == "direction":
         loss_fn = nn.BCEWithLogitsLoss()
     else:
@@ -1020,7 +1047,10 @@ def train(
                 n_va += len(xb)
         va_loss /= max(1, n_va)
 
-        print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f}")
+        # Update learning rate scheduler
+        scheduler.step(va_loss)
+        current_lr = opt.param_groups[0]['lr']
+        print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={current_lr:.2e}")
         
         # Log epoch-level metrics to TensorBoard
         if writer:
@@ -1030,6 +1060,7 @@ def train(
             writer.add_scalar('Metrics/No_Improve_Count', no_improve, epoch)
             writer.add_scalar('Metrics/Total_Samples_Trained', n_tr, epoch)
             writer.add_scalar('Metrics/Total_Samples_Validated', n_va, epoch)
+            writer.add_scalar('Learning_Rate/Epoch', current_lr, epoch)
         
         if va_loss + 1e-9 < best_val:
             best_val = va_loss
@@ -1044,6 +1075,7 @@ def train(
                 target_col=tgt_col,
                 horizon=horizon,
                 aux_task=aux_task,
+                extra={"scheduler_state": scheduler.state_dict()},
             )
             if writer:
                 writer.add_scalar('Checkpoints/Best_Model_Saved', best_val, epoch)
@@ -1068,7 +1100,7 @@ def train(
                 target_col=tgt_col,
                 horizon=horizon,
                 aux_task=aux_task,
-                extra={"epoch": epoch, "val_loss": va_loss},
+                extra={"epoch": epoch, "val_loss": va_loss, "scheduler_state": scheduler.state_dict()},
             )
             print(f"Saved epoch checkpoint: {epoch_ckpt_path}")
 
