@@ -478,7 +478,7 @@ def train(
                             model = CNNLSTMAttn(cfg).to(device)
                             opt = torch.optim.AdamW(model.parameters(), lr=lr)
                             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                                opt, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-7
+                                opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
                             )
                             
                             # Load model state if resuming (only once when model is first created)
@@ -792,8 +792,11 @@ def train(
             
             # Update learning rate scheduler
             if 'scheduler' in locals():
+                old_lr = opt.param_groups[0]['lr']
                 scheduler.step(va_loss_avg)
                 current_lr = opt.param_groups[0]['lr']
+                if current_lr != old_lr:
+                    print(f"Learning rate reduced from {old_lr:.2e} to {current_lr:.2e}")
                 print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f} lr={current_lr:.2e}")
             else:
                 print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f}")
@@ -976,7 +979,7 @@ def train(
     model = CNNLSTMAttn(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='min', factor=0.5, patience=3, verbose=True, min_lr=1e-7
+        opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
     )
     if aux_task == "direction":
         loss_fn = nn.BCEWithLogitsLoss()
@@ -1048,8 +1051,11 @@ def train(
         va_loss /= max(1, n_va)
 
         # Update learning rate scheduler
+        old_lr = opt.param_groups[0]['lr']
         scheduler.step(va_loss)
         current_lr = opt.param_groups[0]['lr']
+        if current_lr != old_lr:
+            print(f"Learning rate reduced from {old_lr:.2e} to {current_lr:.2e}")
         print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={current_lr:.2e}")
         
         # Log epoch-level metrics to TensorBoard
