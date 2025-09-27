@@ -195,7 +195,7 @@ def train(
     target_col: Optional[str] = None,
     batch_size: int = 128,
     epochs: int = 20,
-    lr: float = 1e-3,
+    lr: float = 1e-4,
     device: Optional[str] = None,
     aux_task: str = "regression",  # one of {"regression", "direction", "volatility"}
     checkpoint_every_chunks: Optional[int] = None,  # save checkpoint every N chunks
@@ -220,7 +220,7 @@ def train(
     - target_col (Optional[str], default=None): 예측 대상 컬럼명. None일 경우 첫 번째 feature를 사용합니다.
     - batch_size (int, default=128): 학습 배치 크기.
     - epochs (int, default=20): 최대 학습 에폭 수(얼리 스탑 적용).
-    - lr (float, default=1e-3): AdamW 옵티마이저의 학습률.
+    - lr (float, default=1e-4): AdamW 옵티마이저의 학습률.
     - device (Optional[str], default=None): "cuda"/"cpu" 등 장치 지정. None이면 가능 시 CUDA 사용, 아니면 CPU.
     - aux_task (str, default="regression"): 보조 학습 목표. {regression, direction, volatility}
     - checkpoint_every_chunks (Optional[int], default=None): N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화
@@ -1138,7 +1138,7 @@ def main():
     p.add_argument("--target-col", default=None, help="예측 대상 컬럼명. 미지정 시 첫 번째 feature 사용")
     p.add_argument("--batch-size", type=int, default=128, help="학습 배치 크기. 기본값: 128")
     p.add_argument("--epochs", type=int, default=20, help="최대 학습 에폭 수(얼리 스탑 적용). 기본값: 20")
-    p.add_argument("--lr", type=float, default=1e-3, help="학습률(AdamW). 기본값: 1e-3")
+    p.add_argument("--lr", type=float, default=1e-4, help="학습률(AdamW). 기본값: 1e-4")
     p.add_argument("--device", default=None, help="장치 지정: cuda/cpu. 미지정 시 가능하면 CUDA 사용, 아니면 CPU")
     p.add_argument("--aux-task", choices=["regression", "direction", "volatility"], default="regression", help="보조 학습 목표")
     p.add_argument("--ckpt-every-chunks", type=int, default=None, help="N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화")
