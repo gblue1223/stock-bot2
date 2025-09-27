@@ -10,6 +10,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import duckdb
+from torch.utils.tensorboard import SummaryWriter
 
 from .data import load_real_dataframe
 from .models import CNNLSTMAttn, ModelConfig
@@ -203,6 +204,7 @@ def train(
     chunk_size: int = 1000,
     progress_every: int = 10,
     resume_from: Optional[str] = None,  # path to checkpoint to resume from
+    enable_tensorboard: bool = True,  # enable TensorBoard logging
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -227,6 +229,7 @@ def train(
     - chunk_size (int, default=1000): DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드
     - progress_every (int, default=10): 청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화
     - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로 또는 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. None이면 처음부터 시작
+    - enable_tensorboard (bool, default=True): TensorBoard 로깅 활성화 여부
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -237,6 +240,15 @@ def train(
         (checkpoint_epochs is not None and checkpoint_epochs.strip() != "") or
         checkpoint_every_chunks is not None):
         os.makedirs(ckpt_dir, exist_ok=True)
+
+    # Initialize TensorBoard writer
+    writer = None
+    if enable_tensorboard:
+        log_dir = os.path.join(output_dir, "tensorboard_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=log_dir)
+        print(f"TensorBoard logs will be saved to: {log_dir}")
+        print(f"To view logs, run: tensorboard --logdir {log_dir}")
 
     # Parse checkpoint epochs list
     epoch_save_set = set()
@@ -539,6 +551,7 @@ def train(
 
                         # train
                         model.train()
+                        batch_count = 0
                         for xb, yb in train_loader:
                             xb = xb.to(device)
                             yb = yb.to(device)
@@ -550,6 +563,13 @@ def train(
                             opt.step()
                             tr_loss_epoch_sum += loss.item() * len(xb)
                             tr_samples += len(xb)
+                            
+                            # Log batch-level metrics to TensorBoard
+                            if writer and batch_count % 10 == 0:  # Log every 10 batches
+                                global_step = (epoch - 1) * 1000 + global_trained_chunk_count * 10 + batch_count
+                                writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+                                writer.add_scalar('Learning_Rate', opt.param_groups[0]['lr'], global_step)
+                            batch_count += 1
 
                         # val
                         model.eval()
@@ -763,6 +783,16 @@ def train(
             va_loss_avg = va_loss_epoch_sum / max(1, va_samples)
             print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f}")
 
+            # Log epoch-level metrics to TensorBoard
+            if writer:
+                writer.add_scalar('Loss/Train_Epoch', tr_loss_avg, epoch)
+                writer.add_scalar('Loss/Validation_Epoch', va_loss_avg, epoch)
+                writer.add_scalar('Metrics/Best_Validation_Loss', best_val, epoch)
+                writer.add_scalar('Metrics/No_Improve_Count', no_improve, epoch)
+                writer.add_scalar('Metrics/Trained_Chunks', global_trained_chunk_count, epoch)
+                writer.add_scalar('Metrics/Total_Samples_Trained', tr_samples, epoch)
+                writer.add_scalar('Metrics/Total_Samples_Validated', va_samples, epoch)
+
             if va_loss_avg + 1e-9 < best_val:
                 best_val = va_loss_avg
                 no_improve = 0
@@ -777,10 +807,14 @@ def train(
                     horizon=horizon,
                     aux_task=aux_task,
                 )
+                if writer:
+                    writer.add_scalar('Checkpoints/Best_Model_Saved', best_val, epoch)
             else:
                 no_improve += 1
                 if no_improve >= patience:
                     print("Early stopping")
+                    if writer:
+                        writer.add_text('Training/Early_Stop', f'Early stopping at epoch {epoch}', epoch)
                     break
 
             # Optional epoch checkpoints
@@ -815,6 +849,11 @@ def train(
         }
         with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
+        
+        # Close TensorBoard writer
+        if writer:
+            writer.close()
+            print("TensorBoard logging completed.")
         return
 
     # 1) db_path가 폴더라면 폴더 내의 모든 DuckDB 파일을 로드하여 concat
@@ -947,6 +986,7 @@ def train(
         model.train()
         tr_loss = 0.0
         n_tr = 0
+        batch_count = 0
         for xb, yb in train_loader:
             xb = xb.to(device)
             yb = yb.to(device)
@@ -958,6 +998,13 @@ def train(
             opt.step()
             tr_loss += loss.item() * len(xb)
             n_tr += len(xb)
+            
+            # Log batch-level metrics to TensorBoard
+            if writer and batch_count % 10 == 0:  # Log every 10 batches
+                global_step = (epoch - 1) * len(train_loader) + batch_count
+                writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+                writer.add_scalar('Learning_Rate', opt.param_groups[0]['lr'], global_step)
+            batch_count += 1
         tr_loss /= max(1, n_tr)
 
         model.eval()
@@ -974,6 +1021,16 @@ def train(
         va_loss /= max(1, n_va)
 
         print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f}")
+        
+        # Log epoch-level metrics to TensorBoard
+        if writer:
+            writer.add_scalar('Loss/Train_Epoch', tr_loss, epoch)
+            writer.add_scalar('Loss/Validation_Epoch', va_loss, epoch)
+            writer.add_scalar('Metrics/Best_Validation_Loss', best_val, epoch)
+            writer.add_scalar('Metrics/No_Improve_Count', no_improve, epoch)
+            writer.add_scalar('Metrics/Total_Samples_Trained', n_tr, epoch)
+            writer.add_scalar('Metrics/Total_Samples_Validated', n_va, epoch)
+        
         if va_loss + 1e-9 < best_val:
             best_val = va_loss
             no_improve = 0
@@ -988,10 +1045,14 @@ def train(
                 horizon=horizon,
                 aux_task=aux_task,
             )
+            if writer:
+                writer.add_scalar('Checkpoints/Best_Model_Saved', best_val, epoch)
         else:
             no_improve += 1
             if no_improve >= patience:
                 print("Early stopping")
+                if writer:
+                    writer.add_text('Training/Early_Stop', f'Early stopping at epoch {epoch}', epoch)
                 break
 
         # Optional checkpointing by epoch index
@@ -1026,6 +1087,11 @@ def train(
     }
     with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
+    
+    # Close TensorBoard writer
+    if writer:
+        writer.close()
+        print("TensorBoard logging completed.")
 
 
 def main():
@@ -1049,6 +1115,7 @@ def main():
     p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로 또는 체크포인트 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. 미지정 시 처음부터 시작")
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
     p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
+    p.add_argument("--no-tensorboard", action="store_true", help="TensorBoard 로깅 비활성화")
     args = p.parse_args()
 
     train(
@@ -1071,6 +1138,7 @@ def main():
         chunk_size=args.chunk_size,
         progress_every=args.progress_every,
         resume_from=args.resume_from,
+        enable_tensorboard=not args.no_tensorboard,
     )
 
 
