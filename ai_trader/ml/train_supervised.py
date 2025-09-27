@@ -120,8 +120,8 @@ def log_startup_summary(
     batch_size: int,
     epochs: int,
     chunk_size: int | None,
-    checkpoint_every: int | None,
     checkpoint_every_chunks: int | None,
+    checkpoint_every_epochs: int | None,
     checkpoint_epochs: str | None,
     progress_every: int | None,
 ) -> None:
@@ -147,8 +147,8 @@ def log_startup_summary(
     print(f"epochs         : {epochs}")
     if chunk_size is not None:
         print(f"chunk_size     : {chunk_size}")
-    print(f"ckpt-every         : {checkpoint_every}")
-    print(f"ckpt-epochs-chunks : {checkpoint_every_chunks}")
+    print(f"ckpt-every-chunks : {checkpoint_every_chunks}")
+    print(f"ckpt-every-epochs  : {checkpoint_every_epochs}")
     print(f"ckpt-epochs        : {checkpoint_epochs}")
     if progress_every is not None:
         print(f"progress-every : {progress_every}")
@@ -169,11 +169,11 @@ def train(
     lr: float = 1e-3,
     device: Optional[str] = None,
     aux_task: str = "regression",  # one of {"regression", "direction", "volatility"}
-    checkpoint_every: Optional[int] = None,
+    checkpoint_every_chunks: Optional[int] = None,  # save checkpoint every N chunks
+    checkpoint_every_epochs: Optional[int] = None,
     checkpoint_epochs: Optional[str] = None,  # comma-separated list, e.g., "5,10,20"
     chunk_size: int = 1000,
     progress_every: int = 10,
-    checkpoint_every_chunks: Optional[int] = None,  # save checkpoint every N chunks
     resume_from: Optional[str] = None,  # path to checkpoint to resume from
 ):
     """
@@ -193,11 +193,11 @@ def train(
     - lr (float, default=1e-3): AdamW 옵티마이저의 학습률.
     - device (Optional[str], default=None): "cuda"/"cpu" 등 장치 지정. None이면 가능 시 CUDA 사용, 아니면 CPU.
     - aux_task (str, default="regression"): 보조 학습 목표. {regression, direction, volatility}
+    - checkpoint_every_chunks (Optional[int], default=None): N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화
     - checkpoint_every (Optional[int], default=None): N 에폭마다 체크포인트 저장 (예: 5). 미지정 시 비활성화
     - checkpoint_epochs (Optional[str], default=None): 지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')
     - chunk_size (int, default=1000): DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드
     - progress_every (int, default=10): 청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화
-    - checkpoint_every_chunks (Optional[int], default=None): N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화
     - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로. None이면 처음부터 시작
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -205,7 +205,7 @@ def train(
 
     # Prepare checkpoint directory for periodic/specified-epoch saves
     ckpt_dir = os.path.join(output_dir, "checkpoints")
-    if (checkpoint_every is not None or 
+    if (checkpoint_every_epochs is not None or 
         (checkpoint_epochs is not None and checkpoint_epochs.strip() != "") or
         checkpoint_every_chunks is not None):
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -329,8 +329,8 @@ def train(
             batch_size=batch_size,
             epochs=epochs,
             chunk_size=chunk_size,
-            checkpoint_every=checkpoint_every,
             checkpoint_every_chunks=checkpoint_every_chunks,
+            checkpoint_every_epochs=checkpoint_every_epochs,
             checkpoint_epochs=checkpoint_epochs,
             progress_every=progress_every,
         )
@@ -739,7 +739,7 @@ def train(
                     break
 
             # Optional epoch checkpoints
-            save_by_interval = checkpoint_every is not None and checkpoint_every > 0 and (epoch % checkpoint_every == 0)
+            save_by_interval = checkpoint_every_epochs is not None and checkpoint_every_epochs > 0 and (epoch % checkpoint_every_epochs == 0)
             save_by_list = epoch in epoch_save_set
             if save_by_interval or save_by_list:
                 epoch_ckpt_path = os.path.join(ckpt_dir, f"model_epoch{epoch}.pt")
@@ -888,8 +888,8 @@ def train(
         batch_size=batch_size,
         epochs=epochs,
         chunk_size=None,
-        checkpoint_every=checkpoint_every,
         checkpoint_every_chunks=None,
+        checkpoint_every_epochs=checkpoint_every_epochs,
         checkpoint_epochs=checkpoint_epochs,
         progress_every=None,
     )
@@ -950,7 +950,7 @@ def train(
                 break
 
         # Optional checkpointing by epoch index
-        save_by_interval = checkpoint_every is not None and checkpoint_every > 0 and (epoch % checkpoint_every == 0)
+        save_by_interval = checkpoint_every_epochs is not None and checkpoint_every_epochs > 0 and (epoch % checkpoint_every_epochs == 0)
         save_by_list = epoch in epoch_save_set
         if save_by_interval or save_by_list:
             epoch_ckpt_path = os.path.join(ckpt_dir, f"model_epoch{epoch}.pt")
@@ -998,9 +998,9 @@ def main():
     p.add_argument("--lr", type=float, default=1e-3, help="학습률(AdamW). 기본값: 1e-3")
     p.add_argument("--device", default=None, help="장치 지정: cuda/cpu. 미지정 시 가능하면 CUDA 사용, 아니면 CPU")
     p.add_argument("--aux-task", choices=["regression", "direction", "volatility"], default="regression", help="보조 학습 목표")
-    p.add_argument("--ckpt-every", type=int, default=None, help="N 에폭마다 체크포인트 저장 (예: 5). 미지정 시 비활성화")
-    p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
     p.add_argument("--ckpt-every-chunks", type=int, default=None, help="N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화")
+    p.add_argument("--ckpt-every-epochs", type=int, default=None, help="N 에폭마다 체크포인트 저장 (예: 5). 미지정 시 비활성화")
+    p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
     p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로. 미지정 시 처음부터 시작")
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
     p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
@@ -1020,11 +1020,11 @@ def main():
         lr=args.lr,
         device=args.device,
         aux_task=args.aux_task,
-        checkpoint_every=args.ckpt_every,
+        checkpoint_every_chunks=args.ckpt_every_chunks,
+        checkpoint_every_epochs=args.ckpt_every,
         checkpoint_epochs=args.ckpt_epochs,
         chunk_size=args.chunk_size,
         progress_every=args.progress_every,
-        checkpoint_every_chunks=args.ckpt_every_chunks,
         resume_from=args.resume_from,
     )
 
