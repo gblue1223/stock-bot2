@@ -70,6 +70,34 @@ def save_checkpoint(path: str,
     torch.save(payload, path)
 
 
+def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
+    """Find the latest checkpoint file in the given directory"""
+    if not os.path.isdir(checkpoint_dir):
+        return None
+    
+    checkpoint_files = []
+    for filename in os.listdir(checkpoint_dir):
+        if filename.endswith('.pt'):
+            filepath = os.path.join(checkpoint_dir, filename)
+            if os.path.isfile(filepath):
+                # Get modification time
+                mtime = os.path.getmtime(filepath)
+                checkpoint_files.append((mtime, filepath, filename))
+    
+    if not checkpoint_files:
+        return None
+    
+    # Sort by modification time (newest first)
+    checkpoint_files.sort(reverse=True)
+    latest_file = checkpoint_files[0][1]
+    latest_name = checkpoint_files[0][2]
+    
+    print(f"Found {len(checkpoint_files)} checkpoint(s) in {checkpoint_dir}")
+    print(f"Latest checkpoint: {latest_name}")
+    
+    return latest_file
+
+
 def load_checkpoint(path: str, device: str) -> dict:
     """Load checkpoint and return its contents"""
     if not os.path.exists(path):
@@ -198,7 +226,7 @@ def train(
     - checkpoint_epochs (Optional[str], default=None): 지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')
     - chunk_size (int, default=1000): DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드
     - progress_every (int, default=10): 청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화
-    - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로. None이면 처음부터 시작
+    - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로 또는 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. None이면 처음부터 시작
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -248,12 +276,29 @@ def train(
         # Load checkpoint if resuming
         resume_last_no = None
         if resume_from:
-            if not os.path.exists(resume_from):
+            checkpoint_path = resume_from
+            
+            # If resume_from is a directory, find the latest checkpoint
+            if os.path.isdir(resume_from):
+                latest_checkpoint = find_latest_checkpoint(resume_from)
+                if latest_checkpoint:
+                    checkpoint_path = latest_checkpoint
+                    resume_from = latest_checkpoint  # Update resume_from for later use
+                    print(f"Auto-selected latest checkpoint from directory: {resume_from}")
+                else:
+                    print(f"WARNING: No checkpoint files found in directory: {resume_from}")
+                    print("Starting from scratch...")
+                    checkpoint_path = None
+                    resume_from = None
+            elif not os.path.exists(resume_from):
                 print(f"WARNING: Resume checkpoint not found: {resume_from}")
                 print("Starting from scratch...")
-            else:
+                checkpoint_path = None
+                resume_from = None
+            
+            if checkpoint_path:
                 try:
-                    checkpoint = load_checkpoint(resume_from, device)
+                    checkpoint = load_checkpoint(checkpoint_path, device)
                     start_epoch = checkpoint.get("epoch", 1)
                     # Try both keys for backward compatibility
                     resume_chunk_count = checkpoint.get("trained_chunks", checkpoint.get("chunk", 0))
@@ -1001,7 +1046,7 @@ def main():
     p.add_argument("--ckpt-every-chunks", type=int, default=None, help="N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화")
     p.add_argument("--ckpt-every-epochs", type=int, default=None, help="N 에폭마다 체크포인트 저장 (예: 5). 미지정 시 비활성화")
     p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
-    p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로. 미지정 시 처음부터 시작")
+    p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로 또는 체크포인트 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. 미지정 시 처음부터 시작")
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
     p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
     args = p.parse_args()
@@ -1021,7 +1066,7 @@ def main():
         device=args.device,
         aux_task=args.aux_task,
         checkpoint_every_chunks=args.ckpt_every_chunks,
-        checkpoint_every_epochs=args.ckpt_every,
+        checkpoint_every_epochs=args.ckpt_every_epochs,
         checkpoint_epochs=args.ckpt_epochs,
         chunk_size=args.chunk_size,
         progress_every=args.progress_every,
