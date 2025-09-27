@@ -70,6 +70,25 @@ def save_checkpoint(path: str,
     torch.save(payload, path)
 
 
+def load_checkpoint(path: str, device: str) -> dict:
+    """Load checkpoint and return its contents"""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+    
+    checkpoint = torch.load(path, map_location=device)
+    print(f"Loaded checkpoint from: {path}")
+    
+    # Print checkpoint info
+    if "epoch" in checkpoint:
+        print(f"  - Epoch: {checkpoint['epoch']}")
+    if "chunk" in checkpoint:
+        print(f"  - Chunk: {checkpoint['chunk']}")
+    if "val_loss" in checkpoint:
+        print(f"  - Val Loss: {checkpoint['val_loss']:.6f}")
+    
+    return checkpoint
+
+
 def _fmt_int(n: int) -> str:
     try:
         return f"{int(n):,}"
@@ -143,6 +162,8 @@ def train(
     checkpoint_epochs: Optional[str] = None,  # comma-separated list, e.g., "5,10,20"
     chunk_size: int = 1000,
     progress_every: int = 10,
+    checkpoint_every_chunks: Optional[int] = None,  # save checkpoint every N chunks
+    resume_from: Optional[str] = None,  # path to checkpoint to resume from
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -165,13 +186,17 @@ def train(
     - checkpoint_epochs (Optional[str], default=None): 지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')
     - chunk_size (int, default=1000): DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드
     - progress_every (int, default=10): 청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화
+    - checkpoint_every_chunks (Optional[int], default=None): N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화
+    - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로. None이면 처음부터 시작
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Prepare checkpoint directory for periodic/specified-epoch saves
     ckpt_dir = os.path.join(output_dir, "checkpoints")
-    if checkpoint_every is not None or (checkpoint_epochs is not None and checkpoint_epochs.strip() != ""):
+    if (checkpoint_every is not None or 
+        (checkpoint_epochs is not None and checkpoint_epochs.strip() != "") or
+        checkpoint_every_chunks is not None):
         os.makedirs(ckpt_dir, exist_ok=True)
 
     # Parse checkpoint epochs list
@@ -203,6 +228,22 @@ def train(
         best_val = float("inf")
         patience = 5
         no_improve = 0
+        global_chunk_count = 0  # Track total chunks processed across all epochs
+        start_epoch = 1
+        resume_chunk_count = 0
+
+        # Load checkpoint if resuming
+        if resume_from and os.path.exists(resume_from):
+            try:
+                checkpoint = load_checkpoint(resume_from, device)
+                start_epoch = checkpoint.get("epoch", 1)
+                resume_chunk_count = checkpoint.get("chunk", 0)
+                global_chunk_count = resume_chunk_count
+                best_val = checkpoint.get("val_loss", float("inf"))
+                print(f"Resuming from epoch {start_epoch}, chunk {resume_chunk_count}")
+            except Exception as e:
+                print(f"Failed to load checkpoint: {e}")
+                print("Starting from scratch...")
 
         duckdb_files = list_duckdb_files(db_path)
 
@@ -259,7 +300,7 @@ def train(
             progress_every=progress_every,
         )
 
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             tr_loss_epoch_sum = 0.0
             tr_samples = 0
             va_loss_epoch_sum = 0.0
@@ -313,8 +354,19 @@ def train(
                                 break
                             processed += len(df_chunk)
                             chunk_idx += 1
+                            global_chunk_count += 1
+                            
+                            # Skip chunks if resuming and haven't reached resume point yet
+                            if global_chunk_count <= resume_chunk_count:
+                                if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
+                                    print(f"[stream-skip] file={os.path.basename(fpath)} epoch={epoch} chunks={chunk_idx} processed={processed}/{total} (skipping)")
+                                if "번호" in df_chunk.columns:
+                                    last_no = int(df_chunk["번호"].iloc[-1])
+                                continue
+                            
                             if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
                                 print(f"[stream] file={os.path.basename(fpath)} epoch={epoch} chunks={chunk_idx} processed={processed}/{total}")
+                            
                             # update last_no for next page
                             if "번호" in df_chunk.columns:
                                 last_no = int(df_chunk["번호"].iloc[-1])
@@ -328,8 +380,18 @@ def train(
                                 continue
                             processed += len(df_chunk)
                             chunk_idx += 1
+                            global_chunk_count += 1
+                            
+                            # Skip chunks if resuming and haven't reached resume point yet
+                            if global_chunk_count <= resume_chunk_count:
+                                if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
+                                    print(f"[stream-offset-skip] file={os.path.basename(fpath)} epoch={epoch} chunks={chunk_idx} processed={processed}/{total} (skipping)")
+                                continue
+                            
                             if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
                                 print(f"[stream-offset] file={os.path.basename(fpath)} epoch={epoch} chunks={chunk_idx} processed={processed}/{total}")
+                            
+
 
                     # Transform 날짜 -> month
                     convert_date_to_month_inplace(df_chunk)
@@ -351,6 +413,16 @@ def train(
                         cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
                         model = CNNLSTMAttn(cfg).to(device)
                         opt = torch.optim.AdamW(model.parameters(), lr=lr)
+                        
+                        # Load model state if resuming
+                        if resume_from and os.path.exists(resume_from):
+                            try:
+                                checkpoint = load_checkpoint(resume_from, device)
+                                model.load_state_dict(checkpoint["state_dict"])
+                                print("Model state loaded from checkpoint")
+                            except Exception as e:
+                                print(f"Failed to load model state: {e}")
+                                print("Using fresh model...")
 
                     # Align to global feature order, fill missing with 0
                     feats = feats.reindex(columns=global_features, fill_value=0.0)
@@ -438,6 +510,24 @@ def train(
                                 loss = loss_fn(pred, yb)
                                 va_loss_epoch_sum += loss.item() * len(xb)
                                 va_samples += len(xb)
+
+                        # Save checkpoint every N chunks if specified (after training on chunk)
+                        if (checkpoint_every_chunks is not None and 
+                            checkpoint_every_chunks > 0 and 
+                            global_chunk_count % checkpoint_every_chunks == 0):
+                            chunk_ckpt_path = os.path.join(ckpt_dir, f"model_chunk{global_chunk_count}.pt")
+                            cfg_dict = model.cfg.__dict__ if hasattr(model, 'cfg') else {"input_features": len(global_features), "seq_len": seq_len}
+                            save_checkpoint(
+                                chunk_ckpt_path,
+                                state_dict=model.state_dict(),
+                                config_dict=cfg_dict,
+                                feature_names=list(global_features or []),
+                                target_col=tgt_col,
+                                horizon=horizon,
+                                aux_task=aux_task,
+                                extra={"epoch": epoch, "chunk": global_chunk_count},
+                            )
+                            print(f"Saved chunk checkpoint: {chunk_ckpt_path} (chunk {global_chunk_count})")
 
                     # Update tail for next chunk
                     prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
@@ -737,6 +827,8 @@ def main():
     p.add_argument("--aux-task", choices=["regression", "direction", "volatility"], default="regression", help="보조 학습 목표")
     p.add_argument("--ckpt-every", type=int, default=None, help="N 에폭마다 체크포인트 저장 (예: 5). 미지정 시 비활성화")
     p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
+    p.add_argument("--ckpt-every-chunks", type=int, default=None, help="N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화")
+    p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로. 미지정 시 처음부터 시작")
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
     p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
     args = p.parse_args()
@@ -759,6 +851,8 @@ def main():
         checkpoint_epochs=args.ckpt_epochs,
         chunk_size=args.chunk_size,
         progress_every=args.progress_every,
+        checkpoint_every_chunks=args.ckpt_every_chunks,
+        resume_from=args.resume_from,
     )
 
 
