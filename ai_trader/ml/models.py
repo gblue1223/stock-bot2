@@ -9,16 +9,27 @@ import torch.nn as nn
 class ModelConfig:
     input_features: int
     seq_len: int
+    
+    # 옵션 1: 중간 크기 (약 150만 파라미터)
     conv_channels: int = 128      # 64 → 128 (더 많은 특성 추출)
     lstm_hidden: int = 256        # 128 → 256 (더 큰 은닉 상태)
     lstm_layers: int = 2          # 1 → 2 (더 깊은 시간 모델링)
     attn_heads: int = 8           # 4 → 8 (더 세밀한 attention)
     dropout: float = 0.1
+    
+    # 옵션 2: 대형 모델 (약 400만 파라미터)
     # conv_channels: int = 256      # 64 → 256
     # lstm_hidden: int = 512        # 128 → 512
     # lstm_layers: int = 3          # 1 → 3
     # attn_heads: int = 16          # 4 → 16
-    # dropout: int = 0.15            # 과적합 방지
+    # dropout: int = 0.15           # 과적합 방지
+
+    # 옵션 3: 초대형 모델 (약 1000만 파라미터)
+    # conv_channels: int = 512       # 64 → 512
+    # lstm_hidden: int = 1024        # 128 → 1024
+    # lstm_layers: int = 4           # 1 → 4
+    # attn_heads: int = 32           # 4 → 32
+    # dropout: int = 0.2             # 더 강한 정규화
 
 
 class CNNLSTMAttn(nn.Module):

@@ -559,7 +559,7 @@ def train(
                             pred = model(xb)
                             loss = loss_fn(pred, yb)
                             loss.backward()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                             opt.step()
                             tr_loss_epoch_sum += loss.item() * len(xb)
                             tr_samples += len(xb)
