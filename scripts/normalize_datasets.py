@@ -658,7 +658,7 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
     print(f"  {yyyymm}: {total_groups} 그룹 처리 시작 (group_workers={group_workers})", flush=True)
     
     # Step 1: Process groups to pickle files in parallel
-    pickle_paths = []
+    pickle_paths: List[str] = []
     max_group_workers = max(1, int(group_workers))
     used_group_workers = min(max_group_workers, total_groups)
     
@@ -675,6 +675,17 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
                     pkl_path = fut.result()
                     if pkl_path:
                         pickle_paths.append(pkl_path)
+                        # Incremental ingest when enough pickles are ready
+                        if checkpoint_interval > 0 and len(pickle_paths) >= checkpoint_interval:
+                            batch = pickle_paths[:checkpoint_interval]
+                            print(f"  {yyyymm}: 증분 반영 시작 (batch={len(batch)}) -> {db_path}", flush=True)
+                            try:
+                                _ingest_pickles_to_db(batch, db_path, yyyymm, checkpoint_interval)
+                                # remove ingested ones from buffer
+                                pickle_paths = pickle_paths[checkpoint_interval:]
+                                print(f"  {yyyymm}: 증분 반영 완료 (누적 대기 {len(pickle_paths)} pickle)", flush=True)
+                            except Exception as e:
+                                print(f"  {yyyymm}: 증분 반영 실패: {type(e).__name__}: {e}", flush=True)
                 except Exception as e:
                     print(f"  {yyyymm}: 그룹 처리 중 오류: {type(e).__name__}: {e}", flush=True)
                 finally:
@@ -688,14 +699,27 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
             pkl_path = _process_single_group_to_pickle(group_key, files, tmp_root)
             if pkl_path:
                 pickle_paths.append(pkl_path)
+                # Incremental ingest when buffer reaches checkpoint size
+                if checkpoint_interval > 0 and len(pickle_paths) >= checkpoint_interval:
+                    batch = pickle_paths[:checkpoint_interval]
+                    print(f"  {yyyymm}: 증분 반영 시작 (batch={len(batch)}) -> {db_path}", flush=True)
+                    try:
+                        _ingest_pickles_to_db(batch, db_path, yyyymm, checkpoint_interval)
+                        pickle_paths = pickle_paths[checkpoint_interval:]
+                        print(f"  {yyyymm}: 증분 반영 완료 (누적 대기 {len(pickle_paths)} pickle)", flush=True)
+                    except Exception as e:
+                        print(f"  {yyyymm}: 증분 반영 실패: {type(e).__name__}: {e}", flush=True)
             done += 1
             if done % 5 == 0 or done == total_groups:
                 print(f"  {yyyymm}: pickle 생성 진행률 [{done}/{total_groups}]", flush=True)
-    
+     
     # Step 2: Ingest pickle files to DB sequentially (to avoid DB write conflicts)
-    print(f"  {yyyymm}: {len(pickle_paths)} pickle 파일을 DB에 순차 반영", flush=True)
-    processed_count = _ingest_pickles_to_db(pickle_paths, db_path, yyyymm, checkpoint_interval)
-    
+    if pickle_paths:
+        print(f"  {yyyymm}: {len(pickle_paths)} pickle 파일을 DB에 순차 반영", flush=True)
+        processed_count = _ingest_pickles_to_db(pickle_paths, db_path, yyyymm, checkpoint_interval)
+    else:
+        processed_count = 0
+     
     return processed_count
 
 
