@@ -205,6 +205,8 @@ def train(
     progress_every: int = 10,
     resume_from: Optional[str] = None,  # path to checkpoint to resume from
     enable_tensorboard: bool = True,  # enable TensorBoard logging
+    loss_type: str = "mse",          # regression loss: {"mse", "huber"}
+    huber_delta: float = 1.0,         # Huber delta
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -230,6 +232,8 @@ def train(
     - progress_every (int, default=10): 청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화
     - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로 또는 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. None이면 처음부터 시작
     - enable_tensorboard (bool, default=True): TensorBoard 로깅 활성화 여부
+    - loss_type (str, default="mse"): 회귀 손실 함수 선택: mse 또는 huber
+    - huber_delta (float, default=1.0): Huber 손실의 delta (허용 오차)
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -273,7 +277,7 @@ def train(
         if aux_task == "direction":
             loss_fn = nn.BCEWithLogitsLoss()
         else:
-            loss_fn = nn.MSELoss()
+            loss_fn = nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
 
         # Training loop over epochs and files/chunks
         best_val = float("inf")
@@ -497,8 +501,11 @@ def train(
                                     print("Using fresh model...")
                         # Align to global feature order
                         feats = feats.reindex(columns=global_features, fill_value=0.0)
-
-                        # Concatenate with tail for continuity
+                        
+                        # IMPORTANT: Do NOT re-normalize here. Datasets are already normalized
+                        # by scripts/normalize_datasets.py. Per-chunk normalization causes scale
+                        # drift across chunks and within concatenated tails, destabilizing loss.
+                        # Use features as-is.
                         feats_all = pd.concat([prev_tail_feats, feats], axis=0, ignore_index=True) if prev_tail_feats is not None else feats
 
                         feat_vals = feats_all.to_numpy(dtype=np.float32)
@@ -680,13 +687,13 @@ def train(
                             # But if we started with keyset info, we're already at the right position
                             if resume_chunk_count > 0 and global_chunk_count <= resume_chunk_count and not started_with_keyset:
                                 if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                    print(f"[SKIP-TRAINED] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} file_processed={processed}/{total} (skipping already trained chunk)")
+                                    print(f"[SKIP-TRAINED] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} processed={processed}/{total} (skipping already trained chunk)")
                                 if "번호" in df_chunk.columns:
                                     last_no = int(df_chunk["번호"].iloc[-1])
                                 continue
 
                             if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                print(f"[TRAINING] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} file_processed={processed}/{total} (training chunk)")
+                                print(f"[TRAINING] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} processed={processed}/{total} (training chunk)")
 
                             # update last_no for next page
                             if "번호" in df_chunk.columns:
@@ -754,11 +761,11 @@ def train(
                             # Skip training if resuming and haven't reached resume trained chunk yet
                             if resume_chunk_count > 0 and global_chunk_count <= resume_chunk_count:
                                 if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                    print(f"[SKIP-TRAINED-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} file_processed={processed}/{total} (skipping already trained chunk)")
+                                    print(f"[SKIP-TRAINED-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} processed={processed}/{total} (skipping already trained chunk)")
                                 continue
 
                             if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                print(f"[TRAINING-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} file_processed={processed}/{total} (training chunk)")
+                                print(f"[TRAINING-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} processed={processed}/{total} (training chunk)")
 
                             # Process this chunk immediately
                             trained, _ = _process_chunk(df_chunk)
@@ -984,7 +991,7 @@ def train(
     if aux_task == "direction":
         loss_fn = nn.BCEWithLogitsLoss()
     else:
-        loss_fn = nn.MSELoss()
+        loss_fn = nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
 
     # Non-streaming startup summary
     log_startup_summary(
@@ -1154,6 +1161,8 @@ def main():
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
     p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
     p.add_argument("--no-tensorboard", action="store_true", help="TensorBoard 로깅 비활성화")
+    p.add_argument("--loss", choices=["mse", "huber"], default="mse", help="회귀 손실 함수 선택: mse 또는 huber")
+    p.add_argument("--huber-delta", type=float, default=1.0, help="Huber 손실의 delta (허용 오차)")
     args = p.parse_args()
 
     train(
@@ -1177,6 +1186,8 @@ def main():
         progress_every=args.progress_every,
         resume_from=args.resume_from,
         enable_tensorboard=not args.no_tensorboard,
+        loss_type=args.loss,
+        huber_delta=args.huber_delta,
     )
 
 

@@ -279,7 +279,7 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         "외국계매도추정합", "외국계매수추정합", "외국계매도추정합변동", "외국계매수추정합변동",
     ])
 
-    stdonly_cols = set(["매도호가총잔량직전대비", "매수호가총잔량직전대비"])
+    stdonly_cols = set(["매도호가총잔량직전대비", "매수호가총잔량직전대비", "등락률"])
 
     broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
 
