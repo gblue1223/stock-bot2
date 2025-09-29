@@ -12,6 +12,9 @@ import pickle as _pickle
 import numpy as np
 import pandas as pd
 
+# Global sequential counter for '번호'
+NO_COUNTER: int = 1
+
 FILENAME_PATTERN = re.compile(r"^(?P<code>\d{6})_(?P<name>.+?)_(?P<type>[^_]+)_(?P<date>\d{8})\.csv$")
 TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
 DROP_COLUMNS = {"종류", "씨리얼"}
@@ -456,6 +459,12 @@ def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: st
     try:
         with open(pkl_path, 'rb') as f:
             merged_df = _pickle.load(f)
+        # Overwrite/assign global sequential '번호'
+        global NO_COUNTER
+        n_rows = len(merged_df)
+        if n_rows > 0:
+            merged_df['번호'] = np.arange(NO_COUNTER, NO_COUNTER + n_rows, dtype=np.int64)
+            NO_COUNTER += n_rows
         conn = duckdb.connect(db_path)
         try:
             ensure_datasets_table_duckdb(conn, merged_df)
@@ -571,6 +580,12 @@ def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, ch
             # Load pickle and extract metadata
             with open(pkl_path, 'rb') as f:
                 merged_df = _pickle.load(f)
+            # Overwrite/assign global sequential '번호'
+            global NO_COUNTER
+            n_rows = len(merged_df)
+            if n_rows > 0:
+                merged_df['번호'] = np.arange(NO_COUNTER, NO_COUNTER + n_rows, dtype=np.int64)
+                NO_COUNTER += n_rows
             
             group_key = Path(pkl_path).stem
             parts = group_key.split('_')

@@ -207,6 +207,7 @@ def train(
     enable_tensorboard: bool = True,  # enable TensorBoard logging
     loss_type: str = "mse",          # regression loss: {"mse", "huber"}
     huber_delta: float = 1.0,         # Huber delta
+    weight_decay: float = 1e-4,       # AdamW weight decay
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -234,6 +235,7 @@ def train(
     - enable_tensorboard (bool, default=True): TensorBoard 로깅 활성화 여부
     - loss_type (str, default="mse"): 회귀 손실 함수 선택: mse 또는 huber
     - huber_delta (float, default=1.0): Huber 손실의 delta (허용 오차)
+    - weight_decay (float, default=1e-4): AdamW weight decay (L2 정규화 강도)
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -401,6 +403,9 @@ def train(
             tr_samples = 0
             va_loss_epoch_sum = 0.0
             va_samples = 0
+            # For validation metrics aggregation across chunks
+            va_preds_all: list[float] = []
+            va_targets_all: list[float] = []
 
             # Determine/ensure loss fn per epoch (already set above)
 
@@ -480,7 +485,7 @@ def train(
                             tgt_col = tgt
                             cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
                             model = CNNLSTMAttn(cfg).to(device)
-                            opt = torch.optim.AdamW(model.parameters(), lr=lr)
+                            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
                             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                                 opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
                             )
@@ -596,6 +601,9 @@ def train(
                                 loss = loss_fn(pred, yb)
                                 va_loss_epoch_sum += loss.item() * len(xb)
                                 va_samples += len(xb)
+                                # accumulate for metrics
+                                va_preds_all.extend(pred.detach().cpu().float().tolist())
+                                va_targets_all.extend(yb.detach().cpu().float().tolist())
 
                         # update tail
                         prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
@@ -796,6 +804,23 @@ def train(
             # End of epoch: compute averages and handle checkpoints/early stopping
             tr_loss_avg = tr_loss_epoch_sum / max(1, tr_samples)
             va_loss_avg = va_loss_epoch_sum / max(1, va_samples)
+            # Compute validation metrics
+            va_r = 0.0
+            va_r2 = 0.0
+            if va_targets_all and aux_task == "regression":
+                import numpy as _np
+                y_true = _np.array(va_targets_all, dtype=_np.float32)
+                y_pred = _np.array(va_preds_all, dtype=_np.float32)
+                if y_true.size > 1:
+                    # Pearson r
+                    yt = y_true - y_true.mean()
+                    yp = y_pred - y_pred.mean()
+                    denom = (yt.std() * yp.std())
+                    va_r = float((yt * yp).mean() / denom) if denom != 0 else 0.0
+                    # R^2
+                    ss_res = float(((y_true - y_pred) ** 2).sum())
+                    ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
+                    va_r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
             
             # Update learning rate scheduler
             if 'scheduler' in locals():
@@ -819,7 +844,10 @@ def train(
                 writer.add_scalar('Metrics/Total_Samples_Validated', va_samples, epoch)
                 if 'scheduler' in locals():
                     writer.add_scalar('Learning_Rate/Epoch', opt.param_groups[0]['lr'], epoch)
-
+                if aux_task == 'regression':
+                    writer.add_scalar('Metrics/Val_Pearson_r', va_r, epoch)
+                    writer.add_scalar('Metrics/Val_R2', va_r2, epoch)
+            
             if va_loss_avg + 1e-9 < best_val:
                 best_val = va_loss_avg
                 no_improve = 0
@@ -984,7 +1012,7 @@ def train(
 
     cfg = ModelConfig(input_features=len(real_cols), seq_len=seq_len)
     model = CNNLSTMAttn(cfg).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
     )
@@ -1047,6 +1075,8 @@ def train(
         model.eval()
         va_loss = 0.0
         n_va = 0
+        va_preds_list = []
+        va_targets_list = []
         with torch.no_grad():
             for xb, yb in val_loader:
                 xb = xb.to(device)
@@ -1055,8 +1085,25 @@ def train(
                 loss = loss_fn(pred, yb)
                 va_loss += loss.item() * len(xb)
                 n_va += len(xb)
+                va_preds_list.extend(pred.detach().cpu().float().tolist())
+                va_targets_list.extend(yb.detach().cpu().float().tolist())
         va_loss /= max(1, n_va)
-
+        
+        # Compute validation metrics
+        va_r = 0.0
+        va_r2 = 0.0
+        if aux_task == "regression" and len(va_targets_list) > 1:
+            import numpy as _np
+            y_true = _np.array(va_targets_list, dtype=_np.float32)
+            y_pred = _np.array(va_preds_list, dtype=_np.float32)
+            yt = y_true - y_true.mean()
+            yp = y_pred - y_pred.mean()
+            denom = (yt.std() * yp.std())
+            va_r = float((yt * yp).mean() / denom) if denom != 0 else 0.0
+            ss_res = float(((y_true - y_pred) ** 2).sum())
+            ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
+            va_r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
+        
         # Update learning rate scheduler
         old_lr = opt.param_groups[0]['lr']
         scheduler.step(va_loss)
@@ -1074,11 +1121,14 @@ def train(
             writer.add_scalar('Metrics/Total_Samples_Trained', n_tr, epoch)
             writer.add_scalar('Metrics/Total_Samples_Validated', n_va, epoch)
             writer.add_scalar('Learning_Rate/Epoch', current_lr, epoch)
+            if aux_task == 'regression':
+                writer.add_scalar('Metrics/Val_Pearson_r', va_r, epoch)
+                writer.add_scalar('Metrics/Val_R2', va_r2, epoch)
         
         if va_loss + 1e-9 < best_val:
             best_val = va_loss
             no_improve = 0
-            # save checkpoint
+            # save best checkpoint
             ckpt_path = os.path.join(output_dir, "model.pt")
             save_checkpoint(
                 ckpt_path,
@@ -1100,7 +1150,7 @@ def train(
                     writer.add_text('Training/Early_Stop', f'Early stopping at epoch {epoch}', epoch)
                 break
 
-        # Optional checkpointing by epoch index
+        # Optional epoch checkpoints
         save_by_interval = checkpoint_every_epochs is not None and checkpoint_every_epochs > 0 and (epoch % checkpoint_every_epochs == 0)
         save_by_list = epoch in epoch_save_set
         if save_by_interval or save_by_list:
@@ -1163,6 +1213,7 @@ def main():
     p.add_argument("--no-tensorboard", action="store_true", help="TensorBoard 로깅 비활성화")
     p.add_argument("--loss", choices=["mse", "huber"], default="mse", help="회귀 손실 함수 선택: mse 또는 huber")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber 손실의 delta (허용 오차)")
+    p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (L2 정규화 강도)")
     args = p.parse_args()
 
     train(
@@ -1188,6 +1239,7 @@ def main():
         enable_tensorboard=not args.no_tensorboard,
         loss_type=args.loss,
         huber_delta=args.huber_delta,
+        weight_decay=args.weight_decay,
     )
 
 
