@@ -18,6 +18,63 @@ INPUT_TABLE = "datasets"  # 입력 DuckDB 테이블명
 TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
 DROP_COLUMNS = {"종류", "씨리얼"}
 IGNORING_STOCKS_SET: set[str] = set()
+def _to_time_ms(val: object) -> int:
+    """Convert various time formats to total milliseconds since 00:00:00.
+    Supports:
+    - 'HH:MM:SS[.sss]' or 'HH:MM:SS[.cc]'
+    - 'HHMMSSmmm' (9 digits, milliseconds)
+    - 'HHMMSScc' (8 digits, centiseconds -> ms = cc*10)
+    - 'HHMMSS' (6 digits)
+    - 'HHMM' (4 digits), 'HH' (2 digits)
+    Returns 0 if cannot parse.
+    """
+    try:
+        s = str(val)
+        if not s or s.lower() == 'nan':
+            return 0
+        digits = ''.join(ch for ch in s if ch.isdigit())
+        if not digits:
+            return 0
+        hh = mm = ss = 0
+        ms = 0
+        if len(digits) >= 9:  # HHMMSSmmm...
+            hh = int(digits[0:2])
+            mm = int(digits[2:4])
+            ss = int(digits[4:6])
+            ms = int(digits[6:9])
+        elif len(digits) == 8:  # HHMMSScc (centiseconds)
+            hh = int(digits[0:2])
+            mm = int(digits[2:4])
+            ss = int(digits[4:6])
+            ms = int(digits[6:8]) * 10
+        elif len(digits) == 7:  # HHMMSSc (deciseconds)
+            hh = int(digits[0:2])
+            mm = int(digits[2:4])
+            ss = int(digits[4:6])
+            ms = int(digits[6]) * 100
+        elif len(digits) == 6:  # HHMMSS
+            hh = int(digits[0:2])
+            mm = int(digits[2:4])
+            ss = int(digits[4:6])
+            ms = 0
+        elif len(digits) == 4:  # HHMM
+            hh = int(digits[0:2])
+            mm = int(digits[2:4])
+            ss = 0
+            ms = 0
+        elif len(digits) <= 2:  # HH
+            hh = int(digits[0:2])
+            mm = 0
+            ss = 0
+            ms = 0
+        # clamp
+        hh = max(0, min(23, hh))
+        mm = max(0, min(59, mm))
+        ss = max(0, min(59, ss))
+        ms = max(0, min(999, ms))
+        return ((hh * 60 + mm) * 60 + ss) * 1000 + ms
+    except Exception:
+        return 0
 
 def _load_ignoring_stocks(csv_path: Optional[str]) -> set[str]:
     """Load ignoring stock names from a CSV file that contains a '종목명' column.
@@ -158,14 +215,14 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
                 if mask_ignore.any():
                     df = df[~mask_ignore]
             
-            # 시간 필터링 적용
+            # 시간 필터링 적용 (밀리초 기준)
             if '시간' in df.columns:
-                # 시간 컬럼을 숫자로 변환
-                df['시간_numeric'] = pd.to_numeric(df['시간'].astype(str).str.replace(r'\D', '', regex=True), errors='coerce').fillna(0).astype(int)
-                # 시간 범위 필터링: time_start <= 시간 < time_end
-                df = df[(df['시간_numeric'] >= time_start) & (df['시간_numeric'] < time_end)]
+                # 각 행의 시간값을 총 밀리초(00:00:00.000부터 경과)로 정규화
+                df['시간_ms'] = df['시간'].apply(_to_time_ms)
+                # 시간 범위 필터링: time_start_ms <= 시간_ms < time_end_ms
+                df = df[(df['시간_ms'] >= time_start) & (df['시간_ms'] < time_end)]
                 # 임시 컬럼 제거
-                df = df.drop(columns=['시간_numeric'])
+                df = df.drop(columns=['시간_ms'])
             
             # 불필요 컬럼 제거
             df = df.drop(columns=[col for col in DROP_COLUMNS if col in df.columns], errors="ignore")
@@ -868,7 +925,8 @@ def normalize_datasets(input_db: str, output_db: str, *,
                        checkpoint_interval: int = 20,
                        time_start: int = 90000000,
                        time_end: int = 110000000,
-                       ignoring_stocks_csv: Optional[str] = None):
+                       ignoring_stocks_csv: Optional[str] = None,
+                       single_output: bool = False):
     """
     메인 정규화 함수 (DuckDB 전용)
     - 입력 DuckDB를 스캔하여 유효 데이터 그룹을 찾음
@@ -922,6 +980,11 @@ def normalize_datasets(input_db: str, output_db: str, *,
         except Exception:
             pass
     _sweep_and_ingest_tmp(output_db, _tmp_base, workers=group_workers, checkpoint_interval=checkpoint_interval)
+
+    # Normalize CLI time window to HHMMSS
+    norm_time_start = _normalize_cli_time(time_start)
+    norm_time_end = _normalize_cli_time(time_end)
+    print(f"시간 필터: {norm_time_start:06d} <= 시간 < {norm_time_end:06d}")
 
     # Load ignoring stocks once in the main process
     global IGNORING_STOCKS_SET
@@ -1007,16 +1070,21 @@ def normalize_datasets(input_db: str, output_db: str, *,
     max_workers = max(1, int(workers))
     used_workers = min(max_workers, len(months))
 
-    print(f"월별 처리 시작: 대상 {len(months)}개월, 병렬 workers={used_workers}")
+    if single_output:
+        # 단일 출력 DB로 쓰는 경우 월 단위 병렬 처리를 비활성화하여 DB 충돌 방지
+        used_workers = 1
+        print(f"월별 처리 시작(단일 출력 모드): 대상 {len(months)}개월, 병렬 workers={used_workers}")
+    else:
+        print(f"월별 처리 시작: 대상 {len(months)}개월, 병렬 workers={used_workers}")
 
     # 병렬로 월별 처리 실행
-    if used_workers > 1:
+    if used_workers > 1 and not single_output:
         with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
             futs = {}
             for yyyymm in months:
                 db_path = _monthly_db_path(output_db, yyyymm)
                 groups = monthly_groups[yyyymm]
-                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), time_start, time_end, ignoring_stocks_csv)
+                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), norm_time_start, norm_time_end, ignoring_stocks_csv)
                 futs[fut] = (yyyymm, len(groups), db_path)
             done = 0
             total = len(futs)
@@ -1031,16 +1099,19 @@ def normalize_datasets(input_db: str, output_db: str, *,
                     done += 1
     else:
         for yyyymm in months:
-            db_path = _monthly_db_path(output_db, yyyymm)
+            db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
             groups = monthly_groups[yyyymm]
-            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), time_start, time_end, ignoring_stocks_csv)
+            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), norm_time_start, norm_time_end, ignoring_stocks_csv)
             print(f"월 처리 완료: {yyyymm} ({processed}/{len(groups)}) -> {db_path}")
 
-    # 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행
+    # 최종 CHECKPOINT 수행
     try:
-        processed_months = months
-        if processed_months:
-            _parallel_checkpoint_months(output_db, processed_months, max_workers)
+        if single_output:
+            _checkpoint_db_once(output_db)
+        else:
+            processed_months = months
+            if processed_months:
+                _parallel_checkpoint_months(output_db, processed_months, max_workers)
     except Exception:
         pass
 
@@ -1079,6 +1150,8 @@ def main():
                         help="종료 시간, 미포함 (기본: 110000000 = 오전 11시)")
     parser.add_argument("--ignoring-stocks-csv", default=os.path.join("scripts", "ignoring_stocks.csv"),
                         help="무시할 종목명 리스트 CSV 경로 (기본: scripts/ignoring_stocks.csv, '종목명' 컬럼 필요)")
+    parser.add_argument("--single-output", action="store_true",
+                        help="월별 샤드 대신 하나의 DuckDB 파일(-o)에 모든 결과를 순차 반영합니다")
      
     args = parser.parse_args()
      
@@ -1100,6 +1173,7 @@ def main():
         time_start=args.time_start,
         time_end=args.time_end,
         ignoring_stocks_csv=args.ignoring_stocks_csv,
+        single_output=args.single_output,
     )
 
 
