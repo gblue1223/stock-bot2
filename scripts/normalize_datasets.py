@@ -96,9 +96,12 @@ def _clean_column_name(col: str) -> str:
     return c
 
 
-def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str) -> pd.DataFrame:
+def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str, 
+                                time_start: int = 90000000, time_end: int = 110000000) -> pd.DataFrame:
     """
     DuckDB에서 특정 종목코드/날짜의 데이터를 로드하고 기본 정리
+    time_start: 시작 시간 (기본: 90000000 = 오전 9시)
+    time_end: 종료 시간 (기본: 110000000 = 오전 11시, 미포함)
     """
     try:
         conn = duckdb.connect(db_path, read_only=True)
@@ -116,6 +119,15 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str) ->
             
             # 컬럼명 정규화 (이미 정규화되어 있을 수 있지만 안전장치)
             df = df.rename(columns={c: _clean_column_name(c) for c in df.columns})
+            
+            # 시간 필터링 적용
+            if '시간' in df.columns:
+                # 시간 컬럼을 숫자로 변환
+                df['시간_numeric'] = pd.to_numeric(df['시간'].astype(str).str.replace(r'\D', '', regex=True), errors='coerce').fillna(0).astype(int)
+                # 시간 범위 필터링: time_start <= 시간 < time_end
+                df = df[(df['시간_numeric'] >= time_start) & (df['시간_numeric'] < time_end)]
+                # 임시 컬럼 제거
+                df = df.drop(columns=['시간_numeric'])
             
             # 불필요 컬럼 제거
             df = df.drop(columns=[col for col in DROP_COLUMNS if col in df.columns], errors="ignore")
@@ -180,14 +192,15 @@ def _coalesce_into_base(base: pd.DataFrame, temp: pd.DataFrame, overlap_cols: Li
     return base, temp
 
 
-def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str) -> pd.DataFrame:
+def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str,
+                       time_start: int = 90000000, time_end: int = 110000000) -> pd.DataFrame:
     """
     DuckDB에서 데이터를 로드하여 병합 (이미 병합된 데이터인 경우 그대로 반환)
     """
     # 입력 DB에서는 이미 병합된 상태이므로 단순히 로드만 수행
     if "merged" in group_info:
         db_path, code, name, date = group_info["merged"]
-        df = load_and_clean_from_duckdb(db_path, code, name, date)
+        df = load_and_clean_from_duckdb(db_path, code, name, date, time_start, time_end)
         
         if df.empty:
             return pd.DataFrame()
@@ -490,7 +503,8 @@ def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
         return None
 
 
-def _worker_process(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str) -> Tuple[str, str, str, str]:
+def _worker_process(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str,
+                    time_start: int = 90000000, time_end: int = 110000000) -> Tuple[str, str, str, str]:
     """Top-level worker for multiprocessing: merge + normalize + pickle dump.
     Returns (group_key, code, date, out_pickle_path).
     """
@@ -499,7 +513,7 @@ def _worker_process(group_key: str, group_info: Dict[str, Tuple[str, str, str, s
     date = parts[-1]
     name = '_'.join(parts[1:-1])
     
-    merged_df = merge_from_duckdb(group_info, code, name, date)
+    merged_df = merge_from_duckdb(group_info, code, name, date, time_start, time_end)
     
     if merged_df.empty:
         return group_key, code, date, ""
@@ -524,7 +538,8 @@ def _worker_process(group_key: str, group_info: Dict[str, Tuple[str, str, str, s
     return group_key, code, date, str(out_path)
 
 
-def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str) -> Optional[str]:
+def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str,
+                                     time_start: int = 90000000, time_end: int = 110000000) -> Optional[str]:
     """Process a single group and save to pickle file. Returns pickle path or None on error."""
     try:
         parts = group_key.split('_')
@@ -532,7 +547,7 @@ def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[
         date = parts[-1]
         name = '_'.join(parts[1:-1])
         
-        merged_df = merge_from_duckdb(group_info, code, name, date)
+        merged_df = merge_from_duckdb(group_info, code, name, date, time_start, time_end)
         
         if merged_df.empty:
             return None
@@ -641,7 +656,8 @@ def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, ch
 
 def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, str, str, str]]]], 
                            db_path: str, tmp_root: str, yyyymm: str, 
-                           checkpoint_interval: int, group_workers: int = 1) -> int:
+                           checkpoint_interval: int, group_workers: int = 1,
+                           time_start: int = 90000000, time_end: int = 110000000) -> int:
     """Process all groups for a specific month with parallel group processing.
     Returns the number of processed groups.
     """
@@ -661,7 +677,7 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
         with _fut.ProcessPoolExecutor(max_workers=used_group_workers) as ex:
             futs = []
             for group_key, group_info in month_groups:
-                fut = ex.submit(_process_single_group_to_pickle, group_key, group_info, tmp_root)
+                fut = ex.submit(_process_single_group_to_pickle, group_key, group_info, tmp_root, time_start, time_end)
                 futs.append(fut)
             done = 0
             for fut in _fut.as_completed(futs):
@@ -690,7 +706,7 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
         print(f"  {yyyymm}: 순차 그룹 처리", flush=True)
         done = 0
         for group_key, group_info in month_groups:
-            pkl_path = _process_single_group_to_pickle(group_key, group_info, tmp_root)
+            pkl_path = _process_single_group_to_pickle(group_key, group_info, tmp_root, time_start, time_end)
             if pkl_path:
                 pickle_paths.append(pkl_path)
                 # Incremental ingest when buffer reaches checkpoint size
@@ -848,7 +864,9 @@ def normalize_datasets(input_db: str, output_db: str, *,
                        workers: int = 1,
                        group_workers: int = 1,
                        tmp_dir: Optional[str] = None,
-                       checkpoint_interval: int = 20):
+                       checkpoint_interval: int = 20,
+                       time_start: int = 90000000,
+                       time_end: int = 110000000):
     """
     메인 정규화 함수 (DuckDB 전용)
     - 입력 DuckDB를 스캔하여 유효 데이터 그룹을 찾음
@@ -992,7 +1010,7 @@ def normalize_datasets(input_db: str, output_db: str, *,
             for yyyymm in months:
                 db_path = _monthly_db_path(output_db, yyyymm)
                 groups = monthly_groups[yyyymm]
-                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
+                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), time_start, time_end)
                 futs[fut] = (yyyymm, len(groups), db_path)
             done = 0
             total = len(futs)
@@ -1009,7 +1027,7 @@ def normalize_datasets(input_db: str, output_db: str, *,
         for yyyymm in months:
             db_path = _monthly_db_path(output_db, yyyymm)
             groups = monthly_groups[yyyymm]
-            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
+            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), time_start, time_end)
             print(f"월 처리 완료: {yyyymm} ({processed}/{len(groups)}) -> {db_path}")
 
     # 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행
@@ -1049,6 +1067,10 @@ def main():
                         help="임시 결과 저장 디렉토리 (기본: <output>.tmp)")
     parser.add_argument("--checkpoint-interval", type=int, default=100,
                         help="몇 개 그룹 처리마다 DuckDB CHECKPOINT를 실행할지 지정 (0이면 비활성화, 기본: 100)")
+    parser.add_argument("--time-start", type=int, default=90000000,
+                        help="시작 시간 (기본: 90000000 = 오전 9시)")
+    parser.add_argument("--time-end", type=int, default=110000000,
+                        help="종료 시간, 미포함 (기본: 110000000 = 오전 11시)")
      
     args = parser.parse_args()
      
@@ -1067,6 +1089,8 @@ def main():
         group_workers=args.group_workers,
         tmp_dir=args.tmp_dir,
         checkpoint_interval=args.checkpoint_interval,
+        time_start=args.time_start,
+        time_end=args.time_end,
     )
 
 
