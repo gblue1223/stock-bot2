@@ -17,7 +17,6 @@ NO_COUNTER: int = 1
 INPUT_TABLE = "datasets"  # 입력 DuckDB 테이블명
 TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
 DROP_COLUMNS = {"종류", "씨리얼"}
-REQUIRED_TYPES = {"execution", "orderbook", "trader"}
 IGNORING_STOCKS_SET: set[str] = set()
 
 def _load_ignoring_stocks(csv_path: Optional[str]) -> set[str]:
@@ -217,18 +216,7 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _coalesce_into_base(base: pd.DataFrame, temp: pd.DataFrame, overlap_cols: List[str]) -> pd.DataFrame:
-    """
-    base와 temp(번호로 병합된 상태)에서 동일 컬럼이 있을 때 base의 NaN을 temp의 값으로 보완
-    overlap_cols에 대해 base[col] = base[col].combine_first(temp[f"{col}_new"]) 수행
-    """
-    for col in overlap_cols:
-        new_col = f"{col}_new"
-        if new_col in temp.columns:
-            # 숫자/문자 모두 지원되는 combine_first 사용
-            base[col] = base[col].combine_first(temp[new_col])
-            temp = temp.drop(columns=[new_col])
-    return base, temp
+ 
 
 
 def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str,
@@ -542,44 +530,7 @@ def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
         return None
 
 
-def _worker_process(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str,
-                    time_start: int = 90000000, time_end: int = 110000000,
-                    ignoring_stocks_csv: Optional[str] = None) -> Tuple[str, str, str, str]:
-    """Top-level worker for multiprocessing: merge + normalize + pickle dump.
-    Returns (group_key, code, date, out_pickle_path).
-    """
-    # Ensure ignore set is loaded inside worker process
-    global IGNORING_STOCKS_SET
-    if not IGNORING_STOCKS_SET:
-        IGNORING_STOCKS_SET = _load_ignoring_stocks(ignoring_stocks_csv)
-    parts = group_key.split('_')
-    code = parts[0]
-    date = parts[-1]
-    name = '_'.join(parts[1:-1])
-    
-    merged_df = merge_from_duckdb(group_info, code, name, date, time_start, time_end)
-    
-    if merged_df.empty:
-        return group_key, code, date, ""
-    
-    merged_df = apply_feature_normalization(merged_df)
-    merged_df = merged_df.copy()
-    merged_df['날짜'] = date
-    merged_df = pd.concat([merged_df['날짜'], merged_df.drop(columns=['날짜'])], axis=1)
-    out_path = Path(tmp_root) / f"{group_key}.pkl"
-    # Write to a temp file then atomically replace to avoid partial reads
-    out_tmp = out_path.with_suffix(out_path.suffix + ".part")
-    with open(out_tmp, 'wb') as f:
-        _pickle.dump(merged_df, f, protocol=_pickle.HIGHEST_PROTOCOL)
-    try:
-        os.replace(out_tmp, out_path)
-    except Exception:
-        # Best-effort fallback
-        try:
-            os.remove(out_tmp)
-        except Exception:
-            pass
-    return group_key, code, date, str(out_path)
+ 
 
 
 def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str,
