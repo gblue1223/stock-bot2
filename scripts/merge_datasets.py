@@ -285,8 +285,9 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
                     pass
         # Create index after merge
         try:
+            print("인덱스 생성중: idx_datasets_code_date (종목코드, 날짜)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
-            print("인덱스 생성: idx_datasets_code_date (종목코드, 날짜)")
+            print("인덱스 생성 완료: idx_datasets_code_date (종목코드, 날짜)")
         except Exception as e:
             print(f"경고: 인덱스 생성 실패: {type(e).__name__}: {e}")
         # Final checkpoint
