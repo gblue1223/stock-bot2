@@ -134,7 +134,7 @@ def build_sequences_from_feats(
     seq_len: int,
     horizon: int,
     aux_task: str,
-    direction_threshold: float,
+    direction3_threshold: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     feat_vals = feats_df.to_numpy(dtype=np.float32)
     prices = feats_df[target_col].to_numpy(dtype=np.float32)
@@ -153,9 +153,9 @@ def build_sequences_from_feats(
             p_now = float(prices[i + seq_len - 1])
             p_future = float(prices[i + seq_len + horizon - 1])
             chg = 0.0 if p_now == 0 else (p_future - p_now) / p_now
-            if chg > direction_threshold:
+            if chg > direction3_threshold:
                 yv = 2
-            elif chg < -direction_threshold:
+            elif chg < -direction3_threshold:
                 yv = 0
             else:
                 yv = 1
@@ -224,13 +224,16 @@ def make_loss_fn(aux_task: str, y_tr: np.ndarray, device: str, loss_type: str, h
     if aux_task == "direction":
         return nn.BCEWithLogitsLoss()
     if aux_task == "direction3":
-        unique, counts = np.unique(y_tr, return_counts=True)
-        freq = {int(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
-        w = [1.0 / max(1, freq.get(c, 0)) for c in [0, 1, 2]]
-        w = np.array(w, dtype=np.float32)
-        w = w / (w.mean() if w.mean() > 0 else 1.0)
-        class_weights = torch.tensor(w, dtype=torch.float32, device=device)
-        return nn.CrossEntropyLoss(weight=class_weights)
+        if loss_type == "ce":
+            unique, counts = np.unique(y_tr, return_counts=True)
+            freq = {int(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
+            w = [1.0 / max(1, freq.get(c, 0)) for c in [0, 1, 2]]
+            w = np.array(w, dtype=np.float32)
+            w = w / (w.mean() if w.mean() > 0 else 1.0)
+            class_weights = torch.tensor(w, dtype=torch.float32, device=device)
+            return nn.CrossEntropyLoss(weight=class_weights)
+        else:
+            return nn.CrossEntropyLoss()
     # regression family
     return nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
 
@@ -344,10 +347,10 @@ def train(
     progress_every: int = 10,
     resume_from: Optional[str] = None,  # path to checkpoint to resume from
     enable_tensorboard: bool = True,  # enable TensorBoard logging
-    loss_type: str = "mse",          # regression loss: {"mse", "huber"}
+    loss_type: str = "mse",          # loss: regression {"mse", "huber"}, classification {"ce"}
     huber_delta: float = 1.0,         # Huber delta
     weight_decay: float = 1e-4,       # AdamW weight decay
-    direction_threshold: float = 1e-2,  # 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
+    direction3_threshold: float = 1e-2,  # 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -373,10 +376,10 @@ def train(
     - progress_every (int, default=10): 청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화
     - resume_from (Optional[str], default=None): 재시작할 체크포인트 파일 경로 또는 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. None이면 처음부터 시작
     - enable_tensorboard (bool, default=True): TensorBoard 로깅 활성화 여부
-    - loss_type (str, default="mse"): 회귀 손실 함수 선택: mse 또는 huber
+    - loss_type (str, default="mse"): 손실 함수 선택 (회귀: mse/huber, 분류: ce)
     - huber_delta (float, default=1.0): Huber 손실의 delta (허용 오차)
     - weight_decay (float, default=1e-4): AdamW weight decay (L2 정규화 강도)
-    - direction_threshold (float, default=1e-2): 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
+    - direction3_threshold (float, default=1e-2): 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -667,7 +670,7 @@ def train(
                             prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
                             return (False, None)
                         X, y_arr = build_sequences_from_feats(
-                            feats_all, tgt_col, seq_len, horizon, aux_task, direction_threshold
+                            feats_all, tgt_col, seq_len, horizon, aux_task, direction3_threshold
                         )
 
                         if X.size == 0:
@@ -1068,7 +1071,7 @@ def train(
     convert_date_to_month_inplace(df)
 
     # Build sequences using helper
-    X, y = build_sequences_from_feats(feats, tgt_col, seq_len, horizon, aux_task, direction_threshold)
+    X, y = build_sequences_from_feats(feats, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
     if X.size == 0:
         raise ValueError("Not enough rows to create sequences. Reduce seq_len/horizon or load more data.")
 
@@ -1266,12 +1269,13 @@ def main():
     p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
     p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로 또는 체크포인트 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. 미지정 시 처음부터 시작")
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
-    p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
-    p.add_argument("--no-tensorboard", action="store_true", help="TensorBoard 로깅 비활성화")
-    p.add_argument("--loss", choices=["mse", "huber"], default="mse", help="회귀 손실 함수 선택: mse 또는 huber")
+    p.add_argument("--loss", choices=["mse", "huber", "ce"], default="mse", help="손실 함수: 회귀(mse/huber), 분류(ce)")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber 손실의 delta (허용 오차)")
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (L2 정규화 강도)")
-    p.add_argument("--direction-threshold", type=float, default=1e-2, help="3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)")
+    p.add_argument("--direction3-threshold", type=float, default=1e-2, help="`--aux-task`가 `direction3`일 경우 작동. 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)")
+
+    p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
+    p.add_argument("--no-tensorboard", action="store_true", help="TensorBoard 로깅 비활성화")
     args = p.parse_args()
 
     train(
@@ -1298,7 +1302,7 @@ def main():
         loss_type=args.loss,
         huber_delta=args.huber_delta,
         weight_decay=args.weight_decay,
-        direction_threshold=args.direction_threshold,
+        direction3_threshold=args.direction3_threshold,
     )
 
 
