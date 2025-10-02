@@ -30,14 +30,16 @@ def get_requested_features() -> list[str]:
         "매수거래원별증감1", "매수거래원별증감2", "매수거래원별증감3", "매수거래원별증감4", "매수거래원별증감5",
         "매도거래원1_scalar", "매도거래원2_scalar", "매도거래원3_scalar", "매도거래원4_scalar", "매도거래원5_scalar",
         "매수거래원1_scalar", "매수거래원2_scalar", "매수거래원3_scalar", "매수거래원4_scalar", "매수거래원5_scalar",
-        "종목명_scalar", "시간_scalar",
+        "종목명_scalar", "시간_scalar", "시간_sin", "시간_cos",
     ]
 
 
 def convert_date_to_month_inplace(df: pd.DataFrame) -> None:
-    if "날짜" in df.columns:
-        month_series = df["날짜"].astype(str).str[4:6]
-        df["날짜"] = pd.to_numeric(month_series, errors="coerce").fillna(0).astype(np.int32)
+    # TODO: 날짜를 월로 변환하는 로직 고려
+    # if "날짜" in df.columns:
+    #     month_series = df["날짜"].astype(str).str[4:6]
+    #     df["날짜"] = pd.to_numeric(month_series, errors="coerce").fillna(0).astype(np.int32)
+    pass
 
 
 def list_duckdb_files(path: str) -> list[str]:
@@ -578,34 +580,80 @@ def train(
 
                 conn = duckdb.connect(fpath)
                 try:
-                    # Inspect schema to know if "번호" exists for ordering and which requested features are present
+                    # Inspect schema to know if columns exist
                     schema = list(conn.execute(f"PRAGMA table_info('{table}')").fetchall())
                     col_names = [row[1] for row in schema]
                     has_no = ("번호" in col_names)
-                    # Build WHERE and COUNT
-                    where_clauses = []
-                    params = []
-                    if code:
-                        where_clauses.append('"종목코드" = ?')
-                        params.append(code)
-                    if date:
-                        where_clauses.append('"날짜" = ?')
-                        params.append(date)
-                    where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-                    total = conn.execute(f"SELECT COUNT(*) FROM {table}{where_sql}", params).fetchone()[0]
+                    has_name = ("종목명" in col_names)
 
-                    # Columns to select: available requested features + optional 번호 for ordering
+                    # Columns to select for features only (exclude 식별자)
                     req = get_requested_features()
                     avail_feats = [c for c in req if c in col_names]
-                    select_cols = avail_feats.copy()
-                    if has_no:
-                        select_cols = ["번호", *select_cols]
-                    col_sql = ", ".join([f'"{c}"' for c in select_cols])
 
-                    prev_tail_feats = None  # carry-over for sequence continuity between chunks
-                    step = max(1, int(chunk_size))
-                    processed = 0
-                    chunk_idx = 0
+                    # Build group keys: Option B (by 날짜 and 종목명)
+                    group_keys = []
+                    if has_name:
+                        if date is None:
+                            # all dates and names, optionally filtered by code
+                            base_where = []
+                            base_params = []
+                            if code:
+                                base_where.append('"종목코드" = ?')
+                                base_params.append(code)
+                            base_sql = (" WHERE " + " AND ".join(base_where)) if base_where else ""
+                            rows = conn.execute(
+                                f"SELECT DISTINCT \"날짜\", \"종목명\" FROM {table}{base_sql} ORDER BY 1, 2",
+                                base_params,
+                            ).fetchall()
+                            group_keys = [(r[0], r[1]) for r in rows]
+                        else:
+                            # fixed date: group by name only
+                            base_where = ['"날짜" = ?']
+                            base_params = [date]
+                            if code:
+                                base_where.append('"종목코드" = ?')
+                                base_params.append(code)
+                            base_sql = " WHERE " + " AND ".join(base_where)
+                            rows = conn.execute(
+                                f"SELECT DISTINCT \"종목명\" FROM {table}{base_sql} ORDER BY 1",
+                                base_params,
+                            ).fetchall()
+                            group_keys = [(date, r[0]) for r in rows]
+                    else:
+                        # Fallback: single group with optional filters
+                        group_keys = [(date, None)]
+
+                    # Iterate groups
+                    for g_date, g_name in group_keys:
+                        # Build WHERE and COUNT per group
+                        where_clauses = []
+                        params = []
+                        if code:
+                            where_clauses.append('"종목코드" = ?')
+                            params.append(code)
+                        if g_date is not None:
+                            where_clauses.append('"날짜" = ?')
+                            params.append(g_date)
+                        if g_name is not None:
+                            where_clauses.append('"종목명" = ?')
+                            params.append(g_name)
+                        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+                        total = conn.execute(f"SELECT COUNT(*) FROM {table}{where_sql}", params).fetchone()[0]
+
+                        if total == 0:
+                            continue
+
+                        # Select columns: optional 번호 for ordering (not part of features)
+                        select_cols = avail_feats.copy()
+                        if has_no:
+                            select_cols = ["번호", *select_cols]
+                        col_sql = ", ".join([f'"{c}"' for c in select_cols])
+
+                        # Reset tail per group
+                        prev_tail_feats = None
+                        step = max(1, int(chunk_size))
+                        processed = 0
+                        chunk_idx = 0
 
                     # Define per-chunk processing to ensure training/checkpoint per fetched chunk
                     def _process_chunk(df_chunk: pd.DataFrame) -> tuple[bool, int | None]:
@@ -1067,13 +1115,66 @@ def train(
     if tgt_col not in real_cols:
         raise ValueError(f"target_col '{tgt_col}' not in feature columns")
 
-    # '날짜'를 month(01~12) 정수로 변환하여 덮어쓰기
-    convert_date_to_month_inplace(df)
+    # Grouped sequence building (Option B): per (날짜, 종목명)
+    has_name = ("종목명" in df.columns)
+    has_date_col = ("날짜" in df.columns)
 
-    # Build sequences using helper
-    X, y = build_sequences_from_feats(feats, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
-    if X.size == 0:
-        raise ValueError("Not enough rows to create sequences. Reduce seq_len/horizon or load more data.")
+    X_chunks: list[np.ndarray] = []
+    y_chunks: list[np.ndarray] = []
+
+    if has_name:
+        # Build group keys; if 날짜가 존재하면 (날짜, 종목명)로 그룹, 없으면 종목명만
+        if has_date_col:
+            keys = df[["날짜", "종목명"]].drop_duplicates().sort_values(["날짜", "종목명"]).itertuples(index=False, name=None)
+            for g_date, g_name in keys:
+                mask = (df["날짜"] == g_date) & (df["종목명"] == g_name)
+                df_g = df.loc[mask]
+                if df_g.empty:
+                    continue
+                # Order within group: 번호 > (날짜, 시간_scalar) > as-is
+                if "번호" in df_g.columns:
+                    df_g = df_g.sort_values("번호")
+                elif {"날짜", "시간_scalar"}.issubset(df_g.columns):
+                    df_g = df_g.sort_values(["날짜", "시간_scalar"]) 
+                feats_g = df_g[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                Xg, yg = build_sequences_from_feats(feats_g, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
+                if Xg.size > 0:
+                    X_chunks.append(Xg)
+                    y_chunks.append(yg)
+        else:
+            names = df[["종목명"]].drop_duplicates().sort_values(["종목명"]).itertuples(index=False, name=None)
+            for (g_name,) in names:
+                mask = (df["종목명"] == g_name)
+                df_g = df.loc[mask]
+                if df_g.empty:
+                    continue
+                if "번호" in df_g.columns:
+                    df_g = df_g.sort_values("번호")
+                elif {"날짜", "시간_scalar"}.issubset(df_g.columns):
+                    df_g = df_g.sort_values(["날짜", "시간_scalar"]) 
+                feats_g = df_g[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                Xg, yg = build_sequences_from_feats(feats_g, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
+                if Xg.size > 0:
+                    X_chunks.append(Xg)
+                    y_chunks.append(yg)
+    else:
+        # Fallback: whole-frame building (no 종목명 column)
+        df_sorted = df
+        if "번호" in df.columns:
+            df_sorted = df.sort_values("번호")
+        elif {"날짜", "시간_scalar"}.issubset(df.columns):
+            df_sorted = df.sort_values(["날짜", "시간_scalar"]) 
+        feats_sorted = df_sorted[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        Xg, yg = build_sequences_from_feats(feats_sorted, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
+        if Xg.size > 0:
+            X_chunks.append(Xg)
+            y_chunks.append(yg)
+
+    if not X_chunks:
+        raise ValueError("Not enough rows per (날짜, 종목명) group to create sequences. Reduce seq_len/horizon or load more data.")
+
+    X = np.concatenate(X_chunks, axis=0)
+    y = np.concatenate(y_chunks, axis=0)
 
     # train/val split (time-ordered)
     X_tr, y_tr, X_va, y_va = train_val_split(X, y, val_ratio=0.2)
