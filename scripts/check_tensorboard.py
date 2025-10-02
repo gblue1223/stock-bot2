@@ -195,6 +195,83 @@ def summarize(series: Dict[str, Series]) -> None:
             print("[WARN] Large spikes observed in recent batch losses")
 
 
+# ---------------- STATS + EXPORTS -----------------
+def compute_stats(values: List[float]) -> Dict[str, float]:
+    import statistics as stat
+    if not values:
+        return {"n": 0}
+    n = len(values)
+    mean = stat.fmean(values)
+    std = stat.pstdev(values) if n > 1 else 0.0
+    vmin, vmax = min(values), max(values)
+    last = values[-1]
+    first = values[0]
+    pct = ((last - first) / (abs(first) + 1e-9)) * 100.0 if n > 1 else 0.0
+    # simple slope via last_k trend
+    v0, v1 = last_k_trend(values, min(10, n))
+    slope = (v1 - v0) / max(1, min(10, n) - 1) if not (math.isnan(v0) or math.isnan(v1)) else 0.0
+    return {"n": n, "mean": mean, "std": std, "min": vmin, "max": vmax, "last": last, "pct": pct, "slope": slope}
+
+
+def print_stats(series: Dict[str, Series], tags: List[str], last: int) -> None:
+    print("\n=== Stats (recent) ===")
+    for tag in tags:
+        if tag not in series or not series[tag].values:
+            continue
+        vals = series[tag].values[-last:] if last > 0 else series[tag].values
+        st = compute_stats(vals)
+        print(f"{tag}: n={st['n']} last={st['last']:.6g} mean={st['mean']:.6g} std={st['std']:.6g} min={st['min']:.6g} max={st['max']:.6g} pct={st['pct']:.3f}% slope~={st['slope']:.3g}")
+
+
+def save_png_charts(series: Dict[str, Series], tags: List[str], last: int, outdir: str) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:
+        print("[INFO] matplotlib not installed. Run: pip install matplotlib")
+        return
+    os.makedirs(outdir, exist_ok=True)
+    for tag in tags:
+        if tag not in series or not series[tag].values:
+            continue
+        vals = series[tag].values[-last:] if last > 0 else series[tag].values
+        steps = list(range(len(vals)))
+        plt.figure(figsize=(10, 4))
+        plt.plot(steps, vals, label=tag)
+        plt.title(tag)
+        plt.xlabel('step')
+        plt.ylabel('value')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        fname = os.path.join(outdir, f"{tag.replace('/', '_')}.png")
+        plt.tight_layout()
+        plt.savefig(fname)
+        plt.close()
+        # print(f"[PNG] saved: {fname}")
+
+
+def save_html_report(series: Dict[str, Series], tags: List[str], last: int, outfile: str) -> None:
+    try:
+        import plotly.graph_objs as go
+        from plotly.offline import plot as plot_html
+    except Exception:
+        print("[INFO] plotly not installed. Run: pip install plotly")
+        return
+    figs = []
+    for tag in tags:
+        if tag not in series or not series[tag].values:
+            continue
+        vals = series[tag].values[-last:] if last > 0 else series[tag].values
+        steps = list(range(len(vals)))
+        figs.append(go.Scatter(x=steps, y=vals, name=tag, mode='lines'))
+    if not figs:
+        print("[INFO] No data to render in HTML report")
+        return
+    layout = dict(title='Training Metrics', xaxis_title='step', yaxis_title='value')
+    fig = go.Figure(data=figs, layout=layout)
+    plot_html(fig, filename=outfile, auto_open=False, include_plotlyjs='cdn')
+    # print(f"[HTML] saved: {outfile}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Check TensorBoard event logs for training progress")
     parser.add_argument("--event-file", default=None, help="Path to a specific events.out.tfevents.* file")
@@ -203,6 +280,14 @@ def main():
     parser.add_argument("--interval", type=int, default=15, help="Polling interval seconds in watch mode")
     parser.add_argument("--idle-seconds", type=int, default=120, help="Consider training finished if no update for this many seconds")
     parser.add_argument("--verbose", action="store_true", help="Print per-iteration status in watch mode")
+    # Output options
+    parser.add_argument("--plot-tags", nargs='*', default=[
+        "Loss/Train_Batch", "Loss/Train_Chunk", "Loss/Validation_Chunk", "Metrics/Val_Accuracy_Chunk"
+    ], help="Tags to include in outputs (stats/png/html)")
+    parser.add_argument("--plot-last", type=int, default=200, help="Number of recent points to use (per tag)")
+    parser.add_argument("--save-png", default=None, help="Directory to save PNG charts (requires matplotlib)")
+    parser.add_argument("--out-html", default=None, help="Path to save interactive HTML report (requires plotly)")
+    parser.add_argument("--stats-only", action="store_true", help="Only print numeric stats (no summarize)")
     args = parser.parse_args()
 
     if not args.watch:
@@ -212,7 +297,13 @@ def main():
         if not series:
             print("No scalars found in the event file.")
             return
-        summarize(series)
+        if not args.stats_only:
+            summarize(series)
+        print_stats(series, tags=args.plot_tags, last=args.plot_last)
+        if args.save_png:
+            save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
+        if args.out_html:
+            save_html_report(series, tags=args.plot_tags, last=args.plot_last, outfile=args.out_html)
         return
 
     # Watch mode
@@ -260,7 +351,13 @@ def main():
             # On update: summarize once and reset idle timer
             if current_mtime != last_mtime or current_step != last_step:
                 if series:
-                    summarize(series)
+                    if not args.stats_only:
+                        summarize(series)
+                    print_stats(series, tags=args.plot_tags, last=args.plot_last)
+                    if args.save_png:
+                        save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
+                    if args.out_html:
+                        save_html_report(series, tags=args.plot_tags, last=args.plot_last, outfile=args.out_html)
                 last_mtime = current_mtime
                 last_step = current_step
                 last_change_ts = time.time()
