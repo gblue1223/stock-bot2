@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 from typing import Optional
+import time
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -384,6 +386,8 @@ def train(
     - direction3_threshold (float, default=1e-2): 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    _train_start_ts = time.time()
+    _train_start_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # Prepare checkpoint directory for periodic/specified-epoch saves
@@ -1076,6 +1080,11 @@ def train(
         if writer:
             writer.close()
             print("TensorBoard logging completed.")
+        _train_end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _elapsed = int(time.time() - _train_start_ts)
+        _h, _rem = divmod(_elapsed, 3600)
+        _m, _s = divmod(_rem, 60)
+        print(f"[TRAINING DONE] start={_train_start_str} end={_train_end_str} elapsed={_h:02d}:{_m:02d}:{_s:02d}")
         return
 
     # 1) db_path가 폴더라면 폴더 내의 모든 DuckDB 파일을 로드하여 concat
@@ -1348,6 +1357,12 @@ def train(
     if writer:
         writer.close()
         print("TensorBoard logging completed.")
+
+    _train_end_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    _elapsed = int(time.time() - _train_start_ts)
+    _h, _rem = divmod(_elapsed, 3600)
+    _m, _s = divmod(_rem, 60)
+    print(f"[TRAINING DONE] start={_train_start_str} end={_train_end_str} elapsed={_h:02d}:{_m:02d}:{_s:02d}")
 
 
 def main():
