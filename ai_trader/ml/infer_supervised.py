@@ -48,11 +48,20 @@ def infer(
 
     X = torch.from_numpy(seq.X[-top_k:]).to(device) if top_k > 0 else torch.from_numpy(seq.X).to(device)
     with torch.no_grad():
-        y_pred = model(X).cpu().numpy()
+        logits = model(X).cpu()
 
-    print("Predictions (most recent first):")
-    for i, v in enumerate(y_pred[::-1], 1):
-        print(f"- t-{i}: {float(v):.6f}")
+    # Classification vs regression handling
+    if getattr(model.cfg, 'num_classes', 1) and int(model.cfg.num_classes) >= 2:
+        probs = torch.softmax(logits, dim=-1).numpy()
+        preds = probs.argmax(axis=-1)
+        print("Class probabilities (most recent first): [down, flat, up]")
+        for i, (p, c) in enumerate(zip(probs[::-1], preds[::-1]), 1):
+            print(f"- t-{i}: class={int(c)} probs=" + ", ".join(f"{v:.4f}" for v in p.tolist()))
+    else:
+        y_pred = logits.numpy()
+        print("Predictions (most recent first):")
+        for i, v in enumerate(y_pred[::-1], 1):
+            print(f"- t-{i}: {float(v):.6f}")
 
 
 def main():

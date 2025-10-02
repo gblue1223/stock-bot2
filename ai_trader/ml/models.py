@@ -16,6 +16,11 @@ class ModelConfig:
     lstm_layers: int = 2          # 1 → 2 (더 깊은 시간 모델링)
     attn_heads: int = 8           # 4 → 8 (더 세밀한 attention)
     dropout: float = 0.1
+
+    # 분류 지원: num_classes >= 2 이면 분류 logits 출력
+    # 기존 회귀와의 하위호환을 위해 기본값은 1
+    num_classes: int = 1
+    task: str = "regression"  # optional hint
     
     # 옵션 2: 대형 모델 (약 400만 파라미터)
     # conv_channels: int = 256      # 64 → 256
@@ -67,11 +72,12 @@ class CNNLSTMAttn(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim=attn_embed, num_heads=cfg.attn_heads, batch_first=True, dropout=cfg.dropout)
         self.norm = nn.LayerNorm(attn_embed)
 
+        out_dim = 1 if (cfg.num_classes is None or int(cfg.num_classes) <= 1) else int(cfg.num_classes)
         self.head = nn.Sequential(
             nn.Linear(attn_embed, attn_embed // 2),
             nn.ReLU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(attn_embed // 2, 1),
+            nn.Linear(attn_embed // 2, out_dim),
         )
 
         self._reset()
@@ -114,5 +120,8 @@ class CNNLSTMAttn(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, T, F]
         cls_out = self._forward_features(x)
-        y = self.head(cls_out).squeeze(-1)  # [B]
+        y = self.head(cls_out)
+        # 회귀(1차원)인 경우 [B]로 squeeze, 분류는 [B, C] 유지
+        if y.dim() == 2 and y.size(-1) == 1:
+            y = y.squeeze(-1)
         return y

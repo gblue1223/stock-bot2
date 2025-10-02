@@ -127,6 +127,145 @@ def load_checkpoint(path: str, device: str) -> dict:
     return checkpoint
 
 
+# ---------------------------- Helper utilities (DRY) ----------------------------
+def build_sequences_from_feats(
+    feats_df: pd.DataFrame,
+    target_col: str,
+    seq_len: int,
+    horizon: int,
+    aux_task: str,
+    direction_threshold: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    feat_vals = feats_df.to_numpy(dtype=np.float32)
+    prices = feats_df[target_col].to_numpy(dtype=np.float32)
+    T = len(feats_df)
+    X_list: list[np.ndarray] = []
+    y_list: list[float | int] = []
+    for i in range(T - seq_len - horizon + 1):
+        xw = feat_vals[i : i + seq_len]
+        if aux_task == "regression":
+            yv = float(prices[i + seq_len + horizon - 1])
+        elif aux_task == "direction":
+            p_now = float(prices[i + seq_len - 1])
+            p_future = float(prices[i + seq_len + horizon - 1])
+            yv = 1.0 if (p_future - p_now) > 0 else 0.0
+        elif aux_task == "direction3":
+            p_now = float(prices[i + seq_len - 1])
+            p_future = float(prices[i + seq_len + horizon - 1])
+            chg = 0.0 if p_now == 0 else (p_future - p_now) / p_now
+            if chg > direction_threshold:
+                yv = 2
+            elif chg < -direction_threshold:
+                yv = 0
+            else:
+                yv = 1
+        elif aux_task == "volatility":
+            p0 = float(prices[i + seq_len - 1])
+            if p0 <= 0:
+                yv = 0.0
+            else:
+                future = prices[i + seq_len : i + seq_len + horizon]
+                rets = []
+                prev = p0
+                for p in future:
+                    rets.append((float(p) / float(prev) - 1.0) if prev != 0 else 0.0)
+                    prev = float(p)
+                yv = float(np.std(rets, dtype=np.float32)) if len(rets) > 0 else 0.0
+        else:
+            raise ValueError(f"Unknown aux_task: {aux_task}")
+        X_list.append(xw)
+        y_list.append(yv)
+    if not X_list:
+        return np.empty((0, seq_len, feats_df.shape[1]), dtype=np.float32), (
+            np.empty((0,), dtype=np.int64) if aux_task == "direction3" else np.empty((0,), dtype=np.float32)
+        )
+    X = np.stack(X_list, axis=0).astype(np.float32)
+    if aux_task == "direction3":
+        y = np.array(y_list, dtype=np.int64)
+    else:
+        y = np.array(y_list, dtype=np.float32)
+    return X, y
+
+
+def train_val_split(X: np.ndarray, y: np.ndarray, val_ratio: float = 0.2):
+    n = len(X)
+    n_val = max(1, int(n * val_ratio))
+    n_tr = n - n_val
+    return (X[:n_tr], y[:n_tr], X[n_tr:], y[n_tr:])
+
+
+def make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size: int, aux_task: str):
+    x_tr_t = torch.from_numpy(X_tr)
+    x_va_t = torch.from_numpy(X_va)
+    if aux_task == "direction3":
+        y_tr_t = torch.from_numpy(y_tr.astype(np.int64))
+        y_va_t = torch.from_numpy(y_va.astype(np.int64))
+    else:
+        y_tr_t = torch.from_numpy(y_tr)
+        y_va_t = torch.from_numpy(y_va)
+    train_ds = TensorDataset(x_tr_t, y_tr_t)
+    val_ds = TensorDataset(x_va_t, y_va_t)
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False),
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False),
+    )
+
+
+def create_model(input_features: int, seq_len: int, aux_task: str, device: str):
+    if aux_task == "direction3":
+        cfg = ModelConfig(input_features=input_features, seq_len=seq_len, num_classes=3, task="direction3")
+    else:
+        cfg = ModelConfig(input_features=input_features, seq_len=seq_len)
+    model = CNNLSTMAttn(cfg).to(device)
+    return model, cfg
+
+
+def make_loss_fn(aux_task: str, y_tr: np.ndarray, device: str, loss_type: str, huber_delta: float):
+    if aux_task == "direction":
+        return nn.BCEWithLogitsLoss()
+    if aux_task == "direction3":
+        unique, counts = np.unique(y_tr, return_counts=True)
+        freq = {int(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
+        w = [1.0 / max(1, freq.get(c, 0)) for c in [0, 1, 2]]
+        w = np.array(w, dtype=np.float32)
+        w = w / (w.mean() if w.mean() > 0 else 1.0)
+        class_weights = torch.tensor(w, dtype=torch.float32, device=device)
+        return nn.CrossEntropyLoss(weight=class_weights)
+    # regression family
+    return nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
+
+
+def accumulate_val(aux_task: str, pred: torch.Tensor, yb: torch.Tensor, preds_all: list, targets_all: list):
+    if aux_task == "direction3":
+        preds_all.extend(torch.argmax(pred, dim=1).detach().cpu().tolist())
+        targets_all.extend(yb.detach().cpu().tolist())
+    else:
+        preds_all.extend(pred.detach().cpu().float().tolist())
+        targets_all.extend(yb.detach().cpu().float().tolist())
+
+
+def compute_epoch_metrics(aux_task: str, targets_all: list, preds_all: list):
+    va_r, va_r2, va_acc = 0.0, 0.0, 0.0
+    if aux_task == "regression" and targets_all:
+        import numpy as _np
+        y_true = _np.array(targets_all, dtype=_np.float32)
+        y_pred = _np.array(preds_all, dtype=_np.float32)
+        if y_true.size > 1:
+            yt = y_true - y_true.mean()
+            yp = y_pred - y_pred.mean()
+            denom = (yt.std() * yp.std())
+            va_r = float((yt * yp).mean() / denom) if denom != 0 else 0.0
+            ss_res = float(((y_true - y_pred) ** 2).sum())
+            ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
+            va_r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
+    elif aux_task == "direction3" and targets_all:
+        import numpy as _np
+        y_true = _np.array(targets_all, dtype=_np.int64)
+        y_pred = _np.array(preds_all, dtype=_np.int64)
+        va_acc = float((y_true == y_pred).mean()) if y_true.size > 0 else 0.0
+    return va_r, va_r2, va_acc
+
+
 def _fmt_int(n: int) -> str:
     try:
         return f"{int(n):,}"
@@ -197,7 +336,7 @@ def train(
     epochs: int = 20,
     lr: float = 1e-4,
     device: Optional[str] = None,
-    aux_task: str = "regression",  # one of {"regression", "direction", "volatility"}
+    aux_task: str = "regression",  # one of {"regression", "direction", "direction3", "volatility"}
     checkpoint_every_chunks: Optional[int] = None,  # save checkpoint every N chunks
     checkpoint_every_epochs: Optional[int] = None,
     checkpoint_epochs: Optional[str] = None,  # comma-separated list, e.g., "5,10,20"
@@ -208,6 +347,7 @@ def train(
     loss_type: str = "mse",          # regression loss: {"mse", "huber"}
     huber_delta: float = 1.0,         # Huber delta
     weight_decay: float = 1e-4,       # AdamW weight decay
+    direction_threshold: float = 1e-2,  # 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -236,6 +376,7 @@ def train(
     - loss_type (str, default="mse"): 회귀 손실 함수 선택: mse 또는 huber
     - huber_delta (float, default=1.0): Huber 손실의 delta (허용 오차)
     - weight_decay (float, default=1e-4): AdamW weight decay (L2 정규화 강도)
+    - direction_threshold (float, default=1e-2): 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -278,6 +419,9 @@ def train(
         opt = None
         if aux_task == "direction":
             loss_fn = nn.BCEWithLogitsLoss()
+        elif aux_task == "direction3":
+            # class weights will be computed per-chunk (set later)
+            loss_fn = None  # placeholder
         else:
             loss_fn = nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
 
@@ -483,7 +627,11 @@ def train(
                             if tgt not in global_features:
                                 raise ValueError(f"target_col '{tgt}' not in feature columns")
                             tgt_col = tgt
-                            cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
+                            # Set num_classes for classification
+                            if aux_task == "direction3":
+                                cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len, num_classes=3, task="direction3")
+                            else:
+                                cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
                             model = CNNLSTMAttn(cfg).to(device)
                             opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
                             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -513,61 +661,30 @@ def train(
                         # Use features as-is.
                         feats_all = pd.concat([prev_tail_feats, feats], axis=0, ignore_index=True) if prev_tail_feats is not None else feats
 
-                        feat_vals = feats_all.to_numpy(dtype=np.float32)
-                        prices = feats_all[tgt_col].to_numpy(dtype=np.float32)
+                        # Build sequences from concatenated features
                         T = len(feats_all)
                         if T < (seq_len + horizon):
                             prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
                             return (False, None)
+                        X, y_arr = build_sequences_from_feats(
+                            feats_all, tgt_col, seq_len, horizon, aux_task, direction_threshold
+                        )
 
-                        X_list: list[np.ndarray] = []
-                        y_list: list[float] = []
-                        for i in range(T - seq_len - horizon + 1):
-                            xw = feat_vals[i : i + seq_len]
-                            if aux_task == "regression":
-                                yv = float(prices[i + seq_len + horizon - 1])
-                            elif aux_task == "direction":
-                                p_now = float(prices[i + seq_len - 1])
-                                p_future = float(prices[i + seq_len + horizon - 1])
-                                yv = 1.0 if (p_future - p_now) > 0 else 0.0
-                            elif aux_task == "volatility":
-                                p0 = float(prices[i + seq_len - 1])
-                                if p0 <= 0:
-                                    yv = 0.0
-                                else:
-                                    future = prices[i + seq_len : i + seq_len + horizon]
-                                    rets = []
-                                    prev = p0
-                                    for p in future:
-                                        rets.append((float(p) / float(prev) - 1.0) if prev != 0 else 0.0)
-                                        prev = float(p)
-                                    yv = float(np.std(rets, dtype=np.float32)) if len(rets) > 0 else 0.0
-                            else:
-                                raise ValueError(f"Unknown aux_task: {aux_task}")
-                            X_list.append(xw)
-                            y_list.append(yv)
-
-                        if not X_list:
+                        if X.size == 0:
                             prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
                             return (False, None)
 
                         # We produced sequences => a trained chunk
                         global_trained_chunk_count += 1
 
-                        X = np.stack(X_list, axis=0).astype(np.float32)
-                        y_arr = np.array(y_list, dtype=np.float32)
-
                         # split
-                        n = len(X)
-                        n_val = max(1, int(n * 0.2))
-                        n_tr = n - n_val
-                        X_tr, y_tr = X[:n_tr], y_arr[:n_tr]
-                        X_va, y_va = X[n_tr:], y_arr[n_tr:]
+                        X_tr, y_tr, X_va, y_va = train_val_split(X, y_arr, val_ratio=0.2)
 
-                        train_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
-                        val_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(y_va))
-                        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-                        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+                        # Build dataloaders
+                        train_loader, val_loader = make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size, aux_task)
+
+                        # For 3-class classification, compute class weights per chunk
+                        local_loss_fn = make_loss_fn(aux_task, y_tr, device, loss_type, huber_delta)
 
                         # train
                         model.train()
@@ -577,7 +694,10 @@ def train(
                             yb = yb.to(device)
                             opt.zero_grad()
                             pred = model(xb)
-                            loss = loss_fn(pred, yb)
+                            if aux_task == "direction3":
+                                loss = local_loss_fn(pred, yb.long())
+                            else:
+                                loss = loss_fn(pred, yb)
                             loss.backward()
                             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                             opt.step()
@@ -598,12 +718,14 @@ def train(
                                 xb = xb.to(device)
                                 yb = yb.to(device)
                                 pred = model(xb)
-                                loss = loss_fn(pred, yb)
+                                if aux_task == "direction3":
+                                    loss = local_loss_fn(pred, yb.long())
+                                else:
+                                    loss = loss_fn(pred, yb)
                                 va_loss_epoch_sum += loss.item() * len(xb)
                                 va_samples += len(xb)
                                 # accumulate for metrics
-                                va_preds_all.extend(pred.detach().cpu().float().tolist())
-                                va_targets_all.extend(yb.detach().cpu().float().tolist())
+                                accumulate_val(aux_task, pred, yb, va_preds_all, va_targets_all)
 
                         # update tail
                         prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
@@ -804,23 +926,8 @@ def train(
             # End of epoch: compute averages and handle checkpoints/early stopping
             tr_loss_avg = tr_loss_epoch_sum / max(1, tr_samples)
             va_loss_avg = va_loss_epoch_sum / max(1, va_samples)
-            # Compute validation metrics
-            va_r = 0.0
-            va_r2 = 0.0
-            if va_targets_all and aux_task == "regression":
-                import numpy as _np
-                y_true = _np.array(va_targets_all, dtype=_np.float32)
-                y_pred = _np.array(va_preds_all, dtype=_np.float32)
-                if y_true.size > 1:
-                    # Pearson r
-                    yt = y_true - y_true.mean()
-                    yp = y_pred - y_pred.mean()
-                    denom = (yt.std() * yp.std())
-                    va_r = float((yt * yp).mean() / denom) if denom != 0 else 0.0
-                    # R^2
-                    ss_res = float(((y_true - y_pred) ** 2).sum())
-                    ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
-                    va_r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
+            # Compute validation metrics (DRY)
+            va_r, va_r2, va_acc = compute_epoch_metrics(aux_task, va_targets_all, va_preds_all)
             
             # Update learning rate scheduler
             if 'scheduler' in locals():
@@ -847,6 +954,8 @@ def train(
                 if aux_task == 'regression':
                     writer.add_scalar('Metrics/Val_Pearson_r', va_r, epoch)
                     writer.add_scalar('Metrics/Val_R2', va_r2, epoch)
+                if aux_task == 'direction3':
+                    writer.add_scalar('Metrics/Val_Accuracy', va_acc, epoch)
             
             if va_loss_avg + 1e-9 < best_val:
                 best_val = va_loss_avg
@@ -958,68 +1067,24 @@ def train(
     # '날짜'를 month(01~12) 정수로 변환하여 덮어쓰기
     convert_date_to_month_inplace(df)
 
-    feat_vals = feats.to_numpy(dtype=np.float32)
-    prices = feats[tgt_col].to_numpy(dtype=np.float32)
-    T = len(feats)
-
-    X_list: list[np.ndarray] = []
-    y_list: list[float] = []
-    for i in range(T - seq_len - horizon + 1):
-        xw = feat_vals[i : i + seq_len]
-        # Compute targets depending on aux_task
-        if aux_task == "regression":
-            yv = float(prices[i + seq_len + horizon - 1])
-        elif aux_task == "direction":
-            p_now = float(prices[i + seq_len - 1])
-            p_future = float(prices[i + seq_len + horizon - 1])
-            yv = 1.0 if (p_future - p_now) > 0 else 0.0
-        elif aux_task == "volatility":
-            # std of simple returns over future horizon window
-            p0 = float(prices[i + seq_len - 1])
-            if p0 <= 0:
-                yv = 0.0
-            else:
-                future = prices[i + seq_len : i + seq_len + horizon]
-                # simple returns relative to previous step to avoid div by zero
-                rets = []
-                prev = p0
-                for p in future:
-                    rets.append((float(p) / float(prev) - 1.0) if prev != 0 else 0.0)
-                    prev = float(p)
-                yv = float(np.std(rets, dtype=np.float32)) if len(rets) > 0 else 0.0
-        else:
-            raise ValueError(f"Unknown aux_task: {aux_task}")
-        X_list.append(xw)
-        y_list.append(yv)
-
-    if not X_list:
+    # Build sequences using helper
+    X, y = build_sequences_from_feats(feats, tgt_col, seq_len, horizon, aux_task, direction_threshold)
+    if X.size == 0:
         raise ValueError("Not enough rows to create sequences. Reduce seq_len/horizon or load more data.")
 
-    X = np.stack(X_list, axis=0).astype(np.float32)  # [N, T, F]
-    y = np.array(y_list, dtype=np.float32)           # [N]
-
     # train/val split (time-ordered)
-    n = len(X)
-    n_val = max(1, int(n * 0.2))
-    n_tr = n - n_val
-    X_tr, y_tr = X[:n_tr], y[:n_tr]
-    X_va, y_va = X[n_tr:], y[n_tr:]
+    X_tr, y_tr, X_va, y_va = train_val_split(X, y, val_ratio=0.2)
 
-    train_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
-    val_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(y_va))
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False)
+    # dataloaders
+    train_loader, val_loader = make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size, aux_task)
 
-    cfg = ModelConfig(input_features=len(real_cols), seq_len=seq_len)
-    model = CNNLSTMAttn(cfg).to(device)
+    # model
+    model, cfg = create_model(input_features=len(real_cols), seq_len=seq_len, aux_task=aux_task, device=device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
     )
-    if aux_task == "direction":
-        loss_fn = nn.BCEWithLogitsLoss()
-    else:
-        loss_fn = nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
+    loss_fn = make_loss_fn(aux_task, y_tr, device, loss_type, huber_delta)
 
     # Non-streaming startup summary
     log_startup_summary(
@@ -1057,7 +1122,10 @@ def train(
             yb = yb.to(device)
             opt.zero_grad()
             pred = model(xb)
-            loss = loss_fn(pred, yb)
+            if aux_task == "direction3":
+                loss = loss_fn(pred, yb.long())
+            else:
+                loss = loss_fn(pred, yb)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
@@ -1082,27 +1150,14 @@ def train(
                 xb = xb.to(device)
                 yb = yb.to(device)
                 pred = model(xb)
-                loss = loss_fn(pred, yb)
+                loss = loss_fn(pred, yb.long()) if aux_task == "direction3" else loss_fn(pred, yb)
                 va_loss += loss.item() * len(xb)
                 n_va += len(xb)
-                va_preds_list.extend(pred.detach().cpu().float().tolist())
-                va_targets_list.extend(yb.detach().cpu().float().tolist())
+                accumulate_val(aux_task, pred, yb, va_preds_list, va_targets_list)
         va_loss /= max(1, n_va)
         
-        # Compute validation metrics
-        va_r = 0.0
-        va_r2 = 0.0
-        if aux_task == "regression" and len(va_targets_list) > 1:
-            import numpy as _np
-            y_true = _np.array(va_targets_list, dtype=_np.float32)
-            y_pred = _np.array(va_preds_list, dtype=_np.float32)
-            yt = y_true - y_true.mean()
-            yp = y_pred - y_pred.mean()
-            denom = (yt.std() * yp.std())
-            va_r = float((yt * yp).mean() / denom) if denom != 0 else 0.0
-            ss_res = float(((y_true - y_pred) ** 2).sum())
-            ss_tot = float(((y_true - y_true.mean()) ** 2).sum())
-            va_r2 = 1.0 - ss_res / ss_tot if ss_tot != 0 else 0.0
+        # Compute validation metrics (DRY)
+        va_r, va_r2, va_acc = compute_epoch_metrics(aux_task, va_targets_list, va_preds_list)
         
         # Update learning rate scheduler
         old_lr = opt.param_groups[0]['lr']
@@ -1124,6 +1179,8 @@ def train(
             if aux_task == 'regression':
                 writer.add_scalar('Metrics/Val_Pearson_r', va_r, epoch)
                 writer.add_scalar('Metrics/Val_R2', va_r2, epoch)
+            if aux_task == 'direction3':
+                writer.add_scalar('Metrics/Val_Accuracy', va_acc, epoch)
         
         if va_loss + 1e-9 < best_val:
             best_val = va_loss
@@ -1203,7 +1260,7 @@ def main():
     p.add_argument("--epochs", type=int, default=20, help="최대 학습 에폭 수(얼리 스탑 적용). 기본값: 20")
     p.add_argument("--lr", type=float, default=1e-4, help="학습률(AdamW). 기본값: 1e-4")
     p.add_argument("--device", default=None, help="장치 지정: cuda/cpu. 미지정 시 가능하면 CUDA 사용, 아니면 CPU")
-    p.add_argument("--aux-task", choices=["regression", "direction", "volatility"], default="regression", help="보조 학습 목표")
+    p.add_argument("--aux-task", choices=["regression", "direction", "direction3", "volatility"], default="regression", help="보조 학습 목표")
     p.add_argument("--ckpt-every-chunks", type=int, default=None, help="N 청크마다 체크포인트 저장 (예: 100). 미지정 시 비활성화")
     p.add_argument("--ckpt-every-epochs", type=int, default=None, help="N 에폭마다 체크포인트 저장 (예: 5). 미지정 시 비활성화")
     p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
@@ -1214,6 +1271,7 @@ def main():
     p.add_argument("--loss", choices=["mse", "huber"], default="mse", help="회귀 손실 함수 선택: mse 또는 huber")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber 손실의 delta (허용 오차)")
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (L2 정규화 강도)")
+    p.add_argument("--direction-threshold", type=float, default=1e-2, help="3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)")
     args = p.parse_args()
 
     train(
@@ -1240,13 +1298,9 @@ def main():
         loss_type=args.loss,
         huber_delta=args.huber_delta,
         weight_decay=args.weight_decay,
+        direction_threshold=args.direction_threshold,
     )
 
 
-#
-# python -m ai_trader.rl.train_rl --algo ppo --db models/test_datasets2.db --out models/rl_ppo --seq-len 60 --target-col 현재가 --total-timesteps 200000
-#
-# python -m ai_trader.rl.infer_rl --algo ppo --db models/test_datasets2.db --model models/rl/ppo_model.zip --seq-len 60 --target-col 현재가
-#
 if __name__ == "__main__":
     main()
