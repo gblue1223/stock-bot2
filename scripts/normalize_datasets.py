@@ -5,6 +5,8 @@ import argparse
 import duckdb
 import numpy as np
 import pandas as pd
+import time
+from datetime import datetime
 import concurrent.futures as _fut
 import shutil as _shutil
 import pickle as _pickle
@@ -1245,6 +1247,11 @@ def main():
             print(f"입력 DuckDB 파일이 존재하지 않습니다: {args.input_db}")
             return
 
+    # 작업 시작/종료/경과 시간 로깅
+    start_ts = time.time()
+    start_dt = datetime.now()
+    print(f"작업 시작: {start_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
     normalize_datasets(
         args.input_db,
         args.output,
@@ -1260,6 +1267,11 @@ def main():
         ignoring_stocks_csv=args.ignoring_stocks_csv,
         single_output=args.single_output,
     )
+
+    end_dt = datetime.now()
+    elapsed = time.time() - start_ts
+    print(f"작업 종료: {end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"총 경과 시간: {elapsed:.2f}초")
 
 
 if __name__ == "__main__":
