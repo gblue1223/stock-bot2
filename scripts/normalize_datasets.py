@@ -1,78 +1,68 @@
-import argparse
+import sys
 import os
 import re
+import argparse
 import duckdb
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
 import concurrent.futures as _fut
 import shutil as _shutil
 import pickle as _pickle
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
 
 # Global sequential counter for '번호'
 NO_COUNTER: int = 1
 
 INPUT_TABLE = "datasets"  # 입력 DuckDB 테이블명
-TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
+TEXT_COLUMNS = {"종목코드", "종목명", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
 DROP_COLUMNS = {"종류", "씨리얼"}
 IGNORING_STOCKS_SET: set[str] = set()
 def _to_time_ms(val: object) -> int:
-    """Convert various time formats to total milliseconds since 00:00:00.
+    """Convert various time formats to a 9-digit HHMMSSmmm integer.
     Supports:
-    - 'HH:MM:SS[.sss]' or 'HH:MM:SS[.cc]'
-    - 'HHMMSSmmm' (9 digits, milliseconds)
-    - 'HHMMSScc' (8 digits, centiseconds -> ms = cc*10)
-    - 'HHMMSS' (6 digits)
-    - 'HHMM' (4 digits), 'HH' (2 digits)
+    - 'HHMMSSmmm' (9 digits)
     Returns 0 if cannot parse.
     """
     try:
         s = str(val)
         if not s or s.lower() == 'nan':
             return 0
+        # If format is like HHMMSSmmm.xxxx, ignore the fractional part after the dot
+        if '.' in s:
+            s = s.split('.', 1)[0]
         digits = ''.join(ch for ch in s if ch.isdigit())
         if not digits:
             return 0
+        # Fix size to 9 by taking the last up to 9 digits and left-padding with zeros
+        digits = digits[-9:].rjust(9, '0')
         hh = mm = ss = 0
         ms = 0
-        if len(digits) >= 9:  # HHMMSSmmm...
+        if len(digits) == 9:  # HHMMSSmmm...
             hh = int(digits[0:2])
             mm = int(digits[2:4])
             ss = int(digits[4:6])
             ms = int(digits[6:9])
-        elif len(digits) == 8:  # HHMMSScc (centiseconds)
-            hh = int(digits[0:2])
-            mm = int(digits[2:4])
-            ss = int(digits[4:6])
-            ms = int(digits[6:8]) * 10
-        elif len(digits) == 7:  # HHMMSSc (deciseconds)
-            hh = int(digits[0:2])
-            mm = int(digits[2:4])
-            ss = int(digits[4:6])
-            ms = int(digits[6]) * 100
-        elif len(digits) == 6:  # HHMMSS
-            hh = int(digits[0:2])
-            mm = int(digits[2:4])
-            ss = int(digits[4:6])
-            ms = 0
-        elif len(digits) == 4:  # HHMM
-            hh = int(digits[0:2])
-            mm = int(digits[2:4])
-            ss = 0
-            ms = 0
-        elif len(digits) <= 2:  # HH
-            hh = int(digits[0:2])
-            mm = 0
-            ss = 0
-            ms = 0
+        else:
+            sys.exit(f"Invalid time format: {digits}")
         # clamp
         hh = max(0, min(23, hh))
         mm = max(0, min(59, mm))
         ss = max(0, min(59, ss))
         ms = max(0, min(999, ms))
-        return ((hh * 60 + mm) * 60 + ss) * 1000 + ms
+        if hh > 20:
+            sys.exit(f"Error: Invalid hour {hh} in time {s}")
+        return int(f"{hh:02d}{mm:02d}{ss:02d}{ms:03d}")
+    except Exception:
+        return 0
+
+def _normalize_cli_time(t: int) -> int:
+    """Normalize CLI time argument to a 9-digit HHMMSSmmm integer using _to_time_ms.
+    Accepts digit-only inputs; if colon format is used upstream, ensure it's converted to digits before passing.
+    """
+    try:
+        return _to_time_ms(t)
     except Exception:
         return 0
 
@@ -211,18 +201,40 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
 
             # 종목명 필터링: IGNORING_STOCKS에 포함된 종목은 제외
             if '종목명' in df.columns:
+                n_before_ignore = len(df)
                 mask_ignore = df['종목명'].astype(str).str.strip().isin(IGNORING_STOCKS_SET)
                 if mask_ignore.any():
                     df = df[~mask_ignore]
+                    removed = n_before_ignore - len(df)
+                    print(f"[IGNORE] removed={removed} keep={len(df)} ({name}, {date})")
+                    # 무시 종목 필터로 모두 제거된 경우, 이후 시간 필터 등은 수행하지 않고 즉시 반환
+                    if df.empty:
+                        return pd.DataFrame()
             
-            # 시간 필터링 적용 (밀리초 기준)
+            # 시간 필터링 적용 (HHMMSSmmm 정수 기준)
             if '시간' in df.columns:
-                # 각 행의 시간값을 총 밀리초(00:00:00.000부터 경과)로 정규화
-                df['시간_ms'] = df['시간'].apply(_to_time_ms)
-                # 시간 범위 필터링: time_start_ms <= 시간_ms < time_end_ms
-                df = df[(df['시간_ms'] >= time_start) & (df['시간_ms'] < time_end)]
+                # 각 행의 시간값을 9자리 HHMMSSmmm 정수로 정규화 (한 번만 계산)
+                conv = df['시간'].apply(_to_time_ms)
+                # 진단 로그: 시간창, 변환 최소/최대, 샘플
+                if not conv.empty:
+                    try:
+                        tmin = int(conv.min())
+                        tmax = int(conv.max())
+                    except Exception:
+                        tmin = tmax = -1
+                    print(f"[DEBUG] window={time_start:09d}-{time_end:09d} min={tmin:09d} max={tmax:09d} samples={conv.head(5).tolist()} ({name}, {date})")
+                else:
+                    print(f"[DEBUG] window={time_start:09d}-{time_end:09d} (no convertible times) ({name}, {date})")
+                df['시간_hhmmssmmm'] = conv
+                # 시간 범위 필터링: time_start <= 시간_hhmmssmmm < time_end
+                before_time = len(df)
+                df = df[(df['시간_hhmmssmmm'] >= time_start) & (df['시간_hhmmssmmm'] < time_end)]
+                print(f"[DEBUG] filtered {before_time}->{len(df)} rows ({name}, {date})")
+                if len(df['시간_hhmmssmmm']) == 0:
+                    print(f"[DEBUG] 시간 범위 필터링 후 데이터가 없습니다. ({name}, {date})")
+                    return pd.DataFrame()
                 # 임시 컬럼 제거
-                df = df.drop(columns=['시간_ms'])
+                df = df.drop(columns=['시간_hhmmssmmm'])
             
             # 불필요 컬럼 제거
             df = df.drop(columns=[col for col in DROP_COLUMNS if col in df.columns], errors="ignore")
@@ -273,11 +285,8 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
- 
-
-
 def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str,
-                       time_start: int = 90000000, time_end: int = 110000000) -> pd.DataFrame:
+                      time_start: int = 90000000, time_end: int = 110000000) -> pd.DataFrame:
     """
     DuckDB에서 데이터를 로드하여 병합 (이미 병합된 데이터인 경우 그대로 반환)
     """
@@ -314,12 +323,71 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
 
 
 def _signed_log1p(arr: pd.Series) -> pd.Series:
-    """Signed log1p that supports negative values: sign(x) * log1p(|x|)."""
+    """
+    부호를 보존하는 log1p 변환을 적용합니다.
+
+    정의: y = sign(x) * log1p(|x|)
+    - 음수/양수 모두에 대해 로그 스케일링의 효과를 주면서 부호는 유지합니다.
+    - `arr`는 수치형으로 강제 변환되며, 변환 실패/결측은 0으로 채웁니다.
+
+    매개변수:
+    - arr: pd.Series
+
+    반환값:
+    - pd.Series: 입력과 동일한 인덱스를 가지는 변환 결과
+
+    예시:
+    >>> import pandas as pd
+    >>> s = pd.Series([-100, -1, 0, 1, 9])
+    >>> _signed_log1p(s).round(6).tolist()
+    [-4.615121, -0.693147, 0.0, 0.693147, 2.302585]
+    """
     x = pd.to_numeric(arr, errors="coerce").fillna(0)
     return np.sign(x) * np.log1p(np.abs(x))
 
 
+def _time_ms_to_seconds(t: int) -> int:
+    """
+    Convert a 9-digit HHMMSSmmm integer (milliseconds) to seconds since 00:00:00.
+
+    - If input is malformed, it is coerced via `_to_time_ms` first.
+    - Milliseconds are discarded.
+    """
+    try:
+        t9 = _to_time_ms(t)
+        s = str(int(t9)).rjust(9, '0')
+        hh = int(s[0:2])
+        mm = int(s[2:4])
+        ss = int(s[4:6])
+        return hh * 3600 + mm * 60 + ss
+    except Exception:
+        return 0
+
+
 def _standard_scale(series: pd.Series) -> pd.Series:
+    """
+    Z-Score 표준화(평균 0, 표준편차 1) 변환을 수행합니다.
+
+    - 평균과 표준편차는 모집단 표준편차(ddof=0)로 계산합니다.
+    - 표준편차가 0(상수 시리즈)인 경우 전부 0으로 반환합니다.
+    - 비수치/결측은 0으로 대체 후 계산합니다.
+
+    매개변수:
+    - series: pd.Series
+
+    반환값:
+    - pd.Series: 표준화된 시리즈
+
+    예시:
+    >>> import pandas as pd
+    >>> s = pd.Series([1, 2, 3, 4])
+    >>> _standard_scale(s).round(6).tolist()
+    [-1.341641, -0.447214, 0.447214, 1.341641]
+
+    >>> s2 = pd.Series([5, 5, 5])  # 표준편차 0
+    >>> _standard_scale(s2).tolist()
+    [0.0, 0.0, 0.0]
+    """
     x = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
     mean = float(x.mean())
     std = float(x.std(ddof=0))
@@ -329,6 +397,32 @@ def _standard_scale(series: pd.Series) -> pd.Series:
 
 
 def _minmax_scale(series: pd.Series) -> pd.Series:
+    """
+    Min-Max 스케일링을 수행하여 값을 [0, 1] 구간으로 변환합니다.
+
+    - 비수치/결측은 0으로 대체 후 계산합니다.
+    - 최소값과 최대값이 같아 범위가 0이면 모든 값을 0으로 반환합니다.
+
+    매개변수:
+    - series: pd.Series
+
+    반환값:
+    - pd.Series: [0, 1] 범위로 스케일된 시리즈
+
+    예시:
+    >>> import pandas as pd
+    >>> s = pd.Series([10, 20, 30])
+    >>> _minmax_scale(s).tolist()
+    [0.0, 0.5, 1.0]
+
+    >>> s2 = pd.Series([-5, 0, 5])
+    >>> _minmax_scale(s2).tolist()
+    [0.0, 0.5, 1.0]
+
+    >>> s3 = pd.Series([7, 7, 7])  # 범위 0
+    >>> _minmax_scale(s3).tolist()
+    [0.0, 0.0, 0.0]
+    """
     x = pd.to_numeric(series, errors="coerce").fillna(0).astype(float)
     min_v = float(x.min())
     max_v = float(x.max())
@@ -345,7 +439,6 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     - Standard only: *_총잔량직전대비
     - Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
     - Character-level scalar encoding for '종목명' (append scalar, keep original)
-    - '시간' normalized to '시간_scalar' by dividing numeric value by 90000000.0 (keep original '시간')
     - Min-Max: remaining numeric columns (excluding '번호' and text columns and already-normalized columns)
     """
     out = df.copy()
@@ -431,30 +524,23 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
             out["종목명_scalar"] = cats.apply(_encode_scalar_name).astype(float)
         broker_scalar_cols.append("종목명_scalar")
 
-    # '시간' -> '시간_scalar' (numeric normalization by 90000000.0)
+    # '시간' 파생 피처: 기존 시간 스칼라 + sin/cos 주기 변환 + 장 시작 후 경과 초
     if '시간' in out.columns:
-        def _to_num_time(v) -> float:
-            try:
-                # fast path for numeric
-                val = float(v)
-                return val
-            except Exception:
-                s = str(v)
-                digits = re.sub(r"\D", "", s)
-                if not digits:
-                    return 0.0
-                try:
-                    return float(digits)
-                except Exception:
-                    return 0.0
 
-        num_time = out['시간'].apply(_to_num_time).astype(float)
-        denom = 90000000.0
-        out['시간_scalar'] = (num_time / denom).astype(float)
-        broker_scalar_cols.append('시간_scalar')
+        # HHMMSSmmm -> seconds
+        secs = out['시간'].apply(_time_ms_to_seconds).astype(int)
+        SECONDS_IN_DAY = 24 * 60 * 60
+        MARKET_OPEN_SECONDS = 9 * 3600  # 09:00:00
+        out['시간_sin'] = np.sin(2 * np.pi * secs / SECONDS_IN_DAY)
+        out['시간_cos'] = np.cos(2 * np.pi * secs / SECONDS_IN_DAY)
+        # 장 시작 후 경과 시간(초), 0 미만은 0으로 클립
+        sec_from_open = (secs - MARKET_OPEN_SECONDS).clip(lower=0).astype(float)
+        out['시간_scalar'] = _standard_scale(sec_from_open)
+        # 파생 컬럼들은 이미 정상화 되었거나 [-1,1] 구간이므로 추가 스케일 제외 목록에 포함
+        broker_scalar_cols.extend(['시간_sin', '시간_cos', '시간_scalar'])
 
     # Min-Max for remaining numeric columns not already processed
-    processed = set(["번호"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
+    processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
     numeric_rest = [c for c in out.columns if c not in processed and pd.api.types.is_numeric_dtype(out[c])]
     for col in numeric_rest:
         out[col] = _minmax_scale(out[col])
@@ -585,9 +671,6 @@ def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
         return group_key, code, date, pkl_path
     except Exception:
         return None
-
-
- 
 
 
 def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str,
@@ -735,7 +818,9 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
         with _fut.ProcessPoolExecutor(max_workers=used_group_workers) as ex:
             futs = []
             for group_key, group_info in month_groups:
-                fut = ex.submit(_process_single_group_to_pickle, group_key, group_info, tmp_root, time_start, time_end, ignoring_stocks_csv)
+                fut = ex.submit(_process_single_group_to_pickle, 
+                                group_key, group_info, tmp_root, 
+                                time_start, time_end, ignoring_stocks_csv)
                 futs.append(fut)
             done = 0
             for fut in _fut.as_completed(futs):
@@ -764,7 +849,8 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
         print(f"  {yyyymm}: 순차 그룹 처리", flush=True)
         done = 0
         for group_key, group_info in month_groups:
-            pkl_path = _process_single_group_to_pickle(group_key, group_info, tmp_root, time_start, time_end, ignoring_stocks_csv)
+            pkl_path = _process_single_group_to_pickle(group_key, group_info, tmp_root, 
+                                                       time_start, time_end, ignoring_stocks_csv)
             if pkl_path:
                 pickle_paths.append(pkl_path)
                 # Incremental ingest when buffer reaches checkpoint size
@@ -780,14 +866,14 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
             done += 1
             if done % 5 == 0 or done == total_groups:
                 print(f"  {yyyymm}: pickle 생성 진행률 [{done}/{total_groups}]", flush=True)
-     
+
     # Step 2: Ingest pickle files to DB sequentially (to avoid DB write conflicts)
     if pickle_paths:
         print(f"  {yyyymm}: {len(pickle_paths)} pickle 파일을 DB에 순차 반영", flush=True)
         processed_count = _ingest_pickles_to_db(pickle_paths, db_path, yyyymm, checkpoint_interval)
     else:
         processed_count = 0
-     
+
     return processed_count
 
 
@@ -981,10 +1067,10 @@ def normalize_datasets(input_db: str, output_db: str, *,
             pass
     _sweep_and_ingest_tmp(output_db, _tmp_base, workers=group_workers, checkpoint_interval=checkpoint_interval)
 
-    # Normalize CLI time window to HHMMSS
+    # Normalize CLI time window to HHMMSSmmm (9-digit)
     norm_time_start = _normalize_cli_time(time_start)
     norm_time_end = _normalize_cli_time(time_end)
-    print(f"시간 필터: {norm_time_start:06d} <= 시간 < {norm_time_end:06d}")
+    print(f"시간 필터: {norm_time_start:09d} <= 시간 < {norm_time_end:09d}")
 
     # Load ignoring stocks once in the main process
     global IGNORING_STOCKS_SET
@@ -1087,7 +1173,6 @@ def normalize_datasets(input_db: str, output_db: str, *,
                 fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), norm_time_start, norm_time_end, ignoring_stocks_csv)
                 futs[fut] = (yyyymm, len(groups), db_path)
             done = 0
-            total = len(futs)
             for fut in _fut.as_completed(futs):
                 yyyymm, n_groups, db_path = futs[fut]
                 try:
@@ -1152,14 +1237,14 @@ def main():
                         help="무시할 종목명 리스트 CSV 경로 (기본: scripts/ignoring_stocks.csv, '종목명' 컬럼 필요)")
     parser.add_argument("--single-output", action="store_true",
                         help="월별 샤드 대신 하나의 DuckDB 파일(-o)에 모든 결과를 순차 반영합니다")
-     
+    
     args = parser.parse_args()
-     
+
     if not args.compact_only:
         if not os.path.exists(args.input_db):
             print(f"입력 DuckDB 파일이 존재하지 않습니다: {args.input_db}")
             return
-     
+
     normalize_datasets(
         args.input_db,
         args.output,
