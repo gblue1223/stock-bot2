@@ -750,6 +750,8 @@ def train(
                             # train
                             model.train()
                             batch_count = 0
+                            # chunk-local accumulators
+                            tr_chunk_sum, tr_chunk_n = 0.0, 0
                             for xb, yb in train_loader:
                                 xb = xb.to(device)
                                 yb = yb.to(device)
@@ -764,6 +766,8 @@ def train(
                                 opt.step()
                                 tr_loss_epoch_sum += loss.item() * len(xb)
                                 tr_samples += len(xb)
+                                tr_chunk_sum += loss.item() * len(xb)
+                                tr_chunk_n += len(xb)
                                 
                                 # Log batch-level metrics to TensorBoard
                                 if writer and batch_count % 10 == 0:  # Log every 10 batches
@@ -774,6 +778,8 @@ def train(
 
                             # val
                             model.eval()
+                            va_chunk_sum, va_chunk_n = 0.0, 0
+                            va_preds_c, va_targets_c = [], []
                             with torch.no_grad():
                                 for xb, yb in val_loader:
                                     xb = xb.to(device)
@@ -785,8 +791,28 @@ def train(
                                         loss = loss_fn(pred, yb)
                                     va_loss_epoch_sum += loss.item() * len(xb)
                                     va_samples += len(xb)
+                                    va_chunk_sum += loss.item() * len(xb)
+                                    va_chunk_n += len(xb)
                                     # accumulate for metrics
                                     accumulate_val(aux_task, pred, yb, va_preds_all, va_targets_all)
+                                    accumulate_val(aux_task, pred, yb, va_preds_c, va_targets_c)
+
+                            # chunk-level scalars
+                            if writer:
+                                if tr_chunk_n > 0:
+                                    writer.add_scalar('Loss/Train_Chunk', tr_chunk_sum / max(1, tr_chunk_n), global_trained_chunk_count)
+                                if va_chunk_n > 0:
+                                    writer.add_scalar('Loss/Validation_Chunk', va_chunk_sum / max(1, va_chunk_n), global_trained_chunk_count)
+                                # per-chunk accuracy for direction3
+                                if aux_task == 'direction3' and va_targets_c:
+                                    import numpy as _np
+                                    y_true_c = _np.array(va_targets_c, dtype=_np.int64)
+                                    y_pred_c = _np.array(va_preds_c, dtype=_np.int64)
+                                    acc_c = float((y_true_c == y_pred_c).mean()) if y_true_c.size > 0 else 0.0
+                                    writer.add_scalar('Metrics/Val_Accuracy_Chunk', acc_c, global_trained_chunk_count)
+                                # periodic flush to ensure visibility in TensorBoard
+                                if (global_trained_chunk_count % 10) == 0:
+                                    writer.flush()
 
                             # update tail
                             prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
