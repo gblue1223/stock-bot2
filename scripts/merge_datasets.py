@@ -121,15 +121,15 @@ def _build_union_schema(inputs: List[str], table: str, strict: bool = False) -> 
                         first_schema = schema
                         first_db = path
                     else:
-                        if schema != first_schema:
-                            # compute deltas
-                            def to_map(s):
-                                return {c: t for c, t in s}
-                            a = to_map(first_schema)
-                            b = to_map(schema)
-                            missing = [c for c in a.keys() if c not in b]
-                            extra = [c for c in b.keys() if c not in a]
-                            type_diff = [c for c in a.keys() & b.keys() if (a[c] or '').upper() != (b[c] or '').upper()]
+                        # Order-insensitive strict comparison: compare as name->type maps
+                        def to_map(s):
+                            return {c: (t or '').upper() for c, t in s}
+                        a = to_map(first_schema)
+                        b = to_map(schema)
+                        missing = [c for c in a.keys() if c not in b]
+                        extra = [c for c in b.keys() if c not in a]
+                        type_diff = [c for c in a.keys() & b.keys() if a[c] != b[c]]
+                        if missing or extra or type_diff:
                             raise SystemExit(
                                 "스키마 불일치로 종료:\n"
                                 f"  기준: {os.path.basename(first_db or '')}\n"
@@ -225,11 +225,7 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
         # Pragmas for performance
         conn.execute(f"PRAGMA memory_limit='{memory_limit}'")
         conn.execute(f"PRAGMA threads={int(threads)}")
-
-        # Pragmas for performance
-        conn.execute(f"PRAGMA memory_limit='{memory_limit}'")
-        conn.execute(f"PRAGMA threads={int(threads)}")
-        conn.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        conn.execute(f"SET temp_directory='{temp_directory}'")
 
         _ensure_output_table(conn, table, union_schema)
 
