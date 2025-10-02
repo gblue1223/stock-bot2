@@ -779,7 +779,9 @@ def train(
                             # val
                             model.eval()
                             va_chunk_sum, va_chunk_n = 0.0, 0
-                            va_preds_c, va_targets_c = [], []
+                            # diagnostic collectors
+                            va_preds_c, va_targets_c = [], []  # existing accumulate_val usage
+                            y_true_c2, y_pred_c2 = [], []      # explicit argmax-based labels
                             with torch.no_grad():
                                 for xb, yb in val_loader:
                                     xb = xb.to(device)
@@ -796,6 +798,10 @@ def train(
                                     # accumulate for metrics
                                     accumulate_val(aux_task, pred, yb, va_preds_all, va_targets_all)
                                     accumulate_val(aux_task, pred, yb, va_preds_c, va_targets_c)
+                                    # explicit argmax-based predictions for diagnostics (direction3)
+                                    if aux_task == 'direction3':
+                                        y_true_c2.extend(yb.long().detach().cpu().numpy().tolist())
+                                        y_pred_c2.extend(torch.argmax(pred, dim=1).detach().cpu().numpy().tolist())
 
                             # chunk-level scalars
                             if writer:
@@ -804,12 +810,32 @@ def train(
                                 if va_chunk_n > 0:
                                     writer.add_scalar('Loss/Validation_Chunk', va_chunk_sum / max(1, va_chunk_n), global_trained_chunk_count)
                                 # per-chunk accuracy for direction3
-                                if aux_task == 'direction3' and va_targets_c:
+                                if aux_task == 'direction3':
                                     import numpy as _np
-                                    y_true_c = _np.array(va_targets_c, dtype=_np.int64)
-                                    y_pred_c = _np.array(va_preds_c, dtype=_np.int64)
-                                    acc_c = float((y_true_c == y_pred_c).mean()) if y_true_c.size > 0 else 0.0
-                                    writer.add_scalar('Metrics/Val_Accuracy_Chunk', acc_c, global_trained_chunk_count)
+                                    # existing accumulate_val-based accuracy (for legacy comparision)
+                                    if va_targets_c:
+                                        y_true_c = _np.array(va_targets_c, dtype=_np.int64)
+                                        y_pred_c = _np.array(va_preds_c, dtype=_np.int64)
+                                        acc_c = float((y_true_c == y_pred_c).mean()) if y_true_c.size > 0 else 0.0
+                                        writer.add_scalar('Metrics/Val_Accuracy_Chunk', acc_c, global_trained_chunk_count)
+                                    # argmax-based diagnostics
+                                    if y_true_c2:
+                                        yt = _np.array(y_true_c2, dtype=_np.int64)
+                                        yp = _np.array(y_pred_c2, dtype=_np.int64)
+                                        acc_logits = float((yt == yp).mean()) if yt.size > 0 else 0.0
+                                        writer.add_scalar('Metrics/Val_Accuracy_Chunk_logits', acc_logits, global_trained_chunk_count)
+                                        # class distributions
+                                        for cls in (0, 1, 2):
+                                            writer.add_scalar(f'Metrics/Val_True_Class{cls}_Count_Chunk', int((yt == cls).sum()), global_trained_chunk_count)
+                                            writer.add_scalar(f'Metrics/Val_Pred_Class{cls}_Count_Chunk', int((yp == cls).sum()), global_trained_chunk_count)
+                                        # occasional confusion matrix as text (every 50 chunks)
+                                        if (global_trained_chunk_count % 50) == 0:
+                                            cm = _np.zeros((3, 3), dtype=_np.int64)
+                                            for t, p in zip(yt, yp):
+                                                if 0 <= t < 3 and 0 <= p < 3:
+                                                    cm[t, p] += 1
+                                            cm_str = "\n".join([" ".join(map(str, row.tolist())) for row in cm])
+                                            writer.add_text('Diagnostics/Confusion_Matrix_Chunk', f"chunk={global_trained_chunk_count}\n{cm_str}", global_trained_chunk_count)
                                 # periodic flush to ensure visibility in TensorBoard
                                 if (global_trained_chunk_count % 10) == 0:
                                     writer.flush()

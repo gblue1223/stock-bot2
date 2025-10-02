@@ -43,16 +43,14 @@ from tensorboard.backend.event_processing import event_accumulator as ea
 # - Learning_Rate/Epoch: 에폭 단위 러닝레이트. 스케줄러 작동 시 감소 가능.
 #   성공: 손실 정체 시 적절히 감소하며 NaN/Inf 없음.
 # - Learning_Rate: 배치 단위 러닝레이트(있을 경우). Epoch과 동일 해석.
-KEY_TAGS = [
-    "Loss/Train_Epoch",
-    "Loss/Validation_Epoch",
-    "Loss/Train_Batch",
-    "Metrics/Val_Accuracy",
-    "Metrics/Val_Pearson_r",
-    "Metrics/Val_R2",
-    "Learning_Rate/Epoch",
-    "Learning_Rate",
-]
+# - Loss/Train_Chunk: 청크 단위 학습 손실 평균. 낮을수록 좋음. 에폭 종료 전 중간 추세 확인용.
+# - Loss/Validation_Chunk: 청크 단위 검증 손실 평균. 낮을수록 좋음. 최근 하락 추세면 양호.
+# - Metrics/Val_Accuracy_Chunk: 청크 단위 정확도(누적 로직 기반). 높을수록 좋음. 3-클래스 기준선 ≈0.333 초과 및 상승 추세면 양호.
+# - Metrics/Val_Accuracy_Chunk_logits: 청크 단위 정확도(모델 로짓 argmax 직접 산출). 위와 유사하되, 산출 경로가 다르므로 둘이 유사해야 정상.
+# - Metrics/Val_True_Class{0,1,2}_Count_Chunk: 청크 내 타깃 클래스별 개수. 분포가 특정 클래스에 과도하게 치우치지 않는지 확인.
+# - Metrics/Val_Pred_Class{0,1,2}_Count_Chunk: 청크 내 예측 클래스별 개수. 다수 클래스 편향 여부 확인.
+#   성공: 타깃/예측 분포가 유사하고, 소수 클래스에 대한 예측도 점차 개선.
+
 
 @dataclass
 class Series:
@@ -220,7 +218,37 @@ def print_stats(series: Dict[str, Series], tags: List[str], last: int) -> None:
             continue
         vals = series[tag].values[-last:] if last > 0 else series[tag].values
         st = compute_stats(vals)
-        print(f"{tag}: n={st['n']} last={st['last']:.6g} mean={st['mean']:.6g} std={st['std']:.6g} min={st['min']:.6g} max={st['max']:.6g} pct={st['pct']:.3f}% slope~={st['slope']:.3g}")
+        print(f"{tag}: n={st['n']} last={st['last']:.6g} mean={st['mean']:.6g} std={st['std']:.6g} min={st['min']:.6g} max={st['max']:.6g} pct={st['pct']:.3f}% slope~={st['slope']:.3g}\n")
+
+
+def print_class_distribution(series: Dict[str, Series], last: int) -> None:
+    # Aggregate last-N counts if available and show proportions for true/pred
+    true_tags = [
+        'Metrics/Val_True_Class0_Count_Chunk',
+        'Metrics/Val_True_Class1_Count_Chunk',
+        'Metrics/Val_True_Class2_Count_Chunk',
+    ]
+    pred_tags = [
+        'Metrics/Val_Pred_Class0_Count_Chunk',
+        'Metrics/Val_Pred_Class1_Count_Chunk',
+        'Metrics/Val_Pred_Class2_Count_Chunk',
+    ]
+    def agg(tags: List[str]) -> List[float]:
+        out = []
+        for t in tags:
+            if t in series and series[t].values:
+                vals = series[t].values[-last:] if last > 0 else series[t].values
+                out.append(float(sum(vals)))
+            else:
+                out.append(0.0)
+        s = sum(out)
+        return [v / s if s > 0 else 0.0 for v in out]
+    true_prop = agg(true_tags)
+    pred_prop = agg(pred_tags)
+    if sum(true_prop) > 0 or sum(pred_prop) > 0:
+        print("=== Class Distribution (recent) ===")
+        print(f"True:  C0={true_prop[0]:.3f} C1={true_prop[1]:.3f} C2={true_prop[2]:.3f}")
+        print(f"Pred:  C0={pred_prop[0]:.3f} C1={pred_prop[1]:.3f} C2={pred_prop[2]:.3f}")
 
 
 def save_png_charts(series: Dict[str, Series], tags: List[str], last: int, outdir: str) -> None:
@@ -282,7 +310,17 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Print per-iteration status in watch mode")
     # Output options
     parser.add_argument("--plot-tags", nargs='*', default=[
-        "Loss/Train_Batch", "Loss/Train_Chunk", "Loss/Validation_Chunk", "Metrics/Val_Accuracy_Chunk"
+        "Loss/Train_Batch",
+        "Loss/Train_Chunk",
+        "Loss/Validation_Chunk",
+        "Metrics/Val_Accuracy_Chunk",
+        "Metrics/Val_Accuracy_Chunk_logits",
+        "Metrics/Val_True_Class0_Count_Chunk",
+        "Metrics/Val_True_Class1_Count_Chunk",
+        "Metrics/Val_True_Class2_Count_Chunk",
+        "Metrics/Val_Pred_Class0_Count_Chunk",
+        "Metrics/Val_Pred_Class1_Count_Chunk",
+        "Metrics/Val_Pred_Class2_Count_Chunk",
     ], help="Tags to include in outputs (stats/png/html)")
     parser.add_argument("--plot-last", type=int, default=200, help="Number of recent points to use (per tag)")
     parser.add_argument("--save-png", default=None, help="Directory to save PNG charts (requires matplotlib)")
@@ -300,6 +338,7 @@ def main():
         if not args.stats_only:
             summarize(series)
         print_stats(series, tags=args.plot_tags, last=args.plot_last)
+        print_class_distribution(series, last=args.plot_last)
         if args.save_png:
             save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
         if args.out_html:
@@ -354,6 +393,7 @@ def main():
                     if not args.stats_only:
                         summarize(series)
                     print_stats(series, tags=args.plot_tags, last=args.plot_last)
+                    print_class_distribution(series, last=args.plot_last)
                     if args.save_png:
                         save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
                     if args.out_html:
