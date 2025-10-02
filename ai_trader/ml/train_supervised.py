@@ -20,7 +20,7 @@ from .models import CNNLSTMAttn, ModelConfig
 
 def get_requested_features() -> list[str]:
     return [
-        "날짜", "등락률", "누적거래대금", "거래회전율", "체결강도",
+        "날짜", "현재가", "등락률", "누적거래대금", "거래회전율", "체결강도",
         "매도호가수량1", "매도호가수량2", "매도호가수량3", "매도호가수량4", "매도호가수량5",
         "매도호가수량6", "매도호가수량7", "매도호가수량8", "매도호가수량9", "매도호가수량10",
         "매수호가수량1", "매수호가수량2", "매수호가수량3", "매수호가수량4", "매수호가수량5",
@@ -659,322 +659,262 @@ def train(
                         processed = 0
                         chunk_idx = 0
 
-                    # Define per-chunk processing to ensure training/checkpoint per fetched chunk
-                    def _process_chunk(df_chunk: pd.DataFrame) -> tuple[bool, int | None]:
-                        nonlocal prev_tail_feats, global_features, tgt_col, model, opt
-                        nonlocal tr_loss_epoch_sum, tr_samples, va_loss_epoch_sum, va_samples
-                        nonlocal global_trained_chunk_count
+                        # Define per-chunk processing to ensure training/checkpoint per fetched chunk
+                        def _process_chunk(df_chunk: pd.DataFrame) -> tuple[bool, int | None]:
+                            nonlocal prev_tail_feats, global_features, tgt_col, model, opt
+                            nonlocal tr_loss_epoch_sum, tr_samples, va_loss_epoch_sum, va_samples
+                            nonlocal global_trained_chunk_count
 
-                        if df_chunk.empty:
-                            return (False, None)
-                        # Transform 날짜 -> month
-                        convert_date_to_month_inplace(df_chunk)
-                        # Keep only feature columns (exclude 번호)
-                        feats = df_chunk[[c for c in avail_feats if c in df_chunk.columns]].copy()
-                        feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-                        # Lazy init model and features
-                        if global_features is None:
-                            if feats.empty:
+                            if df_chunk.empty:
                                 return (False, None)
-                            global_features = list(feats.columns)
-                            tgt = target_col or ("현재가" if "현재가" in global_features else global_features[0])
-                            if tgt not in global_features:
-                                raise ValueError(f"target_col '{tgt}' not in feature columns")
-                            tgt_col = tgt
-                            # Set num_classes for classification
-                            if aux_task == "direction3":
-                                cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len, num_classes=3, task="direction3")
-                            else:
-                                cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
-                            model = CNNLSTMAttn(cfg).to(device)
-                            opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-                            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                                opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
+                            # Transform 날짜 -> month
+                            convert_date_to_month_inplace(df_chunk)
+                            # Keep only feature columns (exclude 번호)
+                            feats = df_chunk[[c for c in avail_feats if c in df_chunk.columns]].copy()
+                            feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+                            # Lazy init model and features
+                            if global_features is None:
+                                if feats.empty:
+                                    return (False, None)
+                                global_features = list(feats.columns)
+                                tgt = target_col or ("현재가" if "현재가" in global_features else global_features[0])
+                                # Safety: for direction3, enforce price-like target if possible
+                                if aux_task == "direction3":
+                                    price_like = {"현재가", "종가", "시가", "고가", "저가"}
+                                    if tgt not in price_like and "현재가" in global_features:
+                                        print("[WARN] direction3 uses price change; switching target_col to '현재가' from non-price target")
+                                        tgt = "현재가"
+                                if tgt not in global_features:
+                                    raise ValueError(f"target_col '{tgt}' not in feature columns")
+                                tgt_col = tgt
+                                # Set num_classes for classification
+                                if aux_task == "direction3":
+                                    cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len, num_classes=3, task="direction3")
+                                else:
+                                    cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
+                                model = CNNLSTMAttn(cfg).to(device)
+                                opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+                                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                                    opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
+                                )
+                                
+                                # Load model state if resuming (only once when model is first created)
+                                if resume_from and os.path.exists(resume_from):
+                                    try:
+                                        checkpoint = load_checkpoint(resume_from, device)
+                                        model.load_state_dict(checkpoint["state_dict"])
+                                        # Load scheduler state if available
+                                        if "scheduler_state" in checkpoint:
+                                            scheduler.load_state_dict(checkpoint["scheduler_state"])
+                                            print("Model and scheduler state loaded from checkpoint")
+                                        else:
+                                            print("Model state loaded from checkpoint (no scheduler state)")
+                                    except Exception as e:
+                                        print(f"Failed to load model state: {e}")
+                                        print("Using fresh model...")
+                            # Align to global feature order
+                            feats = feats.reindex(columns=global_features, fill_value=0.0)
+                            
+                            # IMPORTANT: Do NOT re-normalize here. Datasets are already normalized
+                            # by scripts/normalize_datasets.py. Per-chunk normalization causes scale
+                            # drift across chunks and within concatenated tails, destabilizing loss.
+                            # Use features as-is.
+                            feats_all = pd.concat([prev_tail_feats, feats], axis=0, ignore_index=True) if prev_tail_feats is not None else feats
+
+                            # Build sequences from concatenated features
+                            T = len(feats_all)
+                            if T < (seq_len + horizon):
+                                prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
+                                return (False, None)
+                            X, y_arr = build_sequences_from_feats(
+                                feats_all, tgt_col, seq_len, horizon, aux_task, direction3_threshold
                             )
-                            
-                            # Load model state if resuming (only once when model is first created)
-                            if resume_from and os.path.exists(resume_from):
-                                try:
-                                    checkpoint = load_checkpoint(resume_from, device)
-                                    model.load_state_dict(checkpoint["state_dict"])
-                                    # Load scheduler state if available
-                                    if "scheduler_state" in checkpoint:
-                                        scheduler.load_state_dict(checkpoint["scheduler_state"])
-                                        print("Model and scheduler state loaded from checkpoint")
-                                    else:
-                                        print("Model state loaded from checkpoint (no scheduler state)")
-                                except Exception as e:
-                                    print(f"Failed to load model state: {e}")
-                                    print("Using fresh model...")
-                        # Align to global feature order
-                        feats = feats.reindex(columns=global_features, fill_value=0.0)
-                        
-                        # IMPORTANT: Do NOT re-normalize here. Datasets are already normalized
-                        # by scripts/normalize_datasets.py. Per-chunk normalization causes scale
-                        # drift across chunks and within concatenated tails, destabilizing loss.
-                        # Use features as-is.
-                        feats_all = pd.concat([prev_tail_feats, feats], axis=0, ignore_index=True) if prev_tail_feats is not None else feats
 
-                        # Build sequences from concatenated features
-                        T = len(feats_all)
-                        if T < (seq_len + horizon):
-                            prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
-                            return (False, None)
-                        X, y_arr = build_sequences_from_feats(
-                            feats_all, tgt_col, seq_len, horizon, aux_task, direction3_threshold
-                        )
+                            if X.size == 0:
+                                prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
+                                return (False, None)
 
-                        if X.size == 0:
-                            prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
-                            return (False, None)
+                            # We produced sequences => a trained chunk
+                            global_trained_chunk_count += 1
 
-                        # We produced sequences => a trained chunk
-                        global_trained_chunk_count += 1
+                            # split
+                            X_tr, y_tr, X_va, y_va = train_val_split(X, y_arr, val_ratio=0.2)
 
-                        # split
-                        X_tr, y_tr, X_va, y_va = train_val_split(X, y_arr, val_ratio=0.2)
+                            # Build dataloaders
+                            train_loader, val_loader = make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size, aux_task)
 
-                        # Build dataloaders
-                        train_loader, val_loader = make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size, aux_task)
+                            # For 3-class classification, compute class weights per chunk
+                            local_loss_fn = make_loss_fn(aux_task, y_tr, device, loss_type, huber_delta)
 
-                        # For 3-class classification, compute class weights per chunk
-                        local_loss_fn = make_loss_fn(aux_task, y_tr, device, loss_type, huber_delta)
-
-                        # train
-                        model.train()
-                        batch_count = 0
-                        for xb, yb in train_loader:
-                            xb = xb.to(device)
-                            yb = yb.to(device)
-                            opt.zero_grad()
-                            pred = model(xb)
-                            if aux_task == "direction3":
-                                loss = local_loss_fn(pred, yb.long())
-                            else:
-                                loss = loss_fn(pred, yb)
-                            loss.backward()
-                            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                            opt.step()
-                            tr_loss_epoch_sum += loss.item() * len(xb)
-                            tr_samples += len(xb)
-                            
-                            # Log batch-level metrics to TensorBoard
-                            if writer and batch_count % 10 == 0:  # Log every 10 batches
-                                global_step = (epoch - 1) * 1000 + global_trained_chunk_count * 10 + batch_count
-                                writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
-                                writer.add_scalar('Learning_Rate', opt.param_groups[0]['lr'], global_step)
-                            batch_count += 1
-
-                        # val
-                        model.eval()
-                        with torch.no_grad():
-                            for xb, yb in val_loader:
+                            # train
+                            model.train()
+                            batch_count = 0
+                            for xb, yb in train_loader:
                                 xb = xb.to(device)
                                 yb = yb.to(device)
+                                opt.zero_grad()
                                 pred = model(xb)
                                 if aux_task == "direction3":
                                     loss = local_loss_fn(pred, yb.long())
                                 else:
                                     loss = loss_fn(pred, yb)
-                                va_loss_epoch_sum += loss.item() * len(xb)
-                                va_samples += len(xb)
-                                # accumulate for metrics
-                                accumulate_val(aux_task, pred, yb, va_preds_all, va_targets_all)
-
-                        # update tail
-                        prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
-
-                        # return trained True and end 번호 if present
-                        end_no = None
-                        if "번호" in df_chunk.columns:
-                            try:
-                                end_no = int(df_chunk["번호"].iloc[-1])
-                            except Exception:
-                                end_no = None
-                        return (True, end_no)
-
-                    if has_no:
-                        # Keyset pagination using 번호 to avoid huge OFFSET scans
-                        # Seed last_no from resume if provided
-                        last_no = int(resume_last_no) if resume_last_no is not None else None
-                        # Clear after first use
-                        resume_last_no = None
-                        
-                        # If resuming with keyset pagination, estimate current position
-                        estimated_processed = 0
-                        started_with_keyset = False
-                        if resume_chunk_count > 0 and last_no is not None:
-                            started_with_keyset = True
-                            # Estimate how many rows we've processed based on last_no
-                            try:
-                                # Build the count query with proper WHERE/AND logic
-                                if where_sql:
-                                    count_sql = f"SELECT COUNT(*) FROM {table}{where_sql} AND \"번호\" <= ?"
-                                else:
-                                    count_sql = f"SELECT COUNT(*) FROM {table} WHERE \"번호\" <= ?"
-                                count_params = list(params) + [last_no]
-                                estimated_processed = conn.execute(count_sql, count_params).fetchone()[0]
-                                processed = estimated_processed
-                                print(f"[KEYSET-RESUME] file={os.path.basename(fpath)} resuming from 번호={last_no}, estimated_processed={estimated_processed}/{total}")
-                            except Exception as e:
-                                print(f"[KEYSET-RESUME] Failed to estimate position: {e}")
-                        
-                        # If resuming but no keyset info, calculate chunks to skip
-                        elif resume_chunk_count > 0:
-                            remaining_chunks_to_skip = resume_chunk_count - global_chunk_count
-                            if remaining_chunks_to_skip > 0:
-                                # Calculate how many chunks this file can contribute to skipping
-                                max_chunks_in_file = (total + step - 1) // step  # ceiling division
-                                chunks_to_skip_in_file = min(remaining_chunks_to_skip, max_chunks_in_file)
+                                loss.backward()
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                                opt.step()
+                                tr_loss_epoch_sum += loss.item() * len(xb)
+                                tr_samples += len(xb)
                                 
-                                if chunks_to_skip_in_file > 0:
-                                    # Skip chunks by using OFFSET
-                                    skip_offset = chunks_to_skip_in_file * step
-                                    processed += skip_offset
-                                    chunk_idx += chunks_to_skip_in_file
-                                    global_chunk_count += chunks_to_skip_in_file
-                                    
-                                    print(f"[FAST-SKIP] file={os.path.basename(fpath)} skipped {chunks_to_skip_in_file} chunks (offset={skip_offset}) chunk={global_chunk_count}/{resume_chunk_count}")
-                                    
-                                    # If we've skipped all chunks in this file, continue to next file
-                                    if chunks_to_skip_in_file >= max_chunks_in_file:
-                                        continue
-                                    
-                                    # Start from the offset position
-                                    if last_no is None:
-                                        # Use OFFSET to jump to the right position
-                                        skip_sql = f"SELECT \"번호\" FROM {table}{where_sql} ORDER BY \"번호\" ASC LIMIT 1 OFFSET {skip_offset - 1}"
-                                        try:
-                                            result = conn.execute(skip_sql, params).fetchone()
-                                            if result:
-                                                last_no = int(result[0])
-                                        except:
-                                            pass
-                        
-                        while True:
-                            base_sql = f"SELECT {col_sql} FROM {table}{where_sql} ORDER BY \"번호\" ASC LIMIT {step}"
-                            if last_no is None:
-                                sql = base_sql
-                                params2 = list(params)
-                            else:
-                                extra = (" AND " if where_sql else " WHERE ") + '"번호" > ?'
-                                sql = f"SELECT {col_sql} FROM {table}{where_sql}{extra} ORDER BY \"번호\" ASC LIMIT {step}"
-                                params2 = list(params) + [last_no]
-                            df_chunk = conn.execute(sql, params2).df()
-                            if df_chunk.empty:
-                                break
-                            processed += len(df_chunk)
-                            chunk_idx += 1
-                            global_chunk_count += 1
+                                # Log batch-level metrics to TensorBoard
+                                if writer and batch_count % 10 == 0:  # Log every 10 batches
+                                    global_step = (epoch - 1) * 1000 + global_trained_chunk_count * 10 + batch_count
+                                    writer.add_scalar('Loss/Train_Batch', loss.item(), global_step)
+                                    writer.add_scalar('Learning_Rate', opt.param_groups[0]['lr'], global_step)
+                                batch_count += 1
 
-                            # Skip training if resuming and haven't reached resume trained chunk yet
-                            # But if we started with keyset info, we're already at the right position
-                            if resume_chunk_count > 0 and global_chunk_count <= resume_chunk_count and not started_with_keyset:
-                                if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                    print(f"[SKIP-TRAINED] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} processed={processed}/{total} (skipping already trained chunk)")
-                                if "번호" in df_chunk.columns:
-                                    last_no = int(df_chunk["번호"].iloc[-1])
-                                continue
+                            # val
+                            model.eval()
+                            with torch.no_grad():
+                                for xb, yb in val_loader:
+                                    xb = xb.to(device)
+                                    yb = yb.to(device)
+                                    pred = model(xb)
+                                    if aux_task == "direction3":
+                                        loss = local_loss_fn(pred, yb.long())
+                                    else:
+                                        loss = loss_fn(pred, yb)
+                                    va_loss_epoch_sum += loss.item() * len(xb)
+                                    va_samples += len(xb)
+                                    # accumulate for metrics
+                                    accumulate_val(aux_task, pred, yb, va_preds_all, va_targets_all)
 
-                            if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                print(f"[TRAINING] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} processed={processed}/{total} (training chunk)")
+                            # update tail
+                            prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
 
-                            # update last_no for next page
+                            # return trained True and end 번호 if present
+                            end_no = None
                             if "번호" in df_chunk.columns:
-                                last_no = int(df_chunk["번호"].iloc[-1])
+                                try:
+                                    end_no = int(df_chunk["번호"].iloc[-1])
+                                except Exception:
+                                    end_no = None
+                            return (True, end_no)
 
-                            # Process this chunk immediately
-                            trained, end_no = _process_chunk(df_chunk)
+                        # In-group pagination and training (moved inside group loop)
+                        if has_no:
+                            # Keyset pagination per group
+                            group_last_no = int(resume_last_no) if resume_last_no is not None else None
+                            started_with_keyset = False
+                            if resume_chunk_count > 0 and group_last_no is not None:
+                                started_with_keyset = True
+                            while True:
+                                base_sql = f"SELECT {col_sql} FROM {table}{where_sql} ORDER BY \"번호\" ASC LIMIT {step}"
+                                if group_last_no is None:
+                                    sql = base_sql
+                                    params2 = list(params)
+                                else:
+                                    extra = (" AND " if where_sql else " WHERE ") + '"번호" > ?'
+                                    sql = f"SELECT {col_sql} FROM {table}{where_sql}{extra} ORDER BY \"번호\" ASC LIMIT {step}"
+                                    params2 = list(params) + [group_last_no]
+                                df_chunk = conn.execute(sql, params2).df()
+                                if df_chunk.empty:
+                                    break
+                                processed += len(df_chunk)
+                                chunk_idx += 1
+                                global_chunk_count += 1
 
-                            # per N trained chunks checkpoint (after processing so we can include file and end_no)
-                            if trained and (checkpoint_every_chunks is not None and checkpoint_every_chunks > 0 and
-                                global_trained_chunk_count % checkpoint_every_chunks == 0):
-                                chunk_ckpt_path = os.path.join(ckpt_dir, f"model_chunk_trained{global_trained_chunk_count}.pt")
-                                cfg_dict = model.cfg.__dict__ if hasattr(model, 'cfg') else {"input_features": len(global_features), "seq_len": seq_len}
-                                save_checkpoint(
-                                    chunk_ckpt_path,
-                                    state_dict=model.state_dict(),
-                                    config_dict=cfg_dict,
-                                    feature_names=list(global_features or []),
-                                    target_col=tgt_col,
-                                    horizon=horizon,
-                                    aux_task=aux_task,
-                                    # Save both keys for compatibility + keyset hint
-                                    extra={
-                                        "epoch": epoch,
-                                        "trained_chunks": global_trained_chunk_count,
-                                        "chunk": global_trained_chunk_count,
-                                        "file": os.path.basename(fpath),
-                                        "last_no": end_no,
-                                    },
-                                )
-                                print(f"Saved chunk checkpoint: {chunk_ckpt_path} (trained_chunks {global_trained_chunk_count})")
-                    else:
-                        # Fallback to OFFSET pagination (slower). Consider reducing chunk_size if slow.
-                        
-                        # If resuming, calculate starting offset to skip already processed chunks
-                        start_offset = 0
-                        if resume_chunk_count > 0:
-                            remaining_chunks_to_skip = resume_chunk_count - global_chunk_count
-                            if remaining_chunks_to_skip > 0:
-                                max_chunks_in_file = (total + step - 1) // step
-                                chunks_to_skip_in_file = min(remaining_chunks_to_skip, max_chunks_in_file)
-                                
-                                if chunks_to_skip_in_file > 0:
-                                    start_offset = chunks_to_skip_in_file * step
-                                    processed += start_offset
-                                    chunk_idx += chunks_to_skip_in_file
-                                    global_chunk_count += chunks_to_skip_in_file
-                                    
-                                    print(f"[FAST-SKIP-OFFSET] file={os.path.basename(fpath)} skipped {chunks_to_skip_in_file} chunks (offset={start_offset}) chunk={global_chunk_count}/{resume_chunk_count}")
-                                    
-                                    # If we've skipped all chunks in this file, continue to next file
-                                    if start_offset >= total:
-                                        continue
-                        
-                        for offset in range(start_offset, total, step):
-                            order_sql = ""  # no stable key; OFFSET may be expensive
-                            sql = f"SELECT {col_sql} FROM {table}{where_sql}{order_sql} LIMIT {step} OFFSET {offset}"
-                            df_chunk = conn.execute(sql, params).df()
-                            if df_chunk.empty:
-                                continue
-                            processed += len(df_chunk)
-                            chunk_idx += 1
-                            global_chunk_count += 1
+                                # Skip training if resuming and haven't reached resume trained chunk yet
+                                if resume_chunk_count > 0 and global_chunk_count <= resume_chunk_count and not started_with_keyset:
+                                    if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
+                                        print(f"[SKIP-TRAINED] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} processed={processed}/{total} (skipping already trained chunk)")
+                                    if "번호" in df_chunk.columns:
+                                        group_last_no = int(df_chunk["번호"].iloc[-1])
+                                    continue
 
-                            # Skip training if resuming and haven't reached resume trained chunk yet
-                            if resume_chunk_count > 0 and global_chunk_count <= resume_chunk_count:
                                 if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                    print(f"[SKIP-TRAINED-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} processed={processed}/{total} (skipping already trained chunk)")
-                                continue
+                                    print(f"[TRAINING] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} processed={processed}/{total} (training chunk)")
 
-                            if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
-                                print(f"[TRAINING-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} processed={processed}/{total} (training chunk)")
+                                # update last_no for next page
+                                if "번호" in df_chunk.columns:
+                                    group_last_no = int(df_chunk["번호"].iloc[-1])
 
-                            # Process this chunk immediately
-                            trained, _ = _process_chunk(df_chunk)
-                            if trained and (checkpoint_every_chunks is not None and checkpoint_every_chunks > 0 and
-                                global_trained_chunk_count % checkpoint_every_chunks == 0):
-                                chunk_ckpt_path = os.path.join(ckpt_dir, f"model_chunk_trained{global_trained_chunk_count}.pt")
-                                cfg_dict = model.cfg.__dict__ if hasattr(model, 'cfg') else {"input_features": len(global_features), "seq_len": seq_len}
-                                save_checkpoint(
-                                    chunk_ckpt_path,
-                                    state_dict=model.state_dict(),
-                                    config_dict=cfg_dict,
-                                    feature_names=list(global_features or []),
-                                    target_col=tgt_col,
-                                    horizon=horizon,
-                                    aux_task=aux_task,
-                                    extra={
-                                        "epoch": epoch,
-                                        "trained_chunks": global_trained_chunk_count,
-                                        "chunk": global_trained_chunk_count,
-                                        "file": os.path.basename(fpath),
-                                        "last_no": None,
-                                    },
-                                )
-                                print(f"Saved chunk checkpoint: {chunk_ckpt_path} (trained_chunks {global_trained_chunk_count})")
+                                # Process this chunk immediately
+                                trained, end_no = _process_chunk(df_chunk)
+
+                                # per N trained chunks checkpoint (after processing so we can include file and end_no)
+                                if trained and (checkpoint_every_chunks is not None and checkpoint_every_chunks > 0 and
+                                    global_trained_chunk_count % checkpoint_every_chunks == 0):
+                                    chunk_ckpt_path = os.path.join(ckpt_dir, f"model_chunk_trained{global_trained_chunk_count}.pt")
+                                    cfg_dict = model.cfg.__dict__ if hasattr(model, 'cfg') else {"input_features": len(global_features), "seq_len": seq_len}
+                                    save_checkpoint(
+                                        chunk_ckpt_path,
+                                        state_dict=model.state_dict(),
+                                        config_dict=cfg_dict,
+                                        feature_names=list(global_features or []),
+                                        target_col=tgt_col,
+                                        horizon=horizon,
+                                        aux_task=aux_task,
+                                        extra={
+                                            "epoch": epoch,
+                                            "trained_chunks": global_trained_chunk_count,
+                                            "chunk": global_trained_chunk_count,
+                                            "file": os.path.basename(fpath),
+                                            "last_no": end_no,
+                                        },
+                                    )
+                                    print(f"Saved chunk checkpoint: {chunk_ckpt_path} (trained_chunks {global_trained_chunk_count})")
+                        else:
+                            # OFFSET pagination per group (slower)
+                            start_offset = 0
+                            if resume_chunk_count > 0:
+                                # we don't estimate by group; start_offset remains 0 to simplify
+                                pass
+                            for offset in range(start_offset, total, step):
+                                order_sql = ""  # no stable key; OFFSET may be expensive
+                                sql = f"SELECT {col_sql} FROM {table}{where_sql}{order_sql} LIMIT {step} OFFSET {offset}"
+                                df_chunk = conn.execute(sql, params).df()
+                                if df_chunk.empty:
+                                    continue
+                                processed += len(df_chunk)
+                                chunk_idx += 1
+                                global_chunk_count += 1
+
+                                # Skip training if resuming and haven't reached resume trained chunk yet
+                                if resume_chunk_count > 0 and global_chunk_count <= resume_chunk_count:
+                                    if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
+                                        print(f"[SKIP-TRAINED-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count}/{resume_chunk_count} processed={processed}/{total} (skipping already trained chunk)")
+                                    continue
+
+                                if progress_every > 0 and (chunk_idx % progress_every == 0 or processed >= total):
+                                    print(f"[TRAINING-OFFSET] file={os.path.basename(fpath)} epoch={epoch} chunk={global_chunk_count} processed={processed}/{total} (training chunk)")
+
+                                # Process this chunk immediately
+                                trained, _ = _process_chunk(df_chunk)
+                                if trained and (checkpoint_every_chunks is not None and checkpoint_every_chunks > 0 and
+                                    global_trained_chunk_count % checkpoint_every_chunks == 0):
+                                    chunk_ckpt_path = os.path.join(ckpt_dir, f"model_chunk_trained{global_trained_chunk_count}.pt")
+                                    cfg_dict = model.cfg.__dict__ if hasattr(model, 'cfg') else {"input_features": len(global_features), "seq_len": seq_len}
+                                    save_checkpoint(
+                                        chunk_ckpt_path,
+                                        state_dict=model.state_dict(),
+                                        config_dict=cfg_dict,
+                                        feature_names=list(global_features or []),
+                                        target_col=tgt_col,
+                                        horizon=horizon,
+                                        aux_task=aux_task,
+                                        extra={
+                                            "epoch": epoch,
+                                            "trained_chunks": global_trained_chunk_count,
+                                            "chunk": global_trained_chunk_count,
+                                            "file": os.path.basename(fpath),
+                                            "last_no": None,
+                                        },
+                                    )
+                                    print(f"Saved chunk checkpoint: {chunk_ckpt_path} (trained_chunks {global_trained_chunk_count})")
+
+                        # (moved _process_chunk above)
+
+                    # Removed legacy global pagination; now handled inside per-group loop above.
                 finally:
                     conn.close()
 
