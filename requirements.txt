@@ -14,3 +14,6 @@ tensorboard>=2.14
 gymnasium>=0.29
 stable-baselines3>=2.3.0
 duckdb>=1.4.0
+
+# Env loader
+python-dotenv>=1.0
