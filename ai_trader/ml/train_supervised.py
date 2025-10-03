@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import pandas as pd
 import duckdb
 from torch.utils.tensorboard import SummaryWriter
+import sys
 
 from .data import load_real_dataframe
 from .models import CNNLSTMAttn, ModelConfig
@@ -271,6 +272,49 @@ def compute_epoch_metrics(aux_task: str, targets_all: list, preds_all: list):
         y_pred = _np.array(preds_all, dtype=_np.int64)
         va_acc = float((y_true == y_pred).mean()) if y_true.size > 0 else 0.0
     return va_r, va_r2, va_acc
+
+
+def _diagnose_and_abort(scope: str,
+                        val_loss: float | None,
+                        y_true_list: list[int] | None,
+                        y_pred_list: list[int] | None) -> None:
+    """간단 자동 진단: 분류(direction3)에서 기준선 수준 정체/클래스 붕괴/다수 클래스 기준선 정착을 감지하면 중단.
+
+    scope: 'chunk' | 'epoch' (표시용)
+    """
+    issues: list[str] = []
+
+    # 1) 검증 손실이 3-클래스 기준선(ln(3)≈1.0986)에 정체
+    if val_loss is not None and not np.isnan(val_loss) and not np.isinf(val_loss):
+        if abs(float(val_loss) - float(np.log(3.0))) < 0.02:
+            issues.append("검증 손실이 3-클래스 기준선 수준(≈ln(3))에 정체되어 있습니다.")
+
+    # 2) 예측 붕괴/다수 클래스 기준선
+    if y_true_list and y_pred_list:
+        yt = np.array(y_true_list, dtype=np.int64)
+        yp = np.array(y_pred_list, dtype=np.int64)
+        if yt.size > 0 and yp.size > 0:
+            acc = float((yt == yp).mean())
+            # 분포
+            def prop(arr):
+                out = [float((arr == c).mean() if arr.size > 0 else 0.0) for c in (0, 1, 2)]
+                return out
+            p_true = prop(yt)
+            p_pred = prop(yp)
+            # collapse: 단일 클래스 98% 이상
+            if max(p_pred) > 0.98 and sum(1 for v in p_pred if v < 0.01) >= 2:
+                issues.append(f"예측 붕괴 감지: 최근 {scope} 검증에서 단일 클래스에 거의 수렴했습니다. 예측분포={p_pred}")
+            # majority baseline 근접
+            majority = max(p_true)
+            if abs(acc - majority) < 0.02:
+                issues.append(f"검증 정확도가 최근 실제 분포의 다수 클래스 기준선에 근접합니다 (acc={acc:.3f}, baseline={majority:.3f}).")
+
+    if issues:
+        print("\n=== 자동 진단: 잠재적 문제 감지 (학습 중단) ===")
+        for i, msg in enumerate(issues, 1):
+            print(f"[{i}] {msg}")
+        print("진단으로 학습을 중단합니다.")
+        sys.exit(2)
 
 
 def _fmt_int(n: int) -> str:
@@ -840,6 +884,16 @@ def train(
                                 if (global_trained_chunk_count % 10) == 0:
                                     writer.flush()
 
+                            # Automated diagnosis per chunk (direction3 only)
+                            if aux_task == 'direction3' and va_chunk_n > 0:
+                                val_chunk_loss = float(va_chunk_sum / max(1, va_chunk_n))
+                                _diagnose_and_abort(
+                                    scope='chunk',
+                                    val_loss=val_chunk_loss,
+                                    y_true_list=y_true_c2,
+                                    y_pred_list=y_pred_c2,
+                                )
+
                             # update tail
                             prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
 
@@ -975,6 +1029,15 @@ def train(
             va_loss_avg = va_loss_epoch_sum / max(1, va_samples)
             # Compute validation metrics (DRY)
             va_r, va_r2, va_acc = compute_epoch_metrics(aux_task, va_targets_all, va_preds_all)
+
+            # Automated diagnosis per epoch (direction3 only)
+            if aux_task == 'direction3':
+                _diagnose_and_abort(
+                    scope='epoch',
+                    val_loss=float(va_loss_avg),
+                    y_true_list=va_targets_all,
+                    y_pred_list=va_preds_all,
+                )
             
             # Update learning rate scheduler
             if 'scheduler' in locals():
@@ -1263,6 +1326,15 @@ def train(
         
         # Compute validation metrics (DRY)
         va_r, va_r2, va_acc = compute_epoch_metrics(aux_task, va_targets_list, va_preds_list)
+
+        # Automated diagnosis per epoch (direction3 only)
+        if aux_task == 'direction3':
+            _diagnose_and_abort(
+                scope='epoch',
+                val_loss=float(va_loss),
+                y_true_list=va_targets_list,
+                y_pred_list=va_preds_list,
+            )
         
         # Update learning rate scheduler
         old_lr = opt.param_groups[0]['lr']
