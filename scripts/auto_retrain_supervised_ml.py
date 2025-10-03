@@ -44,6 +44,9 @@ except Exception:
     pass
 
 # ---------------- 설정 ----------------
+# 메모리 파일 경로 (이 스크립트와 같은 디렉터리 아래에 생성)
+MEMORY_PATH = os.path.join(os.path.dirname(__file__), 
+                           ".auto_retrain_supervised_ml.memory.json")
 # 기본 학습 CLI (사용자 예시 기반)
 BASE_CMD: List[str] = shlex.split(
     r'''./.venv64/Scripts/python -m ai_trader.ml.train_supervised 
@@ -168,7 +171,46 @@ def kv_to_cmd(base: List[str], kv: Dict[str, Any]) -> List[str]:
     return out
 
 
-def build_prompt(stdout_tail: str, stderr_tail: str, current_kv: Dict[str, Any]) -> str:
+# ---------------- 메모리 관리 ----------------
+def load_memory() -> Dict[str, Any]:
+    try:
+        if os.path.exists(MEMORY_PATH):
+            with open(MEMORY_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {"interactions": []}
+
+
+def save_memory(mem: Dict[str, Any]) -> None:
+    try:
+        with open(MEMORY_PATH, 'w', encoding='utf-8') as f:
+            json.dump(mem, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[경고] 메모리 저장 실패: {e}")
+
+
+def summarize_history(mem: Dict[str, Any]) -> str:
+    if not mem or not mem.get("interactions"):
+        return "(이전 대화 없음)"
+    lines: list[str] = []
+    for item in mem["interactions"][-5:]:
+        attempt = item.get("attempt")
+        applied_kv = item.get("applied_kv", {})
+        changed = ", ".join([f"{k}={v}" for k, v in applied_kv.items()]) if applied_kv else "(적용 없음)"
+        lines.append(f"- 시도#{attempt}: 적용 {changed}")
+    return "\n".join(lines)
+
+
+def already_tried_pairs(mem: Dict[str, Any]) -> set[tuple]:
+    tried: set[tuple] = set()
+    for item in mem.get("interactions", []):
+        for k, v in item.get("applied_kv", {}).items():
+            tried.add((k, v))
+    return tried
+
+
+def build_prompt(stdout_tail: str, stderr_tail: str, current_kv: Dict[str, Any], history_summary: str, tried_pairs: List[str]) -> str:
     return textwrap.dedent(f"""
     역할: 당신은 머신러닝 트레이닝 자동화 도우미입니다. 아래 로그를 분석해 실패 원인을 간단히 요약하고,
     허용된 범위 내에서 CLI 하이퍼파라미터를 수정해 다음 재시도에 사용할 JSON을 제공합니다.
@@ -184,9 +226,16 @@ def build_prompt(stdout_tail: str, stderr_tail: str, current_kv: Dict[str, Any])
     - 허용 키만 제안: {list(ALLOWED_KEYS.keys())}
     - 한 번에 최대 2개 키만 변경하세요.
     - 권장 범위: threshold[0.001,0.02], horizon[5,60], lr[1e-5,3e-3], weight-decay[0,1e-2], batch-size[32,512]
+    - 아래의 '이미 시도한 변경'과 동일한 제안은 피하세요. 동일한 (key,value) 조합을 다시 제안하지 마세요.
 
     현재 CLI 값:
     {json.dumps(current_kv, ensure_ascii=False)}
+
+    이미 시도한 변경 요약:
+    {history_summary}
+
+    이미 시도한 (key,value) 목록:
+    {json.dumps(tried_pairs, ensure_ascii=False)}
 
     최근 STDOUT:
     ```
@@ -236,7 +285,7 @@ def ask_chatgpt(prompt: str) -> Dict[str, Any]:
         sys.exit(5)
 
 
-def apply_suggestions(current_kv: Dict[str, Any], suggestions: Dict[str, Any]) -> Dict[str, Any]:
+def apply_suggestions(current_kv: Dict[str, Any], suggestions: Dict[str, Any], mem: Dict[str, Any]) -> Dict[str, Any]:
     sug_args = suggestions.get("suggested_args", {}) if suggestions else {}
     changed_keys = suggestions.get("changed_keys", []) if suggestions else []
     print("\n[정보] ChatGPT 제안:")
@@ -245,8 +294,12 @@ def apply_suggestions(current_kv: Dict[str, Any], suggestions: Dict[str, Any]) -
     # 필터링: 허용 키와 유효성 검사
     new_kv = dict(current_kv)
     applied = []
+    tried = already_tried_pairs(mem)
     for k, v in sug_args.items():
         if k in ALLOWED_KEYS and ALLOWED_KEYS[k](v):
+            # 중복 (key,value) 시도 방지
+            if (k, v) in tried:
+                continue
             new_kv[k] = v if not isinstance(v, float) else float(v)
             applied.append(k)
     # 2개 초과 변경은 제한
@@ -273,6 +326,7 @@ def apply_suggestions(current_kv: Dict[str, Any], suggestions: Dict[str, Any]) -
 def main():
     attempt = 1
     cmd = BASE_CMD
+    mem = load_memory()
     while attempt <= MAX_ATTEMPTS:
         print("\n" + "="*20 + f" 시도 #{attempt} " + "="*20)
         proc = run_training(cmd)
@@ -287,10 +341,22 @@ def main():
         stdout_tail = proc.stdout[-2000:]
         stderr_tail = proc.stderr[-1000:]
         current_kv = cmd_list_to_kv(cmd)
-        prompt = build_prompt(stdout_tail, stderr_tail, current_kv)
+        hist_summary = summarize_history(mem)
+        tried_pairs = [f"{k}={v}" for (k, v) in sorted(list(already_tried_pairs(mem)))]
+        prompt = build_prompt(stdout_tail, stderr_tail, current_kv, hist_summary, tried_pairs)
         suggestions = ask_chatgpt(prompt)
-        new_kv = apply_suggestions(current_kv, suggestions)
+        new_kv = apply_suggestions(current_kv, suggestions, mem)
         cmd = kv_to_cmd(cmd, new_kv)
+
+        # 메모리에 기록
+        applied_kv = {k: new_kv.get(k) for k in ALLOWED_KEYS.keys() if k in new_kv and current_kv.get(k) != new_kv.get(k)}
+        mem.setdefault("interactions", []).append({
+            "attempt": attempt,
+            "prompt": prompt,
+            "response": suggestions,
+            "applied_kv": applied_kv,
+        })
+        save_memory(mem)
 
         print("\n[정보] 수정된 CLI로 재시작합니다:")
         print(" ", " ".join(cmd))
