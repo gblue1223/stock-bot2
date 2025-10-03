@@ -15,8 +15,8 @@
   python scripts/auto_retrain_supervised_ml.py
 
 주의
-- 현재 학습 코드는 손실 종류에 ce/mse/huber만 지원합니다. (focal 미지원)
-- 안전한 변경만 적용합니다: direction3-threshold, horizon, lr, weight-decay, batch-size
+- 현재 학습 코드는 회귀(mse/huber)와 분류(ce/focal)를 지원합니다.
+- 안전한 변경 우선: direction3-threshold, horizon, lr, weight-decay, batch-size, label-smoothing, focal-gamma, loss, seq-len
 """
 import os
 import sys
@@ -49,30 +49,34 @@ MEMORY_PATH = os.path.join(os.path.dirname(__file__),
                            ".auto_retrain_supervised_ml.memory.json")
 # 기본 학습 CLI (사용자 예시 기반)
 BASE_CMD: List[str] = shlex.split(
-    r'''./.venv64/Scripts/python -m ai_trader.ml.train_supervised 
-    --db "C:\\Users\\user\\Workspace\\datasets@20251002\\datasets_norm_all.duckdb" 
-    --table datasets 
-    --out models/supervised 
-    --seq-len 60 
-    --horizon 20 
-    --chunk-size 50000 
-    --device cuda 
-    --batch-size 128 
-    --epochs 10 
-    --lr 3e-4 
-    --weight-decay 0 
-    --progress-every 10 
-    --ckpt-every-chunks 50 
-    --resume-from models/supervised/checkpoints 
-    --target-col 현재가 
-    --aux-task direction3 
-    --loss ce 
-    --direction3-threshold 0.015
-    --auto-diagnosis abort 
-    --diag-warmup-chunks 10 
-    --diag-warmup-epochs 1 
-    --diag-min-val-samples 512 
-    --diag-require-consecutive 2'''
+    r'''./.venv64/Scripts/python -m ai_trader.ml.train_supervised
+  --db "C:\Users\user\Workspace\datasets@20251002\datasets_norm_all.duckdb"
+  --table datasets
+  --out models/supervised
+  --seq-len 60
+  --horizon 20
+  --chunk-size 50000
+  --device cuda
+  --batch-size 128
+  --epochs 10
+  --lr 1e-4
+  --weight-decay 1e-4
+  --progress-every 10
+  --ckpt-every-chunks 50
+  --resume-from models/supervised/checkpoints
+  --target-col 현재가
+ 
+  --aux-task direction3
+  --loss ce
+  --label-smoothing 0.05
+  --use-weighted-sampler
+  --direction3-threshold 0.015
+ 
+  --auto-diagnosis abort
+  --diag-warmup-chunks 10
+  --diag-warmup-epochs 1
+  --diag-min-val-samples 512
+  --diag-require-consecutive 2'''
 )
 
 # 최대 재시도 횟수
@@ -80,11 +84,19 @@ MAX_ATTEMPTS = 3
 
 # 허용 변경 키 및 검증 규칙
 ALLOWED_KEYS = {
+    # Class distribution / label policy
     "direction3-threshold": lambda v: isinstance(v, (int, float)) and 0.001 <= float(v) <= 0.02,
+    # Temporal horizon and input length
     "horizon": lambda v: isinstance(v, int) and 5 <= v <= 60,
+    "seq-len": lambda v: isinstance(v, int) and 20 <= v <= 200,
+    # Optimizer settings
     "lr": lambda v: isinstance(v, (int, float)) and 1e-5 <= float(v) <= 3e-3,
     "weight-decay": lambda v: isinstance(v, (int, float)) and 0.0 <= float(v) <= 1e-2,
     "batch-size": lambda v: isinstance(v, int) and 32 <= v <= 512,
+    # Classification loss shaping (direction3)
+    "label-smoothing": lambda v: isinstance(v, (int, float)) and 0.0 <= float(v) <= 0.3,
+    "focal-gamma": lambda v: isinstance(v, (int, float)) and 0.0 <= float(v) <= 5.0,
+    "loss": lambda v: isinstance(v, str) and v in {"ce", "focal", "mse", "huber"},
 }
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
