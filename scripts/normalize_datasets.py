@@ -447,6 +447,11 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
 
     # Define column groups
     logstd_cols = set([
+        # 가격 관련 (CRITICAL: 로그 변환 필수)
+        "현재가", "시가", "고가", "저가",
+        *[f"매도호가{i}" for i in range(1, 11)],
+        *[f"매수호가{i}" for i in range(1, 11)],
+        # 거래량/금액 관련
         "거래량", "누적거래량", "누적거래대금", "거래회전율",
         *[f"매도호가수량{i}" for i in range(1, 11)],
         *[f"매수호가수량{i}" for i in range(1, 11)],
@@ -459,14 +464,21 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         "외국계매도추정합", "외국계매수추정합", "외국계매도추정합변동", "외국계매수추정합변동",
     ])
 
-    stdonly_cols = set(["매도호가총잔량직전대비", "매수호가총잔량직전대비", "등락률"])
+    stdonly_cols = set([
+        "매도호가총잔량직전대비", "매수호가총잔량직전대비", "등락률",
+        # 직전대비 컬럼들 (이미 변화율이므로 표준화만)
+        *[f"매도호가직전대비{i}" for i in range(1, 11)],
+        *[f"매수호가직전대비{i}" for i in range(1, 11)],
+        "전일거래량대비", "전일거래량대비비율",
+    ])
 
     broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
 
-    # Ensure optional columns exist
-    for col in list(logstd_cols | stdonly_cols):
-        if col not in out.columns:
-            out[col] = 0
+    # Ensure optional numeric columns exist (batch add to avoid fragmentation)
+    missing_numeric = [col for col in (logstd_cols | stdonly_cols) if col not in out.columns]
+    if missing_numeric:
+        add_df = pd.DataFrame({col: pd.Series(0.0, index=out.index) for col in missing_numeric}, index=out.index)
+        out = pd.concat([out, add_df], axis=1)
 
     # Log + Standard scaling (signed log1p then z-score)
     for col in sorted(logstd_cols):
@@ -480,15 +492,17 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
 
     # Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
     broker_scalar_cols: List[str] = []
+    _broker_new: Dict[str, pd.Series] = {}
     for col in broker_cat_cols:
         if col in out.columns:
             cats = out[col].astype(str).replace({"nan": ""})
             # Build per-column char dictionary
             unique_chars = sorted(set("".join(cats.tolist())))
+            scalar_col = f"{col}_scalar"
             if len(unique_chars) == 0:
                 # empty column -> scalar zeros
-                out[f"{col}_scalar"] = 0.0
-                broker_scalar_cols.append(f"{col}_scalar")
+                _broker_new[scalar_col] = pd.Series(0.0, index=out.index)
+                broker_scalar_cols.append(scalar_col)
                 continue
             char_to_id = {ch: i + 1 for i, ch in enumerate(unique_chars)}  # 1..N
             max_id = float(len(unique_chars))
@@ -502,15 +516,19 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
                 # mean of ids normalized by max id -> [0,1]
                 return float(np.mean(ids)) / max_id
 
-            out[f"{col}_scalar"] = cats.apply(_encode_scalar).astype(float)
-            broker_scalar_cols.append(f"{col}_scalar")
+            _broker_new[scalar_col] = cats.apply(_encode_scalar).astype(float)
+            broker_scalar_cols.append(scalar_col)
+
+    if _broker_new:
+        out = pd.concat([out, pd.DataFrame(_broker_new, index=out.index)], axis=1)
 
     # Character-level scalar encoding for '종목명'
+    _extra_new: Dict[str, pd.Series] = {}
     if '종목명' in out.columns:
         cats = out['종목명'].astype(str).replace({"nan": ""})
         unique_chars = sorted(set("".join(cats.tolist())))
         if len(unique_chars) == 0:
-            out["종목명_scalar"] = 0.0
+            _extra_new["종목명_scalar"] = pd.Series(0.0, index=out.index)
         else:
             char_to_id = {ch: i + 1 for i, ch in enumerate(unique_chars)}
             max_id = float(len(unique_chars))
@@ -523,7 +541,7 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
                     return 0.0
                 return float(np.mean(ids)) / max_id
 
-            out["종목명_scalar"] = cats.apply(_encode_scalar_name).astype(float)
+            _extra_new["종목명_scalar"] = cats.apply(_encode_scalar_name).astype(float)
         broker_scalar_cols.append("종목명_scalar")
 
     # '시간' 파생 피처: 기존 시간 스칼라 + sin/cos 주기 변환 + 장 시작 후 경과 초
@@ -533,13 +551,16 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         secs = out['시간'].apply(_time_ms_to_seconds).astype(int)
         SECONDS_IN_DAY = 24 * 60 * 60
         MARKET_OPEN_SECONDS = 9 * 3600  # 09:00:00
-        out['시간_sin'] = np.sin(2 * np.pi * secs / SECONDS_IN_DAY)
-        out['시간_cos'] = np.cos(2 * np.pi * secs / SECONDS_IN_DAY)
+        _extra_new['시간_sin'] = np.sin(2 * np.pi * secs / SECONDS_IN_DAY)
+        _extra_new['시간_cos'] = np.cos(2 * np.pi * secs / SECONDS_IN_DAY)
         # 장 시작 후 경과 시간(초), 0 미만은 0으로 클립
         sec_from_open = (secs - MARKET_OPEN_SECONDS).clip(lower=0).astype(float)
-        out['시간_scalar'] = _standard_scale(sec_from_open)
+        _extra_new['시간_scalar'] = _standard_scale(sec_from_open)
         # 파생 컬럼들은 이미 정상화 되었거나 [-1,1] 구간이므로 추가 스케일 제외 목록에 포함
         broker_scalar_cols.extend(['시간_sin', '시간_cos', '시간_scalar'])
+
+    if _extra_new:
+        out = pd.concat([out, pd.DataFrame(_extra_new, index=out.index)], axis=1)
 
     # Min-Max for remaining numeric columns not already processed
     processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
@@ -554,6 +575,8 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         else:
             out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
 
+    # Defragment the frame once before returning (improves downstream setitem performance)
+    out = out.copy()
     return out
 
 
