@@ -353,6 +353,7 @@ def main():
     last_mtime = 0.0
     last_step = -1
     last_change_ts = time.time()
+    update_index = 0
 
     try:
         while True:
@@ -389,6 +390,15 @@ def main():
 
             # On update: summarize once and reset idle timer
             if current_mtime != last_mtime or current_step != last_step:
+                # header to separate updates
+                update_index += 1
+                ts = time.strftime('%Y-%m-%d %H:%M:%S')
+                delta_step = (current_step - last_step) if last_step >= 0 and current_step >= 0 else 0
+                print("\n" + "=" * 20 + f" UPDATE #{update_index} " + "=" * 20)
+                print(f"[time] {ts}")
+                print(f"[event] {event_path}")
+                print(f"[steps] prev={last_step} -> curr={current_step} (Δ={delta_step})")
+                print("-" * 56)
                 if series:
                     if not args.stats_only:
                         summarize(series)
