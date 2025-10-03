@@ -67,8 +67,8 @@ BASE_CMD: List[str] = shlex.split(
   --target-col 현재가
  
   --aux-task direction3
-  --loss ce
-  --label-smoothing 0.05
+  --loss focal
+  --focal-gamma 2.0
   --use-weighted-sampler
   --direction3-threshold 0.015
  
@@ -236,13 +236,23 @@ def build_prompt(stdout_tail: str, stderr_tail: str, current_kv: Dict[str, Any],
     - 반드시 JSON만 출력하세요. 다른 텍스트는 금지.
     - JSON 스키마:
       {{
-        "suggested_args": {{ "direction3-threshold": float, "horizon": int, "lr": float, "weight-decay": float, "batch-size": int }},
+        "suggested_args": {{
+          "direction3-threshold"?: float,
+          "horizon"?: int,
+          "seq-len"?: int,
+          "lr"?: float,
+          "weight-decay"?: float,
+          "batch-size"?: int,
+          "label-smoothing"?: float,
+          "focal-gamma"?: float,
+          "loss"?: "ce" | "focal" | "mse" | "huber"
+        }},
         "rationale": "한글 설명",
         "changed_keys": ["..."]
       }}
     - 허용 키만 제안: {list(ALLOWED_KEYS.keys())}
     - 한 번에 최대 2개 키만 변경하세요.
-    - 권장 범위: threshold[0.001,0.02], horizon[5,60], lr[1e-5,3e-3], weight-decay[0,1e-2], batch-size[32,512]
+    - 권장 범위: threshold[0.001,0.02], horizon[5,60], seq-len[20,200], lr[1e-5,3e-3], weight-decay[0,1e-2], batch-size[32,512], label-smoothing[0.0,0.3], focal-gamma[0.0,5.0], loss∈[ce,focal,mse,huber]
     - 아래의 '이미 시도한 변경'과 동일한 제안은 피하세요. 동일한 (key,value) 조합을 다시 제안하지 마세요.
 
     현재 CLI 값:
