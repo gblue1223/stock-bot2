@@ -260,14 +260,18 @@ def _get_vals(series: Dict[str, Series], tag: str, last: int) -> List[float]:
     return vals[-last:] if last > 0 else vals
 
 
-def analyze_training(series: Dict[str, Series], last: int = 200) -> List[str]:
-    issues: List[str] = []
+def analyze_training(series: Dict[str, Series], last: int = 200) -> Tuple[List[str], List[str]]:
+    """Analyze training progress and return (warnings, successes)"""
+    warnings: List[str] = []
+    successes: List[str] = []
 
     # 1) Validation loss presence
     val_epoch = _get_vals(series, "Loss/Validation_Epoch", last)
     val_chunk = _get_vals(series, "Loss/Validation_Chunk", last)
     if not val_epoch and not val_chunk:
-        issues.append("No validation loss scalars found (neither epoch nor chunk). Training may not be validating correctly.")
+        warnings.append("검증 손실 스칼라를 찾을 수 없습니다 (에폭/청크 모두). 검증이 올바르게 수행되지 않을 수 있습니다.")
+    else:
+        successes.append("✅ 검증 손실 데이터가 정상적으로 기록되고 있습니다")
 
     # Choose a validation loss signal to analyze trend/level
     vloss = val_epoch if val_epoch else val_chunk
@@ -279,7 +283,9 @@ def analyze_training(series: Dict[str, Series], last: int = 200) -> List[str]:
     train_chunk = _get_vals(series, "Loss/Train_Chunk", last)
     train_epoch = _get_vals(series, "Loss/Train_Epoch", last)
     if has_bad(train_batch) or has_bad(train_chunk) or has_bad(train_epoch) or has_bad(vloss):
-        issues.append("Detected NaN/Inf in recent losses (train or validation). Check data and learning rate.")
+        warnings.append("최근 손실값에서 NaN/Inf가 감지되었습니다. 데이터와 학습률을 확인하세요.")
+    else:
+        successes.append("✅ 손실값이 안정적으로 계산되고 있습니다 (NaN/Inf 없음)")
 
     # 3) Chance-level plateau for 3-class CE (~ln(3)≈1.0986)
     if vloss:
@@ -288,7 +294,9 @@ def analyze_training(series: Dict[str, Series], last: int = 200) -> List[str]:
         near_chance = abs(last_v - math.log(3)) < 0.02  # within ~0.02 of ln(3)
         non_decreasing = (not math.isnan(v0) and not math.isnan(v1) and v1 >= v0)
         if near_chance and non_decreasing:
-            issues.append(f"Validation loss stuck near chance level (~ln(3)≈1.0986). last={last_v:.4f}. Likely prediction collapse or no learning.")
+            warnings.append(f"검증 손실이 우연 수준에 정체되어 있습니다 (~ln(3)≈1.0986). 현재={last_v:.4f}. 예측 붕괴 또는 학습 부족 가능성.")
+        elif last_v < math.log(3) - 0.1:  # significantly better than chance
+            successes.append(f"🎯 검증 손실이 우연 수준보다 유의하게 낮습니다 (현재={last_v:.4f} < 1.099)")
 
     # 4) Class collapse detection using chunk diagnostics (streaming path)
     true0 = sum(_get_vals(series, 'Metrics/Val_True_Class0_Count_Chunk', last))
@@ -299,14 +307,22 @@ def analyze_training(series: Dict[str, Series], last: int = 200) -> List[str]:
     pred2 = sum(_get_vals(series, 'Metrics/Val_Pred_Class2_Count_Chunk', last))
     pred_sum = pred0 + pred1 + pred2
     true_sum = true0 + true1 + true2
+    
     if pred_sum > 0:
         p0, p1, p2 = pred0 / pred_sum, pred1 / pred_sum, pred2 / pred_sum
+        collapsed = False
         if p1 > 0.98 and p0 < 0.01 and p2 < 0.01:
-            issues.append("Prediction collapse detected: ~all validations predicted as class 1 (others near 0).")
+            warnings.append("예측 붕괴 감지: 거의 모든 검증이 클래스 1로 예측됩니다.")
+            collapsed = True
         if p0 > 0.98 and p1 < 0.01 and p2 < 0.01:
-            issues.append("Prediction collapse detected: ~all validations predicted as class 0.")
+            warnings.append("예측 붕괴 감지: 거의 모든 검증이 클래스 0으로 예측됩니다.")
+            collapsed = True
         if p2 > 0.98 and p0 < 0.01 and p1 < 0.01:
-            issues.append("Prediction collapse detected: ~all validations predicted as class 2.")
+            warnings.append("예측 붕괴 감지: 거의 모든 검증이 클래스 2로 예측됩니다.")
+            collapsed = True
+        
+        if not collapsed and min(p0, p1, p2) > 0.05:  # all classes have some predictions
+            successes.append(f"🎲 모든 클래스에 대한 예측이 균형적입니다 (C0:{p0:.2f}, C1:{p1:.2f}, C2:{p2:.2f})")
 
     # 5) Accuracy at majority baseline
     acc_chunk = _get_vals(series, 'Metrics/Val_Accuracy_Chunk', last)
@@ -314,21 +330,44 @@ def analyze_training(series: Dict[str, Series], last: int = 200) -> List[str]:
     vacc = acc_epoch[-1] if acc_epoch else (acc_chunk[-1] if acc_chunk else None)
     if vacc is not None and true_sum > 0:
         majority = max(true0, true1, true2) / true_sum if true_sum > 0 else None
-        if majority is not None and abs(vacc - majority) < 0.02 and pred_sum > 0:
-            issues.append(f"Validation accuracy ≈ majority class baseline (acc={vacc:.3f}, baseline={majority:.3f}). Suggests biased predictions.")
+        if majority is not None:
+            if abs(vacc - majority) < 0.02 and pred_sum > 0:
+                warnings.append(f"검증 정확도가 다수 클래스 기준선과 유사합니다 (정확도={vacc:.3f}, 기준선={majority:.3f}). 편향된 예측 가능성.")
+            elif vacc > majority + 0.05:  # significantly better than majority baseline
+                successes.append(f"📈 검증 정확도가 다수 클래스 기준선을 상회합니다 (정확도={vacc:.3f} > 기준선={majority:.3f})")
+            
+            # Check if accuracy is above random baseline for 3-class
+            if vacc > 0.4:  # well above 1/3 for 3-class
+                successes.append(f"🎯 검증 정확도가 우연 수준을 크게 상회합니다 (정확도={vacc:.3f} >> 0.333)")
 
     # 6) Stalled learning: no improvement trend on validation loss and accuracy not increasing
+    loss_improving = False
+    acc_improving = False
+    
     if vloss and len(vloss) >= 5:
         v0, v1 = last_k_trend(vloss, 5)
-        if not math.isnan(v0) and not math.isnan(v1) and v1 >= v0:
-            issues.append("Validation loss did not improve over recent steps (non-decreasing trend).")
+        if not math.isnan(v0) and not math.isnan(v1):
+            if v1 >= v0:
+                warnings.append("최근 구간에서 검증 손실이 개선되지 않았습니다 (비감소 추세).")
+            else:
+                loss_improving = True
+                successes.append("📉 검증 손실이 최근 구간에서 개선되고 있습니다")
+    
     acc_for_trend = acc_epoch if acc_epoch else acc_chunk
     if acc_for_trend and len(acc_for_trend) >= 5:
         a0, a1 = last_k_trend(acc_for_trend, 5)
-        if not math.isnan(a0) and not math.isnan(a1) and a1 <= a0:
-            issues.append("Validation accuracy did not increase over recent steps.")
+        if not math.isnan(a0) and not math.isnan(a1):
+            if a1 <= a0:
+                warnings.append("최근 구간에서 검증 정확도가 상승하지 않았습니다.")
+            else:
+                acc_improving = True
+                successes.append("📈 검증 정확도가 최근 구간에서 상승하고 있습니다")
+    
+    # Overall learning progress
+    if loss_improving and acc_improving:
+        successes.append("🚀 학습이 순조롭게 진행되고 있습니다 (손실 감소 + 정확도 상승)")
 
-    return issues
+    return warnings, successes
 
 
 def save_png_charts(series: Dict[str, Series], tags: List[str], last: int, outdir: str) -> None:
@@ -420,13 +459,22 @@ def main():
         print_stats(series, tags=args.plot_tags, last=args.plot_last)
         print_class_distribution(series, last=args.plot_last)
         # 자동 진단
-        issues = analyze_training(series, last=args.plot_last)
-        if issues:
-            print("\n=== 자동 진단: 잠재적 문제 감지 ===")
-            for i, msg in enumerate(issues, 1):
+        warnings, successes = analyze_training(series, last=args.plot_last)
+        
+        if successes:
+            print("\n=== 🎉 학습 성공 지표 ===")
+            for i, msg in enumerate(successes, 1):
                 print(f"[{i}] {msg}")
-            print("문제가 감지되어 비정상 종료합니다.")
-            sys.exit(2)
+        
+        if warnings:
+            print("\n=== ⚠️  주의사항 ===")
+            for i, msg in enumerate(warnings, 1):
+                print(f"[{i}] {msg}")
+            print("⚠️  위 사항들을 검토해보세요. (계속 진행됩니다)")
+        
+        if not warnings and not successes:
+            print("\n=== ℹ️  진단 정보 부족 ===")
+            print("충분한 데이터가 없어 자동 진단을 수행할 수 없습니다.")
         if args.save_png:
             save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
         if args.out_html:
@@ -493,13 +541,22 @@ def main():
                     print_stats(series, tags=args.plot_tags, last=args.plot_last)
                     print_class_distribution(series, last=args.plot_last)
                     # 워치 모드 자동 진단
-                    issues = analyze_training(series, last=args.plot_last)
-                    if issues:
-                        print("\n=== 자동 진단: 잠재적 문제 감지 ===")
-                        for i, msg in enumerate(issues, 1):
+                    warnings, successes = analyze_training(series, last=args.plot_last)
+                    
+                    if successes:
+                        print("\n=== 🎉 학습 성공 지표 ===")
+                        for i, msg in enumerate(successes, 1):
                             print(f"[{i}] {msg}")
-                        print("문제가 감지되어 비정상 종료합니다.")
-                        sys.exit(2)
+                    
+                    if warnings:
+                        print("\n=== ⚠️  주의사항 ===")
+                        for i, msg in enumerate(warnings, 1):
+                            print(f"[{i}] {msg}")
+                        print("⚠️  위 사항들을 검토해보세요. (모니터링 계속)")
+                    
+                    if not warnings and not successes:
+                        print("\n=== ℹ️  진단 정보 부족 ===")
+                        print("충분한 데이터가 없어 자동 진단을 수행할 수 없습니다.")
                     if args.save_png:
                         save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
                     if args.out_html:

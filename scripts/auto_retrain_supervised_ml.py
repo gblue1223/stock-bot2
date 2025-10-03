@@ -68,15 +68,16 @@ BASE_CMD: List[str] = shlex.split(
  
   --aux-task direction3
   --loss focal
-  --focal-gamma 2.0
+  --focal-gamma 1.5
   --use-weighted-sampler
-  --direction3-threshold 0.015
+  --direction3-threshold 0.01
+  --label-smoothing 0.1
  
-  --auto-diagnosis abort
-  --diag-warmup-chunks 10
-  --diag-warmup-epochs 1
-  --diag-min-val-samples 512
-  --diag-require-consecutive 2'''
+  --auto-diagnosis warn
+  --diag-warmup-chunks 200
+  --diag-warmup-epochs 2
+  --diag-min-val-samples 4096
+  --diag-require-consecutive 5'''  # warn 모드로 변경, 더 관대한 설정
 )
 
 # 최대 재시도 횟수
