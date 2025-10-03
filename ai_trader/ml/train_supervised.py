@@ -274,19 +274,24 @@ def compute_epoch_metrics(aux_task: str, targets_all: list, preds_all: list):
     return va_r, va_r2, va_acc
 
 
-def _diagnose_and_abort(scope: str,
-                        val_loss: float | None,
-                        y_true_list: list[int] | None,
-                        y_pred_list: list[int] | None) -> None:
-    """간단 자동 진단: 분류(direction3)에서 기준선 수준 정체/클래스 붕괴/다수 클래스 기준선 정착을 감지하면 중단.
+def _diagnose_check(scope: str,
+                    val_loss: float | None,
+                    y_true_list: list[int] | None,
+                    y_pred_list: list[int] | None,
+                    *,
+                    baseline_epsilon: float = 0.02,
+                    collapse_threshold: float = 0.98,
+                    minority_max: float = 0.01,
+                    majority_epsilon: float = 0.02) -> list[str]:
+    """간단 자동 진단 체크만 수행하여 문제 목록을 반환합니다.
 
-    scope: 'chunk' | 'epoch' (표시용)
+    반환: 문제 메시지 리스트 (문제 없으면 빈 리스트)
     """
     issues: list[str] = []
 
     # 1) 검증 손실이 3-클래스 기준선(ln(3)=1.0986 근방)에 정체
     if val_loss is not None and not np.isnan(val_loss) and not np.isinf(val_loss):
-        if abs(float(val_loss) - float(np.log(3.0))) < 0.02:
+        if abs(float(val_loss) - float(np.log(3.0))) < baseline_epsilon:
             issues.append("검증 손실이 3-클래스 기준선 수준(ln(3)=1.0986 근방)에 정체되어 있습니다.")
 
     # 2) 예측 붕괴/다수 클래스 기준선
@@ -301,20 +306,15 @@ def _diagnose_and_abort(scope: str,
                 return out
             p_true = prop(yt)
             p_pred = prop(yp)
-            # collapse: 단일 클래스 98% 이상
-            if max(p_pred) > 0.98 and sum(1 for v in p_pred if v < 0.01) >= 2:
+            # collapse: 단일 클래스 98% 이상, 나머지 <1%
+            if max(p_pred) > collapse_threshold and sum(1 for v in p_pred if v < minority_max) >= 2:
                 issues.append(f"예측 붕괴 감지: 최근 {scope} 검증에서 단일 클래스에 거의 수렴했습니다. 예측분포={p_pred}")
             # majority baseline 근접
             majority = max(p_true)
-            if abs(acc - majority) < 0.02:
+            if abs(acc - majority) < majority_epsilon:
                 issues.append(f"검증 정확도가 최근 실제 분포의 다수 클래스 기준선에 근접합니다 (acc={acc:.3f}, baseline={majority:.3f}).")
 
-    if issues:
-        print("\n=== 자동 진단: 잠재적 문제 감지 (학습 중단) ===")
-        for i, msg in enumerate(issues, 1):
-            print(f"[{i}] {msg}")
-        print("진단으로 학습을 중단합니다.")
-        sys.exit(2)
+    return issues
 
 
 def _fmt_int(n: int) -> str:
@@ -399,6 +399,12 @@ def train(
     huber_delta: float = 1.0,         # Huber delta
     weight_decay: float = 1e-4,       # AdamW weight decay
     direction3_threshold: float = 1e-2,  # 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
+    # Auto-diagnosis controls
+    auto_diagnosis: str = "abort",          # {'abort','warn','off'}
+    diag_warmup_chunks: int = 10,            # 최소 학습 청크 수 이후에만 진단
+    diag_warmup_epochs: int = 1,             # 최소 에폭 수 이후에만 진단
+    diag_min_val_samples: int = 512,         # 진단에 필요한 최소 검증 샘플 수
+    diag_require_consecutive: int = 2,       # 연속 감지 횟수 임계
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -487,6 +493,9 @@ def train(
         global_processed_rows = 0  # Track total rows processed across all files
         start_epoch = 1
         resume_chunk_count = 0
+        # diagnosis consecutive counters
+        consecutive_chunk_issues = 0
+        consecutive_epoch_issues = 0
 
         # Load checkpoint if resuming
         resume_last_no = None
@@ -708,6 +717,7 @@ def train(
                             nonlocal prev_tail_feats, global_features, tgt_col, model, opt
                             nonlocal tr_loss_epoch_sum, tr_samples, va_loss_epoch_sum, va_samples
                             nonlocal global_trained_chunk_count
+                            nonlocal consecutive_chunk_issues
 
                             if df_chunk.empty:
                                 return (False, None)
@@ -884,15 +894,28 @@ def train(
                                 if (global_trained_chunk_count % 10) == 0:
                                     writer.flush()
 
-                            # Automated diagnosis per chunk (direction3 only)
-                            if aux_task == 'direction3' and va_chunk_n > 0:
+                            # Automated diagnosis per chunk (direction3 only, gated)
+                            if (aux_task == 'direction3' and
+                                auto_diagnosis != 'off' and
+                                va_chunk_n >= max(1, diag_min_val_samples) and
+                                global_trained_chunk_count >= max(0, diag_warmup_chunks)):
                                 val_chunk_loss = float(va_chunk_sum / max(1, va_chunk_n))
-                                _diagnose_and_abort(
+                                issues = _diagnose_check(
                                     scope='chunk',
                                     val_loss=val_chunk_loss,
                                     y_true_list=y_true_c2,
                                     y_pred_list=y_pred_c2,
                                 )
+                                if issues:
+                                    consecutive_chunk_issues += 1
+                                    print("\n=== 자동 진단: 잠재적 이슈 감지 (chunk) ===")
+                                    for i, msg in enumerate(issues, 1):
+                                        print(f"[{i}] {msg}")
+                                    if consecutive_chunk_issues >= max(1, diag_require_consecutive) and auto_diagnosis == 'abort':
+                                        print("진단 조건이 연속적으로 충족되어 학습을 중단합니다.")
+                                        sys.exit(2)
+                                else:
+                                    consecutive_chunk_issues = 0
 
                             # update tail
                             prev_tail_feats = feats_all.tail(seq_len + horizon - 1)
@@ -1030,14 +1053,30 @@ def train(
             # Compute validation metrics (DRY)
             va_r, va_r2, va_acc = compute_epoch_metrics(aux_task, va_targets_all, va_preds_all)
 
-            # Automated diagnosis per epoch (direction3 only)
-            if aux_task == 'direction3':
-                _diagnose_and_abort(
+            # Automated diagnosis per epoch (direction3 only, gated)
+            if (aux_task == 'direction3' and auto_diagnosis != 'off' and
+                va_samples >= max(1, diag_min_val_samples) and
+                epoch >= max(1, diag_warmup_epochs)):
+                issues = _diagnose_check(
                     scope='epoch',
                     val_loss=float(va_loss_avg),
                     y_true_list=va_targets_all,
                     y_pred_list=va_preds_all,
                 )
+                if issues:
+                    consecutive_epoch_issues += 1
+                    print("\n=== 자동 진단: 잠재적 이슈 감지 (epoch) ===")
+                    for i, msg in enumerate(issues, 1):
+                        print(f"[{i}] {msg}")
+                    if consecutive_epoch_issues >= max(1, diag_require_consecutive) and auto_diagnosis == 'abort':
+                        print("진단 조건이 연속적으로 충족되어 학습을 중단합니다.")
+                        if writer:
+                            writer.add_text('Training/AutoDiagnosis', f'abort at epoch {epoch}: ' + " | ".join(issues), epoch)
+                        sys.exit(2)
+                    elif writer:
+                        writer.add_text('Training/AutoDiagnosis', f'warn at epoch {epoch}: ' + " | ".join(issues), epoch)
+                else:
+                    consecutive_epoch_issues = 0
             
             # Update learning rate scheduler
             if 'scheduler' in locals():
@@ -1327,14 +1366,34 @@ def train(
         # Compute validation metrics (DRY)
         va_r, va_r2, va_acc = compute_epoch_metrics(aux_task, va_targets_list, va_preds_list)
 
-        # Automated diagnosis per epoch (direction3 only)
-        if aux_task == 'direction3':
-            _diagnose_and_abort(
+        # Automated diagnosis per epoch (direction3 only, gated)
+        if (aux_task == 'direction3' and auto_diagnosis != 'off' and
+            n_va >= max(1, diag_min_val_samples) and
+            epoch >= max(1, diag_warmup_epochs)):
+            issues = _diagnose_check(
                 scope='epoch',
                 val_loss=float(va_loss),
                 y_true_list=va_targets_list,
                 y_pred_list=va_preds_list,
             )
+            if issues:
+                # local counter for non-streaming mode
+                if not hasattr(train, '_ns_consecutive_epoch_issues'):
+                    train._ns_consecutive_epoch_issues = 0  # type: ignore[attr-defined]
+                train._ns_consecutive_epoch_issues += 1    # type: ignore[attr-defined]
+                print("\n=== 자동 진단: 잠재적 이슈 감지 (epoch) ===")
+                for i, msg in enumerate(issues, 1):
+                    print(f"[{i}] {msg}")
+                if train._ns_consecutive_epoch_issues >= max(1, diag_require_consecutive) and auto_diagnosis == 'abort':  # type: ignore[attr-defined]
+                    print("진단 조건이 연속적으로 충족되어 학습을 중단합니다.")
+                    if writer:
+                        writer.add_text('Training/AutoDiagnosis', f'abort at epoch {epoch}: ' + " | ".join(issues), epoch)
+                    sys.exit(2)
+                elif writer:
+                    writer.add_text('Training/AutoDiagnosis', f'warn at epoch {epoch}: ' + " | ".join(issues), epoch)
+            else:
+                if hasattr(train, '_ns_consecutive_epoch_issues'):
+                    train._ns_consecutive_epoch_issues = 0  # type: ignore[attr-defined]
         
         # Update learning rate scheduler
         old_lr = opt.param_groups[0]['lr']
@@ -1454,6 +1513,13 @@ def main():
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (L2 정규화 강도)")
     p.add_argument("--direction3-threshold", type=float, default=1e-2, help="`--aux-task`가 `direction3`일 경우 작동. 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)")
 
+    # Auto-diagnosis controls
+    p.add_argument("--auto-diagnosis", choices=["abort", "warn", "off"], default="abort", help="자동 진단 동작: abort/warn/off")
+    p.add_argument("--diag-warmup-chunks", type=int, default=10, help="자동 진단 활성화 전 최소 학습 청크 수")
+    p.add_argument("--diag-warmup-epochs", type=int, default=1, help="자동 진단 활성화 전 최소 에폭 수")
+    p.add_argument("--diag-min-val-samples", type=int, default=512, help="자동 진단에 필요한 최소 검증 샘플 수")
+    p.add_argument("--diag-require-consecutive", type=int, default=2, help="중단/경고 전 연속 감지 필요 횟수")
+
     p.add_argument("--progress-every", type=int, default=10, help="청크 진행 로그 출력 주기(청크 단위). 0이면 비활성화")
     p.add_argument("--no-tensorboard", action="store_true", help="TensorBoard 로깅 비활성화")
     args = p.parse_args()
@@ -1483,6 +1549,11 @@ def main():
         huber_delta=args.huber_delta,
         weight_decay=args.weight_decay,
         direction3_threshold=args.direction3_threshold,
+        auto_diagnosis=args.auto_diagnosis,
+        diag_warmup_chunks=args.diag_warmup_chunks,
+        diag_warmup_epochs=args.diag_warmup_epochs,
+        diag_min_val_samples=args.diag_min_val_samples,
+        diag_require_consecutive=args.diag_require_consecutive,
     )
 
 
