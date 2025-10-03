@@ -67,7 +67,12 @@ BASE_CMD: List[str] = shlex.split(
     --target-col 현재가 
     --aux-task direction3 
     --loss ce 
-    --direction3-threshold 0.015'''
+    --direction3-threshold 0.015
+    --auto-diagnosis abort 
+    --diag-warmup-chunks 10 
+    --diag-warmup-epochs 1 
+    --diag-min-val-samples 512 
+    --diag-require-consecutive 2'''
 )
 
 # 최대 재시도 횟수
@@ -287,7 +292,6 @@ def ask_chatgpt(prompt: str) -> Dict[str, Any]:
 
 def apply_suggestions(current_kv: Dict[str, Any], suggestions: Dict[str, Any], mem: Dict[str, Any]) -> Dict[str, Any]:
     sug_args = suggestions.get("suggested_args", {}) if suggestions else {}
-    changed_keys = suggestions.get("changed_keys", []) if suggestions else []
     print("\n[정보] ChatGPT 제안:")
     print(json.dumps(suggestions, ensure_ascii=False, indent=2))
 
@@ -325,8 +329,22 @@ def apply_suggestions(current_kv: Dict[str, Any], suggestions: Dict[str, Any], m
 
 def main():
     attempt = 1
-    cmd = BASE_CMD
     mem = load_memory()
+    cmd = BASE_CMD
+    # 메모리를 토대로 기본 CLI 초기화 (가장 최근 적용값 반영)
+    def _get_last_applied_kv(m: Dict[str, Any]) -> Dict[str, Any]:
+        for item in reversed(m.get("interactions", [])):
+            akv = item.get("applied_kv", {})
+            if akv:
+                return akv
+        return {}
+    init_kv = _get_last_applied_kv(mem)
+    if init_kv:
+        # 허용 키만 필터링
+        init_kv = {k: init_kv[k] for k in init_kv.keys() if k in ALLOWED_KEYS}
+        if init_kv:
+            print(f"[정보] 메모리 기반 초기 CLI 적용: {init_kv}")
+            cmd = kv_to_cmd(cmd, init_kv)
     while attempt <= MAX_ATTEMPTS:
         print("\n" + "="*20 + f" 시도 #{attempt} " + "="*20)
         proc = run_training(cmd)
