@@ -9,6 +9,7 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 import pandas as pd
 import duckdb
@@ -357,8 +358,16 @@ def _diagnose_check(scope: str,
             p_true = prop(yt)
             p_pred = prop(yp)
             # collapse: 단일 클래스 98% 이상, 나머지 <1%
-            if max(p_pred) > collapse_threshold and sum(1 for v in p_pred if v < minority_max) >= 2:
-                issues.append(f"예측 붕괴 감지: 최근 {scope} 검증에서 단일 클래스에 거의 수렴했습니다. 예측분포={p_pred}")
+            # 단, 실제 타깃도 단일 클래스에 가까운 경우(진짜 한쪽뿐인 데이터)에는 붕괴로 판단하지 않음
+            true_non_major = 1.0 - max(p_true)
+            if (
+                max(p_pred) > collapse_threshold
+                and sum(1 for v in p_pred if v < minority_max) >= 2
+                and true_non_major >= 0.05  # 최소한 비다수 클래스가 5% 이상 존재해야 붕괴로 간주
+            ):
+                issues.append(
+                    f"예측 붕괴 감지: 최근 {scope} 검증에서 단일 클래스에 거의 수렴했습니다. 예측분포={p_pred} 실제분포={p_true}"
+                )
             # majority baseline 근접
             majority = max(p_true)
             if abs(acc - majority) < majority_epsilon:
@@ -855,18 +864,49 @@ def train(
                                 balance_sampling=bool(use_weighted_sampler)
                             )
 
-                            # For 3-class classification, compute class weights per chunk
-                            local_loss_fn = make_loss_fn(
-                                aux_task, y_tr, device, loss_type, huber_delta,
-                                label_smoothing=label_smoothing,
-                                focal_gamma=focal_gamma
-                            )
+                            # For 3-class classification: adapt loss under severe imbalance
+                            if aux_task == "direction3":
+                                import numpy as _np
+                                _u, _c = _np.unique(y_tr, return_counts=True)
+                                _c_sum = int(_c.sum()) if _c.size > 0 else 0
+                                _maj_prop = (float(_c.max()) / float(max(1, _c_sum))) if _c.size > 0 else 0.0
+                                _use_focal = (_maj_prop >= 0.85) or (loss_type == "focal")
+                                _loss_choice = "focal" if _use_focal else loss_type
+                                local_loss_fn = make_loss_fn(
+                                    aux_task,
+                                    y_tr,
+                                    device,
+                                    _loss_choice,
+                                    huber_delta,
+                                    label_smoothing=label_smoothing,
+                                    focal_gamma=(focal_gamma if float(focal_gamma) > 0 else 2.0),
+                                )
+                                # Set adaptive entropy regularization strength (discourage peaky collapse)
+                                ent_lambda = 0.0
+                                if _maj_prop >= 0.85:
+                                    ent_lambda = 0.01  # small push towards higher entropy when chunks are very imbalanced
+                            else:
+                                local_loss_fn = make_loss_fn(
+                                    aux_task, y_tr, device, loss_type, huber_delta,
+                                    label_smoothing=label_smoothing,
+                                    focal_gamma=focal_gamma
+                                )
+                                ent_lambda = 0.0
 
                             # train
                             model.train()
                             batch_count = 0
                             # chunk-local accumulators
                             tr_chunk_sum, tr_chunk_n = 0.0, 0
+                            
+                            # Print chunk info for debugging
+                            print(f"  Processing chunk {global_trained_chunk_count}: X_tr.shape={X_tr.shape}, y_tr.shape={y_tr.shape}")
+                            if aux_task == "direction3":
+                                import numpy as _np
+                                unique, counts = _np.unique(y_tr, return_counts=True)
+                                class_dist = {int(k): int(v) for k, v in zip(unique, counts)}
+                                print(f"  Class distribution: {class_dist}")
+                            
                             for xb, yb in train_loader:
                                 xb = xb.to(device)
                                 yb = yb.to(device)
@@ -874,6 +914,11 @@ def train(
                                 pred = model(xb)
                                 if aux_task == "direction3":
                                     loss = local_loss_fn(pred, yb.long())
+                                    # Adaptive entropy regularization to mitigate collapse under imbalance
+                                    if ent_lambda > 0.0:
+                                        probs = F.softmax(pred, dim=-1).clamp_min(1e-8)
+                                        ent = -(probs * probs.log()).sum(dim=1).mean()
+                                        loss = loss - ent_lambda * ent
                                 else:
                                     loss = loss_fn(pred, yb)
                                 loss.backward()
@@ -897,6 +942,9 @@ def train(
                             # diagnostic collectors
                             va_preds_c, va_targets_c = [], []  # existing accumulate_val usage
                             y_true_c2, y_pred_c2 = [], []      # explicit argmax-based labels
+                            
+                            print(f"  Validation: X_va.shape={X_va.shape}, y_va.shape={y_va.shape}")
+                            
                             with torch.no_grad():
                                 for xb, yb in val_loader:
                                     xb = xb.to(device)
@@ -918,12 +966,17 @@ def train(
                                         y_true_c2.extend(yb.long().detach().cpu().numpy().tolist())
                                         y_pred_c2.extend(torch.argmax(pred, dim=1).detach().cpu().numpy().tolist())
 
+                            # Print chunk results
+                            chunk_tr_loss = tr_chunk_sum / max(1, tr_chunk_n) if tr_chunk_n > 0 else 0.0
+                            chunk_va_loss = va_chunk_sum / max(1, va_chunk_n) if va_chunk_n > 0 else 0.0
+                            print(f"  Chunk {global_trained_chunk_count} results: train_loss={chunk_tr_loss:.6f}, val_loss={chunk_va_loss:.6f}")
+                            
                             # chunk-level scalars
                             if writer:
                                 if tr_chunk_n > 0:
-                                    writer.add_scalar('Loss/Train_Chunk', tr_chunk_sum / max(1, tr_chunk_n), global_trained_chunk_count)
+                                    writer.add_scalar('Loss/Train_Chunk', chunk_tr_loss, global_trained_chunk_count)
                                 if va_chunk_n > 0:
-                                    writer.add_scalar('Loss/Validation_Chunk', va_chunk_sum / max(1, va_chunk_n), global_trained_chunk_count)
+                                    writer.add_scalar('Loss/Validation_Chunk', chunk_va_loss, global_trained_chunk_count)
                                 # per-chunk accuracy for direction3
                                 if aux_task == 'direction3':
                                     import numpy as _np
@@ -959,7 +1012,8 @@ def train(
                             if (aux_task == 'direction3' and
                                 auto_diagnosis != 'off' and
                                 va_chunk_n >= max(1, diag_min_val_samples) and
-                                global_trained_chunk_count >= max(0, diag_warmup_chunks)):
+                                # 최소 30개의 훈련된 청크 이후로 진단 활성화 (과조기 중단 방지)
+                                global_trained_chunk_count >= max(0, max(diag_warmup_chunks, 30))):
                                 val_chunk_loss = float(va_chunk_sum / max(1, va_chunk_n))
                                 issues = _diagnose_check(
                                     scope='chunk',
@@ -1117,7 +1171,9 @@ def train(
             # Automated diagnosis per epoch (direction3 only, gated)
             if (aux_task == 'direction3' and auto_diagnosis != 'off' and
                 va_samples >= max(1, diag_min_val_samples) and
-                epoch >= max(1, diag_warmup_epochs)):
+                epoch >= max(1, diag_warmup_epochs) and
+                # 에폭 단위 진단도 최소 훈련 청크 수를 충족할 때만 활성화
+                global_trained_chunk_count >= max(0, max(diag_warmup_chunks, 30))):
                 issues = _diagnose_check(
                     scope='epoch',
                     val_loss=float(va_loss_avg),

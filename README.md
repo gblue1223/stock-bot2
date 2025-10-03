@@ -40,8 +40,33 @@ python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" --out "C:\Us
         - direction3-threshold → 0.015~0.02
     - “가격 수치 예측” 같은 회귀 문제라면 → Huber가 더 낫습니다.
 
-##### CE(CrossEntropy)방식
+##### 분류(Focal, CrossEntropy)방식
 ```bash
+python -m ai_trader.ml.train_supervised \
+  --db "C:\Users\user\Workspace\datasets@20251002\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/supervised_sample_test \
+  --seq-len 60 \
+  --horizon 20 \
+  --chunk-size 500 \
+  --device cuda \
+  --batch-size 64 \
+  --epochs 8 \
+  --lr 3e-5 \
+  --weight-decay 1e-4 \
+  --progress-every 100 \
+  --ckpt-every-chunks 50 \
+  --resume-from models/supervised_sample_test/checkpoints \
+  --target-col 현재가 \
+  --code 000100 \
+  --date 20241128 \
+  \
+  --aux-task direction3 \
+  --loss focal \
+  --focal-gamma 2.0 \
+  --use-weighted-sampler \
+  --direction3-threshold 0.015
+
 python -m ai_trader.ml.train_supervised \
   --db "C:\Users\user\Workspace\datasets@20251002\datasets_norm_all.duckdb" \
   --table datasets \
@@ -54,14 +79,14 @@ python -m ai_trader.ml.train_supervised \
   --epochs 10 \
   --lr 1e-4 \
   --weight-decay 1e-4 \
-  --progress-every 10 \
+  --progress-every 100 \
   --ckpt-every-chunks 50 \
   --resume-from models/supervised/checkpoints \
   --target-col 현재가 \
   \
   --aux-task direction3 \
-  --loss ce \
-  --label-smoothing 0.05 \
+  --loss focal \
+  --focal-gamma 2.0 \
   --use-weighted-sampler \
   --direction3-threshold 0.015 \
   \
@@ -83,21 +108,21 @@ python -m ai_trader.ml.train_supervised \
   --epochs 10 \
   --lr 1e-4 \
   --weight-decay 1e-4 \
-  --progress-every 10 \
+  --progress-every 100 \
   --ckpt-every-chunks 50 \
   --resume-from models/supervised/checkpoints \
   --target-col 현재가 \
   \
   --aux-task direction3 \
-  --loss focal \
-  --focal-gamma 2.0 \
+  --loss ce \
+  --label-smoothing 0.05 \
   --use-weighted-sampler \
   --direction3-threshold 0.015 \
   \
   --auto-diagnosis abort \
-  --diag-warmup-chunks 10 \
+  --diag-warmup-chunks 50 \
   --diag-warmup-epochs 1 \
-  --diag-min-val-samples 512 \
+  --diag-min-val-samples 4096 \
   --diag-require-consecutive 2
 ```
 
@@ -114,7 +139,7 @@ python -m ai_trader.ml.train_supervised \
   --batch-size 128 \
   --epochs 10 \
   --lr 1e-4 \
-  --progress-every 10 \
+  --progress-every 100 \
   --ckpt-every-chunks 50 \
   --resume-from models/supervised/checkpoints \
   --target-col 등락률 \
@@ -125,14 +150,14 @@ python -m ai_trader.ml.train_supervised \
 
 ### 로스 보기
 ```bash
-$ tensorboard --logdir models/supervised/tensorboard_logs/
+$ tensorboard --logdir models/supervised_sample_test/tensorboard_logs/
 
 $ python scripts/check_tensorboard.py \
   --logdir "D:/Workspace/Project/stock-bot/stock-bot2/models/supervised/tensorboard_logs" \
   --watch --interval 10 --idle-seconds 180 --verbose \
   --plot-last 400 \
   --save-png "D:/Workspace/Project/stock-bot/stock-bot2/models/supervised/plots" \
-  --out-html ./train_result-2025-10-02.html
+  --out-html ./train_result-2025-10-03.html
 ```
 
 ### 트러블슈팅
