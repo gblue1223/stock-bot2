@@ -284,10 +284,10 @@ def _diagnose_and_abort(scope: str,
     """
     issues: list[str] = []
 
-    # 1) 검증 손실이 3-클래스 기준선(ln(3)≈1.0986)에 정체
+    # 1) 검증 손실이 3-클래스 기준선(ln(3)=1.0986 근방)에 정체
     if val_loss is not None and not np.isnan(val_loss) and not np.isinf(val_loss):
         if abs(float(val_loss) - float(np.log(3.0))) < 0.02:
-            issues.append("검증 손실이 3-클래스 기준선 수준(≈ln(3))에 정체되어 있습니다.")
+            issues.append("검증 손실이 3-클래스 기준선 수준(ln(3)=1.0986 근방)에 정체되어 있습니다.")
 
     # 2) 예측 붕괴/다수 클래스 기준선
     if y_true_list and y_pred_list:
