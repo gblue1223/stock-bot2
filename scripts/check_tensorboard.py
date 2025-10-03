@@ -26,6 +26,7 @@ import os
 from dataclasses import dataclass
 import time
 from typing import Dict, List, Tuple
+import sys
 
 from tensorboard.backend.event_processing import event_accumulator as ea
 
@@ -117,10 +118,10 @@ def last_k_trend(vals: List[float], k: int = 5) -> Tuple[float, float]:
 
 
 def summarize(series: Dict[str, Series]) -> None:
-    print("=== Available Scalar Tags ===")
+    print("=== 사용 가능한 스칼라 태그 목록 ===")
     for t in sorted(series.keys()):
-        print(f"- {t} (n={len(series[t].values)})")
-    print("=============================")
+        print(f"- {t} (개수={len(series[t].values)})")
+    print("==============================")
 
     def print_summary(tag: str, better: str) -> None:
         if tag not in series:
@@ -149,9 +150,9 @@ def summarize(series: Dict[str, Series]) -> None:
             guide = "(높을수록 좋음, 0 이상 유지 및 점진적 상승)"
         elif tag == "Learning_Rate/Epoch" or tag == "Learning_Rate":
             guide = "(스케줄러에 의해 점진적 감소 가능, NaN/Inf 금지)"
-        print(f"{tag}: last={last:.6f} best={best:.6f} @step={best_step} trend(5)={trend} {guide}")
+        print(f"{tag}: 마지막={last:.6f} 최고={best:.6f} @단계={best_step} 추세(5)={trend} {guide}")
 
-    print("\n=== Key Metrics ===")
+    print("\n=== 핵심 지표 ===")
     print_summary("Loss/Train_Epoch", better="lower")
     print_summary("Loss/Validation_Epoch", better="lower")
     print_summary("Metrics/Val_Accuracy", better="higher")
@@ -159,22 +160,22 @@ def summarize(series: Dict[str, Series]) -> None:
     print_summary("Metrics/Val_R2", better="higher")
     print_summary("Learning_Rate/Epoch", better="lower")
 
-    print("\n=== Anomaly Checks ===")
+    print("\n=== 이상 징후 점검 ===")
     # NaN/Inf check and monotonicity for val loss
     def has_nan_or_inf(vals: List[float]) -> bool:
         return any((math.isnan(v) or math.isinf(v)) for v in vals)
 
     if "Loss/Validation_Epoch" in series and series["Loss/Validation_Epoch"].values:
         vals = series["Loss/Validation_Epoch"].values
-        print(f"ValLoss length={len(vals)} nan/inf={has_nan_or_inf(vals)}")
+        print(f"검증 손실 길이={len(vals)} NaN/Inf 포함={has_nan_or_inf(vals)}")
         if len(vals) >= 3:
             # non-increasing over last k implies potential plateau/regression
             v0, v1 = last_k_trend(vals, 5)
             if not math.isnan(v0) and not math.isnan(v1):
                 if v1 >= v0:
-                    print("[WARN] Validation loss did not improve over recent steps (non-decreasing trend)")
+                    print("[경고] 최근 구간에서 검증 손실이 개선되지 않았습니다(비감소 추세)")
     else:
-        print("[INFO] No Validation loss scalars found")
+        print("[정보] 검증 손실 스칼라가 없습니다 (에폭/청크 태그 모두 미존재)")
 
     # Accuracy increasing check (direction3)
     if "Metrics/Val_Accuracy" in series and series["Metrics/Val_Accuracy"].values:
@@ -182,15 +183,15 @@ def summarize(series: Dict[str, Series]) -> None:
         v0, v1 = last_k_trend(acc_vals, 5)
         if not math.isnan(v0) and not math.isnan(v1):
             if v1 <= v0:
-                print("[WARN] Validation accuracy did not increase over recent steps")
+                print("[경고] 최근 구간에서 검증 정확도가 상승하지 않았습니다")
 
     # Batch loss spikes check
     if "Loss/Train_Batch" in series and len(series["Loss/Train_Batch"].values) >= 10:
         bvals = series["Loss/Train_Batch"].values[-50:]
         if has_nan_or_inf(bvals):
-            print("[WARN] NaN/Inf detected in recent batch losses")
+            print("[경고] 최근 배치 손실에서 NaN/Inf가 감지되었습니다")
         if max(bvals) > (min(bvals) * 5.0 + 1e-6):
-            print("[WARN] Large spikes observed in recent batch losses")
+            print("[경고] 최근 배치 손실에서 큰 스파이크가 관측되었습니다")
 
 
 # ---------------- STATS + EXPORTS -----------------
@@ -212,13 +213,13 @@ def compute_stats(values: List[float]) -> Dict[str, float]:
 
 
 def print_stats(series: Dict[str, Series], tags: List[str], last: int) -> None:
-    print("\n=== Stats (recent) ===")
+    print("\n=== 통계(최근) ===")
     for tag in tags:
         if tag not in series or not series[tag].values:
             continue
         vals = series[tag].values[-last:] if last > 0 else series[tag].values
         st = compute_stats(vals)
-        print(f"{tag}: n={st['n']} last={st['last']:.6g} mean={st['mean']:.6g} std={st['std']:.6g} min={st['min']:.6g} max={st['max']:.6g} pct={st['pct']:.3f}% slope~={st['slope']:.3g}\n")
+        print(f"{tag}: 개수={st['n']} 마지막={st['last']:.6g} 평균={st['mean']:.6g} 표준편차={st['std']:.6g} 최소={st['min']:.6g} 최대={st['max']:.6g} 변화율={st['pct']:.3f}% 기울기~={st['slope']:.3g}\n")
 
 
 def print_class_distribution(series: Dict[str, Series], last: int) -> None:
@@ -246,16 +247,95 @@ def print_class_distribution(series: Dict[str, Series], last: int) -> None:
     true_prop = agg(true_tags)
     pred_prop = agg(pred_tags)
     if sum(true_prop) > 0 or sum(pred_prop) > 0:
-        print("=== Class Distribution (recent) ===")
-        print(f"True:  C0={true_prop[0]:.3f} C1={true_prop[1]:.3f} C2={true_prop[2]:.3f}")
-        print(f"Pred:  C0={pred_prop[0]:.3f} C1={pred_prop[1]:.3f} C2={pred_prop[2]:.3f}")
+        print("=== 클래스 분포(최근) ===")
+        print(f"실제: C0={true_prop[0]:.3f} C1={true_prop[1]:.3f} C2={true_prop[2]:.3f}")
+        print(f"예측: C0={pred_prop[0]:.3f} C1={pred_prop[1]:.3f} C2={pred_prop[2]:.3f}")
+
+
+# ---------------- Automated Diagnosis -----------------
+def _get_vals(series: Dict[str, Series], tag: str, last: int) -> List[float]:
+    if tag not in series or not series[tag].values:
+        return []
+    vals = series[tag].values
+    return vals[-last:] if last > 0 else vals
+
+
+def analyze_training(series: Dict[str, Series], last: int = 200) -> List[str]:
+    issues: List[str] = []
+
+    # 1) Validation loss presence
+    val_epoch = _get_vals(series, "Loss/Validation_Epoch", last)
+    val_chunk = _get_vals(series, "Loss/Validation_Chunk", last)
+    if not val_epoch and not val_chunk:
+        issues.append("No validation loss scalars found (neither epoch nor chunk). Training may not be validating correctly.")
+
+    # Choose a validation loss signal to analyze trend/level
+    vloss = val_epoch if val_epoch else val_chunk
+
+    # 2) NaN/Inf checks on losses
+    def has_bad(vals: List[float]) -> bool:
+        return any((math.isnan(v) or math.isinf(v)) for v in vals)
+    train_batch = _get_vals(series, "Loss/Train_Batch", last)
+    train_chunk = _get_vals(series, "Loss/Train_Chunk", last)
+    train_epoch = _get_vals(series, "Loss/Train_Epoch", last)
+    if has_bad(train_batch) or has_bad(train_chunk) or has_bad(train_epoch) or has_bad(vloss):
+        issues.append("Detected NaN/Inf in recent losses (train or validation). Check data and learning rate.")
+
+    # 3) Chance-level plateau for 3-class CE (~ln(3)≈1.0986)
+    if vloss:
+        last_v = vloss[-1]
+        v0, v1 = last_k_trend(vloss, min(10, len(vloss)))
+        near_chance = abs(last_v - math.log(3)) < 0.02  # within ~0.02 of ln(3)
+        non_decreasing = (not math.isnan(v0) and not math.isnan(v1) and v1 >= v0)
+        if near_chance and non_decreasing:
+            issues.append(f"Validation loss stuck near chance level (~ln(3)≈1.0986). last={last_v:.4f}. Likely prediction collapse or no learning.")
+
+    # 4) Class collapse detection using chunk diagnostics (streaming path)
+    true0 = sum(_get_vals(series, 'Metrics/Val_True_Class0_Count_Chunk', last))
+    true1 = sum(_get_vals(series, 'Metrics/Val_True_Class1_Count_Chunk', last))
+    true2 = sum(_get_vals(series, 'Metrics/Val_True_Class2_Count_Chunk', last))
+    pred0 = sum(_get_vals(series, 'Metrics/Val_Pred_Class0_Count_Chunk', last))
+    pred1 = sum(_get_vals(series, 'Metrics/Val_Pred_Class1_Count_Chunk', last))
+    pred2 = sum(_get_vals(series, 'Metrics/Val_Pred_Class2_Count_Chunk', last))
+    pred_sum = pred0 + pred1 + pred2
+    true_sum = true0 + true1 + true2
+    if pred_sum > 0:
+        p0, p1, p2 = pred0 / pred_sum, pred1 / pred_sum, pred2 / pred_sum
+        if p1 > 0.98 and p0 < 0.01 and p2 < 0.01:
+            issues.append("Prediction collapse detected: ~all validations predicted as class 1 (others near 0).")
+        if p0 > 0.98 and p1 < 0.01 and p2 < 0.01:
+            issues.append("Prediction collapse detected: ~all validations predicted as class 0.")
+        if p2 > 0.98 and p0 < 0.01 and p1 < 0.01:
+            issues.append("Prediction collapse detected: ~all validations predicted as class 2.")
+
+    # 5) Accuracy at majority baseline
+    acc_chunk = _get_vals(series, 'Metrics/Val_Accuracy_Chunk', last)
+    acc_epoch = _get_vals(series, 'Metrics/Val_Accuracy', last)
+    vacc = acc_epoch[-1] if acc_epoch else (acc_chunk[-1] if acc_chunk else None)
+    if vacc is not None and true_sum > 0:
+        majority = max(true0, true1, true2) / true_sum if true_sum > 0 else None
+        if majority is not None and abs(vacc - majority) < 0.02 and pred_sum > 0:
+            issues.append(f"Validation accuracy ≈ majority class baseline (acc={vacc:.3f}, baseline={majority:.3f}). Suggests biased predictions.")
+
+    # 6) Stalled learning: no improvement trend on validation loss and accuracy not increasing
+    if vloss and len(vloss) >= 5:
+        v0, v1 = last_k_trend(vloss, 5)
+        if not math.isnan(v0) and not math.isnan(v1) and v1 >= v0:
+            issues.append("Validation loss did not improve over recent steps (non-decreasing trend).")
+    acc_for_trend = acc_epoch if acc_epoch else acc_chunk
+    if acc_for_trend and len(acc_for_trend) >= 5:
+        a0, a1 = last_k_trend(acc_for_trend, 5)
+        if not math.isnan(a0) and not math.isnan(a1) and a1 <= a0:
+            issues.append("Validation accuracy did not increase over recent steps.")
+
+    return issues
 
 
 def save_png_charts(series: Dict[str, Series], tags: List[str], last: int, outdir: str) -> None:
     try:
         import matplotlib.pyplot as plt
     except Exception:
-        print("[INFO] matplotlib not installed. Run: pip install matplotlib")
+        print("[정보] matplotlib가 설치되어 있지 않습니다. 설치: pip install matplotlib")
         return
     os.makedirs(outdir, exist_ok=True)
     for tag in tags:
@@ -282,7 +362,7 @@ def save_html_report(series: Dict[str, Series], tags: List[str], last: int, outf
         import plotly.graph_objs as go
         from plotly.offline import plot as plot_html
     except Exception:
-        print("[INFO] plotly not installed. Run: pip install plotly")
+        print("[정보] plotly가 설치되어 있지 않습니다. 설치: pip install plotly")
         return
     figs = []
     for tag in tags:
@@ -292,7 +372,7 @@ def save_html_report(series: Dict[str, Series], tags: List[str], last: int, outf
         steps = list(range(len(vals)))
         figs.append(go.Scatter(x=steps, y=vals, name=tag, mode='lines'))
     if not figs:
-        print("[INFO] No data to render in HTML report")
+        print("[정보] HTML 리포트로 렌더링할 데이터가 없습니다")
         return
     layout = dict(title='Training Metrics', xaxis_title='step', yaxis_title='value')
     fig = go.Figure(data=figs, layout=layout)
@@ -330,15 +410,23 @@ def main():
 
     if not args.watch:
         event_path = find_event_file(args.logdir, args.event_file)
-        print(f"Using event file: {event_path}")
+        print(f"사용할 이벤트 파일: {event_path}")
         series = load_scalars(event_path)
         if not series:
-            print("No scalars found in the event file.")
+            print("이벤트 파일에서 스칼라를 찾지 못했습니다.")
             return
         if not args.stats_only:
             summarize(series)
         print_stats(series, tags=args.plot_tags, last=args.plot_last)
         print_class_distribution(series, last=args.plot_last)
+        # 자동 진단
+        issues = analyze_training(series, last=args.plot_last)
+        if issues:
+            print("\n=== 자동 진단: 잠재적 문제 감지 ===")
+            for i, msg in enumerate(issues, 1):
+                print(f"[{i}] {msg}")
+            print("문제가 감지되어 비정상 종료합니다.")
+            sys.exit(2)
         if args.save_png:
             save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
         if args.out_html:
@@ -362,7 +450,7 @@ def main():
                 event_path = newest_event_file_in(args.logdir)
                 if not event_path:
                     if args.verbose:
-                        print("[watch] no event files yet...")
+                        print("[watch] 이벤트 파일이 아직 없습니다...")
                     time.sleep(max(1, args.interval))
                     continue
             else:
@@ -370,7 +458,7 @@ def main():
 
             # Detect file switch
             if event_path != last_event_path:
-                print(f"[watch] using event file: {event_path}")
+                print(f"[watch] 사용할 이벤트 파일: {event_path}")
                 last_event_path = event_path
                 last_mtime = 0.0
                 last_step = -1
@@ -382,11 +470,11 @@ def main():
                 series = load_scalars(event_path)
             except Exception as e:
                 if args.verbose:
-                    print(f"[watch] reload failed: {e}")
+                    print(f"[watch] 재로딩 실패: {e}")
 
             current_step = max_step(series) if series else -1
             if args.verbose:
-                print(f"[watch] mtime={current_mtime:.0f} step={current_step}")
+                print(f"[watch] 수정시각={current_mtime:.0f} 스텝={current_step}")
 
             # On update: summarize once and reset idle timer
             if current_mtime != last_mtime or current_step != last_step:
@@ -394,16 +482,24 @@ def main():
                 update_index += 1
                 ts = time.strftime('%Y-%m-%d %H:%M:%S')
                 delta_step = (current_step - last_step) if last_step >= 0 and current_step >= 0 else 0
-                print("\n" + "=" * 20 + f" UPDATE #{update_index} " + "=" * 20)
-                print(f"[time] {ts}")
-                print(f"[event] {event_path}")
-                print(f"[steps] prev={last_step} -> curr={current_step} (Δ={delta_step})")
+                print("\n" + "=" * 20 + f" 업데이트 #{update_index} " + "=" * 20)
+                print(f"[시간] {ts}")
+                print(f"[이벤트] {event_path}")
+                print(f"[스텝] 이전={last_step} -> 현재={current_step} (Δ={delta_step})")
                 print("-" * 56)
                 if series:
                     if not args.stats_only:
                         summarize(series)
                     print_stats(series, tags=args.plot_tags, last=args.plot_last)
                     print_class_distribution(series, last=args.plot_last)
+                    # 워치 모드 자동 진단
+                    issues = analyze_training(series, last=args.plot_last)
+                    if issues:
+                        print("\n=== 자동 진단: 잠재적 문제 감지 ===")
+                        for i, msg in enumerate(issues, 1):
+                            print(f"[{i}] {msg}")
+                        print("문제가 감지되어 비정상 종료합니다.")
+                        sys.exit(2)
                     if args.save_png:
                         save_png_charts(series, tags=args.plot_tags, last=args.plot_last, outdir=args.save_png)
                     if args.out_html:
