@@ -9,7 +9,7 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 import pandas as pd
 import duckdb
 from torch.utils.tensorboard import SummaryWriter
@@ -199,7 +199,14 @@ def train_val_split(X: np.ndarray, y: np.ndarray, val_ratio: float = 0.2):
     return (X[:n_tr], y[:n_tr], X[n_tr:], y[n_tr:])
 
 
-def make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size: int, aux_task: str):
+def make_dataloaders(X_tr,
+                     y_tr,
+                     X_va,
+                     y_va,
+                     batch_size: int,
+                     aux_task: str,
+                     *,
+                     balance_sampling: bool = True):
     x_tr_t = torch.from_numpy(X_tr)
     x_va_t = torch.from_numpy(X_va)
     if aux_task == "direction3":
@@ -210,8 +217,23 @@ def make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size: int, aux_task: str):
         y_va_t = torch.from_numpy(y_va)
     train_ds = TensorDataset(x_tr_t, y_tr_t)
     val_ds = TensorDataset(x_va_t, y_va_t)
+    # Balanced sampling for 3-class classification to mitigate class collapse
+    if aux_task == "direction3" and balance_sampling and len(y_tr) > 0:
+        import numpy as _np
+        classes, counts = _np.unique(y_tr, return_counts=True)
+        freq = {int(k): int(v) for k, v in zip(classes.tolist(), counts.tolist())}
+        # Inverse-frequency weights
+        weights = _np.array([1.0 / max(1, freq.get(int(lbl), 0)) for lbl in y_tr], dtype=_np.float32)
+        # Normalize for stability
+        w_sum = float(weights.sum())
+        if w_sum > 0:
+            weights = weights / w_sum
+        sampler = WeightedRandomSampler(torch.from_numpy(weights), num_samples=len(weights), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=sampler, shuffle=False, drop_last=False)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False),
+        train_loader,
         DataLoader(val_ds, batch_size=batch_size, shuffle=False, drop_last=False),
     )
 
@@ -225,10 +247,37 @@ def create_model(input_features: int, seq_len: int, aux_task: str, device: str):
     return model, cfg
 
 
-def make_loss_fn(aux_task: str, y_tr: np.ndarray, device: str, loss_type: str, huber_delta: float):
+def make_loss_fn(aux_task: str,
+                 y_tr: np.ndarray,
+                 device: str,
+                 loss_type: str,
+                 huber_delta: float,
+                 label_smoothing: float = 0.05,
+                 focal_gamma: float = 0.0):
     if aux_task == "direction":
         return nn.BCEWithLogitsLoss()
     if aux_task == "direction3":
+        if loss_type == "focal":
+            # Simple focal loss on logits
+            class FocalLoss(nn.Module):
+                def __init__(self, weight=None, gamma: float = 2.0):
+                    super().__init__()
+                    self.weight = weight
+                    self.gamma = gamma
+                    self.ce = nn.CrossEntropyLoss(weight=weight, reduction='none')
+                def forward(self, logits, target):
+                    ce = self.ce(logits, target)
+                    with torch.no_grad():
+                        pt = torch.softmax(logits, dim=-1).gather(1, target.view(-1, 1)).squeeze(1).clamp_min(1e-6)
+                    loss = (1 - pt) ** self.gamma * ce
+                    return loss.mean()
+            unique, counts = np.unique(y_tr, return_counts=True)
+            freq = {int(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
+            w = [1.0 / max(1, freq.get(c, 0)) for c in [0, 1, 2]]
+            w = np.array(w, dtype=np.float32)
+            w = w / (w.mean() if w.mean() > 0 else 1.0)
+            class_weights = torch.tensor(w, dtype=torch.float32, device=device)
+            return FocalLoss(weight=class_weights, gamma=focal_gamma if focal_gamma > 0 else 2.0)
         if loss_type == "ce":
             unique, counts = np.unique(y_tr, return_counts=True)
             freq = {int(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
@@ -236,9 +285,10 @@ def make_loss_fn(aux_task: str, y_tr: np.ndarray, device: str, loss_type: str, h
             w = np.array(w, dtype=np.float32)
             w = w / (w.mean() if w.mean() > 0 else 1.0)
             class_weights = torch.tensor(w, dtype=torch.float32, device=device)
-            return nn.CrossEntropyLoss(weight=class_weights)
+            # Use label smoothing to avoid overconfident collapse
+            return nn.CrossEntropyLoss(weight=class_weights, label_smoothing=max(0.0, float(label_smoothing)))
         else:
-            return nn.CrossEntropyLoss()
+            return nn.CrossEntropyLoss(label_smoothing=max(0.0, float(label_smoothing)))
     # regression family
     return nn.HuberLoss(delta=huber_delta) if (loss_type == "huber") else nn.MSELoss()
 
@@ -395,16 +445,20 @@ def train(
     progress_every: int = 10,
     resume_from: Optional[str] = None,  # path to checkpoint to resume from
     enable_tensorboard: bool = True,  # enable TensorBoard logging
-    loss_type: str = "mse",          # loss: regression {"mse", "huber"}, classification {"ce"}
+    loss_type: str = "mse",          # loss: regression {"mse", "huber"}, classification {"ce", "focal"}
     huber_delta: float = 1.0,         # Huber delta
     weight_decay: float = 1e-4,       # AdamW weight decay
     direction3_threshold: float = 1e-2,  # 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)
     # Auto-diagnosis controls
-    auto_diagnosis: str = "abort",          # {'abort','warn','off'}
+    auto_diagnosis: str = "warn",           # {'abort','warn','off'} (default warn to avoid premature abort)
     diag_warmup_chunks: int = 10,            # 최소 학습 청크 수 이후에만 진단
     diag_warmup_epochs: int = 1,             # 최소 에폭 수 이후에만 진단
     diag_min_val_samples: int = 512,         # 진단에 필요한 최소 검증 샘플 수
     diag_require_consecutive: int = 2,       # 연속 감지 횟수 임계
+    # Imbalance/collapse mitigation controls
+    label_smoothing: float = 0.05,
+    use_weighted_sampler: bool = True,
+    focal_gamma: float = 0.0,
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -796,10 +850,17 @@ def train(
                             X_tr, y_tr, X_va, y_va = train_val_split(X, y_arr, val_ratio=0.2)
 
                             # Build dataloaders
-                            train_loader, val_loader = make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size, aux_task)
+                            train_loader, val_loader = make_dataloaders(
+                                X_tr, y_tr, X_va, y_va, batch_size, aux_task,
+                                balance_sampling=bool(use_weighted_sampler)
+                            )
 
                             # For 3-class classification, compute class weights per chunk
-                            local_loss_fn = make_loss_fn(aux_task, y_tr, device, loss_type, huber_delta)
+                            local_loss_fn = make_loss_fn(
+                                aux_task, y_tr, device, loss_type, huber_delta,
+                                label_smoothing=label_smoothing,
+                                focal_gamma=focal_gamma
+                            )
 
                             # train
                             model.train()
@@ -1283,7 +1344,10 @@ def train(
     X_tr, y_tr, X_va, y_va = train_val_split(X, y, val_ratio=0.2)
 
     # dataloaders
-    train_loader, val_loader = make_dataloaders(X_tr, y_tr, X_va, y_va, batch_size, aux_task)
+    train_loader, val_loader = make_dataloaders(
+        X_tr, y_tr, X_va, y_va, batch_size, aux_task,
+        balance_sampling=bool(use_weighted_sampler)
+    )
 
     # model
     model, cfg = create_model(input_features=len(real_cols), seq_len=seq_len, aux_task=aux_task, device=device)
@@ -1291,7 +1355,10 @@ def train(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
     )
-    loss_fn = make_loss_fn(aux_task, y_tr, device, loss_type, huber_delta)
+    loss_fn = make_loss_fn(
+        aux_task, y_tr, device, loss_type, huber_delta,
+        label_smoothing=label_smoothing, focal_gamma=focal_gamma
+    )
 
     # Non-streaming startup summary
     log_startup_summary(
@@ -1508,7 +1575,10 @@ def main():
     p.add_argument("--ckpt-epochs", default=None, help="지정 에폭에서 체크포인트 저장 (쉼표 구분, 예: '5,10,20')")
     p.add_argument("--resume-from", default=None, help="재시작할 체크포인트 파일 경로 또는 체크포인트 폴더 경로. 폴더 지정 시 가장 최신 체크포인트 자동 선택. 미지정 시 처음부터 시작")
     p.add_argument("--chunk-size", type=int, default=1000, help="DuckDB에서 한 번에 읽을 레코드 수. 기본값: 1000. 0 또는 음수면 전체 로드")
-    p.add_argument("--loss", choices=["mse", "huber", "ce"], default="mse", help="손실 함수: 회귀(mse/huber), 분류(ce)")
+    p.add_argument("--loss", choices=["mse", "huber", "ce", "focal"], default="mse", help="손실 함수: 회귀(mse/huber), 분류(ce/focal)")
+    p.add_argument("--label-smoothing", type=float, default=0.05, help="CE 라벨 스무딩 계수 (direction3 전용). 기본값: 0.05")
+    p.add_argument("--focal-gamma", type=float, default=0.0, help="Focal Loss 감마. 0이면 비활성. 기본값: 0.0")
+    p.add_argument("--use-weighted-sampler", action="store_true", help="direction3에서 클래스 불균형 완화를 위해 WeightedRandomSampler 사용")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber 손실의 delta (허용 오차)")
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (L2 정규화 강도)")
     p.add_argument("--direction3-threshold", type=float, default=1e-2, help="`--aux-task`가 `direction3`일 경우 작동. 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)")
@@ -1549,6 +1619,9 @@ def main():
         huber_delta=args.huber_delta,
         weight_decay=args.weight_decay,
         direction3_threshold=args.direction3_threshold,
+        label_smoothing=args.label_smoothing,
+        use_weighted_sampler=bool(args.use_weighted_sampler),
+        focal_gamma=args.focal_gamma,
         auto_diagnosis=args.auto_diagnosis,
         diag_warmup_chunks=args.diag_warmup_chunks,
         diag_warmup_epochs=args.diag_warmup_epochs,
