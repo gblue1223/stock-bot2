@@ -470,6 +470,8 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         *[f"매도호가직전대비{i}" for i in range(1, 11)],
         *[f"매수호가직전대비{i}" for i in range(1, 11)],
         "전일거래량대비", "전일거래량대비비율",
+        # 체결강도: 비율 피처이므로 표준화만 적용 (CRITICAL FIX)
+        "체결강도",
     ])
 
     broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
