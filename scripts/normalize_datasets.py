@@ -21,6 +21,11 @@ INPUT_TABLE = "datasets"  # 입력 DuckDB 테이블명
 TEXT_COLUMNS = {"종목코드", "종목명", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
 DROP_COLUMNS = {"종류", "씨리얼"}
 IGNORING_STOCKS_SET: set[str] = set()
+
+# Default minimum required per-minute cumulative traded value (누적거래대금)
+DEFAULT_TRADE_VALUE_PER_MINUTE: float = 3000.0
+# Default minimum number of minutes that must satisfy the trade value threshold
+DEFAULT_MIN_QUALIFYING_MINUTES: int = 2
 def _to_time_ms(val: object) -> int:
     """Convert various time formats to a 9-digit HHMMSSmmm integer.
     Supports:
@@ -177,8 +182,41 @@ def _clean_column_name(col: str) -> str:
     return c
 
 
+def _count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: float) -> Optional[int]:
+    """Return count of minutes where 누적거래대금 increases by at least `trade_threshold_per_minute`."""
+    if '누적거래대금' not in df.columns or '시간' not in df.columns:
+        return None
+
+    trade_values = pd.to_numeric(df['누적거래대금'], errors='coerce')
+    time_secs = df['시간'].apply(_time_ms_to_seconds)
+    time_secs = pd.to_numeric(time_secs, errors='coerce')
+
+    mask = trade_values.notna() & time_secs.notna()
+    if mask.sum() == 0:
+        return None
+
+    trade_values = trade_values[mask].astype(float)
+    time_secs = time_secs[mask].astype(int)
+
+    if trade_values.empty:
+        return None
+
+    order = np.argsort(time_secs.values, kind="mergesort")
+    trade_values = trade_values.iloc[order]
+    time_secs = time_secs.iloc[order]
+
+    minutes = (time_secs // 60).astype(int)
+    df_group = pd.DataFrame({'minute': minutes.values, 'trade': trade_values.values})
+    deltas = df_group.groupby('minute')['trade'].agg(lambda s: float(s.max() - s.min()))
+    qualifying = (deltas >= trade_threshold_per_minute).sum()
+
+    return int(qualifying)
+
+
 def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str, 
-                                time_start: int = 90000000, time_end: int = 110000000) -> pd.DataFrame:
+                                time_start: int = 90000000, time_end: int = 110000000,
+                                trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+                                min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES) -> pd.DataFrame:
     """
     DuckDB에서 특정 종목코드/날짜의 데이터를 로드하고 기본 정리
     time_start: 시작 시간 (기본: 90000000 = 오전 9시)
@@ -238,6 +276,18 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
                 # 임시 컬럼 제거
                 df = df.drop(columns=['시간_hhmmssmmm'])
             
+            if trade_threshold_per_minute > 0:
+                qualifying_minutes = _count_trade_value_minutes(df, trade_threshold_per_minute)
+                if qualifying_minutes is None:
+                    print(f"[FILTER] 누적거래대금 데이터 부족으로 제외 ({name}, {date})")
+                    return pd.DataFrame()
+                if qualifying_minutes < min_qualifying_minutes:
+                    print(
+                        f"[FILTER] 누적거래대금 1분 구간 불충족 {qualifying_minutes} < {min_qualifying_minutes} "
+                        f"({name}, {date})"
+                    )
+                    return pd.DataFrame()
+
             # 불필요 컬럼 제거
             df = df.drop(columns=[col for col in DROP_COLUMNS if col in df.columns], errors="ignore")
             
@@ -288,14 +338,25 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str,
-                      time_start: int = 90000000, time_end: int = 110000000) -> pd.DataFrame:
+                      time_start: int = 90000000, time_end: int = 110000000,
+                      trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+                      min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES) -> pd.DataFrame:
     """
     DuckDB에서 데이터를 로드하여 병합 (이미 병합된 데이터인 경우 그대로 반환)
     """
     # 입력 DB에서는 이미 병합된 상태이므로 단순히 로드만 수행
     if "merged" in group_info:
         db_path, code, name, date = group_info["merged"]
-        df = load_and_clean_from_duckdb(db_path, code, name, date, time_start, time_end)
+        df = load_and_clean_from_duckdb(
+            db_path,
+            code,
+            name,
+            date,
+            time_start,
+            time_end,
+            trade_threshold_per_minute=trade_threshold_per_minute,
+            min_qualifying_minutes=min_qualifying_minutes,
+        )
         
         if df.empty:
             return pd.DataFrame()
@@ -702,7 +763,9 @@ def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
 
 def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[str, str, str, str]], tmp_root: str,
                                      time_start: int = 90000000, time_end: int = 110000000,
-                                     ignoring_stocks_csv: Optional[str] = None) -> Optional[str]:
+                                     ignoring_stocks_csv: Optional[str] = None,
+                                     trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+                                     min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES) -> Optional[str]:
     """Process a single group and save to pickle file. Returns pickle path or None on error."""
     try:
         # Ensure ignore set is loaded inside worker/subprocess
@@ -714,7 +777,17 @@ def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[
         date = parts[-1]
         name = '_'.join(parts[1:-1])
         
-        merged_df = merge_from_duckdb(group_info, code, name, date, time_start, time_end)
+        merged_df = merge_from_duckdb(
+            group_info,
+            code,
+            name,
+            date,
+            time_start,
+            time_end,
+            require_trade_threshold=require_trade_threshold,
+            trade_threshold_per_minute=trade_threshold_per_minute,
+            min_qualifying_minutes=min_qualifying_minutes,
+        )
         
         if merged_df.empty:
             return None
@@ -825,7 +898,9 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
                            db_path: str, tmp_root: str, yyyymm: str, 
                            checkpoint_interval: int, group_workers: int = 1,
                            time_start: int = 90000000, time_end: int = 110000000,
-                           ignoring_stocks_csv: Optional[str] = None) -> int:
+                           ignoring_stocks_csv: Optional[str] = None,
+                           trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+                           min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES) -> int:
     """Process all groups for a specific month with parallel group processing.
     Returns the number of processed groups.
     """
@@ -847,7 +922,8 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
             for group_key, group_info in month_groups:
                 fut = ex.submit(_process_single_group_to_pickle, 
                                 group_key, group_info, tmp_root, 
-                                time_start, time_end, ignoring_stocks_csv)
+                                time_start, time_end, ignoring_stocks_csv,
+                                trade_threshold_per_minute, min_qualifying_minutes)
                 futs.append(fut)
             done = 0
             for fut in _fut.as_completed(futs):
@@ -877,7 +953,8 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
         done = 0
         for group_key, group_info in month_groups:
             pkl_path = _process_single_group_to_pickle(group_key, group_info, tmp_root, 
-                                                       time_start, time_end, ignoring_stocks_csv)
+                                                       time_start, time_end, ignoring_stocks_csv,
+                                                       trade_threshold_per_minute, min_qualifying_minutes)
             if pkl_path:
                 pickle_paths.append(pkl_path)
                 # Incremental ingest when buffer reaches checkpoint size
@@ -1039,7 +1116,9 @@ def normalize_datasets(input_db: str, output_db: str, *,
                        time_start: int = 90000000,
                        time_end: int = 110000000,
                        ignoring_stocks_csv: Optional[str] = None,
-                       single_output: bool = False):
+                       single_output: bool = False,
+                       trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+                       min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES):
     """
     메인 정규화 함수 (DuckDB 전용)
     - 입력 DuckDB를 스캔하여 유효 데이터 그룹을 찾음
@@ -1197,7 +1276,20 @@ def normalize_datasets(input_db: str, output_db: str, *,
             for yyyymm in months:
                 db_path = _monthly_db_path(output_db, yyyymm)
                 groups = monthly_groups[yyyymm]
-                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), norm_time_start, norm_time_end, ignoring_stocks_csv)
+                fut = ex.submit(
+                    _process_monthly_groups,
+                    groups,
+                    db_path,
+                    str(_tmp_base),
+                    yyyymm,
+                    int(checkpoint_interval),
+                    int(group_workers),
+                    norm_time_start,
+                    norm_time_end,
+                    ignoring_stocks_csv,
+                    trade_threshold_per_minute,
+                    min_qualifying_minutes,
+                )
                 futs[fut] = (yyyymm, len(groups), db_path)
             done = 0
             for fut in _fut.as_completed(futs):
@@ -1213,7 +1305,19 @@ def normalize_datasets(input_db: str, output_db: str, *,
         for yyyymm in months:
             db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
             groups = monthly_groups[yyyymm]
-            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers), norm_time_start, norm_time_end, ignoring_stocks_csv)
+            processed = _process_monthly_groups(
+                groups,
+                db_path,
+                str(_tmp_base),
+                yyyymm,
+                int(checkpoint_interval),
+                int(group_workers),
+                norm_time_start,
+                norm_time_end,
+                ignoring_stocks_csv,
+                trade_threshold_per_minute,
+                min_qualifying_minutes,
+            )
             print(f"월 처리 완료: {yyyymm} ({processed}/{len(groups)}) -> {db_path}")
 
     # 최종 CHECKPOINT 수행
@@ -1264,6 +1368,10 @@ def main():
                         help="무시할 종목명 리스트 CSV 경로 (기본: scripts/ignoring_stocks.csv, '종목명' 컬럼 필요)")
     parser.add_argument("--single-output", action="store_true",
                         help="월별 샤드 대신 하나의 DuckDB 파일(-o)에 모든 결과를 순차 반영합니다")
+    parser.add_argument("--trade-threshold", type=float, default=DEFAULT_TRADE_VALUE_PER_MINUTE,
+                        help=f"누적거래대금 1분 필터 기준값. 0 이하이면 필터 비활성화 (기본: {DEFAULT_TRADE_VALUE_PER_MINUTE})")
+    parser.add_argument("--qualifying-minutes", type=int, default=DEFAULT_MIN_QUALIFYING_MINUTES,
+                        help=f"필터 활성화 시 기준을 충족해야 하는 분 수(기본: {DEFAULT_MIN_QUALIFYING_MINUTES})")
     
     args = parser.parse_args()
 
@@ -1291,6 +1399,8 @@ def main():
         time_end=args.time_end,
         ignoring_stocks_csv=args.ignoring_stocks_csv,
         single_output=args.single_output,
+        trade_threshold_per_minute=args.trade_threshold,
+        min_qualifying_minutes=args.qualifying_minutes,
     )
 
     end_dt = datetime.now()
