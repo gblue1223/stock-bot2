@@ -439,6 +439,8 @@ def train(
     table: str = "datasets",
     code: Optional[str] = None,
     date: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     seq_len: int = 60,
     horizon: int = 10,
     target_col: Optional[str] = None,
@@ -468,6 +470,10 @@ def train(
     label_smoothing: float = 0.05,
     use_weighted_sampler: bool = True,
     focal_gamma: float = 0.0,
+    # Training stability controls
+    grad_clip: float = 1.0,              # Gradient clipping max norm
+    use_scheduler: bool = True,          # Use learning rate scheduler
+    scheduler_patience: int = 3,         # ReduceLROnPlateau patience
 ):
     """
     SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
@@ -478,6 +484,8 @@ def train(
     - table (str, default="datasets"): DB에서 읽어올 테이블명.
     - code (Optional[str], default=None): 특정 종목 코드로 데이터 필터링(예: "005930"). None이면 전체(환경/데이터 로직에 따름).
     - date (Optional[str], default=None): 특정 일자(YYYYMMDD)로 데이터 필터링. None이면 전체 사용.
+    - start_date (Optional[str], default=None): 시작 일자(YYYYMMDD) 범위 필터. date가 지정되지 않은 경우에만 적용.
+    - end_date (Optional[str], default=None): 종료 일자(YYYYMMDD) 범위 필터. date가 지정되지 않은 경우에만 적용.
     - seq_len (int, default=60): 모델 입력으로 사용할 시퀀스(윈도우) 길이.
     - horizon (int, default=10): 예측 시점까지의 간격(몇 스텝 뒤를 예측할지). direction/volatility에서도 사용.
     - target_col (Optional[str], default=None): 예측 대상 컬럼명. None일 경우 첫 번째 feature를 사용합니다.
@@ -633,9 +641,17 @@ def train(
                 if code:
                     where_clauses.append('"종목코드" = ?')
                     params.append(code)
+                # Apply date equality or range filter
                 if date:
                     where_clauses.append('"날짜" = ?')
                     params.append(date)
+                else:
+                    if start_date:
+                        where_clauses.append('"날짜" >= ?')
+                        params.append(start_date)
+                    if end_date:
+                        where_clauses.append('"날짜" <= ?')
+                        params.append(end_date)
                 where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
                 cnt = conn.execute(f"SELECT COUNT(*) FROM {table}{where_sql}", params).fetchone()[0]
                 per_file_rows.append(int(cnt))
@@ -714,12 +730,19 @@ def train(
                     group_keys = []
                     if has_name:
                         if date is None:
-                            # all dates and names, optionally filtered by code
+                            # all dates within optional range and names, optionally filtered by code
                             base_where = []
                             base_params = []
                             if code:
                                 base_where.append('"종목코드" = ?')
                                 base_params.append(code)
+                            # Apply date range if provided
+                            if start_date:
+                                base_where.append('"날짜" >= ?')
+                                base_params.append(start_date)
+                            if end_date:
+                                base_where.append('"날짜" <= ?')
+                                base_params.append(end_date)
                             base_sql = (" WHERE " + " AND ".join(base_where)) if base_where else ""
                             rows = conn.execute(
                                 f"SELECT DISTINCT \"날짜\", \"종목명\" FROM {table}{base_sql} ORDER BY 1, 2",
@@ -740,8 +763,28 @@ def train(
                             ).fetchall()
                             group_keys = [(date, r[0]) for r in rows]
                     else:
-                        # Fallback: single group with optional filters
-                        group_keys = [(date, None)]
+                        # No 종목명 column. Build groups by 날짜 only.
+                        if date is None:
+                            base_where = []
+                            base_params = []
+                            if code:
+                                base_where.append('"종목코드" = ?')
+                                base_params.append(code)
+                            if start_date:
+                                base_where.append('"날짜" >= ?')
+                                base_params.append(start_date)
+                            if end_date:
+                                base_where.append('"날짜" <= ?')
+                                base_params.append(end_date)
+                            base_sql = (" WHERE " + " AND ".join(base_where)) if base_where else ""
+                            rows = conn.execute(
+                                f"SELECT DISTINCT \"날짜\" FROM {table}{base_sql} ORDER BY 1",
+                                base_params,
+                            ).fetchall()
+                            group_keys = [(r[0], None) for r in rows]
+                        else:
+                            # fixed date single group
+                            group_keys = [(date, None)]
 
                     # Iterate groups
                     for g_date, g_name in group_keys:
@@ -812,9 +855,11 @@ def train(
                                     cfg = ModelConfig(input_features=len(global_features), seq_len=seq_len)
                                 model = CNNLSTMAttn(cfg).to(device)
                                 opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-                                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                                    opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
-                                )
+                                scheduler = None
+                                if use_scheduler:
+                                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                                        opt, mode='min', factor=0.5, patience=scheduler_patience, min_lr=1e-7
+                                    )
                                 
                                 # Load model state if resuming (only once when model is first created)
                                 if resume_from and os.path.exists(resume_from):
@@ -822,7 +867,7 @@ def train(
                                         checkpoint = load_checkpoint(resume_from, device)
                                         model.load_state_dict(checkpoint["state_dict"])
                                         # Load scheduler state if available
-                                        if "scheduler_state" in checkpoint:
+                                        if scheduler and "scheduler_state" in checkpoint:
                                             scheduler.load_state_dict(checkpoint["scheduler_state"])
                                             print("Model and scheduler state loaded from checkpoint")
                                         else:
@@ -898,14 +943,17 @@ def train(
                             batch_count = 0
                             # chunk-local accumulators
                             tr_chunk_sum, tr_chunk_n = 0.0, 0
+                            # control verbose logging frequency
+                            should_log_chunk = (progress_every > 0 and (global_trained_chunk_count % progress_every == 0))
                             
                             # Print chunk info for debugging
-                            print(f"  Processing chunk {global_trained_chunk_count}: X_tr.shape={X_tr.shape}, y_tr.shape={y_tr.shape}")
-                            if aux_task == "direction3":
-                                import numpy as _np
-                                unique, counts = _np.unique(y_tr, return_counts=True)
-                                class_dist = {int(k): int(v) for k, v in zip(unique, counts)}
-                                print(f"  Class distribution: {class_dist}")
+                            if should_log_chunk:
+                                print(f"  Processing chunk {global_trained_chunk_count}: X_tr.shape={X_tr.shape}, y_tr.shape={y_tr.shape}")
+                                if aux_task == "direction3":
+                                    import numpy as _np
+                                    unique, counts = _np.unique(y_tr, return_counts=True)
+                                    class_dist = {int(k): int(v) for k, v in zip(unique, counts)}
+                                    print(f"  Class distribution: {class_dist}")
                             
                             for xb, yb in train_loader:
                                 xb = xb.to(device)
@@ -922,7 +970,7 @@ def train(
                                 else:
                                     loss = loss_fn(pred, yb)
                                 loss.backward()
-                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
                                 opt.step()
                                 tr_loss_epoch_sum += loss.item() * len(xb)
                                 tr_samples += len(xb)
@@ -943,7 +991,8 @@ def train(
                             va_preds_c, va_targets_c = [], []  # existing accumulate_val usage
                             y_true_c2, y_pred_c2 = [], []      # explicit argmax-based labels
                             
-                            print(f"  Validation: X_va.shape={X_va.shape}, y_va.shape={y_va.shape}")
+                            if should_log_chunk:
+                                print(f"  Validation: X_va.shape={X_va.shape}, y_va.shape={y_va.shape}")
                             
                             with torch.no_grad():
                                 for xb, yb in val_loader:
@@ -969,7 +1018,8 @@ def train(
                             # Print chunk results
                             chunk_tr_loss = tr_chunk_sum / max(1, tr_chunk_n) if tr_chunk_n > 0 else 0.0
                             chunk_va_loss = va_chunk_sum / max(1, va_chunk_n) if va_chunk_n > 0 else 0.0
-                            print(f"  Chunk {global_trained_chunk_count} results: train_loss={chunk_tr_loss:.6f}, val_loss={chunk_va_loss:.6f}")
+                            if should_log_chunk:
+                                print(f"  Chunk {global_trained_chunk_count} results: train_loss={chunk_tr_loss:.6f}, val_loss={chunk_va_loss:.6f}")
                             
                             # chunk-level scalars
                             if writer:
@@ -1196,7 +1246,7 @@ def train(
                     consecutive_epoch_issues = 0
             
             # Update learning rate scheduler
-            if 'scheduler' in locals():
+            if 'scheduler' in locals() and scheduler is not None:
                 old_lr = opt.param_groups[0]['lr']
                 scheduler.step(va_loss_avg)
                 current_lr = opt.param_groups[0]['lr']
@@ -1204,7 +1254,8 @@ def train(
                     print(f"Learning rate reduced from {old_lr:.2e} to {current_lr:.2e}")
                 print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f} lr={current_lr:.2e}")
             else:
-                print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f}")
+                current_lr = opt.param_groups[0]['lr']
+                print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss_avg:.6f} val_loss={va_loss_avg:.6f} lr={current_lr:.2e}")
 
             # Log epoch-level metrics to TensorBoard
             if writer:
@@ -1277,6 +1328,8 @@ def train(
             "table": table,
             "code": code,
             "date": date,
+            "start_date": start_date,
+            "end_date": end_date,
             "seq_len": seq_len,
             "horizon": horizon,
             "target_col": tgt_col,
@@ -1326,6 +1379,15 @@ def train(
     available_features = [c for c in requested_features if c in df.columns]
     if not available_features:
         raise ValueError("None of the requested feature columns exist in the loaded DataFrame.")
+
+    # Apply date range filtering in non-streaming path if provided (and not using single date)
+    if date is None and (start_date or end_date) and "날짜" in df.columns:
+        mask = pd.Series([True] * len(df))
+        if start_date:
+            mask &= (df["날짜"] >= start_date)
+        if end_date:
+            mask &= (df["날짜"] <= end_date)
+        df = df.loc[mask]
 
     feats = df[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     real_cols = list(feats.columns)
@@ -1408,9 +1470,11 @@ def train(
     # model
     model, cfg = create_model(input_features=len(real_cols), seq_len=seq_len, aux_task=aux_task, device=device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='min', factor=0.5, patience=3, min_lr=1e-7
-    )
+    scheduler = None
+    if use_scheduler:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', factor=0.5, patience=scheduler_patience, min_lr=1e-7
+        )
     loss_fn = make_loss_fn(
         aux_task, y_tr, device, loss_type, huber_delta,
         label_smoothing=label_smoothing, focal_gamma=focal_gamma
@@ -1457,7 +1521,7 @@ def train(
             else:
                 loss = loss_fn(pred, yb)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             opt.step()
             tr_loss += loss.item() * len(xb)
             n_tr += len(xb)
@@ -1519,12 +1583,16 @@ def train(
                     train._ns_consecutive_epoch_issues = 0  # type: ignore[attr-defined]
         
         # Update learning rate scheduler
-        old_lr = opt.param_groups[0]['lr']
-        scheduler.step(va_loss)
-        current_lr = opt.param_groups[0]['lr']
-        if current_lr != old_lr:
-            print(f"Learning rate reduced from {old_lr:.2e} to {current_lr:.2e}")
-        print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={current_lr:.2e}")
+        if use_scheduler and 'scheduler' in locals() and scheduler is not None:
+            old_lr = opt.param_groups[0]['lr']
+            scheduler.step(va_loss)
+            current_lr = opt.param_groups[0]['lr']
+            if current_lr != old_lr:
+                print(f"Learning rate reduced from {old_lr:.2e} to {current_lr:.2e}")
+            print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={current_lr:.2e}")
+        else:
+            current_lr = opt.param_groups[0]['lr']
+            print(f"Epoch {epoch}/{epochs} - train_loss={tr_loss:.6f} val_loss={va_loss:.6f} lr={current_lr:.2e}")
         
         # Log epoch-level metrics to TensorBoard
         if writer:
@@ -1589,6 +1657,8 @@ def train(
         "table": table,
         "code": code,
         "date": date,
+        "start_date": start_date,
+        "end_date": end_date,
         "seq_len": seq_len,
         "horizon": horizon,
         "target_col": tgt_col,
@@ -1617,6 +1687,8 @@ def main():
     p.add_argument("--table", default="datasets", help="DB에서 사용할 테이블명. 기본값: datasets")
     p.add_argument("--code", default=None, help="특정 종목 코드로 필터링(예: 005930). 미지정 시 전체/로직에 따름")
     p.add_argument("--date", default=None, help="특정 일자(YYYYMMDD)로 필터링. 미지정 시 전체/로직에 따름")
+    p.add_argument("--start-date", default=None, help="시작 일자(YYYYMMDD) 범위 필터. --date 미지정 시에만 적용")
+    p.add_argument("--end-date", default=None, help="종료 일자(YYYYMMDD) 범위 필터. --date 미지정 시에만 적용")
     p.add_argument("--out", default="models/supervised", help="출력 디렉터리(체크포인트와 설정 저장). 기본값: models/supervised")
     p.add_argument("--seq-len", type=int, default=60, help="입력 시퀀스(윈도우) 길이. 기본값: 60")
     p.add_argument("--horizon", type=int, default=10, help="예측 시점까지의 간격(몇 스텝 뒤를 예측할지). 기본값: 1")
@@ -1637,7 +1709,13 @@ def main():
     p.add_argument("--use-weighted-sampler", action="store_true", help="direction3에서 클래스 불균형 완화를 위해 WeightedRandomSampler 사용")
     p.add_argument("--huber-delta", type=float, default=1.0, help="Huber 손실의 delta (허용 오차)")
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay (L2 정규화 강도)")
-    p.add_argument("--direction3-threshold", type=float, default=1e-2, help="`--aux-task`가 `direction3`일 경우 작동. 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%)")
+    p.add_argument("--direction3-threshold", type=float, default=1e-2, help="`--aux-task`가 `direction3`일 경우 작동. 3-클래스(하락/보합/상승) 분류 임계값 (예: 0.01 = 1%%)")
+
+    # Training stability controls
+    p.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping max norm. 기본값: 1.0")
+    p.add_argument("--use-scheduler", action="store_true", default=True, help="Learning rate scheduler 사용 여부. 기본값: True")
+    p.add_argument("--no-scheduler", dest="use_scheduler", action="store_false", help="Learning rate scheduler 비활성화")
+    p.add_argument("--scheduler-patience", type=int, default=3, help="ReduceLROnPlateau patience. 기본값: 3")
 
     # Auto-diagnosis controls
     p.add_argument("--auto-diagnosis", choices=["abort", "warn", "off"], default="abort", help="자동 진단 동작: abort/warn/off")
@@ -1656,6 +1734,8 @@ def main():
         table=args.table,
         code=args.code,
         date=args.date,
+        start_date=args.start_date,
+        end_date=args.end_date,
         seq_len=args.seq_len,
         horizon=args.horizon,
         target_col=args.target_col,
@@ -1683,6 +1763,9 @@ def main():
         diag_warmup_epochs=args.diag_warmup_epochs,
         diag_min_val_samples=args.diag_min_val_samples,
         diag_require_consecutive=args.diag_require_consecutive,
+        grad_clip=args.grad_clip,
+        use_scheduler=args.use_scheduler,
+        scheduler_patience=args.scheduler_patience,
     )
 
 

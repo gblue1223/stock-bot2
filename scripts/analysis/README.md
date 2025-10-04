@@ -85,13 +85,62 @@ python scripts/analysis/training_analyzer.py models/model_v2
 - **불량 (> 1.0)**: ❌ 재훈련 권장
 
 ### 권장사항 적용
-분석 결과에서 제공하는 권장 설정을 복사하여 다음 훈련에 사용하세요.
-
 ## 🔧 확장 가능성
 
 이 도구는 다음과 같이 확장할 수 있습니다:
 
-1. **자동 비교**: 여러 모델 자동 비교 기능
-2. **시각화**: matplotlib을 이용한 그래프 생성
-3. **리포트**: HTML/PDF 리포트 생성
-4. **알림**: 성능 임계값 기반 알림 시스템
+  1. **자동 비교**: 여러 모델 자동 비교 기능
+  2. **시각화**: matplotlib을 이용한 그래프 생성
+  3. **리포트**: HTML/PDF 리포트 생성
+  4. **알림**: 성능 임계값 기반 알림 시스템
+
+## 🧰 도구 통합 안내
+
+중복되는 스크립트를 정리하여 핵심 도구만 유지했습니다.
+
+- **유지**
+  - `scripts/analysis/training_analyzer.py`: 모델 디렉토리 종합 분석
+  - `scripts/analysis/diagnose_training_issues.py`: 데이터/정규화/누수 등 종합 진단
+  - `scripts/check_tensorboard.py`: TensorBoard 로그 분석(워치 모드, 차트/리포트)
+- **보관(Archive)**: 중복/부분기능 스크립트는 `scripts/analysis/_archive/`로 이동
+  - `analyze_training_loss.py`
+  - `check_group_normalization.py`
+  - `deep_normalization_check.py`
+  - `verify_normalization.py`
+  - `check_data_quality.py`
+  
+## 🧪 diagnose_training_issues.py
+  
+  데이터셋(DuckDB)에 대한 종합 진단을 수행합니다. 데이터 누수, 그룹별 정규화 여부, 타겟 분포, 시계열 연속성, 피처 분산 등을 점검합니다.
+
+### 사용법
+
+```bash
+python scripts/analysis/diagnose_training_issues.py path/to/dataset.duckdb \\
+{{ ... }}
+  --date-col 날짜 --code-col 종목명_scalar --target-col direction3
+```
+
+### 주요 출력
+
+- **누수 탐지**: 학습/검증 구간 교차, 미래 정보 포함 여부
+- **정규화 점검**: 그룹별 통계 분포 비교(날짜/종목)
+- **타겟 분포**: 클래스 불균형, 편향
+- **시퀀스 연속성**: 결측 구간, 샘플 간 간격
+- **피처 분산**: 상수화/폭발(Inf/NaN) 여부
+
+## 📈 TensorBoard 로그 점검
+
+학습 로그와 메트릭 이상 탐지는 `scripts/check_tensorboard.py`를 사용하세요.
+
+### 사용법 예시
+
+```bash
+python scripts/check_tensorboard.py runs/sb3/ppo_scalp_cnn_1 --watch --export report.html
+```
+
+### 기능
+
+- **스칼라 요약**: 주요 태그의 최종/최고값, 추세
+- **이상 탐지**: NaN/Inf, 수렴 정체, 검증 손실 비감소 등
+- **리포트 출력**: 콘솔 요약, HTML/PNG 저장

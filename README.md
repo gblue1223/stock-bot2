@@ -13,15 +13,19 @@
 ```bash
 python scripts/generate_datasets.py \
   "D:\Workspace\Project\stock-bot\hoga-crawler\data" \
-  -o "C:\Users\user\Workspace\datasets\datasets.duckdb" \
+  -o "C:\Users\user\Workspace\datasets@raw\datasets.duckdb" \
   --workers 12 \
-  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
+  --tmp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
   --checkpoint-interval 50
 
-python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" --out "C:\Users\user\Workspace\datasets\datasets_all.duckdb" --temp-dir "C:\Users\user\Workspace\datasets\tmp" --threads 2 --memory-limit 64GB
+python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
+  --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+  --temp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
+  --threads 2 \
+  --memory-limit 64GB
 
 python scripts/normalize_datasets.py \
-  "C:\Users\user\Workspace\datasets\datasets_all.duckdb" \
+  "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
   -o "C:\Users\user\Workspace\datasets\datasets_norm.duckdb" \
   --workers 12 \
   --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
@@ -43,32 +47,37 @@ python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" --out "C:\Us
 ##### 분류(Focal, CrossEntropy)방식
 ```bash
 python -m ai_trader.ml.train_supervised \
-  --db "C:\Users\user\Workspace\datasets@20251002\datasets_norm_all.duckdb" \
+  --db "C:\Users\user\Workspace\datasets@20251003\datasets_norm_all.duckdb" \
   --table datasets \
   --out models/supervised_sample_test \
   --seq-len 60 \
   --horizon 20 \
   --chunk-size 500 \
   --device cuda \
-  --batch-size 64 \
-  --epochs 8 \
-  --lr 3e-5 \
-  --weight-decay 1e-4 \
-  --progress-every 100 \
-  --ckpt-every-chunks 50 \
-  --resume-from models/supervised_sample_test/checkpoints \
+  --batch-size 128 \
+  --epochs 3 \
+  --lr 2e-5 \
+  --weight-decay 1e-5 \
+  --grad-clip 1.0 \
   --target-col 현재가 \
-  --code 000100 \
-  --date 20241128 \
   \
   --aux-task direction3 \
   --loss focal \
-  --focal-gamma 2.0 \
+  --focal-gamma 1.0 \
   --use-weighted-sampler \
-  --direction3-threshold 0.015
+  --direction3-threshold 0.015 \
+  \
+  --progress-every 10000 \
+  --ckpt-every-chunks 50 \
+  --resume-from models/supervised_sample_test/checkpoints \
+  --auto-diagnosis warn \
+  --diag-warmup-chunks 30 \
+  --code 000100 \
+  --start-date 20240902 \
+  --end-date 20240930
 
 python -m ai_trader.ml.train_supervised \
-  --db "C:\Users\user\Workspace\datasets@20251002\datasets_norm_all.duckdb" \
+  --db "C:\Users\user\Workspace\datasets@20251003\datasets_norm_all.duckdb" \
   --table datasets \
   --out models/supervised \
   --seq-len 60 \
@@ -77,27 +86,25 @@ python -m ai_trader.ml.train_supervised \
   --device cuda \
   --batch-size 128 \
   --epochs 10 \
-  --lr 1e-4 \
-  --weight-decay 1e-4 \
-  --progress-every 100 \
-  --ckpt-every-chunks 50 \
-  --resume-from models/supervised/checkpoints \
+  --lr 5e-5 \
+  --weight-decay 1e-5 \
+  --grad-clip 1.0 \
   --target-col 현재가 \
   \
   --aux-task direction3 \
   --loss focal \
-  --focal-gamma 2.0 \
+  --focal-gamma 1.0 \
   --use-weighted-sampler \
   --direction3-threshold 0.015 \
   \
-  --auto-diagnosis abort \
-  --diag-warmup-chunks 10 \
-  --diag-warmup-epochs 1 \
-  --diag-min-val-samples 512 \
-  --diag-require-consecutive 2
+  --progress-every 10000 \
+  --ckpt-every-chunks 50 \
+  --resume-from models/supervised/checkpoints \
+  --auto-diagnosis warn \
+  --diag-warmup-chunks 30
 
 python -m ai_trader.ml.train_supervised \
-  --db "C:\Users\user\Workspace\datasets@20251002\datasets_norm_all.duckdb" \
+  --db "C:\Users\user\Workspace\datasets@20251003\datasets_norm_all.duckdb" \
   --table datasets \
   --out models/supervised \
   --seq-len 60 \
@@ -129,7 +136,7 @@ python -m ai_trader.ml.train_supervised \
 ##### 회기방식
 ```bash
 python -m ai_trader.ml.train_supervised \
-  --db "C:\Users\user\Workspace\datasets@20251002" \
+  --db "C:\Users\user\Workspace\datasets@20251003" \
   --table datasets \
   --out models/supervised \
   --seq-len 60 \

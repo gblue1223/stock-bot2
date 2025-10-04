@@ -52,8 +52,10 @@ class CNNLSTMAttn(nn.Module):
         # Conv over time: treat features as channels
         self.conv = nn.Sequential(
             nn.Conv1d(cfg.input_features, cfg.conv_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cfg.conv_channels),
             nn.ReLU(),
             nn.Conv1d(cfg.conv_channels, cfg.conv_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(cfg.conv_channels),
             nn.ReLU(),
         )
         # Project conv channels to LSTM input feature size
