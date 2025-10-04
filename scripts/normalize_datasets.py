@@ -26,6 +26,22 @@ IGNORING_STOCKS_SET: set[str] = set()
 DEFAULT_TRADE_VALUE_PER_MINUTE: float = 3000.0
 # Default minimum number of minutes that must satisfy the trade value threshold
 DEFAULT_MIN_QUALIFYING_MINUTES: int = 2
+
+
+# Final column order required
+FINAL_COLUMNS: List[str] = [
+    "종목코드", "종목명", "시간", "등락률",
+    "누적거래대금", "거래회전율", "체결강도",
+    # 매도/매수 대기금액 1~10
+    *[f"매도대기금액{i}" for i in range(1, 11)],
+    *[f"매수대기금액{i}" for i in range(1, 11)],
+    # TODO: 나중에 추가
+    # *[f"매도거래원{i}" for i in range(1, 6)],
+    # *[f"매도거래원수량{i}" for i in range(1, 6)],
+    # *[f"매수거래원{i}" for i in range(1, 6)],
+    # *[f"매수거래원수량{i}" for i in range(1, 6)],
+]
+
 def _to_time_ms(val: object) -> int:
     """Convert various time formats to a 9-digit HHMMSSmmm integer.
     Supports:
@@ -105,29 +121,6 @@ def _load_ignoring_stocks(csv_path: Optional[str]) -> set[str]:
     except Exception as e:
         print(f"경고: ignoring_stocks CSV 로드 실패: {type(e).__name__}: {e}")
         return set()
-
-# Final column order required
-FINAL_COLUMNS: List[str] = [
-    "종목코드", "종목명", "시간", "현재가", "등락률", "거래량", "누적거래량", "누적거래대금", "시가", "고가", "저가",
-    "전일거래량대비", "전일거래량대비비율", "거래회전율", "체결강도",
-    # 매도호가/수량/직전대비 1~10
-    *[f"매도호가{i}" for i in range(1, 11)],
-    *[f"매도호가수량{i}" for i in range(1, 11)],
-    *[f"매도호가직전대비{i}" for i in range(1, 11)],
-    # 매수호가/수량/직전대비 1~10
-    *[f"매수호가{i}" for i in range(1, 11)],
-    *[f"매수호가수량{i}" for i in range(1, 11)],
-    *[f"매수호가직전대비{i}" for i in range(1, 11)],
-    "매도호가총잔량", "매도호가총잔량직전대비", "매수호가총잔량", "매수호가총잔량직전대비",
-    # 거래원 관련 (문자열 컬럼들)
-    *[f"매도거래원{i}" for i in range(1, 6)],
-    *[f"매도거래원수량{i}" for i in range(1, 6)],
-    *[f"매도거래원별증감{i}" for i in range(1, 6)],
-    *[f"매수거래원{i}" for i in range(1, 6)],
-    *[f"매수거래원수량{i}" for i in range(1, 6)],
-    *[f"매수거래원별증감{i}" for i in range(1, 6)],
-]
-
 
 def find_duckdb_groups(input_db: str) -> Dict[str, Dict[str, Tuple[str, str, str]]]:
     """
@@ -367,12 +360,18 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
         # 종목코드, 종목명 보정
         df['종목코드'] = df.get('종목코드', pd.Series(index=df.index, dtype=object)).fillna(code).replace({"": code})
         df['종목명'] = df.get('종목명', pd.Series(index=df.index, dtype=object)).fillna(name).replace({"": name})
-        
+
         # 누락 컬럼 생성 (최종 스키마 강제)
-        for col in FINAL_COLUMNS:
-            if col not in df.columns:
-                df[col] = "" if col in TEXT_COLUMNS else 0
-        
+        missing_final_columns = [col for col in FINAL_COLUMNS if col not in df.columns]
+        if missing_final_columns:
+            add_cols: Dict[str, pd.Series] = {}
+            for col in missing_final_columns:
+                if col in TEXT_COLUMNS:
+                    add_cols[col] = pd.Series([""] * len(df), index=df.index, dtype=object)
+                else:
+                    add_cols[col] = pd.Series(np.zeros(len(df), dtype=float), index=df.index)
+            df = pd.concat([df, pd.DataFrame(add_cols, index=df.index)], axis=1)
+
         # 채우기(직전/직후)로 결측 제거
         df = fill_missing_values(df)
         
@@ -495,11 +494,45 @@ def _minmax_scale(series: pd.Series) -> pd.Series:
     return (x - min_v) / rng
 
 
+def _scale_with_bounds(series: pd.Series, min_value: float, max_value: float) -> pd.Series:
+    """
+    지정된 최소/최대 범위를 사용해 값을 [0, 1] 구간으로 스케일합니다.
+
+    - 입력 시리즈는 수치형으로 강제 변환되며 결측은 0으로 대체합니다.
+    - 지정된 범위를 벗어난 값은 clip 처리합니다.
+    - 최소값과 최대값이 같을 경우 전부 0으로 반환합니다.
+    """
+    x = pd.to_numeric(series, errors="coerce").fillna(0.0).astype(float)
+    x = np.clip(x, min_value, max_value)
+    span = max_value - min_value
+    if span == 0:
+        return pd.Series(np.zeros(len(x)), index=series.index)
+    return (x - min_value) / span
+
+
+def _encode_char_scalar(series: pd.Series) -> pd.Series:
+    cats = series.astype(str).replace({"nan": ""})
+    unique_chars = sorted(set("".join(cats.tolist())))
+    if not unique_chars:
+        return pd.Series(0.0, index=series.index, dtype=float)
+    char_to_id = {ch: idx + 1 for idx, ch in enumerate(unique_chars)}
+    max_id = float(len(unique_chars))
+
+    def _encode(s: str) -> float:
+        if not s:
+            return 0.0
+        ids = [char_to_id.get(ch, 0) for ch in s]
+        if not ids:
+            return 0.0
+        return float(np.mean(ids)) / max_id
+
+    return cats.apply(_encode).astype(float)
+
+
 def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     """
     Normalize columns per rules:
     - Log + Standard: specified quantity and flow columns
-    - Standard only: *_총잔량직전대비
     - Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
     - Character-level scalar encoding for '종목명' (append scalar, keep original)
     - Min-Max: remaining numeric columns (excluding '번호' and text columns and already-normalized columns)
@@ -507,79 +540,41 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     # Define column groups
-    logstd_cols = set([
-        # 가격 관련 (CRITICAL: 로그 변환 필수)
-        "현재가", "시가", "고가", "저가",
-        *[f"매도호가{i}" for i in range(1, 11)],
-        *[f"매수호가{i}" for i in range(1, 11)],
-        # 거래량/금액 관련
-        "거래량", "누적거래량", "누적거래대금", "거래회전율",
-        *[f"매도호가수량{i}" for i in range(1, 11)],
-        *[f"매수호가수량{i}" for i in range(1, 11)],
-        "매도호가총잔량", "매수호가총잔량",
-        *[f"매도거래원수량{i}" for i in range(1, 6)],
-        *[f"매수거래원수량{i}" for i in range(1, 6)],
-        *[f"매도거래원별증감{i}" for i in range(1, 6)],
-        *[f"매수거래원별증감{i}" for i in range(1, 6)],
-        # 외국계 추정 관련 (없으면 생성 후 0)
-        "외국계매도추정합", "외국계매수추정합", "외국계매도추정합변동", "외국계매수추정합변동",
-    ])
+    range_scale_bounds: Dict[str, Tuple[float, float]] = {
+        "등락률": (-300.0, 300.0),
+        "누적거래대금": (0.0, 10_000_000.0),
+        "거래회전율": (0.0, 1000.0),
+        "체결강도": (0.0, 1000.0),
+    }
+    for i in range(1, 11):
+        range_scale_bounds[f"매도대기금액{i}"] = (0.0, 1_000_000.0)
+        range_scale_bounds[f"매수대기금액{i}"] = (0.0, 1_000_000.0)
 
-    stdonly_cols = set([
-        "매도호가총잔량직전대비", "매수호가총잔량직전대비", "등락률",
-        # 직전대비 컬럼들 (이미 변화율이므로 표준화만)
-        *[f"매도호가직전대비{i}" for i in range(1, 11)],
-        *[f"매수호가직전대비{i}" for i in range(1, 11)],
-        "전일거래량대비", "전일거래량대비비율",
-        # 체결강도: 비율 피처이므로 표준화만 적용 (CRITICAL FIX)
-        "체결강도",
-    ])
+    logstd_cols = set()
+
+    stdonly_cols = set()
 
     broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
 
     # Ensure optional numeric columns exist (batch add to avoid fragmentation)
-    missing_numeric = [col for col in (logstd_cols | stdonly_cols) if col not in out.columns]
+    numeric_targets = set(range_scale_bounds.keys()) | logstd_cols | stdonly_cols
+    missing_numeric = [col for col in numeric_targets if col not in out.columns]
     if missing_numeric:
         add_df = pd.DataFrame({col: pd.Series(0.0, index=out.index) for col in missing_numeric}, index=out.index)
         out = pd.concat([out, add_df], axis=1)
 
-    # Log + Standard scaling (signed log1p then z-score)
-    for col in sorted(logstd_cols):
+    # Fixed-range scaling
+    for col, (min_bound, max_bound) in range_scale_bounds.items():
         if col in out.columns:
-            out[col] = _standard_scale(_signed_log1p(out[col]))
-
-    # Standard only
-    for col in sorted(stdonly_cols):
-        if col in out.columns:
-            out[col] = _standard_scale(out[col])
+            out[col] = _scale_with_bounds(out[col], min_bound, max_bound)
 
     # Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
     broker_scalar_cols: List[str] = []
     _broker_new: Dict[str, pd.Series] = {}
     for col in broker_cat_cols:
         if col in out.columns:
-            cats = out[col].astype(str).replace({"nan": ""})
-            # Build per-column char dictionary
-            unique_chars = sorted(set("".join(cats.tolist())))
             scalar_col = f"{col}_scalar"
-            if len(unique_chars) == 0:
-                # empty column -> scalar zeros
-                _broker_new[scalar_col] = pd.Series(0.0, index=out.index)
-                broker_scalar_cols.append(scalar_col)
-                continue
-            char_to_id = {ch: i + 1 for i, ch in enumerate(unique_chars)}  # 1..N
-            max_id = float(len(unique_chars))
-
-            def _encode_scalar(s: str) -> float:
-                if not s:
-                    return 0.0
-                ids = [char_to_id.get(ch, 0) for ch in s]
-                if not ids:
-                    return 0.0
-                # mean of ids normalized by max id -> [0,1]
-                return float(np.mean(ids)) / max_id
-
-            _broker_new[scalar_col] = cats.apply(_encode_scalar).astype(float)
+            _broker_new[scalar_col] = _encode_char_scalar(out[col])
             broker_scalar_cols.append(scalar_col)
 
     if _broker_new:
@@ -588,28 +583,11 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     # Character-level scalar encoding for '종목명'
     _extra_new: Dict[str, pd.Series] = {}
     if '종목명' in out.columns:
-        cats = out['종목명'].astype(str).replace({"nan": ""})
-        unique_chars = sorted(set("".join(cats.tolist())))
-        if len(unique_chars) == 0:
-            _extra_new["종목명_scalar"] = pd.Series(0.0, index=out.index)
-        else:
-            char_to_id = {ch: i + 1 for i, ch in enumerate(unique_chars)}
-            max_id = float(len(unique_chars))
-
-            def _encode_scalar_name(s: str) -> float:
-                if not s:
-                    return 0.0
-                ids = [char_to_id.get(ch, 0) for ch in s]
-                if not ids:
-                    return 0.0
-                return float(np.mean(ids)) / max_id
-
-            _extra_new["종목명_scalar"] = cats.apply(_encode_scalar_name).astype(float)
+        _extra_new["종목명_scalar"] = _encode_char_scalar(out['종목명'])
         broker_scalar_cols.append("종목명_scalar")
 
     # '시간' 파생 피처: 기존 시간 스칼라 + sin/cos 주기 변환 + 장 시작 후 경과 초
     if '시간' in out.columns:
-
         # HHMMSSmmm -> seconds
         secs = out['시간'].apply(_time_ms_to_seconds).astype(int)
         SECONDS_IN_DAY = 24 * 60 * 60
@@ -626,7 +604,7 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         out = pd.concat([out, pd.DataFrame(_extra_new, index=out.index)], axis=1)
 
     # Min-Max for remaining numeric columns not already processed
-    processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
+    processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols) | set(range_scale_bounds.keys())
     numeric_rest = [c for c in out.columns if c not in processed and pd.api.types.is_numeric_dtype(out[c])]
     for col in numeric_rest:
         out[col] = _minmax_scale(out[col])
@@ -784,7 +762,6 @@ def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[
             date,
             time_start,
             time_end,
-            require_trade_threshold=require_trade_threshold,
             trade_threshold_per_minute=trade_threshold_per_minute,
             min_qualifying_minutes=min_qualifying_minutes,
         )

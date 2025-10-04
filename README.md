@@ -21,7 +21,7 @@ python scripts/generate_datasets.py \
 python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
   --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
   --temp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
-  --threads 2 \
+  --threads 4 \
   --memory-limit 64GB
 
 python scripts/normalize_datasets.py \
@@ -32,7 +32,11 @@ python scripts/normalize_datasets.py \
   --checkpoint-interval 50 \
   --ignoring-stocks-csv scripts/ignoring_stocks.csv
 
-python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" --out "C:\Users\user\Workspace\datasets\datasets_norm_all.duckdb" --temp-dir "C:\Users\user\Workspace\datasets\tmp" --threads 2 --memory-limit 64GB
+python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" \
+  --out "C:\Users\user\Workspace\datasets\datasets_norm_all.duckdb" \
+  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
+  --threads 4 \
+  --memory-limit 64GB
 
 @train_supervised.py 에서 폴더 지정시 해당 폴더 안의 모든 duckdb 파일을 로드하고, 다음 컬럼을 features 로 사용하되 "날짜"는 month만 (예. 20240902 일때 09 만) 이용해서 훈련할 수 있도록 수정.
 ```
@@ -159,7 +163,7 @@ python -m ai_trader.ml.train_supervised \
 ```bash
 $ tensorboard --logdir models/supervised_sample_test/tensorboard_logs/
 
-$ python scripts/check_tensorboard.py \
+$ python scripts/analysis/check_tensorboard.py \
   --logdir "D:/Workspace/Project/stock-bot/stock-bot2/models/supervised/tensorboard_logs" \
   --watch --interval 10 --idle-seconds 180 --verbose \
   --plot-last 400 \
