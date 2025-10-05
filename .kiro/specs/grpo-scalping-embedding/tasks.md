@@ -48,15 +48,15 @@
     - argparse로 --db, --table, --out, --seq-len, --embedding-dim, --batch-size, --epochs, --lr, --device 인수 처리
     - _요구사항: 6.2_
 
-
   - [x] 5.2 훈련 루프 구현
+
     - 데이터 로더에서 배치 로드
     - 모델 forward pass 및 손실 계산
     - Optimizer 업데이트 (Adam)
     - 체크포인트 저장 (설정 가능한 간격)
     - _요구사항: 5.5, 5.6, 6.1_
 
-  - [ ] 5.3 검증 및 TensorBoard 로깅 구현
+  - [x] 5.3 검증 및 TensorBoard 로깅 구현
     - 검증 세트에서 손실 계산
     - 임베딩 품질 메트릭 계산 (silhouette score, temporal coherence)
     - TensorBoard에 메트릭 로깅

@@ -30,6 +30,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
+from sklearn.metrics import silhouette_score
 
 from ai_trader.embedding.models import TradingEmbeddingModel
 from ai_trader.embedding.losses import InfoNCELoss
@@ -337,7 +338,7 @@ def validate(
     dataloader: torch.utils.data.DataLoader,
     criterion: nn.Module,
     device: torch.device
-) -> float:
+) -> tuple:
     """
     검증
     
@@ -348,36 +349,172 @@ def validate(
         device: 디바이스
         
     Returns:
-        평균 검증 손실
+        (평균 검증 손실, 임베딩 리스트, 종목코드 리스트, 타임스탬프 리스트)
     """
     model.eval()
     total_loss = 0.0
     num_batches = 0
     
+    # 임베딩 품질 메트릭 계산을 위한 데이터 수집
+    all_embeddings = []
+    all_stock_codes = []
+    all_timestamps = []
+    
     with torch.no_grad():
-        for anchor, positive, negative in dataloader:
-            # 디바이스로 이동
-            anchor = anchor.to(device)
-            positive = positive.to(device)
-            negative = negative.to(device)
-            
-            # Forward pass
-            anchor_emb = model(anchor)
-            positive_emb = model(positive)
-            negative_emb = model(negative)
-            
-            # 부정 샘플을 배치 차원으로 변환
-            negative_emb = negative_emb.unsqueeze(1)
-            
-            # 손실 계산
-            loss = criterion(anchor_emb, positive_emb, negative_emb)
-            
-            # 통계 업데이트
-            total_loss += loss.item()
-            num_batches += 1
+        for batch_data in dataloader:
+            if len(batch_data) == 3:
+                # 훈련 데이터 형식: (anchor, positive, negative)
+                anchor, positive, negative = batch_data
+                
+                # 디바이스로 이동
+                anchor = anchor.to(device)
+                positive = positive.to(device)
+                negative = negative.to(device)
+                
+                # Forward pass
+                anchor_emb = model(anchor)
+                positive_emb = model(positive)
+                negative_emb = model(negative)
+                
+                # 부정 샘플을 배치 차원으로 변환
+                negative_emb = negative_emb.unsqueeze(1)
+                
+                # 손실 계산
+                loss = criterion(anchor_emb, positive_emb, negative_emb)
+                
+                # 통계 업데이트
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # 임베딩 수집 (anchor만 사용)
+                all_embeddings.append(anchor_emb.cpu().numpy())
+            elif len(batch_data) == 5:
+                # 메타데이터 포함 형식: (anchor, positive, negative, stock_codes, timestamps)
+                anchor, positive, negative, stock_codes, timestamps = batch_data
+                
+                # 디바이스로 이동
+                anchor = anchor.to(device)
+                positive = positive.to(device)
+                negative = negative.to(device)
+                
+                # Forward pass
+                anchor_emb = model(anchor)
+                positive_emb = model(positive)
+                negative_emb = model(negative)
+                
+                # 부정 샘플을 배치 차원으로 변환
+                negative_emb = negative_emb.unsqueeze(1)
+                
+                # 손실 계산
+                loss = criterion(anchor_emb, positive_emb, negative_emb)
+                
+                # 통계 업데이트
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # 임베딩 및 메타데이터 수집
+                all_embeddings.append(anchor_emb.cpu().numpy())
+                all_stock_codes.extend(stock_codes)
+                all_timestamps.extend(timestamps)
     
     avg_loss = total_loss / num_batches
-    return avg_loss
+    
+    # 임베딩 배열로 변환
+    if all_embeddings:
+        all_embeddings = np.vstack(all_embeddings)
+    else:
+        all_embeddings = np.array([])
+    
+    return avg_loss, all_embeddings, all_stock_codes, all_timestamps
+
+
+def compute_silhouette_score(embeddings: np.ndarray, stock_codes: list) -> float:
+    """
+    Silhouette score 계산 - 종목별 클러스터링 품질 평가
+    
+    Args:
+        embeddings: 임베딩 벡터 배열 (n_samples, embedding_dim)
+        stock_codes: 종목 코드 리스트 (n_samples,)
+        
+    Returns:
+        Silhouette score (-1 ~ 1, 높을수록 좋음)
+    """
+    if len(embeddings) == 0 or len(stock_codes) == 0:
+        return 0.0
+    
+    # 종목 코드를 숫자 레이블로 변환
+    unique_stocks = list(set(stock_codes))
+    if len(unique_stocks) < 2:
+        # 클러스터가 2개 미만이면 silhouette score 계산 불가
+        return 0.0
+    
+    stock_to_label = {stock: idx for idx, stock in enumerate(unique_stocks)}
+    labels = np.array([stock_to_label[stock] for stock in stock_codes])
+    
+    try:
+        # Silhouette score 계산
+        score = silhouette_score(embeddings, labels, metric='cosine')
+        return float(score)
+    except Exception as e:
+        logger.warning(f"Silhouette score 계산 실패: {e}")
+        return 0.0
+
+
+def compute_temporal_coherence(embeddings: np.ndarray, timestamps: list) -> float:
+    """
+    Temporal coherence 계산 - 시간적으로 가까운 샘플의 유사도 평가
+    
+    시간적으로 가까운 샘플들의 임베딩이 유사한지 측정합니다.
+    
+    Args:
+        embeddings: 임베딩 벡터 배열 (n_samples, embedding_dim)
+        timestamps: 타임스탬프 리스트 (n_samples,)
+        
+    Returns:
+        Temporal coherence score (0 ~ 1, 높을수록 좋음)
+    """
+    if len(embeddings) == 0 or len(timestamps) == 0:
+        return 0.0
+    
+    if len(embeddings) < 2:
+        return 0.0
+    
+    try:
+        # 타임스탬프를 숫자로 변환 (정렬을 위해)
+        if isinstance(timestamps[0], str):
+            # 문자열 타임스탬프를 숫자로 변환
+            timestamps = [float(t) if isinstance(t, (int, float)) else hash(t) for t in timestamps]
+        
+        # 타임스탬프 순서로 정렬
+        sorted_indices = np.argsort(timestamps)
+        sorted_embeddings = embeddings[sorted_indices]
+        
+        # 연속된 샘플 간의 코사인 유사도 계산
+        similarities = []
+        for i in range(len(sorted_embeddings) - 1):
+            emb1 = sorted_embeddings[i]
+            emb2 = sorted_embeddings[i + 1]
+            
+            # 코사인 유사도 계산
+            norm1 = np.linalg.norm(emb1)
+            norm2 = np.linalg.norm(emb2)
+            
+            if norm1 > 0 and norm2 > 0:
+                similarity = np.dot(emb1, emb2) / (norm1 * norm2)
+                similarities.append(similarity)
+        
+        if len(similarities) == 0:
+            return 0.0
+        
+        # 평균 유사도 반환 (0 ~ 1 범위로 정규화)
+        avg_similarity = np.mean(similarities)
+        # 코사인 유사도는 -1 ~ 1 범위이므로 0 ~ 1로 변환
+        temporal_coherence = (avg_similarity + 1) / 2
+        
+        return float(temporal_coherence)
+    except Exception as e:
+        logger.warning(f"Temporal coherence 계산 실패: {e}")
+        return 0.0
 
 
 def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
@@ -464,14 +601,16 @@ def main():
         split='train',
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        return_metadata=False  # 훈련 시에는 메타데이터 불필요
     )
     
     val_dataloader = data_loader.get_dataloader(
         split='val',
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        return_metadata=True  # 검증 시에는 메트릭 계산을 위해 메타데이터 필요
     )
     
     logger.info(f"Train batches: {len(train_dataloader)}")
@@ -521,7 +660,7 @@ def main():
         logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
         
         # 검증
-        val_loss = validate(
+        val_loss, val_embeddings, val_stock_codes, val_timestamps = validate(
             model=model,
             dataloader=val_dataloader,
             criterion=criterion,
@@ -530,9 +669,26 @@ def main():
         
         logger.info(f"Epoch {epoch} - Val Loss: {val_loss:.4f}")
         
+        # 임베딩 품질 메트릭 계산
+        silhouette = 0.0
+        temporal_coherence = 0.0
+        
+        if len(val_embeddings) > 0:
+            # Silhouette score 계산 (종목 클러스터링 품질)
+            if len(val_stock_codes) > 0:
+                silhouette = compute_silhouette_score(val_embeddings, val_stock_codes)
+                logger.info(f"Epoch {epoch} - Silhouette Score: {silhouette:.4f}")
+            
+            # Temporal coherence 계산 (시간적 일관성)
+            if len(val_timestamps) > 0:
+                temporal_coherence = compute_temporal_coherence(val_embeddings, val_timestamps)
+                logger.info(f"Epoch {epoch} - Temporal Coherence: {temporal_coherence:.4f}")
+        
         # TensorBoard 로깅
         writer.add_scalar('train/loss', train_loss, epoch)
         writer.add_scalar('val/loss', val_loss, epoch)
+        writer.add_scalar('val/silhouette_score', silhouette, epoch)
+        writer.add_scalar('val/temporal_coherence', temporal_coherence, epoch)
         writer.add_scalar('learning_rate', args.lr, epoch)
         
         # 최고 모델 저장

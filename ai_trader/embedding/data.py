@@ -163,12 +163,13 @@ class EmbeddingDataLoader:
             logger.error(f"Failed to load and split data: {e}")
             raise DataLoadError(f"Cannot load data: {e}")
     
-    def get_dataset(self, split: str = 'train') -> 'ContrastiveDataset':
+    def get_dataset(self, split: str = 'train', return_metadata: bool = False) -> 'ContrastiveDataset':
         """
         특정 분할에 대한 Dataset 객체 반환
         
         Args:
             split: 'train', 'val', 또는 'test'
+            return_metadata: 메타데이터 반환 여부 (기본값: False)
             
         Returns:
             ContrastiveDataset 객체
@@ -179,7 +180,8 @@ class EmbeddingDataLoader:
         return ContrastiveDataset(
             data=self.data_splits[split]['data'],
             metadata=self.data_splits[split]['metadata'],
-            seq_len=self.seq_len
+            seq_len=self.seq_len,
+            return_metadata=return_metadata
         )
     
     def get_dataloader(
@@ -187,7 +189,8 @@ class EmbeddingDataLoader:
         split: str = 'train',
         batch_size: int = 128,
         shuffle: bool = True,
-        num_workers: int = 4
+        num_workers: int = 4,
+        return_metadata: bool = False
     ) -> DataLoader:
         """
         DataLoader 생성
@@ -197,11 +200,12 @@ class EmbeddingDataLoader:
             batch_size: 배치 크기
             shuffle: 셔플 여부
             num_workers: 워커 프로세스 수
+            return_metadata: 메타데이터 반환 여부 (기본값: False)
             
         Returns:
             PyTorch DataLoader
         """
-        dataset = self.get_dataset(split)
+        dataset = self.get_dataset(split, return_metadata=return_metadata)
         return DataLoader(
             dataset,
             batch_size=batch_size,
@@ -226,6 +230,7 @@ class ContrastiveDataset(Dataset):
         seq_len: 시퀀스 길이
         positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
         negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
+        return_metadata: 메타데이터 반환 여부 (기본값: False)
     """
     
     def __init__(
@@ -234,13 +239,15 @@ class ContrastiveDataset(Dataset):
         metadata: np.ndarray,
         seq_len: int = 60,
         positive_time_threshold: int = 10,
-        negative_time_threshold: int = 60
+        negative_time_threshold: int = 60,
+        return_metadata: bool = False
     ):
         self.data = data
         self.metadata = metadata
         self.seq_len = seq_len
         self.positive_time_threshold = positive_time_threshold
         self.negative_time_threshold = negative_time_threshold
+        self.return_metadata = return_metadata
         
         # 시퀀스 생성을 위한 유효한 인덱스 계산
         self.valid_indices = self._compute_valid_indices()
@@ -367,16 +374,17 @@ class ContrastiveDataset(Dataset):
         # 폴백: 랜덤 샘플 선택
         return np.random.choice(self.valid_indices)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int):
         """
-        배치 아이템 반환: (앵커, 긍정, 부정)
+        배치 아이템 반환: (앵커, 긍정, 부정) 또는 (앵커, 긍정, 부정, 종목코드, 타임스탬프)
         
         Args:
             idx: 인덱스
             
         Returns:
-            (anchor, positive, negative) 튜플
-            각각 shape: (seq_len, n_features)
+            return_metadata=False: (anchor, positive, negative) 튜플
+            return_metadata=True: (anchor, positive, negative, stock_code, timestamp) 튜플
+            각 텐서 shape: (seq_len, n_features)
         """
         anchor_idx = self.valid_indices[idx]
         
@@ -400,4 +408,10 @@ class ContrastiveDataset(Dataset):
         positive_tensor = torch.from_numpy(positive).float()
         negative_tensor = torch.from_numpy(negative).float()
         
-        return anchor_tensor, positive_tensor, negative_tensor
+        if self.return_metadata:
+            # 메타데이터 추출 (앵커 기준)
+            stock_code = str(self.metadata[anchor_idx, 0])
+            timestamp = float(self.metadata[anchor_idx, 2])  # 번호를 타임스탬프로 사용
+            return anchor_tensor, positive_tensor, negative_tensor, stock_code, timestamp
+        else:
+            return anchor_tensor, positive_tensor, negative_tensor
