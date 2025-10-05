@@ -19,7 +19,28 @@
 import argparse
 import os
 import sys
+import logging
 from pathlib import Path
+from typing import Dict, Any
+import json
+from datetime import datetime
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+
+from ai_trader.embedding.models import TradingEmbeddingModel
+from ai_trader.embedding.losses import InfoNCELoss
+from ai_trader.embedding.data import EmbeddingDataLoader
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 
 def parse_args():
@@ -98,6 +119,44 @@ def parse_args():
         help='훈련에 사용할 디바이스'
     )
     
+    # 체크포인트 설정
+    parser.add_argument(
+        '--checkpoint-interval',
+        type=int,
+        default=5,
+        help='체크포인트 저장 간격 (에포크 단위)'
+    )
+    
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='재개할 체크포인트 경로 (선택사항)'
+    )
+    
+    # 모델 하이퍼파라미터 (추가)
+    parser.add_argument(
+        '--num-heads',
+        type=int,
+        default=4,
+        help='Multi-head Attention의 헤드 수'
+    )
+    
+    parser.add_argument(
+        '--temperature',
+        type=float,
+        default=0.07,
+        help='InfoNCE 손실의 temperature 파라미터'
+    )
+    
+    # 데이터 로더 설정
+    parser.add_argument(
+        '--num-workers',
+        type=int,
+        default=4,
+        help='데이터 로더 워커 프로세스 수'
+    )
+    
     return parser.parse_args()
 
 
@@ -140,6 +199,209 @@ def validate_args(args):
     return args
 
 
+def save_checkpoint(
+    model: nn.Module,
+    optimizer: optim.Optimizer,
+    epoch: int,
+    loss: float,
+    val_loss: float,
+    config: Dict[str, Any],
+    feature_names: list,
+    normalization_stats: Dict[str, Any],
+    output_dir: Path
+) -> str:
+    """
+    체크포인트 저장
+    
+    Args:
+        model: 모델
+        optimizer: Optimizer
+        epoch: 현재 에포크
+        loss: 훈련 손실
+        val_loss: 검증 손실
+        config: 모델 설정
+        feature_names: 특징 컬럼명 리스트
+        normalization_stats: 정규화 통계
+        output_dir: 출력 디렉토리
+        
+    Returns:
+        저장된 체크포인트 경로
+    """
+    checkpoint_path = output_dir / f"checkpoint_epoch{epoch}.pt"
+    
+    checkpoint = {
+        'state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': config,
+        'feature_names': feature_names,
+        'normalization_stats': normalization_stats,
+        'training_metadata': {
+            'epoch': epoch,
+            'loss': loss,
+            'val_loss': val_loss,
+            'timestamp': datetime.now().isoformat()
+        }
+    }
+    
+    torch.save(checkpoint, checkpoint_path)
+    logger.info(f"Checkpoint saved: {checkpoint_path}")
+    
+    return str(checkpoint_path)
+
+
+def load_checkpoint(checkpoint_path: str, model: nn.Module, optimizer: optim.Optimizer) -> Dict[str, Any]:
+    """
+    체크포인트 로드
+    
+    Args:
+        checkpoint_path: 체크포인트 경로
+        model: 모델
+        optimizer: Optimizer
+        
+    Returns:
+        체크포인트 메타데이터
+    """
+    checkpoint = torch.load(checkpoint_path)
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    logger.info(f"Checkpoint loaded: {checkpoint_path}")
+    logger.info(f"Resuming from epoch {checkpoint['training_metadata']['epoch']}")
+    
+    return checkpoint['training_metadata']
+
+
+def train_epoch(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    epoch: int
+) -> float:
+    """
+    한 에포크 훈련
+    
+    Args:
+        model: 모델
+        dataloader: 데이터 로더
+        criterion: 손실 함수
+        optimizer: Optimizer
+        device: 디바이스
+        epoch: 현재 에포크
+        
+    Returns:
+        평균 손실
+    """
+    model.train()
+    total_loss = 0.0
+    num_batches = 0
+    
+    for batch_idx, (anchor, positive, negative) in enumerate(dataloader):
+        # 디바이스로 이동
+        anchor = anchor.to(device)
+        positive = positive.to(device)
+        negative = negative.to(device)
+        
+        # Forward pass
+        anchor_emb = model(anchor)
+        positive_emb = model(positive)
+        negative_emb = model(negative)
+        
+        # 부정 샘플을 배치 차원으로 변환 (InfoNCE 손실 함수 형식에 맞춤)
+        # (batch, embedding_dim) -> (batch, 1, embedding_dim)
+        negative_emb = negative_emb.unsqueeze(1)
+        
+        # 손실 계산
+        loss = criterion(anchor_emb, positive_emb, negative_emb)
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        # 통계 업데이트
+        total_loss += loss.item()
+        num_batches += 1
+        
+        # 진행 상황 출력
+        if (batch_idx + 1) % 10 == 0:
+            logger.info(f"Epoch [{epoch}] Batch [{batch_idx + 1}/{len(dataloader)}] Loss: {loss.item():.4f}")
+    
+    avg_loss = total_loss / num_batches
+    return avg_loss
+
+
+def validate(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device
+) -> float:
+    """
+    검증
+    
+    Args:
+        model: 모델
+        dataloader: 데이터 로더
+        criterion: 손실 함수
+        device: 디바이스
+        
+    Returns:
+        평균 검증 손실
+    """
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+    
+    with torch.no_grad():
+        for anchor, positive, negative in dataloader:
+            # 디바이스로 이동
+            anchor = anchor.to(device)
+            positive = positive.to(device)
+            negative = negative.to(device)
+            
+            # Forward pass
+            anchor_emb = model(anchor)
+            positive_emb = model(positive)
+            negative_emb = model(negative)
+            
+            # 부정 샘플을 배치 차원으로 변환
+            negative_emb = negative_emb.unsqueeze(1)
+            
+            # 손실 계산
+            loss = criterion(anchor_emb, positive_emb, negative_emb)
+            
+            # 통계 업데이트
+            total_loss += loss.item()
+            num_batches += 1
+    
+    avg_loss = total_loss / num_batches
+    return avg_loss
+
+
+def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    정규화 통계 계산
+    
+    Args:
+        data: 데이터 배열 (n_samples, n_features)
+        
+    Returns:
+        정규화 통계 (mean, std)
+    """
+    mean = np.mean(data, axis=0)
+    std = np.std(data, axis=0)
+    
+    # std가 0인 경우 1로 대체 (division by zero 방지)
+    std = np.where(std == 0, 1.0, std)
+    
+    return {
+        'mean': mean.tolist(),
+        'std': std.tolist()
+    }
+
+
 def main():
     """메인 훈련 함수"""
     # CLI 인수 파싱 및 검증
@@ -147,23 +409,185 @@ def main():
     args = validate_args(args)
     
     # 설정 출력
-    print("=" * 80)
-    print("임베딩 모델 훈련 시작")
-    print("=" * 80)
-    print(f"데이터베이스: {args.db}")
-    print(f"테이블: {args.table}")
-    print(f"출력 디렉토리: {args.out}")
-    print(f"시퀀스 길이: {args.seq_len}")
-    print(f"임베딩 차원: {args.embedding_dim}")
-    print(f"배치 크기: {args.batch_size}")
-    print(f"에포크: {args.epochs}")
-    print(f"학습률: {args.lr}")
-    print(f"디바이스: {args.device}")
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("임베딩 모델 훈련 시작")
+    logger.info("=" * 80)
+    logger.info(f"데이터베이스: {args.db}")
+    logger.info(f"테이블: {args.table}")
+    logger.info(f"출력 디렉토리: {args.out}")
+    logger.info(f"시퀀스 길이: {args.seq_len}")
+    logger.info(f"임베딩 차원: {args.embedding_dim}")
+    logger.info(f"배치 크기: {args.batch_size}")
+    logger.info(f"에포크: {args.epochs}")
+    logger.info(f"학습률: {args.lr}")
+    logger.info(f"디바이스: {args.device}")
+    logger.info(f"체크포인트 간격: {args.checkpoint_interval}")
+    logger.info("=" * 80)
     
-    # TODO: 실제 훈련 로직은 task 5.2에서 구현
-    print("\n[TODO] 훈련 루프 구현 예정 (task 5.2)")
-    print("현재는 CLI 인터페이스만 구현되었습니다.")
+    # 디바이스 설정
+    device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+    logger.info(f"Using device: {device}")
+    
+    # 출력 디렉토리 설정
+    output_dir = Path(args.out)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # TensorBoard 설정
+    tensorboard_dir = output_dir / 'tensorboard_logs'
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    logger.info(f"TensorBoard logs: {tensorboard_dir}")
+    
+    # 데이터 로더 초기화
+    logger.info("Initializing data loader...")
+    data_loader = EmbeddingDataLoader(
+        db_path=args.db,
+        table_name=args.table,
+        seq_len=args.seq_len
+    )
+    
+    # 데이터 로드 및 분할
+    logger.info("Loading and splitting data...")
+    data_loader.load_and_split_data()
+    
+    # 특징 컬럼 가져오기
+    feature_names = data_loader._get_feature_columns()
+    input_dim = len(feature_names)
+    logger.info(f"Input dimension: {input_dim}")
+    
+    # 정규화 통계 계산 (훈련 세트 기준)
+    logger.info("Computing normalization statistics...")
+    normalization_stats = compute_normalization_stats(data_loader.data_splits['train']['data'])
+    
+    # DataLoader 생성
+    train_dataloader = data_loader.get_dataloader(
+        split='train',
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers
+    )
+    
+    val_dataloader = data_loader.get_dataloader(
+        split='val',
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
+    
+    logger.info(f"Train batches: {len(train_dataloader)}")
+    logger.info(f"Val batches: {len(val_dataloader)}")
+    
+    # 모델 초기화
+    logger.info("Initializing model...")
+    model = TradingEmbeddingModel(
+        input_dim=input_dim,
+        embedding_dim=args.embedding_dim,
+        seq_len=args.seq_len,
+        num_heads=args.num_heads
+    ).to(device)
+    
+    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # 손실 함수 및 Optimizer 초기화
+    criterion = InfoNCELoss(temperature=args.temperature)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    
+    # 체크포인트 재개 (선택사항)
+    start_epoch = 1
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        metadata = load_checkpoint(args.resume, model, optimizer)
+        start_epoch = metadata['epoch'] + 1
+    
+    # 훈련 루프
+    logger.info("Starting training loop...")
+    best_val_loss = float('inf')
+    
+    for epoch in range(start_epoch, args.epochs + 1):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Epoch {epoch}/{args.epochs}")
+        logger.info(f"{'='*80}")
+        
+        # 훈련
+        train_loss = train_epoch(
+            model=model,
+            dataloader=train_dataloader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch
+        )
+        
+        logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
+        
+        # 검증
+        val_loss = validate(
+            model=model,
+            dataloader=val_dataloader,
+            criterion=criterion,
+            device=device
+        )
+        
+        logger.info(f"Epoch {epoch} - Val Loss: {val_loss:.4f}")
+        
+        # TensorBoard 로깅
+        writer.add_scalar('train/loss', train_loss, epoch)
+        writer.add_scalar('val/loss', val_loss, epoch)
+        writer.add_scalar('learning_rate', args.lr, epoch)
+        
+        # 최고 모델 저장
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_checkpoint_path = save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                loss=train_loss,
+                val_loss=val_loss,
+                config=model.get_config(),
+                feature_names=feature_names,
+                normalization_stats=normalization_stats,
+                output_dir=output_dir
+            )
+            logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
+        
+        # 주기적 체크포인트 저장
+        if epoch % args.checkpoint_interval == 0:
+            checkpoint_path = save_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
+                loss=train_loss,
+                val_loss=val_loss,
+                config=model.get_config(),
+                feature_names=feature_names,
+                normalization_stats=normalization_stats,
+                output_dir=output_dir
+            )
+    
+    # 최종 체크포인트 저장
+    final_checkpoint_path = save_checkpoint(
+        model=model,
+        optimizer=optimizer,
+        epoch=args.epochs,
+        loss=train_loss,
+        val_loss=val_loss,
+        config=model.get_config(),
+        feature_names=feature_names,
+        normalization_stats=normalization_stats,
+        output_dir=output_dir
+    )
+    
+    logger.info(f"\n{'='*80}")
+    logger.info("Training completed!")
+    logger.info(f"Best validation loss: {best_val_loss:.4f}")
+    logger.info(f"Final checkpoint: {final_checkpoint_path}")
+    logger.info(f"TensorBoard logs: {tensorboard_dir}")
+    logger.info(f"{'='*80}")
+    
+    # 정리
+    writer.close()
+    data_loader.close()
     
     return 0
 
