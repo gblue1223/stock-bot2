@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
@@ -463,6 +464,17 @@ class GRPOTrainer:
         요구사항 4.4, 4.5에 따라 PPO 스타일 클리핑된 목적 함수와
         KL 발산 제약을 사용하여 정책을 업데이트합니다.
         
+        PPO 클리핑 목적 함수:
+        L^CLIP(θ) = E[min(r_t(θ) * A_t, clip(r_t(θ), 1-ε, 1+ε) * A_t)]
+        
+        여기서:
+        - r_t(θ) = π_θ(a_t|s_t) / π_θ_old(a_t|s_t) (확률 비율)
+        - A_t: 어드밴티지
+        - ε: 클리핑 파라미터 (self.clip_epsilon)
+        
+        KL 발산 제약:
+        - 참조 정책과의 KL 발산이 목표값(self.kl_target)을 초과하면 조기 종료
+        
         Args:
             episodes: 에피소드 데이터 리스트
             advantages: 어드밴티지 리스트
@@ -470,18 +482,203 @@ class GRPOTrainer:
         Returns:
             업데이트 메트릭 딕셔너리
         """
-        # Placeholder: 실제 구현은 task 7.5에서 수행
+        # 1. 데이터 준비
+        all_states = []
+        all_actions = []
+        all_old_log_probs = []
+        all_advantages = []
+        all_returns = []
+        
+        for episode, advantage in zip(episodes, advantages):
+            states = episode['states']
+            actions = episode['actions']
+            old_log_probs = episode['log_probs']
+            rewards = episode['rewards']
+            
+            # 리턴 계산 (할인된 누적 보상)
+            returns = self._compute_returns(rewards)
+            
+            # 데이터 추가
+            all_states.append(states)
+            all_actions.append(actions)
+            all_old_log_probs.append(old_log_probs)
+            all_advantages.append(advantage)
+            all_returns.append(returns)
+        
+        # 배열로 변환
+        all_states = np.concatenate(all_states, axis=0)
+        all_actions = np.concatenate(all_actions, axis=0)
+        all_old_log_probs = np.concatenate(all_old_log_probs, axis=0)
+        all_advantages = np.concatenate(all_advantages, axis=0)
+        all_returns = np.concatenate(all_returns, axis=0)
+        
+        # 어드밴티지 정규화
+        all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+        
+        # 텐서로 변환
+        states_tensor = torch.from_numpy(all_states).float().to(self.device)
+        actions_tensor = torch.from_numpy(all_actions).long().to(self.device)
+        old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float().to(self.device)
+        advantages_tensor = torch.from_numpy(all_advantages).float().to(self.device)
+        returns_tensor = torch.from_numpy(all_returns).float().to(self.device)
+        
+        # 2. 참조 정책 저장 (KL 발산 계산용)
+        if self.reference_policy is None:
+            # 첫 업데이트 시 참조 정책 초기화
+            self.reference_policy = type(self.policy)(
+                embedding_dim=self.policy.embedding_dim,
+                hidden_dim=self.policy.hidden_dim,
+                action_dim=self.policy.action_dim
+            ).to(self.device)
+        
+        # 현재 정책을 참조 정책으로 복사
+        self.reference_policy.load_state_dict(self.policy.state_dict())
+        self.reference_policy.eval()
+        
+        # 3. 여러 에포크 동안 정책 업데이트 (PPO의 multiple epochs)
+        num_epochs = 4  # PPO 표준 설정
+        batch_size = 64
+        num_samples = len(all_states)
+        
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        total_kl_divergence = 0.0
+        total_clip_fraction = 0.0
+        num_batches = 0
+        
+        for epoch in range(num_epochs):
+            # 데이터 셔플
+            indices = np.random.permutation(num_samples)
+            
+            for start_idx in range(0, num_samples, batch_size):
+                end_idx = min(start_idx + batch_size, num_samples)
+                batch_indices = indices[start_idx:end_idx]
+                
+                # 배치 데이터
+                batch_states = states_tensor[batch_indices]
+                batch_actions = actions_tensor[batch_indices]
+                batch_old_log_probs = old_log_probs_tensor[batch_indices]
+                batch_advantages = advantages_tensor[batch_indices]
+                batch_returns = returns_tensor[batch_indices]
+                
+                # 4. 정책 평가
+                log_probs, entropy, values = self.policy.evaluate_actions(
+                    batch_states, batch_actions
+                )
+                
+                # 5. PPO 클리핑 목적 함수 계산
+                # 확률 비율: r_t = π_θ(a|s) / π_θ_old(a|s)
+                ratio = torch.exp(log_probs - batch_old_log_probs)
+                
+                # 클리핑되지 않은 목적 함수
+                surr1 = ratio * batch_advantages
+                
+                # 클리핑된 목적 함수
+                ratio_clipped = torch.clamp(
+                    ratio,
+                    1.0 - self.clip_epsilon,
+                    1.0 + self.clip_epsilon
+                )
+                surr2 = ratio_clipped * batch_advantages
+                
+                # 최소값 선택 (보수적 정책 업데이트)
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # 6. 가치 손실 계산 (MSE)
+                value_loss = F.mse_loss(values, batch_returns)
+                
+                # 7. 엔트로피 보너스 (탐험 장려)
+                entropy_loss = -entropy.mean()
+                
+                # 8. 총 손실 계산
+                loss = (
+                    policy_loss +
+                    self.value_coef * value_loss +
+                    self.entropy_coef * entropy_loss
+                )
+                
+                # 9. 그래디언트 업데이트
+                self.optimizer.zero_grad()
+                loss.backward()
+                
+                # 그래디언트 클리핑
+                torch.nn.utils.clip_grad_norm_(
+                    self.policy.parameters(),
+                    self.max_grad_norm
+                )
+                
+                self.optimizer.step()
+                
+                # 10. KL 발산 계산 (조기 종료 체크)
+                with torch.no_grad():
+                    # 참조 정책의 로그 확률
+                    ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
+                        batch_states, batch_actions
+                    )
+                    
+                    # KL 발산: KL(π_old || π_new)
+                    kl_divergence = (batch_old_log_probs - log_probs).mean()
+                    
+                    # 클리핑 비율 계산
+                    clip_fraction = ((ratio < 1.0 - self.clip_epsilon) | 
+                                   (ratio > 1.0 + self.clip_epsilon)).float().mean()
+                
+                # 메트릭 누적
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.mean().item()
+                total_kl_divergence += kl_divergence.item()
+                total_clip_fraction += clip_fraction.item()
+                num_batches += 1
+            
+            # KL 발산이 목표값을 초과하면 조기 종료
+            avg_kl = total_kl_divergence / num_batches
+            if avg_kl > self.kl_target * 1.5:
+                logger.warning(f"Early stopping at epoch {epoch + 1}/{num_epochs} "
+                             f"due to high KL divergence: {avg_kl:.6f} > {self.kl_target * 1.5:.6f}")
+                break
+        
+        # 평균 메트릭 계산
         update_metrics = {
-            'policy_loss': 0.0,
-            'value_loss': 0.0,
-            'entropy': 0.0,
-            'kl_divergence': 0.0,
-            'clip_fraction': 0.0
+            'policy_loss': total_policy_loss / num_batches,
+            'value_loss': total_value_loss / num_batches,
+            'entropy': total_entropy / num_batches,
+            'kl_divergence': total_kl_divergence / num_batches,
+            'clip_fraction': total_clip_fraction / num_batches
         }
         
         self.num_updates += 1
         
+        logger.debug(f"Policy updated: policy_loss={update_metrics['policy_loss']:.4f}, "
+                    f"value_loss={update_metrics['value_loss']:.4f}, "
+                    f"entropy={update_metrics['entropy']:.4f}, "
+                    f"kl_div={update_metrics['kl_divergence']:.6f}, "
+                    f"clip_frac={update_metrics['clip_fraction']:.4f}")
+        
         return update_metrics
+    
+    def _compute_returns(self, rewards: np.ndarray) -> np.ndarray:
+        """
+        할인된 누적 보상 계산
+        
+        R_t = r_t + γ * r_{t+1} + γ^2 * r_{t+2} + ...
+        
+        Args:
+            rewards: 보상 배열 (T,)
+            
+        Returns:
+            리턴 배열 (T,)
+        """
+        returns = np.zeros_like(rewards, dtype=np.float32)
+        running_return = 0.0
+        
+        # 역순으로 계산
+        for t in reversed(range(len(rewards))):
+            running_return = rewards[t] + self.gamma * running_return
+            returns[t] = running_return
+        
+        return returns
     
     def train(
         self,
