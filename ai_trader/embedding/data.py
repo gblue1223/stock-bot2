@@ -96,8 +96,8 @@ class EmbeddingDataLoader:
             columns_df = self.conn.execute(query).fetchdf()
             all_columns = columns_df['column_name'].tolist()
             
-            # 메타데이터 컬럼 제외
-            exclude_columns = {'날짜', '종목코드', '번호'}
+            # 메타데이터 컬럼 제외 (문자열 컬럼 및 식별자)
+            exclude_columns = {'날짜', '종목코드', '번호', '종목명'}
             self.feature_columns = [col for col in all_columns if col not in exclude_columns]
             
             logger.info(f"Found {len(self.feature_columns)} feature columns")

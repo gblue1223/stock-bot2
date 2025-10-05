@@ -75,6 +75,8 @@ python -m ai_trader.embedding.train_embedding \
   --num-heads 4 \
   --val-every 5 \
   --checkpoint-interval 10 \
+  --start-date 20240901 \
+  --end-date 20240930 \
   --num-workers 4
 ```
 
