@@ -72,8 +72,10 @@ python -m ai_trader.embedding.train_embedding \
   --positive-time-threshold 10 \
   --negative-time-threshold 60 \
   --temperature 0.07 \
+  --num-heads 4 \
   --val-every 5 \
-  --ckpt-every 10
+  --checkpoint-interval 10 \
+  --num-workers 4
 ```
 
 #### CLI 인수 설명
@@ -89,27 +91,26 @@ python -m ai_trader.embedding.train_embedding \
 - `--seq-len`: 입력 시퀀스 길이 (기본값: 60)
 - `--embedding-dim`: 임베딩 벡터 차원 (기본값: 128, 권장: 128-256)
 - `--num-heads`: Multi-head Attention 헤드 수 (기본값: 4)
-- `--hidden-dim`: 은닉층 차원 (기본값: 256)
 
 **훈련 설정:**
 
 - `--batch-size`: 배치 크기 (기본값: 128)
 - `--epochs`: 훈련 에포크 수 (기본값: 50)
 - `--lr`: 학습률 (기본값: 1e-4)
-- `--weight-decay`: 가중치 감쇠 (기본값: 1e-5)
 - `--device`: 디바이스 (cuda/cpu, 기본값: cuda)
+- `--num-workers`: 데이터 로더 워커 프로세스 수 (기본값: 4)
 
 **대조 학습 설정:**
 
+- `--temperature`: InfoNCE 손실 온도 파라미터 (기본값: 0.07, 권장: 0.05-0.1)
 - `--positive-time-threshold`: 긍정 쌍 시간 임계값 (초, 기본값: 10)
 - `--negative-time-threshold`: 부정 쌍 시간 임계값 (초, 기본값: 60)
-- `--temperature`: InfoNCE 손실 온도 파라미터 (기본값: 0.07)
 
 **체크포인트 및 로깅:**
 
-- `--val-every`: 검증 주기 (에포크, 기본값: 5)
-- `--ckpt-every`: 체크포인트 저장 주기 (에포크, 기본값: 10)
-- `--resume-from`: 체크포인트에서 재개
+- `--checkpoint-interval`: 체크포인트 저장 간격 (에포크, 기본값: 5)
+- `--val-every`: 검증 주기 (에포크, 기본값: 1 = 매 에포크마다 검증)
+- `--resume`: 재개할 체크포인트 경로 (선택사항)
 
 ### 임베딩 모델 평가
 

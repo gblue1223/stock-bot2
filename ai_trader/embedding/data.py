@@ -163,13 +163,21 @@ class EmbeddingDataLoader:
             logger.error(f"Failed to load and split data: {e}")
             raise DataLoadError(f"Cannot load data: {e}")
     
-    def get_dataset(self, split: str = 'train', return_metadata: bool = False) -> 'ContrastiveDataset':
+    def get_dataset(
+        self,
+        split: str = 'train',
+        return_metadata: bool = False,
+        positive_time_threshold: int = 10,
+        negative_time_threshold: int = 60
+    ) -> 'ContrastiveDataset':
         """
         특정 분할에 대한 Dataset 객체 반환
         
         Args:
             split: 'train', 'val', 또는 'test'
             return_metadata: 메타데이터 반환 여부 (기본값: False)
+            positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
+            negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
             
         Returns:
             ContrastiveDataset 객체
@@ -181,6 +189,8 @@ class EmbeddingDataLoader:
             data=self.data_splits[split]['data'],
             metadata=self.data_splits[split]['metadata'],
             seq_len=self.seq_len,
+            positive_time_threshold=positive_time_threshold,
+            negative_time_threshold=negative_time_threshold,
             return_metadata=return_metadata
         )
     
@@ -190,7 +200,9 @@ class EmbeddingDataLoader:
         batch_size: int = 128,
         shuffle: bool = True,
         num_workers: int = 4,
-        return_metadata: bool = False
+        return_metadata: bool = False,
+        positive_time_threshold: int = 10,
+        negative_time_threshold: int = 60
     ) -> DataLoader:
         """
         DataLoader 생성
@@ -201,11 +213,18 @@ class EmbeddingDataLoader:
             shuffle: 셔플 여부
             num_workers: 워커 프로세스 수
             return_metadata: 메타데이터 반환 여부 (기본값: False)
+            positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
+            negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
             
         Returns:
             PyTorch DataLoader
         """
-        dataset = self.get_dataset(split, return_metadata=return_metadata)
+        dataset = self.get_dataset(
+            split,
+            return_metadata=return_metadata,
+            positive_time_threshold=positive_time_threshold,
+            negative_time_threshold=negative_time_threshold
+        )
         return DataLoader(
             dataset,
             batch_size=batch_size,

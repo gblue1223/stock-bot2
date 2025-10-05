@@ -161,6 +161,29 @@ def parse_args():
         help='데이터 로더 워커 프로세스 수'
     )
     
+    # 대조 학습 쌍 생성 설정
+    parser.add_argument(
+        '--positive-time-threshold',
+        type=int,
+        default=10,
+        help='긍정 쌍 시간 임계값 (초, 기본값: 10)'
+    )
+    
+    parser.add_argument(
+        '--negative-time-threshold',
+        type=int,
+        default=60,
+        help='부정 쌍 시간 임계값 (초, 기본값: 60)'
+    )
+    
+    # 검증 및 체크포인트 설정 (추가)
+    parser.add_argument(
+        '--val-every',
+        type=int,
+        default=1,
+        help='검증 주기 (에포크 단위, 기본값: 1 = 매 에포크마다 검증)'
+    )
+    
     return parser.parse_args()
 
 
@@ -516,7 +539,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        return_metadata=False  # 훈련 시에는 메타데이터 불필요
+        return_metadata=False,  # 훈련 시에는 메타데이터 불필요
+        positive_time_threshold=args.positive_time_threshold,
+        negative_time_threshold=args.negative_time_threshold
     )
     
     val_dataloader = data_loader.get_dataloader(
@@ -524,7 +549,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        return_metadata=True  # 검증 시에는 메트릭 계산을 위해 메타데이터 필요
+        return_metadata=True,  # 검증 시에는 메트릭 계산을 위해 메타데이터 필요
+        positive_time_threshold=args.positive_time_threshold,
+        negative_time_threshold=args.negative_time_threshold
     )
     
     logger.info(f"Train batches: {len(train_dataloader)}")
@@ -573,53 +600,57 @@ def main():
         
         logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
         
-        # 검증
-        val_loss, val_embeddings, val_stock_codes, val_timestamps = validate(
-            model=model,
-            dataloader=val_dataloader,
-            criterion=criterion,
-            device=device
-        )
+        # TensorBoard 로깅 (훈련 손실은 항상 로깅)
+        writer.add_scalar('train/loss', train_loss, epoch)
+        writer.add_scalar('learning_rate', args.lr, epoch)
         
-        logger.info(f"Epoch {epoch} - Val Loss: {val_loss:.4f}")
-        
-        # 임베딩 품질 메트릭 계산
+        # 검증 (val_every 주기마다 실행)
+        val_loss = 0.0
         silhouette = 0.0
         temporal_coherence = 0.0
         
-        if len(val_embeddings) > 0:
-            # Silhouette score 계산 (종목 클러스터링 품질)
-            if len(val_stock_codes) > 0:
-                silhouette = compute_silhouette_score(val_embeddings, val_stock_codes)
-                logger.info(f"Epoch {epoch} - Silhouette Score: {silhouette:.4f}")
-            
-            # Temporal coherence 계산 (시간적 일관성)
-            if len(val_timestamps) > 0:
-                temporal_coherence = compute_temporal_coherence(val_embeddings, val_timestamps)
-                logger.info(f"Epoch {epoch} - Temporal Coherence: {temporal_coherence:.4f}")
-        
-        # TensorBoard 로깅
-        writer.add_scalar('train/loss', train_loss, epoch)
-        writer.add_scalar('val/loss', val_loss, epoch)
-        writer.add_scalar('val/silhouette_score', silhouette, epoch)
-        writer.add_scalar('val/temporal_coherence', temporal_coherence, epoch)
-        writer.add_scalar('learning_rate', args.lr, epoch)
-        
-        # 최고 모델 저장
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_checkpoint_path = save_checkpoint(
+        if epoch % args.val_every == 0:
+            val_loss, val_embeddings, val_stock_codes, val_timestamps = validate(
                 model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                loss=train_loss,
-                val_loss=val_loss,
-                config=model.get_config(),
-                feature_names=feature_names,
-                normalization_stats=normalization_stats,
-                output_dir=output_dir
+                dataloader=val_dataloader,
+                criterion=criterion,
+                device=device
             )
-            logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
+            
+            logger.info(f"Epoch {epoch} - Val Loss: {val_loss:.4f}")
+            
+            # 임베딩 품질 메트릭 계산
+            if len(val_embeddings) > 0:
+                # Silhouette score 계산 (종목 클러스터링 품질)
+                if len(val_stock_codes) > 0:
+                    silhouette = compute_silhouette_score(val_embeddings, val_stock_codes)
+                    logger.info(f"Epoch {epoch} - Silhouette Score: {silhouette:.4f}")
+                
+                # Temporal coherence 계산 (시간적 일관성)
+                if len(val_timestamps) > 0:
+                    temporal_coherence = compute_temporal_coherence(val_embeddings, val_timestamps)
+                    logger.info(f"Epoch {epoch} - Temporal Coherence: {temporal_coherence:.4f}")
+            
+            # TensorBoard 로깅 (검증 메트릭)
+            writer.add_scalar('val/loss', val_loss, epoch)
+            writer.add_scalar('val/silhouette_score', silhouette, epoch)
+            writer.add_scalar('val/temporal_coherence', temporal_coherence, epoch)
+            
+            # 최고 모델 저장 (검증 손실이 개선된 경우)
+            if val_loss > 0 and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_checkpoint_path = save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    loss=train_loss,
+                    val_loss=val_loss,
+                    config=model.get_config(),
+                    feature_names=feature_names,
+                    normalization_stats=normalization_stats,
+                    output_dir=output_dir
+                )
+                logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
         
         # 주기적 체크포인트 저장
         if epoch % args.checkpoint_interval == 0:
