@@ -41,14 +41,14 @@
 
 - [ ] 5. 임베딩 모델 훈련 스크립트 구현
 
-  - [ ] 5.1 CLI 인터페이스 구현
+  - [x] 5.1 CLI 인터페이스 구현
+
 
     - ai_trader/embedding/train_embedding.py 생성
     - argparse로 --db, --table, --out, --seq-len, --embedding-dim, --batch-size, --epochs, --lr, --device 인수 처리
     - _요구사항: 6.2_
 
   - [ ] 5.2 훈련 루프 구현
-
     - 데이터 로더에서 배치 로드
     - 모델 forward pass 및 손실 계산
     - Optimizer 업데이트 (Adam)
