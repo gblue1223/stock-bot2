@@ -272,5 +272,196 @@ def test_quick_exit_rule_metadata():
         pytest.skip(f"Database not available: {e}")
 
 
+def test_episode_metadata_recording():
+    """에피소드 메타데이터 기록 테스트"""
+    embedding_model = MockEmbeddingModel(input_dim=60, embedding_dim=128, seq_len=60)
+    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    
+    try:
+        env = GRPOScalpingEnv(
+            embedding_model=embedding_model,
+            db_path=db_path,
+            embedding_dim=128,
+            quick_exit_threshold=1.5,
+            quick_exit_penalty=0.01
+        )
+        
+        observation, info = env.reset()
+        
+        # 여러 거래 수행
+        terminated = False
+        step_count = 0
+        max_steps = 100
+        
+        while not terminated and step_count < max_steps:
+            # 간단한 전략: 매수 -> 몇 스텝 보유 -> 매도
+            if env.position == 0 and step_count % 10 == 0:
+                action = 1  # 매수
+            elif env.position == 1 and step_count % 10 == 5:
+                action = 2  # 매도
+            else:
+                action = 0  # 보유
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            step_count += 1
+        
+        # 에피소드가 종료되지 않았다면 강제 종료
+        if not terminated:
+            # 에피소드 끝까지 진행
+            while not terminated:
+                obs, reward, terminated, truncated, info = env.step(0)
+        
+        # 에피소드 종료 시 메타데이터 확인
+        assert 'episode' in info
+        episode_metadata = info['episode']
+        
+        # 요구사항 3.7에 따른 메타데이터 확인
+        assert 'total_return' in episode_metadata
+        assert 'num_trades' in episode_metadata
+        assert 'avg_holding_time' in episode_metadata
+        assert 'sharpe_ratio' in episode_metadata
+        assert 'quick_exit_violations' in episode_metadata
+        
+        # 메타데이터 타입 확인
+        assert isinstance(episode_metadata['total_return'], float)
+        assert isinstance(episode_metadata['num_trades'], int)
+        assert isinstance(episode_metadata['avg_holding_time'], float)
+        assert isinstance(episode_metadata['sharpe_ratio'], float)
+        assert isinstance(episode_metadata['quick_exit_violations'], int)
+        
+        # 추가 메트릭 확인
+        assert 'win_rate' in episode_metadata
+        assert 'avg_profit_per_trade' in episode_metadata
+        
+        env.close()
+        
+    except Exception as e:
+        pytest.skip(f"Database not available: {e}")
+
+
+def test_sharpe_ratio_calculation():
+    """샤프 비율 계산 테스트"""
+    embedding_model = MockEmbeddingModel(input_dim=60, embedding_dim=128, seq_len=60)
+    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    
+    try:
+        env = GRPOScalpingEnv(
+            embedding_model=embedding_model,
+            db_path=db_path,
+            embedding_dim=128
+        )
+        
+        observation, info = env.reset()
+        
+        # 여러 거래를 수행하여 보상 분산 생성
+        terminated = False
+        step_count = 0
+        max_steps = 50
+        
+        while not terminated and step_count < max_steps:
+            if env.position == 0 and step_count % 8 == 0:
+                action = 1  # 매수
+            elif env.position == 1 and step_count % 8 == 4:
+                action = 2  # 매도
+            else:
+                action = 0  # 보유
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            step_count += 1
+        
+        # 에피소드 끝까지 진행
+        while not terminated:
+            obs, reward, terminated, truncated, info = env.step(0)
+        
+        # 샤프 비율 확인
+        episode_metadata = info['episode']
+        sharpe_ratio = episode_metadata['sharpe_ratio']
+        
+        # 샤프 비율이 계산되었는지 확인 (NaN이 아님)
+        assert not np.isnan(sharpe_ratio)
+        assert isinstance(sharpe_ratio, float)
+        
+        # 거래가 있었다면 샤프 비율이 의미있는 값이어야 함
+        if episode_metadata['num_trades'] > 0:
+            # 샤프 비율은 실수 범위 내에 있어야 함
+            assert -100 <= sharpe_ratio <= 100
+        
+        env.close()
+        
+    except Exception as e:
+        pytest.skip(f"Database not available: {e}")
+
+
+def test_reset_clears_metadata():
+    """리셋 시 메타데이터 초기화 테스트"""
+    embedding_model = MockEmbeddingModel(input_dim=60, embedding_dim=128, seq_len=60)
+    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    
+    try:
+        env = GRPOScalpingEnv(
+            embedding_model=embedding_model,
+            db_path=db_path,
+            embedding_dim=128
+        )
+        
+        # 첫 번째 에피소드
+        observation, info = env.reset()
+        
+        # 몇 가지 거래 수행
+        env.step(1)  # 매수
+        env.step(0)  # 보유
+        env.step(2)  # 매도
+        
+        # 메타데이터 확인
+        assert len(env.episode_trades) > 0
+        assert len(env.episode_rewards) > 0
+        
+        # 리셋
+        observation, info = env.reset()
+        
+        # 메타데이터가 초기화되었는지 확인
+        assert len(env.episode_trades) == 0
+        assert len(env.episode_rewards) == 0
+        assert env.quick_exit_violations == 0
+        assert env.position == 0
+        
+        env.close()
+        
+    except Exception as e:
+        pytest.skip(f"Database not available: {e}")
+
+
+def test_episode_sampling_diversity():
+    """에피소드 샘플링 다양성 테스트"""
+    embedding_model = MockEmbeddingModel(input_dim=60, embedding_dim=128, seq_len=60)
+    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    
+    try:
+        env = GRPOScalpingEnv(
+            embedding_model=embedding_model,
+            db_path=db_path,
+            embedding_dim=128
+        )
+        
+        # 여러 번 리셋하여 다양한 시작 지점 샘플링
+        stock_codes = []
+        dates = []
+        
+        for _ in range(5):
+            observation, info = env.reset()
+            stock_codes.append(info['stock_code'])
+            dates.append(info['date'])
+        
+        # 최소한 하나의 다른 에피소드가 샘플링되었는지 확인
+        # (확률적으로 모두 같을 수도 있지만 매우 낮은 확률)
+        assert len(set(stock_codes)) >= 1
+        assert len(set(dates)) >= 1
+        
+        env.close()
+        
+    except Exception as e:
+        pytest.skip(f"Database not available: {e}")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -500,15 +500,84 @@ class GRPOScalpingEnv(gym.Env):
         
         if terminated:
             # 에피소드 종료 시 메타데이터 추가
-            info['episode'] = {
-                'total_reward': sum(self.episode_rewards),
-                'num_trades': len(self.episode_trades),
-                'quick_exit_violations': self.quick_exit_violations,
-                'avg_holding_time': np.mean([t['holding_time'] for t in self.episode_trades]) if self.episode_trades else 0.0,
-                'win_rate': np.mean([1 if t['reward'] > 0 else 0 for t in self.episode_trades]) if self.episode_trades else 0.0
-            }
+            episode_metadata = self._calculate_episode_metadata()
+            info['episode'] = episode_metadata
         
         return observation, reward, terminated, truncated, info
+    
+    def _calculate_episode_metadata(self) -> Dict[str, Any]:
+        """
+        에피소드 종료 시 메타데이터 계산
+        
+        요구사항 3.7에 따라 다음 메트릭을 계산합니다:
+        - 총 수익 (total_return)
+        - 거래 횟수 (num_trades)
+        - 평균 보유 시간 (avg_holding_time)
+        - 샤프 비율 (sharpe_ratio)
+        - 빠른 손절 룰 위반 횟수 (quick_exit_violations)
+        
+        Returns:
+            에피소드 메타데이터 딕셔너리
+        """
+        # 총 수익
+        total_return = sum(self.episode_rewards)
+        
+        # 거래 횟수
+        num_trades = len(self.episode_trades)
+        
+        # 평균 보유 시간
+        if self.episode_trades:
+            avg_holding_time = np.mean([t['holding_time'] for t in self.episode_trades])
+        else:
+            avg_holding_time = 0.0
+        
+        # 샤프 비율 계산
+        # 샤프 비율 = (평균 수익률 - 무위험 수익률) / 수익률 표준편차
+        # 스캘핑의 경우 무위험 수익률은 0으로 가정
+        if len(self.episode_rewards) > 1:
+            mean_reward = np.mean(self.episode_rewards)
+            std_reward = np.std(self.episode_rewards)
+            
+            # 표준편차가 0이면 샤프 비율은 0
+            if std_reward > 0:
+                sharpe_ratio = mean_reward / std_reward
+            else:
+                sharpe_ratio = 0.0
+        else:
+            sharpe_ratio = 0.0
+        
+        # 승률 계산 (추가 메트릭)
+        if self.episode_trades:
+            win_rate = np.mean([1 if t['reward'] > 0 else 0 for t in self.episode_trades])
+        else:
+            win_rate = 0.0
+        
+        # 평균 거래당 수익 (추가 메트릭)
+        if self.episode_trades:
+            avg_profit_per_trade = np.mean([t['reward'] for t in self.episode_trades])
+        else:
+            avg_profit_per_trade = 0.0
+        
+        metadata = {
+            'total_return': float(total_return),
+            'num_trades': int(num_trades),
+            'avg_holding_time': float(avg_holding_time),
+            'sharpe_ratio': float(sharpe_ratio),
+            'quick_exit_violations': int(self.quick_exit_violations),
+            'win_rate': float(win_rate),
+            'avg_profit_per_trade': float(avg_profit_per_trade),
+            'episode_length': int(self.episode_length),
+            'steps_taken': int(self.current_step)
+        }
+        
+        logger.info(f"Episode finished: total_return={total_return:.4f}, "
+                   f"num_trades={num_trades}, "
+                   f"avg_holding_time={avg_holding_time:.2f}s, "
+                   f"sharpe_ratio={sharpe_ratio:.4f}, "
+                   f"quick_exit_violations={self.quick_exit_violations}, "
+                   f"win_rate={win_rate:.2%}")
+        
+        return metadata
     
     def close(self):
         """환경 종료"""
