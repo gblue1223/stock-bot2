@@ -91,8 +91,7 @@
 
 - [ ] 7. GRPO 알고리즘 구현
 
-  - [ ] 7.1 GRPOTrainer 클래스 기본 구조 구현
-
+  - [x] 7.1 GRPOTrainer 클래스 기본 구조 구현
     - ai_trader/grpo/grpo.py에 훈련기 정의
     - 정책, 환경, 하이퍼파라미터 초기화
     - _요구사항: 4.1_
