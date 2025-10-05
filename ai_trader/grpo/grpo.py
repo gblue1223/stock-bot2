@@ -208,10 +208,24 @@ class GRPOTrainer:
             (action, log_prob) 튜플
         """
         # 정책에서 행동 확률 분포 얻기
-        # 정책이 구현되면 policy.get_action() 메서드 사용
-        # 현재는 placeholder로 랜덤 행동 반환
-        action = self.env.action_space.sample()
-        log_prob = 0.0  # placeholder
+        # 정책이 get_action 메서드를 가지고 있는지 확인
+        if hasattr(self.policy, 'get_action'):
+            # 정책의 get_action 메서드 사용 (stochastic mode)
+            action, log_prob = self.policy.get_action(state, deterministic=False)
+            
+            # 텐서를 스칼라로 변환
+            if isinstance(action, torch.Tensor):
+                action = action.item()
+            if isinstance(log_prob, torch.Tensor):
+                log_prob = log_prob.item()
+        else:
+            # 정책이 구현되지 않은 경우 랜덤 행동 반환
+            # 이는 정책 네트워크가 구현되기 전의 임시 동작입니다
+            action = self.env.action_space.sample()
+            # 균등 분포 가정: log(1/3) = -log(3)
+            log_prob = -np.log(self.env.action_space.n)
+            
+            logger.warning("Policy does not have get_action method, using random actions")
         
         return action, log_prob
     
