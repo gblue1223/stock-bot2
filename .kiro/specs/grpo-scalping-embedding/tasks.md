@@ -149,7 +149,8 @@
     - get_action() 메서드: deterministic 및 stochastic 모드 지원
     - _요구사항: 4.4_
 
-- [ ] 9. GRPO 훈련 스크립트 구현
+- [x] 9. GRPO 훈련 스크립트 구현
+
 
   - [x] 9.1 CLI 인터페이스 구현
 
@@ -157,7 +158,8 @@
     - argparse로 --embedding-model, --db, --table, --out, --seq-len, --episodes-per-group, --num-groups, --total-timesteps, --quick-exit-threshold, --quick-exit-penalty, --device 인수 처리
     - _요구사항: 6.2_
 
-  - [ ] 9.2 훈련 루프 구현
+  - [x] 9.2 훈련 루프 구현
+
     - GRPOTrainer 초기화
     - 롤아웃 수집 → 그룹화 → 어드밴티지 계산 → 정책 업데이트 반복
     - 체크포인트 저장 (설정 가능한 간격)

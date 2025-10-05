@@ -692,7 +692,7 @@ class GRPOTrainer:
         Args:
             total_episodes: 총 훈련 에피소드 수
             checkpoint_interval: 체크포인트 저장 간격
-            checkpoint_path: 체크포인트 저장 경로
+            checkpoint_path: 체크포인트 저장 경로 (format string with {} for iteration)
             
         Returns:
             훈련 메트릭 딕셔너리
@@ -728,7 +728,9 @@ class GRPOTrainer:
             
             # 6. 체크포인트 저장
             if checkpoint_path and (iteration + 1) % checkpoint_interval == 0:
-                self.save_checkpoint(checkpoint_path, iteration)
+                # Format checkpoint path with iteration number
+                formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
+                self.save_checkpoint(formatted_checkpoint_path, iteration + 1)
             
             logger.info(f"Iteration {iteration + 1}/{num_iterations}: "
                        f"timesteps={self.total_timesteps}, "
