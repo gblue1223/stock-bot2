@@ -304,6 +304,50 @@ class GRPOScalpingEnv(gym.Env):
         # 여기서는 간단히 인덱스 0을 사용
         return float(self.episode_data[self.current_step, 0])
     
+    def _calculate_reward(self, entry_price: float, exit_price: float, holding_time: float) -> Tuple[float, Dict[str, float]]:
+        """
+        보상 계산
+        
+        보상 구조:
+        - 수익률 기반 보상: (청산가 - 진입가) / 진입가 - 거래비용
+        - 거래비용: 수수료(0.015%) + 세금(0.2%) = 0.215% (매수/매도 각각 적용)
+        - 총 거래비용: 0.43% (왕복)
+        - 양의 보상 조건: 수익률 > 0.43%
+        - 장기 보유 페널티: -0.001 * (보유시간 - 60초)
+        
+        Args:
+            entry_price: 진입 가격
+            exit_price: 청산 가격
+            holding_time: 보유 시간 (초)
+            
+        Returns:
+            (total_reward, reward_components) 튜플
+            - total_reward: 총 보상
+            - reward_components: 보상 구성 요소 딕셔너리
+        """
+        # 수익률 계산: (청산가 - 진입가) / 진입가
+        profit_rate = (exit_price - entry_price) / entry_price
+        
+        # 거래 비용 차감 (왕복 0.43%)
+        # 양의 보상을 받으려면 수익률이 0.43%를 초과해야 함
+        reward = profit_rate - self.round_trip_cost
+        
+        # 장기 보유 페널티: -0.001 * (보유시간 - 60초)
+        holding_penalty = 0.0
+        if holding_time > self.max_holding_time:
+            holding_penalty = self.holding_penalty_rate * (holding_time - self.max_holding_time)
+            reward -= holding_penalty
+        
+        # 보상 구성 요소
+        reward_components = {
+            'profit_rate': profit_rate,
+            'transaction_cost': -self.round_trip_cost,
+            'holding_penalty': -holding_penalty,
+            'net_reward': reward
+        }
+        
+        return reward, reward_components
+    
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         행동 실행
@@ -328,37 +372,30 @@ class GRPOScalpingEnv(gym.Env):
         
         elif action == 2:  # 매도
             if self.position == 1:
-                # 수익률 계산
-                profit_rate = (self.current_price - self.entry_price) / self.entry_price
-                
-                # 거래 비용 차감
-                reward = profit_rate - self.round_trip_cost
-                
                 # 보유 시간 계산
                 holding_time = self.current_time - self.entry_time
                 
-                # 빠른 손절 룰 체크
-                if holding_time < self.quick_exit_threshold and profit_rate <= 0:
-                    reward -= self.quick_exit_penalty
-                    self.quick_exit_violations += 1
-                    logger.debug(f"Quick exit violation: holding_time={holding_time:.2f}s")
-                
-                # 장기 보유 페널티
-                if holding_time > self.max_holding_time:
-                    penalty = self.holding_penalty_rate * (holding_time - self.max_holding_time)
-                    reward -= penalty
+                # 보상 계산
+                reward, reward_components = self._calculate_reward(
+                    self.entry_price,
+                    self.current_price,
+                    holding_time
+                )
                 
                 # 거래 기록
-                self.episode_trades.append({
+                trade_info = {
                     'entry_price': self.entry_price,
                     'exit_price': self.current_price,
                     'holding_time': holding_time,
-                    'profit_rate': profit_rate,
-                    'reward': reward
-                })
+                    'profit_rate': reward_components['profit_rate'],
+                    'reward': reward,
+                    'reward_components': reward_components
+                }
+                self.episode_trades.append(trade_info)
                 
                 logger.debug(f"Sell at price={self.current_price:.4f}, "
-                           f"profit_rate={profit_rate:.4f}, reward={reward:.4f}")
+                           f"profit_rate={reward_components['profit_rate']:.4f}, "
+                           f"reward={reward:.4f}, holding_time={holding_time:.2f}s")
                 
                 # 포지션 청산
                 self.position = 0
@@ -377,9 +414,25 @@ class GRPOScalpingEnv(gym.Env):
             
             # 포지션이 남아있으면 강제 청산
             if self.position == 1:
-                profit_rate = (self.current_price - self.entry_price) / self.entry_price
-                final_reward = profit_rate - self.round_trip_cost
+                holding_time = self.current_time - self.entry_time
+                final_reward, final_components = self._calculate_reward(
+                    self.entry_price,
+                    self.current_price,
+                    holding_time
+                )
                 self.episode_rewards.append(final_reward)
+                
+                # 강제 청산 거래 기록
+                self.episode_trades.append({
+                    'entry_price': self.entry_price,
+                    'exit_price': self.current_price,
+                    'holding_time': holding_time,
+                    'profit_rate': final_components['profit_rate'],
+                    'reward': final_reward,
+                    'reward_components': final_components,
+                    'forced_liquidation': True
+                })
+                
                 logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
         
         # 현재 가격 및 시간 업데이트
