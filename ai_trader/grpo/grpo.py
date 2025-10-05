@@ -389,24 +389,66 @@ class GRPOTrainer:
         요구사항 4.3에 따라 각 그룹의 평균 수익을 계산하고
         그룹 내 상대 어드밴티지를 계산합니다.
         
+        그룹 상대 어드밴티지는 다음과 같이 계산됩니다:
+        A_i = R_i - mean(R_group)
+        
+        여기서:
+        - A_i: 에피소드 i의 어드밴티지
+        - R_i: 에피소드 i의 총 수익 (에피소드 보상의 합)
+        - mean(R_group): 그룹 내 모든 에피소드의 평균 수익
+        
         Args:
             grouped_episodes: 그룹화된 에피소드
             
         Returns:
             그룹 ID를 키로 하는 어드밴티지 리스트 딕셔너리
+            각 어드밴티지는 에피소드의 각 타임스텝에 대한 어드밴티지 배열
         """
-        # Placeholder: 실제 구현은 task 7.4에서 수행
         group_advantages = {}
         
         for group_id, group_episodes in grouped_episodes.items():
-            advantages = []
+            # 1. 그룹 내 각 에피소드의 총 수익 계산
+            episode_returns = []
             
             for episode in group_episodes:
-                # 단순히 보상을 어드밴티지로 사용 (placeholder)
-                advantage = episode['rewards']
-                advantages.append(advantage)
+                # 에피소드의 총 수익 = 모든 보상의 합
+                total_return = np.sum(episode['rewards'])
+                episode_returns.append(total_return)
+            
+            # 2. 그룹의 평균 수익 계산
+            mean_group_return = np.mean(episode_returns)
+            
+            # 3. 각 에피소드의 그룹 상대 어드밴티지 계산
+            advantages = []
+            
+            for episode_idx, episode in enumerate(group_episodes):
+                # 에피소드의 총 수익
+                episode_return = episode_returns[episode_idx]
+                
+                # 그룹 상대 어드밴티지: A_i = R_i - mean(R_group)
+                relative_advantage = episode_return - mean_group_return
+                
+                # 에피소드의 각 타임스텝에 동일한 어드밴티지 할당
+                # 이는 에피소드 전체의 성과를 각 행동에 귀속시키는 방식입니다
+                num_steps = len(episode['rewards'])
+                advantage_array = np.full(num_steps, relative_advantage, dtype=np.float32)
+                
+                advantages.append(advantage_array)
+                
+                # 에피소드 메타데이터에 어드밴티지 정보 추가
+                episode['relative_advantage'] = relative_advantage
+                episode['group_mean_return'] = mean_group_return
             
             group_advantages[group_id] = advantages
+            
+            # 그룹 통계 로깅
+            logger.debug(f"Group {group_id}: mean_return={mean_group_return:.4f}, "
+                        f"num_episodes={len(group_episodes)}, "
+                        f"return_std={np.std(episode_returns):.4f}, "
+                        f"return_min={np.min(episode_returns):.4f}, "
+                        f"return_max={np.max(episode_returns):.4f}")
+        
+        logger.info(f"Computed group relative advantages for {len(grouped_episodes)} groups")
         
         return group_advantages
     
