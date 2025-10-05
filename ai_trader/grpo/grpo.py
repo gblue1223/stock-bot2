@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+from sklearn.cluster import KMeans
 
 from .env import GRPOScalpingEnv
 
@@ -242,21 +243,141 @@ class GRPOTrainer:
         Returns:
             그룹 ID를 키로 하는 에피소드 딕셔너리
         """
-        # Placeholder: 실제 구현은 task 7.3에서 수행
-        # 현재는 단순히 순차적으로 그룹 할당
+        if len(episodes) == 0:
+            logger.warning("No episodes to group")
+            return {}
+        
+        # 1. 각 에피소드에서 시장 체제 지표 추출
+        market_indicators = []
+        
+        for episode in episodes:
+            # 에피소드의 보상 시퀀스에서 변동성과 추세 강도 계산
+            rewards = episode['rewards']
+            
+            # 변동성: 보상의 표준편차
+            volatility = np.std(rewards) if len(rewards) > 1 else 0.0
+            
+            # 추세 강도: 보상의 평균 (양수면 상승, 음수면 하락)
+            trend_strength = np.mean(rewards)
+            
+            # 추가 지표: 보상의 범위 (최대 - 최소)
+            reward_range = np.max(rewards) - np.min(rewards) if len(rewards) > 0 else 0.0
+            
+            # 지표를 벡터로 저장
+            indicators = np.array([volatility, trend_strength, reward_range])
+            market_indicators.append(indicators)
+        
+        market_indicators = np.array(market_indicators)
+        
+        # 2. K-means 클러스터링으로 그룹화
+        # num_groups가 에피소드 수보다 많으면 조정
+        n_clusters = min(self.num_groups, len(episodes))
+        
+        if n_clusters < 2:
+            # 클러스터링이 불가능한 경우 모든 에피소드를 그룹 0에 할당
+            logger.warning(f"Not enough episodes for clustering (n={len(episodes)}), assigning all to group 0")
+            return {0: episodes}
+        
+        try:
+            # K-means 클러스터링 수행
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            group_labels = kmeans.fit_predict(market_indicators)
+            
+            # 클러스터 중심 로깅
+            logger.debug(f"K-means cluster centers:\n{kmeans.cluster_centers_}")
+            
+        except Exception as e:
+            logger.error(f"K-means clustering failed: {e}, falling back to rule-based grouping")
+            # K-means 실패 시 규칙 기반 그룹화로 대체
+            group_labels = self._rule_based_grouping(market_indicators)
+        
+        # 3. 그룹별로 에피소드 분류
         grouped_episodes = {}
         
-        for idx, episode in enumerate(episodes):
-            group_id = idx % self.num_groups
+        for idx, (episode, group_id) in enumerate(zip(episodes, group_labels)):
+            group_id = int(group_id)
             
             if group_id not in grouped_episodes:
                 grouped_episodes[group_id] = []
             
+            # 에피소드에 그룹 정보 추가
+            episode['group_id'] = group_id
+            episode['market_indicators'] = market_indicators[idx]
+            
             grouped_episodes[group_id].append(episode)
         
-        logger.debug(f"Grouped {len(episodes)} episodes into {len(grouped_episodes)} groups")
+        # 그룹 통계 로깅
+        for group_id, group_episodes in grouped_episodes.items():
+            group_size = len(group_episodes)
+            group_mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in group_episodes])
+            group_indicators = np.mean([ep['market_indicators'] for ep in group_episodes], axis=0)
+            
+            logger.debug(f"Group {group_id}: size={group_size}, "
+                        f"mean_reward={group_mean_reward:.4f}, "
+                        f"volatility={group_indicators[0]:.4f}, "
+                        f"trend={group_indicators[1]:.4f}, "
+                        f"range={group_indicators[2]:.4f}")
+        
+        logger.info(f"Grouped {len(episodes)} episodes into {len(grouped_episodes)} groups using K-means")
         
         return grouped_episodes
+    
+    def _rule_based_grouping(self, market_indicators: np.ndarray) -> np.ndarray:
+        """
+        규칙 기반 그룹화 (K-means 대체)
+        
+        변동성과 추세 강도를 기준으로 에피소드를 그룹화합니다.
+        
+        그룹화 규칙:
+        - 그룹 0: 낮은 변동성, 횡보 (volatility < 25%, |trend| < 25%)
+        - 그룹 1: 낮은 변동성, 추세 (volatility < 25%, |trend| >= 25%)
+        - 그룹 2: 높은 변동성, 횡보 (volatility >= 25%, |trend| < 25%)
+        - 그룹 3: 높은 변동성, 추세 (volatility >= 25%, |trend| >= 25%)
+        
+        Args:
+            market_indicators: 시장 지표 배열 (n_episodes, 3)
+            
+        Returns:
+            그룹 레이블 배열 (n_episodes,)
+        """
+        volatilities = market_indicators[:, 0]
+        trends = market_indicators[:, 1]
+        
+        # 변동성과 추세의 분위수 계산
+        volatility_threshold = np.percentile(volatilities, 50)  # 중앙값
+        trend_threshold = np.percentile(np.abs(trends), 50)  # 절대값의 중앙값
+        
+        # 그룹 레이블 초기화
+        group_labels = np.zeros(len(market_indicators), dtype=int)
+        
+        for i in range(len(market_indicators)):
+            vol = volatilities[i]
+            trend = trends[i]
+            
+            # 변동성 기준
+            high_volatility = vol >= volatility_threshold
+            
+            # 추세 기준
+            strong_trend = np.abs(trend) >= trend_threshold
+            
+            # 그룹 할당
+            if not high_volatility and not strong_trend:
+                group_labels[i] = 0  # 낮은 변동성, 횡보
+            elif not high_volatility and strong_trend:
+                group_labels[i] = 1  # 낮은 변동성, 추세
+            elif high_volatility and not strong_trend:
+                group_labels[i] = 2  # 높은 변동성, 횡보
+            else:
+                group_labels[i] = 3  # 높은 변동성, 추세
+        
+        # num_groups에 맞게 조정
+        if self.num_groups < 4:
+            group_labels = group_labels % self.num_groups
+        
+        logger.debug(f"Rule-based grouping: volatility_threshold={volatility_threshold:.4f}, "
+                    f"trend_threshold={trend_threshold:.4f}")
+        
+        return group_labels
     
     def compute_group_relative_advantages(
         self,
