@@ -1,0 +1,47 @@
+{
+  "thresholds": [
+    {
+      "metric_name": "max_drawdown",
+      "threshold": 0.05,
+      "comparison": "gt",
+      "level": "CRITICAL",
+      "message_template": "[{level}] Maximum drawdown is {value:.2%}, exceeding threshold of {threshold:.2%}"
+    },
+    {
+      "metric_name": "win_rate",
+      "threshold": 0.45,
+      "comparison": "lt",
+      "level": "WARNING",
+      "message_template": "[{level}] Win rate is {value:.2%}, below threshold of {threshold:.2%}"
+    },
+    {
+      "metric_name": "sharpe_ratio",
+      "threshold": 0.5,
+      "comparison": "lt",
+      "level": "WARNING",
+      "message_template": "[{level}] Sharpe ratio is {value:.4f}, below threshold of {threshold:.4f}"
+    },
+    {
+      "metric_name": "avg_profit_per_trade",
+      "threshold": 0.0,
+      "comparison": "lt",
+      "level": "CRITICAL",
+      "message_template": "[{level}] Average profit per trade is {value:.4f}, below threshold of {threshold:.4f}"
+    },
+    {
+      "metric_name": "avg_holding_time",
+      "threshold": 60.0,
+      "comparison": "gt",
+      "level": "INFO",
+      "message_template": "[{level}] Average holding time is {value:.2f}s, exceeding threshold of {threshold:.2f}s"
+    },
+    {
+      "metric_name": "total_return",
+      "threshold": -0.05,
+      "comparison": "lt",
+      "level": "CRITICAL",
+      "message_template": "[{level}] Total return {value:.2%} is critically negative"
+    }
+  ],
+  "log_file": null
+}

@@ -15,6 +15,7 @@ from datetime import datetime
 
 from ai_trader.inference.infer_grpo import GRPOInference
 from ai_trader.grpo.evaluation import GRPOEvaluationMetrics
+from ai_trader.grpo.alerts import PerformanceAlertSystem, AlertThreshold
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,9 @@ class BacktestSimulator:
         quick_exit_threshold: float = 1.5,
         quick_exit_penalty: float = 0.01,
         max_holding_time: float = 60.0,
-        holding_penalty_rate: float = 0.001
+        holding_penalty_rate: float = 0.001,
+        alert_system: Optional[PerformanceAlertSystem] = None,
+        enable_alerts: bool = True
     ):
         self.inference_engine = inference_engine
         self.db_path = db_path
@@ -72,6 +75,13 @@ class BacktestSimulator:
         self.max_holding_time = max_holding_time
         self.holding_penalty_rate = holding_penalty_rate
         
+        # 알림 시스템 설정
+        self.enable_alerts = enable_alerts
+        if enable_alerts and alert_system is None:
+            self.alert_system = PerformanceAlertSystem()
+        else:
+            self.alert_system = alert_system
+        
         # 데이터베이스 연결
         self.conn = None
         self._connect_db()
@@ -79,7 +89,8 @@ class BacktestSimulator:
         logger.info(f"BacktestSimulator initialized: "
                    f"transaction_cost={transaction_cost_rate*100:.3f}%, "
                    f"slippage={slippage_rate*100:.3f}%, "
-                   f"quick_exit_threshold={quick_exit_threshold}s")
+                   f"quick_exit_threshold={quick_exit_threshold}s, "
+                   f"alerts_enabled={enable_alerts}")
     
     def _connect_db(self):
         """데이터베이스 연결"""
@@ -295,6 +306,21 @@ class BacktestSimulator:
         # 요약 통계
         summary = self._generate_summary(episodes, metrics, all_trades)
         
+        # 성능 알림 체크
+        alerts = []
+        if self.enable_alerts and self.alert_system:
+            metadata = {
+                'test_start_date': test_start_date,
+                'test_end_date': test_end_date,
+                'num_stocks': summary['num_stocks'],
+                'num_episodes': summary['num_episodes'],
+                'total_trades': summary['total_trades']
+            }
+            alerts = self.alert_system.check_metrics(metrics, metadata=metadata)
+            
+            if alerts and verbose:
+                self.alert_system.print_alert_summary()
+        
         if verbose:
             self._print_backtest_results(summary, metrics)
         
@@ -304,7 +330,8 @@ class BacktestSimulator:
             'episodes': episodes,
             'metrics': metrics,
             'trades': all_trades,
-            'summary': summary
+            'summary': summary,
+            'alerts': alerts
         }
     
     def _run_episodes_by_stock(
@@ -765,7 +792,10 @@ def run_backtest(
     quick_exit_penalty: float = 0.01,
     device: str = 'cuda',
     output_path: Optional[str] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    alert_thresholds: Optional[List[AlertThreshold]] = None,
+    alert_log_file: Optional[str] = None,
+    enable_alerts: bool = True
 ) -> Dict[str, Any]:
     """
     백테스팅 실행 (편의 함수)
@@ -786,6 +816,9 @@ def run_backtest(
         device: 디바이스 ('cuda' 또는 'cpu')
         output_path: 결과 저장 경로 (.json)
         verbose: 진행 상황 출력 여부
+        alert_thresholds: 알림 임계값 리스트 (None이면 기본값 사용)
+        alert_log_file: 알림 로그 파일 경로 (선택적)
+        enable_alerts: 알림 시스템 활성화 여부
         
     Returns:
         백테스팅 결과 딕셔너리
@@ -797,6 +830,14 @@ def run_backtest(
         device=device
     )
     
+    # 알림 시스템 초기화
+    alert_system = None
+    if enable_alerts:
+        alert_system = PerformanceAlertSystem(
+            thresholds=alert_thresholds,
+            log_file=alert_log_file
+        )
+    
     # 백테스팅 시뮬레이터 초기화
     simulator = BacktestSimulator(
         inference_engine=inference_engine,
@@ -806,7 +847,9 @@ def run_backtest(
         transaction_cost_rate=transaction_cost_rate,
         slippage_rate=slippage_rate,
         quick_exit_threshold=quick_exit_threshold,
-        quick_exit_penalty=quick_exit_penalty
+        quick_exit_penalty=quick_exit_penalty,
+        alert_system=alert_system,
+        enable_alerts=enable_alerts
     )
     
     try:
