@@ -10,4 +10,6 @@
 - EmbeddingDataLoader: 데이터 로더
 """
 
-__all__ = []
+from .data import EmbeddingDataLoader, ContrastiveDataset, DataLoadError
+
+__all__ = ['EmbeddingDataLoader', 'ContrastiveDataset', 'DataLoadError']
