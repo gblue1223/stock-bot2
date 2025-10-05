@@ -151,7 +151,7 @@
 
 - [ ] 9. GRPO 훈련 스크립트 구현
 
-  - [ ] 9.1 CLI 인터페이스 구현
+  - [x] 9.1 CLI 인터페이스 구현
 
     - ai_trader/grpo/train_grpo.py 생성
     - argparse로 --embedding-model, --db, --table, --out, --seq-len, --episodes-per-group, --num-groups, --total-timesteps, --quick-exit-threshold, --quick-exit-penalty, --device 인수 처리
