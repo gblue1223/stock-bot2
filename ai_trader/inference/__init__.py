@@ -8,4 +8,6 @@
 - GRPOInference: 실시간 추론 엔진
 """
 
-__all__ = []
+from ai_trader.inference.infer_grpo import GRPOInference
+
+__all__ = ['GRPOInference']

@@ -151,7 +151,6 @@
 
 - [x] 9. GRPO 훈련 스크립트 구현
 
-
   - [x] 9.1 CLI 인터페이스 구현
 
     - ai_trader/grpo/train_grpo.py 생성
@@ -167,7 +166,7 @@
 
 - [ ] 10. 추론 파이프라인 구현
 
-  - [ ] 10.1 GRPOInference 클래스 구현
+  - [x] 10.1 GRPOInference 클래스 구현
 
     - ai_trader/inference/infer_grpo.py에 추론 엔진 정의
     - 임베딩 모델 및 정책 로드
