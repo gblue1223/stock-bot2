@@ -330,6 +330,31 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _compute_order_book_amounts(df: pd.DataFrame) -> pd.DataFrame:
+    """Multiply price and quantity columns to derive waiting amounts."""
+    add_cols: Dict[str, pd.Series] = {}
+    for i in range(1, 11):
+        ask_price_col = f"매도호가{i}"
+        ask_qty_col = f"매도호가수량{i}"
+        ask_amt_col = f"매도대기금액{i}"
+        if ask_price_col in df.columns and ask_qty_col in df.columns:
+            price = pd.to_numeric(df[ask_price_col], errors="coerce").fillna(0.0)
+            qty = pd.to_numeric(df[ask_qty_col], errors="coerce").fillna(0.0)
+            add_cols[ask_amt_col] = (price * qty).astype(float) / 1_000_000 # 백만원 단위로 변환
+
+        bid_price_col = f"매수호가{i}"
+        bid_qty_col = f"매수호가수량{i}"
+        bid_amt_col = f"매수대기금액{i}"
+        if bid_price_col in df.columns and bid_qty_col in df.columns:
+            price = pd.to_numeric(df[bid_price_col], errors="coerce").fillna(0.0)
+            qty = pd.to_numeric(df[bid_qty_col], errors="coerce").fillna(0.0)
+            add_cols[bid_amt_col] = (price * qty).astype(float) / 1_000_000 # 백만원 단위로 변환
+
+    if add_cols:
+        df = df.assign(**add_cols)
+    return df
+
+
 def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str,
                       time_start: int = 90000000, time_end: int = 110000000,
                       trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
@@ -360,6 +385,9 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
         # 종목코드, 종목명 보정
         df['종목코드'] = df.get('종목코드', pd.Series(index=df.index, dtype=object)).fillna(code).replace({"": code})
         df['종목명'] = df.get('종목명', pd.Series(index=df.index, dtype=object)).fillna(name).replace({"": name})
+
+        # 호가 기반 대기금액 계산
+        df = _compute_order_book_amounts(df)
 
         # 누락 컬럼 생성 (최종 스키마 강제)
         missing_final_columns = [col for col in FINAL_COLUMNS if col not in df.columns]
@@ -540,33 +568,35 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
 
     # Define column groups
-    range_scale_bounds: Dict[str, Tuple[float, float]] = {
-        "등락률": (-300.0, 300.0),
-        "누적거래대금": (0.0, 10_000_000.0),
-        "거래회전율": (0.0, 1000.0),
-        "체결강도": (0.0, 1000.0),
+    logstd_cols: set[str] = {
+        "누적거래대금",
+        "거래회전율",
+        "체결강도",
     }
     for i in range(1, 11):
-        range_scale_bounds[f"매도대기금액{i}"] = (0.0, 1_000_000.0)
-        range_scale_bounds[f"매수대기금액{i}"] = (0.0, 1_000_000.0)
+        logstd_cols.add(f"매도대기금액{i}")
+        logstd_cols.add(f"매수대기금액{i}")
 
-    logstd_cols = set()
-
-    stdonly_cols = set()
+    stdonly_cols: set[str] = {"등락률"}
 
     broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
 
     # Ensure optional numeric columns exist (batch add to avoid fragmentation)
-    numeric_targets = set(range_scale_bounds.keys()) | logstd_cols | stdonly_cols
+    numeric_targets = logstd_cols | stdonly_cols
     missing_numeric = [col for col in numeric_targets if col not in out.columns]
     if missing_numeric:
         add_df = pd.DataFrame({col: pd.Series(0.0, index=out.index) for col in missing_numeric}, index=out.index)
         out = pd.concat([out, add_df], axis=1)
 
-    # Fixed-range scaling
-    for col, (min_bound, max_bound) in range_scale_bounds.items():
+    # Log + Standard scaling for heavy-tailed columns
+    for col in sorted(logstd_cols):
         if col in out.columns:
-            out[col] = _scale_with_bounds(out[col], min_bound, max_bound)
+            out[col] = _standard_scale(_signed_log1p(out[col]))
+
+    # Standard scaling for percentage columns that can be negative
+    for col in sorted(stdonly_cols):
+        if col in out.columns:
+            out[col] = _standard_scale(out[col])
 
     # Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
     broker_scalar_cols: List[str] = []
@@ -604,7 +634,7 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         out = pd.concat([out, pd.DataFrame(_extra_new, index=out.index)], axis=1)
 
     # Min-Max for remaining numeric columns not already processed
-    processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols) | set(range_scale_bounds.keys())
+    processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
     numeric_rest = [c for c in out.columns if c not in processed and pd.api.types.is_numeric_dtype(out[c])]
     for col in numeric_rest:
         out[col] = _minmax_scale(out[col])
