@@ -30,11 +30,14 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
-from sklearn.metrics import silhouette_score
 
 from ai_trader.embedding.models import TradingEmbeddingModel
 from ai_trader.embedding.losses import InfoNCELoss
 from ai_trader.embedding.data import EmbeddingDataLoader
+from ai_trader.embedding.evaluation import (
+    compute_silhouette_score,
+    compute_temporal_coherence
+)
 
 # 로깅 설정
 logging.basicConfig(
@@ -426,95 +429,6 @@ def validate(
         all_embeddings = np.array([])
     
     return avg_loss, all_embeddings, all_stock_codes, all_timestamps
-
-
-def compute_silhouette_score(embeddings: np.ndarray, stock_codes: list) -> float:
-    """
-    Silhouette score 계산 - 종목별 클러스터링 품질 평가
-    
-    Args:
-        embeddings: 임베딩 벡터 배열 (n_samples, embedding_dim)
-        stock_codes: 종목 코드 리스트 (n_samples,)
-        
-    Returns:
-        Silhouette score (-1 ~ 1, 높을수록 좋음)
-    """
-    if len(embeddings) == 0 or len(stock_codes) == 0:
-        return 0.0
-    
-    # 종목 코드를 숫자 레이블로 변환
-    unique_stocks = list(set(stock_codes))
-    if len(unique_stocks) < 2:
-        # 클러스터가 2개 미만이면 silhouette score 계산 불가
-        return 0.0
-    
-    stock_to_label = {stock: idx for idx, stock in enumerate(unique_stocks)}
-    labels = np.array([stock_to_label[stock] for stock in stock_codes])
-    
-    try:
-        # Silhouette score 계산
-        score = silhouette_score(embeddings, labels, metric='cosine')
-        return float(score)
-    except Exception as e:
-        logger.warning(f"Silhouette score 계산 실패: {e}")
-        return 0.0
-
-
-def compute_temporal_coherence(embeddings: np.ndarray, timestamps: list) -> float:
-    """
-    Temporal coherence 계산 - 시간적으로 가까운 샘플의 유사도 평가
-    
-    시간적으로 가까운 샘플들의 임베딩이 유사한지 측정합니다.
-    
-    Args:
-        embeddings: 임베딩 벡터 배열 (n_samples, embedding_dim)
-        timestamps: 타임스탬프 리스트 (n_samples,)
-        
-    Returns:
-        Temporal coherence score (0 ~ 1, 높을수록 좋음)
-    """
-    if len(embeddings) == 0 or len(timestamps) == 0:
-        return 0.0
-    
-    if len(embeddings) < 2:
-        return 0.0
-    
-    try:
-        # 타임스탬프를 숫자로 변환 (정렬을 위해)
-        if isinstance(timestamps[0], str):
-            # 문자열 타임스탬프를 숫자로 변환
-            timestamps = [float(t) if isinstance(t, (int, float)) else hash(t) for t in timestamps]
-        
-        # 타임스탬프 순서로 정렬
-        sorted_indices = np.argsort(timestamps)
-        sorted_embeddings = embeddings[sorted_indices]
-        
-        # 연속된 샘플 간의 코사인 유사도 계산
-        similarities = []
-        for i in range(len(sorted_embeddings) - 1):
-            emb1 = sorted_embeddings[i]
-            emb2 = sorted_embeddings[i + 1]
-            
-            # 코사인 유사도 계산
-            norm1 = np.linalg.norm(emb1)
-            norm2 = np.linalg.norm(emb2)
-            
-            if norm1 > 0 and norm2 > 0:
-                similarity = np.dot(emb1, emb2) / (norm1 * norm2)
-                similarities.append(similarity)
-        
-        if len(similarities) == 0:
-            return 0.0
-        
-        # 평균 유사도 반환 (0 ~ 1 범위로 정규화)
-        avg_similarity = np.mean(similarities)
-        # 코사인 유사도는 -1 ~ 1 범위이므로 0 ~ 1로 변환
-        temporal_coherence = (avg_similarity + 1) / 2
-        
-        return float(temporal_coherence)
-    except Exception as e:
-        logger.warning(f"Temporal coherence 계산 실패: {e}")
-        return 0.0
 
 
 def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:

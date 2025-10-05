@@ -11,7 +11,7 @@ import os
 # 프로젝트 루트를 Python 경로에 추가
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from ai_trader.embedding.train_embedding import (
+from ai_trader.embedding.evaluation import (
     compute_silhouette_score,
     compute_temporal_coherence
 )
@@ -60,9 +60,9 @@ class TestValidationMetrics:
         embeddings = np.array([])
         stock_codes = []
         
-        score = compute_silhouette_score(embeddings, stock_codes)
-        
-        assert score == 0.0
+        # 빈 데이터는 예외를 발생시켜야 함
+        with pytest.raises(ValueError, match="임베딩 배열이 비어있습니다"):
+            compute_silhouette_score(embeddings, stock_codes)
     
     def test_temporal_coherence_basic(self):
         """기본 Temporal coherence 계산 테스트"""
@@ -101,9 +101,9 @@ class TestValidationMetrics:
         embeddings = np.array([])
         timestamps = []
         
-        coherence = compute_temporal_coherence(embeddings, timestamps)
-        
-        assert coherence == 0.0
+        # 빈 데이터는 예외를 발생시켜야 함
+        with pytest.raises(ValueError, match="임베딩 배열이 비어있습니다"):
+            compute_temporal_coherence(embeddings, timestamps)
     
     def test_temporal_coherence_single_sample(self):
         """단일 샘플 Temporal coherence 테스트"""
