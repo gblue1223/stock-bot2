@@ -11,5 +11,11 @@
 """
 
 from .data import EmbeddingDataLoader, ContrastiveDataset, DataLoadError
+from .models import TradingEmbeddingModel
 
-__all__ = ['EmbeddingDataLoader', 'ContrastiveDataset', 'DataLoadError']
+__all__ = [
+    'EmbeddingDataLoader',
+    'ContrastiveDataset',
+    'DataLoadError',
+    'TradingEmbeddingModel'
+]

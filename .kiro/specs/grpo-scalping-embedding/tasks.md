@@ -9,9 +9,7 @@
 - [x] 2. 임베딩 모델 데이터 로더 구현
 
   - [x] 2.1 DuckDB 연결 및 데이터 로드 기능 구현
-
     - ai_trader/embedding/data.py에 EmbeddingDataLoader 클래스 생성
-
     - 데이터베이스 경로, 테이블명, 인덱스를 사용한 효율적인 쿼리 구현
     - 시간 순서 기반 데이터 분할 (훈련 70%, 검증 15%, 테스트 15%)
     - _요구사항: 5.1, 5.2_
@@ -23,9 +21,9 @@
     - 배치 단위로 쌍 생성 및 반환
     - _요구사항: 5.3_
 
-- [ ] 3. 임베딩 모델 아키텍처 구현
+- [x] 3. 임베딩 모델 아키텍처 구현
 
-  - [ ] 3.1 TradingEmbeddingModel 클래스 구현
+  - [x] 3.1 TradingEmbeddingModel 클래스 구현
     - ai_trader/embedding/models.py에 모델 정의
     - Conv1D 레이어로 지역 패턴 추출
     - Multi-head Attention으로 중요 특징 포착
