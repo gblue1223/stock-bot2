@@ -31,9 +31,9 @@
     - 입력: (batch, seq_len, 60+), 출력: (batch, embedding_dim)
     - _요구사항: 1.1, 1.2, 1.4_
 
-- [ ] 4. 대조 학습 손실 함수 구현
+- [x] 4. 대조 학습 손실 함수 구현
 
-  - [ ] 4.1 InfoNCELoss 클래스 구현
+  - [x] 4.1 InfoNCELoss 클래스 구현
     - ai_trader/embedding/losses.py에 손실 함수 정의
     - 코사인 유사도 기반 긍정/부정 쌍 비교
     - Temperature 파라미터로 손실 스케일 조정
