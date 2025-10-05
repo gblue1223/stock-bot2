@@ -361,6 +361,7 @@ class GRPOScalpingEnv(gym.Env):
         reward = 0.0
         terminated = False
         truncated = False
+        quick_exit_triggered = False
         
         # 행동 실행
         if action == 1:  # 매수
@@ -401,6 +402,51 @@ class GRPOScalpingEnv(gym.Env):
                 self.position = 0
                 self.entry_price = 0.0
                 self.entry_time = 0.0
+        
+        elif action == 0:  # 보유
+            # 빠른 손절 룰 체크: 매수 후 설정 가능한 시간 임계값 이내에 가격이 상승하지 않으면 자동 매도
+            if self.position == 1:
+                holding_time = self.current_time - self.entry_time
+                
+                # 임계값 이내이고 가격이 상승하지 않았는지 체크
+                if holding_time <= self.quick_exit_threshold and self.current_price <= self.entry_price:
+                    # 빠른 손절 룰 위반
+                    quick_exit_triggered = True
+                    self.quick_exit_violations += 1
+                    
+                    # 자동 매도 및 페널티 적용
+                    reward, reward_components = self._calculate_reward(
+                        self.entry_price,
+                        self.current_price,
+                        holding_time
+                    )
+                    
+                    # 빠른 손절 룰 위반 페널티 추가
+                    reward -= self.quick_exit_penalty
+                    
+                    # 거래 기록
+                    trade_info = {
+                        'entry_price': self.entry_price,
+                        'exit_price': self.current_price,
+                        'holding_time': holding_time,
+                        'profit_rate': reward_components['profit_rate'],
+                        'reward': reward,
+                        'reward_components': reward_components,
+                        'quick_exit_violation': True,
+                        'quick_exit_penalty': self.quick_exit_penalty
+                    }
+                    self.episode_trades.append(trade_info)
+                    
+                    logger.debug(f"Quick exit rule triggered: price={self.current_price:.4f}, "
+                               f"entry_price={self.entry_price:.4f}, "
+                               f"holding_time={holding_time:.2f}s, "
+                               f"penalty={self.quick_exit_penalty:.4f}, "
+                               f"reward={reward:.4f}")
+                    
+                    # 포지션 청산
+                    self.position = 0
+                    self.entry_price = 0.0
+                    self.entry_time = 0.0
         
         # 보상 기록
         self.episode_rewards.append(reward)
@@ -448,7 +494,8 @@ class GRPOScalpingEnv(gym.Env):
             'position': self.position,
             'current_price': self.current_price,
             'current_time': self.current_time,
-            'quick_exit_violations': self.quick_exit_violations
+            'quick_exit_violations': self.quick_exit_violations,
+            'quick_exit_triggered': quick_exit_triggered
         }
         
         if terminated:

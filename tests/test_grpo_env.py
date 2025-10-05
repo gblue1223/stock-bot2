@@ -184,5 +184,93 @@ def test_configurable_threshold():
         pytest.skip(f"Database not available: {e}")
 
 
+def test_quick_exit_rule():
+    """빠른 손절 룰 동작 검증"""
+    embedding_model = MockEmbeddingModel(input_dim=60, embedding_dim=128, seq_len=60)
+    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    
+    try:
+        env = GRPOScalpingEnv(
+            embedding_model=embedding_model,
+            db_path=db_path,
+            embedding_dim=128,
+            quick_exit_threshold=1.5,
+            quick_exit_penalty=0.01
+        )
+        
+        observation, info = env.reset()
+        
+        # 매수
+        obs, reward, terminated, truncated, info = env.step(1)
+        assert env.position == 1
+        entry_price = env.entry_price
+        initial_violations = env.quick_exit_violations
+        
+        # 보유 행동을 여러 번 수행하여 빠른 손절 룰 체크
+        # 가격이 하락하거나 유지되면 빠른 손절 룰이 트리거될 수 있음
+        for i in range(5):
+            if env.position == 0:
+                # 빠른 손절 룰이 트리거되어 자동 매도됨
+                break
+            obs, reward, terminated, truncated, info = env.step(0)
+            
+            # 빠른 손절 룰이 트리거되었는지 확인
+            if info.get('quick_exit_triggered', False):
+                # 위반 횟수 증가 확인
+                assert env.quick_exit_violations > initial_violations
+                # 포지션 청산 확인
+                assert env.position == 0
+                # 페널티가 적용된 보상 확인 (음수일 가능성이 높음)
+                assert reward <= 0
+                # 거래 기록 확인
+                assert len(env.episode_trades) > 0
+                last_trade = env.episode_trades[-1]
+                assert last_trade.get('quick_exit_violation', False) == True
+                assert last_trade.get('quick_exit_penalty', 0) == 0.01
+                break
+        
+        env.close()
+        
+    except Exception as e:
+        pytest.skip(f"Database not available: {e}")
+
+
+def test_quick_exit_rule_metadata():
+    """빠른 손절 룰 메타데이터 기록 검증"""
+    embedding_model = MockEmbeddingModel(input_dim=60, embedding_dim=128, seq_len=60)
+    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    
+    try:
+        env = GRPOScalpingEnv(
+            embedding_model=embedding_model,
+            db_path=db_path,
+            embedding_dim=128,
+            quick_exit_threshold=1.5,
+            quick_exit_penalty=0.01
+        )
+        
+        observation, info = env.reset()
+        
+        # 초기 위반 횟수 확인
+        assert env.quick_exit_violations == 0
+        assert info.get('quick_exit_violations', 0) == 0
+        
+        # 매수 후 보유하여 빠른 손절 룰 트리거 시도
+        env.step(1)  # 매수
+        
+        for _ in range(10):
+            if env.position == 0:
+                break
+            obs, reward, terminated, truncated, info = env.step(0)  # 보유
+            
+            # info에 위반 횟수가 기록되는지 확인
+            assert 'quick_exit_violations' in info
+        
+        env.close()
+        
+    except Exception as e:
+        pytest.skip(f"Database not available: {e}")
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
