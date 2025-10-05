@@ -754,43 +754,151 @@ class GRPOTrainer:
         """
         TensorBoard에 메트릭 로깅
         
-        요구사항 4.6에 따라 그룹 수준 메트릭과 전체 메트릭을 로깅합니다.
+        요구사항 4.6, 6.6에 따라 그룹 수준 메트릭과 전체 메트릭을 로깅합니다.
+        
+        그룹 수준 메트릭:
+        - 그룹당 평균 수익
+        - 그룹당 정책 엔트로피
+        - 그룹당 KL 발산
+        
+        전체 메트릭:
+        - 평균 보상
+        - 승률
+        - 평균 보유 시간
+        - 빠른 손절 룰 위반 횟수
+        - 정책 엔트로피
+        - KL 발산
         """
-        # 전체 메트릭
+        # ===== 전체 메트릭 =====
         mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
         mean_steps = np.mean([ep['metadata']['episode_steps'] for ep in episodes])
         
         # 승률 계산
         win_rates = [ep['metadata'].get('win_rate', 0.0) for ep in episodes]
-        mean_win_rate = np.mean(win_rates)
+        mean_win_rate = np.mean(win_rates) if win_rates else 0.0
         
         # 평균 보유 시간
         avg_holding_times = [ep['metadata'].get('avg_holding_time', 0.0) for ep in episodes]
-        mean_holding_time = np.mean(avg_holding_times)
+        mean_holding_time = np.mean(avg_holding_times) if avg_holding_times else 0.0
         
         # 빠른 손절 룰 위반 횟수
         quick_exit_violations = [ep['metadata'].get('quick_exit_violations', 0) for ep in episodes]
         total_violations = sum(quick_exit_violations)
+        mean_violations = np.mean(quick_exit_violations) if quick_exit_violations else 0.0
+        
+        # 거래 횟수
+        num_trades = [ep['metadata'].get('num_trades', 0) for ep in episodes]
+        mean_trades = np.mean(num_trades) if num_trades else 0.0
+        
+        # 샤프 비율
+        sharpe_ratios = [ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes]
+        mean_sharpe = np.mean(sharpe_ratios) if sharpe_ratios else 0.0
         
         # 전체 메트릭 로깅
         self.writer.add_scalar('train/mean_reward', mean_reward, iteration)
         self.writer.add_scalar('train/mean_steps', mean_steps, iteration)
         self.writer.add_scalar('train/win_rate', mean_win_rate, iteration)
         self.writer.add_scalar('train/avg_holding_time', mean_holding_time, iteration)
-        self.writer.add_scalar('train/quick_exit_violations', total_violations, iteration)
+        self.writer.add_scalar('train/quick_exit_violations_total', total_violations, iteration)
+        self.writer.add_scalar('train/quick_exit_violations_mean', mean_violations, iteration)
+        self.writer.add_scalar('train/mean_trades', mean_trades, iteration)
+        self.writer.add_scalar('train/mean_sharpe_ratio', mean_sharpe, iteration)
         
-        # 정책 업데이트 메트릭
+        # 정책 업데이트 메트릭 (정책 엔트로피, KL 발산 포함)
         for key, value in update_metrics.items():
             self.writer.add_scalar(f'train/{key}', value, iteration)
         
-        # 그룹 수준 메트릭
+        # ===== 그룹 수준 메트릭 =====
         for group_id, group_episodes in grouped_episodes.items():
+            # 그룹 평균 수익
             group_rewards = [ep['metadata']['episode_reward'] for ep in group_episodes]
             group_mean_reward = np.mean(group_rewards)
+            group_std_reward = np.std(group_rewards)
             
+            # 그룹 승률
+            group_win_rates = [ep['metadata'].get('win_rate', 0.0) for ep in group_episodes]
+            group_mean_win_rate = np.mean(group_win_rates) if group_win_rates else 0.0
+            
+            # 그룹 평균 보유 시간
+            group_holding_times = [ep['metadata'].get('avg_holding_time', 0.0) for ep in group_episodes]
+            group_mean_holding_time = np.mean(group_holding_times) if group_holding_times else 0.0
+            
+            # 그룹 빠른 손절 룰 위반 횟수
+            group_violations = [ep['metadata'].get('quick_exit_violations', 0) for ep in group_episodes]
+            group_total_violations = sum(group_violations)
+            
+            # 그룹 거래 횟수
+            group_trades = [ep['metadata'].get('num_trades', 0) for ep in group_episodes]
+            group_mean_trades = np.mean(group_trades) if group_trades else 0.0
+            
+            # 그룹 샤프 비율
+            group_sharpe = [ep['metadata'].get('sharpe_ratio', 0.0) for ep in group_episodes]
+            group_mean_sharpe = np.mean(group_sharpe) if group_sharpe else 0.0
+            
+            # 그룹별 정책 엔트로피 계산
+            # 각 에피소드의 상태에서 정책 엔트로피를 계산
+            group_entropies = []
+            for ep in group_episodes:
+                states = ep['states']
+                states_tensor = torch.from_numpy(states).float().to(self.device)
+                
+                with torch.no_grad():
+                    # 정책에서 행동 확률 분포 얻기
+                    if hasattr(self.policy, 'forward'):
+                        action_probs = self.policy(states_tensor)
+                        # 엔트로피 계산: -sum(p * log(p))
+                        entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()
+                        group_entropies.append(entropy.item())
+            
+            group_mean_entropy = np.mean(group_entropies) if group_entropies else 0.0
+            
+            # 그룹별 KL 발산 계산
+            # 참조 정책과 현재 정책 간의 KL 발산
+            group_kl_divergences = []
+            if self.reference_policy is not None:
+                for ep in group_episodes:
+                    states = ep['states']
+                    actions = ep['actions']
+                    states_tensor = torch.from_numpy(states).float().to(self.device)
+                    actions_tensor = torch.from_numpy(actions).long().to(self.device)
+                    
+                    with torch.no_grad():
+                        # 현재 정책의 로그 확률
+                        if hasattr(self.policy, 'evaluate_actions'):
+                            current_log_probs, _, _ = self.policy.evaluate_actions(
+                                states_tensor, actions_tensor
+                            )
+                            
+                            # 참조 정책의 로그 확률
+                            ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
+                                states_tensor, actions_tensor
+                            )
+                            
+                            # KL 발산: KL(π_ref || π_current)
+                            kl_div = (ref_log_probs - current_log_probs).mean()
+                            group_kl_divergences.append(kl_div.item())
+            
+            group_mean_kl = np.mean(group_kl_divergences) if group_kl_divergences else 0.0
+            
+            # 그룹 메트릭 로깅
             self.writer.add_scalar(f'group_{group_id}/mean_return', group_mean_reward, iteration)
+            self.writer.add_scalar(f'group_{group_id}/std_return', group_std_reward, iteration)
+            self.writer.add_scalar(f'group_{group_id}/win_rate', group_mean_win_rate, iteration)
+            self.writer.add_scalar(f'group_{group_id}/avg_holding_time', group_mean_holding_time, iteration)
+            self.writer.add_scalar(f'group_{group_id}/quick_exit_violations', group_total_violations, iteration)
+            self.writer.add_scalar(f'group_{group_id}/mean_trades', group_mean_trades, iteration)
+            self.writer.add_scalar(f'group_{group_id}/sharpe_ratio', group_mean_sharpe, iteration)
+            self.writer.add_scalar(f'group_{group_id}/policy_entropy', group_mean_entropy, iteration)
+            self.writer.add_scalar(f'group_{group_id}/kl_divergence', group_mean_kl, iteration)
+            
+            # 그룹 크기
+            self.writer.add_scalar(f'group_{group_id}/size', len(group_episodes), iteration)
         
-        logger.debug(f"Logged metrics for iteration {iteration}")
+        # 로깅 완료 메시지
+        logger.debug(f"Logged metrics for iteration {iteration}: "
+                    f"mean_reward={mean_reward:.4f}, win_rate={mean_win_rate:.4f}, "
+                    f"violations={total_violations}, entropy={update_metrics.get('entropy', 0.0):.4f}, "
+                    f"kl_div={update_metrics.get('kl_divergence', 0.0):.6f}")
     
     def save_checkpoint(self, checkpoint_path: str, iteration: int):
         """
