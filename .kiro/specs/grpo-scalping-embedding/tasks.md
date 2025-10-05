@@ -1,6 +1,11 @@
 # 구현 계획
 
-- [ ] 1. 프로젝트 구조 및 기본 인터페이스 설정
+- [x] 1. 프로젝트 구조 및 기본 인터페이스 설정
+
+
+
+
+
   - ai_trader/embedding/, ai_trader/grpo/, ai_trader/inference/ 디렉토리 생성
   - 각 모듈의 __init__.py 파일 생성
   - _요구사항: 6.1, 6.2_
