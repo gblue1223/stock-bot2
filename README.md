@@ -112,6 +112,47 @@ python -m ai_trader.embedding.train_embedding \
 - `--val-every`: 검증 주기 (에포크, 기본값: 1 = 매 에포크마다 검증)
 - `--resume`: 재개할 체크포인트 경로 (선택사항)
 
+**데이터 필터링 (메모리 절약):**
+
+- `--start-date`: 시작 날짜 (YYYYMMDD 형식, 예: 20240901)
+- `--end-date`: 종료 날짜 (YYYYMMDD 형식, 예: 20240930)
+- `--stock-codes`: 훈련할 종목 코드 리스트 (예: 005930 000660)
+- `--max-samples`: 최대 샘플 수 (메모리 제한 시 사용, 예: 1000000)
+
+#### 메모리 절약 훈련 예제
+
+메모리가 부족한 경우 다음 옵션을 사용하세요:
+
+```bash
+# 특정 기간만 훈련 (1개월)
+python -m ai_trader.embedding.train_embedding \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/embedding \
+  --start-date 20240901 \
+  --end-date 20240930 \
+  --epochs 50 \
+  --device cuda
+
+# 특정 종목만 훈련
+python -m ai_trader.embedding.train_embedding \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/embedding \
+  --stock-codes 005930 000660 035420 \
+  --epochs 50 \
+  --device cuda
+
+# 최대 샘플 수 제한
+python -m ai_trader.embedding.train_embedding \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/embedding \
+  --max-samples 1000000 \
+  --epochs 50 \
+  --device cuda
+```
+
 ### 임베딩 모델 평가
 
 ```bash

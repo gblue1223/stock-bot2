@@ -42,7 +42,11 @@ class EmbeddingDataLoader:
         seq_len: int = 60,
         train_ratio: float = 0.7,
         val_ratio: float = 0.15,
-        test_ratio: float = 0.15
+        test_ratio: float = 0.15,
+        start_date: str = None,
+        end_date: str = None,
+        stock_codes: list = None,
+        max_samples: int = None
     ):
         self.db_path = db_path
         self.table_name = table_name
@@ -50,6 +54,10 @@ class EmbeddingDataLoader:
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
+        self.start_date = start_date
+        self.end_date = end_date
+        self.stock_codes = stock_codes
+        self.max_samples = max_samples
         
         # 비율 검증
         if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
@@ -114,15 +122,42 @@ class EmbeddingDataLoader:
         feature_cols = self._get_feature_columns()
         
         try:
-            # 시간 순서로 정렬하여 전체 데이터 로드
+            # WHERE 절 구성
+            where_clauses = []
+            
+            if self.start_date:
+                where_clauses.append(f"날짜 >= '{self.start_date}'")
+            
+            if self.end_date:
+                where_clauses.append(f"날짜 <= '{self.end_date}'")
+            
+            if self.stock_codes:
+                codes_str = "', '".join(self.stock_codes)
+                where_clauses.append(f"종목코드 IN ('{codes_str}')")
+            
+            where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
+            
+            # LIMIT 절 구성
+            limit_clause = f"LIMIT {self.max_samples}" if self.max_samples else ""
+            
+            # 시간 순서로 정렬하여 데이터 로드
             # 인덱스 활용: idx_datasets_code_date_time (종목코드, 날짜, 번호)
             query = f"""
                 SELECT 종목코드, 날짜, 번호, {', '.join(feature_cols)}
                 FROM {self.table_name}
+                WHERE {where_clause}
                 ORDER BY 날짜, 번호
+                {limit_clause}
             """
             
             logger.info(f"Loading data from {self.table_name}...")
+            if self.start_date or self.end_date:
+                logger.info(f"Date range: {self.start_date or 'start'} ~ {self.end_date or 'end'}")
+            if self.stock_codes:
+                logger.info(f"Stock codes: {self.stock_codes}")
+            if self.max_samples:
+                logger.info(f"Max samples: {self.max_samples}")
+            
             df = self.conn.execute(query).fetchdf()
             logger.info(f"Loaded {len(df)} rows")
             

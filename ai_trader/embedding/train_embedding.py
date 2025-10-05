@@ -184,6 +184,36 @@ def parse_args():
         help='검증 주기 (에포크 단위, 기본값: 1 = 매 에포크마다 검증)'
     )
     
+    # 데이터 필터링 설정
+    parser.add_argument(
+        '--start-date',
+        type=str,
+        default=None,
+        help='시작 날짜 (YYYYMMDD 형식, 예: 20240901)'
+    )
+    
+    parser.add_argument(
+        '--end-date',
+        type=str,
+        default=None,
+        help='종료 날짜 (YYYYMMDD 형식, 예: 20240930)'
+    )
+    
+    parser.add_argument(
+        '--stock-codes',
+        type=str,
+        nargs='+',
+        default=None,
+        help='훈련할 종목 코드 리스트 (예: 005930 000660)'
+    )
+    
+    parser.add_argument(
+        '--max-samples',
+        type=int,
+        default=None,
+        help='최대 샘플 수 (메모리 제한 시 사용, 예: 1000000)'
+    )
+    
     return parser.parse_args()
 
 
@@ -517,7 +547,11 @@ def main():
     data_loader = EmbeddingDataLoader(
         db_path=args.db,
         table_name=args.table,
-        seq_len=args.seq_len
+        seq_len=args.seq_len,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        stock_codes=args.stock_codes,
+        max_samples=args.max_samples
     )
     
     # 데이터 로드 및 분할
