@@ -1,0 +1,417 @@
+"""
+GRPO 스캘핑 환경
+
+초단위 스캘핑을 위한 Gymnasium 환경을 정의합니다.
+임베딩 모델을 사용하여 관측값을 생성하고, 스캘핑 특화 보상 구조를 제공합니다.
+"""
+
+import logging
+from typing import Optional, Tuple, Dict, Any
+import numpy as np
+import torch
+import gymnasium as gym
+from gymnasium import spaces
+import duckdb
+
+logger = logging.getLogger(__name__)
+
+
+class GRPOScalpingEnv(gym.Env):
+    """
+    스캘핑을 위한 GRPO 훈련 환경
+    
+    관측 공간: 임베딩 벡터 (embedding_dim,)
+    행동 공간: Discrete(3) - 0: 보유, 1: 매수, 2: 매도
+    
+    보상 구조:
+    - 수익: (청산가 - 진입가) / 진입가 - 거래비용
+    - 거래비용: 수수료(0.015%) + 세금(0.2%) = 0.215% (매수/매도 각각 적용)
+    - 총 거래비용: 0.43% (왕복)
+    - 양의 보상 조건: 수익률 > 0.43%
+    - 빠른 손절 룰 위반: -0.01 페널티 (시간 임계값 설정 가능, 기본값 1.5초)
+    - 장기 보유 페널티: -0.001 * (보유시간 - 60초)
+    
+    Args:
+        embedding_model: 훈련된 임베딩 모델
+        db_path: DuckDB 데이터베이스 경로
+        table_name: 테이블명 (기본값: 'datasets')
+        seq_len: 시퀀스 길이 (기본값: 60)
+        embedding_dim: 임베딩 차원 (기본값: 128)
+        transaction_cost_rate: 거래 비용 비율 (기본값: 0.00215 = 0.215%)
+        quick_exit_threshold: 빠른 손절 시간 임계값 (초, 기본값: 1.5)
+        quick_exit_penalty: 빠른 손절 룰 위반 페널티 (기본값: 0.01)
+        max_holding_time: 최대 보유 시간 (초, 기본값: 60)
+        holding_penalty_rate: 장기 보유 페널티 비율 (기본값: 0.001)
+        device: 디바이스 ('cpu' 또는 'cuda')
+    """
+    
+    metadata = {'render_modes': []}
+    
+    def __init__(
+        self,
+        embedding_model: torch.nn.Module,
+        db_path: str,
+        table_name: str = 'datasets',
+        seq_len: int = 60,
+        embedding_dim: int = 128,
+        transaction_cost_rate: float = 0.00215,
+        quick_exit_threshold: float = 1.5,
+        quick_exit_penalty: float = 0.01,
+        max_holding_time: float = 60.0,
+        holding_penalty_rate: float = 0.001,
+        device: str = 'cpu'
+    ):
+        super().__init__()
+        
+        self.embedding_model = embedding_model
+        self.embedding_model.eval()  # 추론 모드
+        self.device = device
+        self.embedding_model.to(device)
+        
+        self.db_path = db_path
+        self.table_name = table_name
+        self.seq_len = seq_len
+        self.embedding_dim = embedding_dim
+        
+        # 거래 비용 설정
+        self.transaction_cost_rate = transaction_cost_rate
+        self.round_trip_cost = transaction_cost_rate * 2  # 왕복 거래비용: 0.43%
+        
+        # 빠른 손절 룰 설정
+        self.quick_exit_threshold = quick_exit_threshold
+        self.quick_exit_penalty = quick_exit_penalty
+        
+        # 보유 시간 페널티 설정
+        self.max_holding_time = max_holding_time
+        self.holding_penalty_rate = holding_penalty_rate
+        
+        # 관측 공간: 임베딩 벡터
+        self.observation_space = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(embedding_dim,),
+            dtype=np.float32
+        )
+        
+        # 행동 공간: 0=보유, 1=매수, 2=매도
+        self.action_space = spaces.Discrete(3)
+        
+        # 데이터베이스 연결
+        self.conn = None
+        self._connect_db()
+        
+        # 에피소드 상태
+        self.current_step = 0
+        self.position = 0  # 0: 포지션 없음, 1: 매수 포지션
+        self.entry_price = 0.0
+        self.entry_time = 0.0
+        self.current_price = 0.0
+        self.current_time = 0.0
+        
+        # 에피소드 메타데이터
+        self.episode_trades = []
+        self.episode_rewards = []
+        self.quick_exit_violations = 0
+        
+        # 현재 에피소드 데이터
+        self.episode_data = None
+        self.episode_metadata = None
+        self.episode_length = 0
+        
+        logger.info(f"GRPOScalpingEnv initialized with embedding_dim={embedding_dim}, "
+                   f"quick_exit_threshold={quick_exit_threshold}s, "
+                   f"transaction_cost={transaction_cost_rate*100:.3f}%")
+    
+    def _connect_db(self):
+        """데이터베이스 연결"""
+        try:
+            self.conn = duckdb.connect(self.db_path, read_only=True)
+            logger.info(f"Connected to database: {self.db_path}")
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            raise RuntimeError(f"Cannot connect to database {self.db_path}: {e}")
+    
+    def _get_feature_columns(self) -> list:
+        """특징 컬럼 목록 가져오기"""
+        try:
+            query = f"DESCRIBE {self.table_name}"
+            columns_df = self.conn.execute(query).fetchdf()
+            all_columns = columns_df['column_name'].tolist()
+            
+            # 메타데이터 컬럼 제외
+            exclude_columns = {'날짜', '종목코드', '번호'}
+            feature_columns = [col for col in all_columns if col not in exclude_columns]
+            
+            return feature_columns
+        except Exception as e:
+            logger.error(f"Failed to get feature columns: {e}")
+            raise RuntimeError(f"Cannot get feature columns: {e}")
+    
+    def _sample_episode_start(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        에피소드 시작 지점 샘플링
+        
+        다양한 시장 상황을 가진 시작 지점을 DuckDB에서 샘플링합니다.
+        
+        Returns:
+            (data, metadata) 튜플
+            - data: (episode_length, n_features)
+            - metadata: (episode_length, 3) - [종목코드, 날짜, 번호]
+        """
+        feature_cols = self._get_feature_columns()
+        
+        try:
+            # 랜덤 종목 및 날짜 선택
+            query = f"""
+                SELECT DISTINCT 종목코드, 날짜
+                FROM {self.table_name}
+                ORDER BY RANDOM()
+                LIMIT 1
+            """
+            result = self.conn.execute(query).fetchdf()
+            
+            if len(result) == 0:
+                raise RuntimeError("No data found in database")
+            
+            stock_code = result['종목코드'].iloc[0]
+            date = result['날짜'].iloc[0]
+            
+            # 해당 종목/날짜의 데이터 로드
+            query = f"""
+                SELECT 종목코드, 날짜, 번호, {', '.join(feature_cols)}
+                FROM {self.table_name}
+                WHERE 종목코드 = ? AND 날짜 = ?
+                ORDER BY 번호
+            """
+            df = self.conn.execute(query, [stock_code, date]).fetchdf()
+            
+            if len(df) < self.seq_len + 100:  # 최소 에피소드 길이 확보
+                # 데이터가 부족하면 다시 샘플링
+                return self._sample_episode_start()
+            
+            # 메타데이터와 특징 분리
+            metadata = df[['종목코드', '날짜', '번호']].values
+            features = df[feature_cols].values.astype(np.float32)
+            
+            logger.debug(f"Sampled episode: stock={stock_code}, date={date}, length={len(features)}")
+            
+            return features, metadata
+            
+        except Exception as e:
+            logger.error(f"Failed to sample episode start: {e}")
+            raise RuntimeError(f"Cannot sample episode start: {e}")
+    
+    def _get_embedding(self, sequence: np.ndarray) -> np.ndarray:
+        """
+        시퀀스를 임베딩으로 변환
+        
+        Args:
+            sequence: (seq_len, n_features)
+            
+        Returns:
+            임베딩 벡터 (embedding_dim,)
+        """
+        with torch.no_grad():
+            # (seq_len, n_features) -> (1, seq_len, n_features)
+            seq_tensor = torch.from_numpy(sequence).float().unsqueeze(0).to(self.device)
+            
+            # 임베딩 생성
+            embedding = self.embedding_model(seq_tensor)  # (1, embedding_dim)
+            
+            # (1, embedding_dim) -> (embedding_dim,)
+            embedding = embedding.squeeze(0).cpu().numpy()
+            
+        return embedding
+    
+    def _get_current_observation(self) -> np.ndarray:
+        """
+        현재 관측값 (임베딩) 반환
+        
+        Returns:
+            임베딩 벡터 (embedding_dim,)
+        """
+        # 현재 스텝에서 seq_len만큼의 시퀀스 추출
+        start_idx = max(0, self.current_step - self.seq_len + 1)
+        end_idx = self.current_step + 1
+        
+        sequence = self.episode_data[start_idx:end_idx]
+        
+        # 시퀀스가 seq_len보다 짧으면 패딩
+        if len(sequence) < self.seq_len:
+            padding = np.zeros((self.seq_len - len(sequence), sequence.shape[1]), dtype=np.float32)
+            sequence = np.vstack([padding, sequence])
+        
+        # 임베딩 생성
+        embedding = self._get_embedding(sequence)
+        
+        return embedding
+    
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        환경 리셋
+        
+        Args:
+            seed: 랜덤 시드
+            options: 추가 옵션
+            
+        Returns:
+            (observation, info) 튜플
+        """
+        super().reset(seed=seed)
+        
+        # 에피소드 데이터 샘플링
+        self.episode_data, self.episode_metadata = self._sample_episode_start()
+        self.episode_length = len(self.episode_data)
+        
+        # 에피소드 상태 초기화
+        self.current_step = self.seq_len - 1  # 최소 seq_len만큼의 히스토리 필요
+        self.position = 0
+        self.entry_price = 0.0
+        self.entry_time = 0.0
+        
+        # 현재 가격 및 시간 (메타데이터의 번호를 시간으로 사용)
+        self.current_price = self._get_current_price()
+        self.current_time = float(self.episode_metadata[self.current_step, 2])
+        
+        # 에피소드 메타데이터 초기화
+        self.episode_trades = []
+        self.episode_rewards = []
+        self.quick_exit_violations = 0
+        
+        # 초기 관측값
+        observation = self._get_current_observation()
+        
+        info = {
+            'stock_code': str(self.episode_metadata[self.current_step, 0]),
+            'date': str(self.episode_metadata[self.current_step, 1]),
+            'time': self.current_time
+        }
+        
+        return observation, info
+    
+    def _get_current_price(self) -> float:
+        """
+        현재 가격 반환
+        
+        실제로는 '등락률' 특징을 사용하여 가격 변화를 시뮬레이션합니다.
+        간단히 하기 위해 등락률을 누적하여 가격을 계산합니다.
+        """
+        # 등락률은 첫 번째 특징이라고 가정 (실제로는 feature_columns에서 확인 필요)
+        # 여기서는 간단히 인덱스 0을 사용
+        return float(self.episode_data[self.current_step, 0])
+    
+    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        """
+        행동 실행
+        
+        Args:
+            action: 0=보유, 1=매수, 2=매도
+            
+        Returns:
+            (observation, reward, terminated, truncated, info) 튜플
+        """
+        reward = 0.0
+        terminated = False
+        truncated = False
+        
+        # 행동 실행
+        if action == 1:  # 매수
+            if self.position == 0:
+                self.position = 1
+                self.entry_price = self.current_price
+                self.entry_time = self.current_time
+                logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
+        
+        elif action == 2:  # 매도
+            if self.position == 1:
+                # 수익률 계산
+                profit_rate = (self.current_price - self.entry_price) / self.entry_price
+                
+                # 거래 비용 차감
+                reward = profit_rate - self.round_trip_cost
+                
+                # 보유 시간 계산
+                holding_time = self.current_time - self.entry_time
+                
+                # 빠른 손절 룰 체크
+                if holding_time < self.quick_exit_threshold and profit_rate <= 0:
+                    reward -= self.quick_exit_penalty
+                    self.quick_exit_violations += 1
+                    logger.debug(f"Quick exit violation: holding_time={holding_time:.2f}s")
+                
+                # 장기 보유 페널티
+                if holding_time > self.max_holding_time:
+                    penalty = self.holding_penalty_rate * (holding_time - self.max_holding_time)
+                    reward -= penalty
+                
+                # 거래 기록
+                self.episode_trades.append({
+                    'entry_price': self.entry_price,
+                    'exit_price': self.current_price,
+                    'holding_time': holding_time,
+                    'profit_rate': profit_rate,
+                    'reward': reward
+                })
+                
+                logger.debug(f"Sell at price={self.current_price:.4f}, "
+                           f"profit_rate={profit_rate:.4f}, reward={reward:.4f}")
+                
+                # 포지션 청산
+                self.position = 0
+                self.entry_price = 0.0
+                self.entry_time = 0.0
+        
+        # 보상 기록
+        self.episode_rewards.append(reward)
+        
+        # 다음 스텝으로 이동
+        self.current_step += 1
+        
+        # 에피소드 종료 체크
+        if self.current_step >= self.episode_length - 1:
+            terminated = True
+            
+            # 포지션이 남아있으면 강제 청산
+            if self.position == 1:
+                profit_rate = (self.current_price - self.entry_price) / self.entry_price
+                final_reward = profit_rate - self.round_trip_cost
+                self.episode_rewards.append(final_reward)
+                logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
+        
+        # 현재 가격 및 시간 업데이트
+        if not terminated:
+            self.current_price = self._get_current_price()
+            self.current_time = float(self.episode_metadata[self.current_step, 2])
+        
+        # 다음 관측값
+        observation = self._get_current_observation() if not terminated else np.zeros(self.embedding_dim, dtype=np.float32)
+        
+        # 정보
+        info = {
+            'position': self.position,
+            'current_price': self.current_price,
+            'current_time': self.current_time,
+            'quick_exit_violations': self.quick_exit_violations
+        }
+        
+        if terminated:
+            # 에피소드 종료 시 메타데이터 추가
+            info['episode'] = {
+                'total_reward': sum(self.episode_rewards),
+                'num_trades': len(self.episode_trades),
+                'quick_exit_violations': self.quick_exit_violations,
+                'avg_holding_time': np.mean([t['holding_time'] for t in self.episode_trades]) if self.episode_trades else 0.0,
+                'win_rate': np.mean([1 if t['reward'] > 0 else 0 for t in self.episode_trades]) if self.episode_trades else 0.0
+            }
+        
+        return observation, reward, terminated, truncated, info
+    
+    def close(self):
+        """환경 종료"""
+        if self.conn:
+            self.conn.close()
+            logger.info("Database connection closed")

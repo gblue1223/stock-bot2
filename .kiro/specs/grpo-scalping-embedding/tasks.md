@@ -64,8 +64,7 @@
 
 - [ ] 6. GRPO 환경 구현
 
-  - [ ] 6.1 GRPOScalpingEnv 클래스 기본 구조 구현
-
+  - [x] 6.1 GRPOScalpingEnv 클래스 기본 구조 구현
     - ai_trader/grpo/env.py에 Gymnasium 환경 정의
     - 관측 공간: Box(embedding_dim,)
     - 행동 공간: Discrete(3) - 보유/매수/매도

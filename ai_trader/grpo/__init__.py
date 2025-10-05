@@ -10,4 +10,6 @@ GRPO 모듈 - Group Relative Policy Optimization
 - GRPOPolicy: 정책 네트워크
 """
 
-__all__ = []
+from ai_trader.grpo.env import GRPOScalpingEnv
+
+__all__ = ['GRPOScalpingEnv']
