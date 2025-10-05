@@ -6,8 +6,10 @@
 
 주요 컴포넌트:
 - GRPOInference: 실시간 추론 엔진
+- TradeLogger: 실시간 거래 로거
 """
 
 from ai_trader.inference.infer_grpo import GRPOInference
+from ai_trader.inference.trade_logger import TradeLogger
 
-__all__ = ['GRPOInference']
+__all__ = ['GRPOInference', 'TradeLogger']
