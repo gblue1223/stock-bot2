@@ -8,8 +8,10 @@ GRPO 모듈 - Group Relative Policy Optimization
 - GRPOScalpingEnv: 스캘핑 환경 (Gymnasium)
 - GRPOTrainer: GRPO 훈련기
 - GRPOPolicy: 정책 네트워크
+- GRPOEvaluationMetrics: 평가 메트릭 계산기
 """
 
 from ai_trader.grpo.env import GRPOScalpingEnv
+from ai_trader.grpo.evaluation import GRPOEvaluationMetrics, evaluate_grpo_agent
 
-__all__ = ['GRPOScalpingEnv']
+__all__ = ['GRPOScalpingEnv', 'GRPOEvaluationMetrics', 'evaluate_grpo_agent']

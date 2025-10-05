@@ -567,7 +567,8 @@ class GRPOScalpingEnv(gym.Env):
             'win_rate': float(win_rate),
             'avg_profit_per_trade': float(avg_profit_per_trade),
             'episode_length': int(self.episode_length),
-            'steps_taken': int(self.current_step)
+            'steps_taken': int(self.current_step),
+            'trades': self.episode_trades  # 개별 거래 데이터 포함 (평가용)
         }
         
         logger.info(f"Episode finished: total_return={total_return:.4f}, "
