@@ -50,6 +50,8 @@ python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 
 임베딩 모델은 60개 이상의 고차원 매매 특징을 저차원 밀집 벡터로 변환하여 GRPO 강화학습 에이전트가 효율적으로 학습할 수 있도록 합니다.
 
+**대규모 훈련**: Google Cloud Platform A100 40GB x12 GPU를 활용한 분산 훈련 가이드는 [GCP 훈련 가이드](docs/GCP_TRAINING_GUIDE.md)를 참조하세요.
+
 ### 임베딩 모델 훈련
 
 대조 학습(Contrastive Learning)을 사용하여 시간적으로 가까운 샘플은 유사하게, 먼 샘플은 다르게 임베딩합니다.
@@ -165,12 +167,14 @@ python scripts/train_embedding_monthly.py \
 #### 대용량 데이터 훈련 전략 (12개월 5억 개 데이터)
 
 **권장 설정**:
+
 - 월별 최대 샘플: 500만 개 (`--max-samples 5000000`)
 - 배치 크기: 256 (`--batch-size 256`)
 - 워커 수: 8 (`--num-workers 8`)
 - 검증 주기: 3 에포크마다 (`--val-every 3`)
 
 **월별 순차 훈련 (자동화)**:
+
 ```bash
 # 9월부터 12월까지 자동으로 순차 훈련
 python scripts/train_embedding_monthly.py \
@@ -182,6 +186,7 @@ python scripts/train_embedding_monthly.py \
 ```
 
 **분기별 재훈련**:
+
 ```bash
 # Q4 (10-12월) 데이터로 전체 재훈련
 python scripts/train_embedding_monthly.py \
@@ -193,6 +198,7 @@ python scripts/train_embedding_monthly.py \
 ```
 
 **수동 월별 훈련**:
+
 ```bash
 # 9월 초기 훈련
 python -m ai_trader.embedding.train_embedding \

@@ -130,3 +130,6 @@ diary_helper/*.bmp
 diary_helper/*.tiff
 diary_helper/*.ico
 screenshots/
+
+# GCP scripts config (contains credentials)
+scripts/gcp/config.sh
