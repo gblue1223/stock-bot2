@@ -617,63 +617,81 @@ def main():
     logger.info("Starting training loop...")
     best_val_loss = float('inf')
     
-    for epoch in range(start_epoch, args.epochs + 1):
-        logger.info(f"\n{'='*80}")
-        logger.info(f"Epoch {epoch}/{args.epochs}")
-        logger.info(f"{'='*80}")
-        
-        # 훈련
-        train_loss = train_epoch(
-            model=model,
-            dataloader=train_dataloader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch
-        )
-        
-        logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
-        
-        # TensorBoard 로깅 (훈련 손실은 항상 로깅)
-        writer.add_scalar('train/loss', train_loss, epoch)
-        writer.add_scalar('learning_rate', args.lr, epoch)
-        
-        # 검증 (val_every 주기마다 실행)
-        val_loss = 0.0
-        silhouette = 0.0
-        temporal_coherence = 0.0
-        
-        if epoch % args.val_every == 0:
-            val_loss, val_embeddings, val_stock_codes, val_timestamps = validate(
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            logger.info(f"\n{'='*80}")
+            logger.info(f"Epoch {epoch}/{args.epochs}")
+            logger.info(f"{'='*80}")
+            
+            # 훈련
+            train_loss = train_epoch(
                 model=model,
-                dataloader=val_dataloader,
+                dataloader=train_dataloader,
                 criterion=criterion,
-                device=device
+                optimizer=optimizer,
+                device=device,
+                epoch=epoch
             )
             
-            logger.info(f"Epoch {epoch} - Val Loss: {val_loss:.4f}")
+            logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
             
-            # 임베딩 품질 메트릭 계산
-            if len(val_embeddings) > 0:
-                # Silhouette score 계산 (종목 클러스터링 품질)
-                if len(val_stock_codes) > 0:
-                    silhouette = compute_silhouette_score(val_embeddings, val_stock_codes)
-                    logger.info(f"Epoch {epoch} - Silhouette Score: {silhouette:.4f}")
+            # TensorBoard 로깅 (훈련 손실은 항상 로깅)
+            writer.add_scalar('train/loss', train_loss, epoch)
+            writer.add_scalar('learning_rate', args.lr, epoch)
+            writer.flush()  # 즉시 디스크에 기록
+            
+            # 검증 (val_every 주기마다 실행)
+            val_loss = 0.0
+            silhouette = 0.0
+            temporal_coherence = 0.0
+            
+            if epoch % args.val_every == 0:
+                val_loss, val_embeddings, val_stock_codes, val_timestamps = validate(
+                    model=model,
+                    dataloader=val_dataloader,
+                    criterion=criterion,
+                    device=device
+                )
                 
-                # Temporal coherence 계산 (시간적 일관성)
-                if len(val_timestamps) > 0:
-                    temporal_coherence = compute_temporal_coherence(val_embeddings, val_timestamps)
-                    logger.info(f"Epoch {epoch} - Temporal Coherence: {temporal_coherence:.4f}")
+                logger.info(f"Epoch {epoch} - Val Loss: {val_loss:.4f}")
+                
+                # 임베딩 품질 메트릭 계산
+                if len(val_embeddings) > 0:
+                    # Silhouette score 계산 (종목 클러스터링 품질)
+                    if len(val_stock_codes) > 0:
+                        silhouette = compute_silhouette_score(val_embeddings, val_stock_codes)
+                        logger.info(f"Epoch {epoch} - Silhouette Score: {silhouette:.4f}")
+                    
+                    # Temporal coherence 계산 (시간적 일관성)
+                    if len(val_timestamps) > 0:
+                        temporal_coherence = compute_temporal_coherence(val_embeddings, val_timestamps)
+                        logger.info(f"Epoch {epoch} - Temporal Coherence: {temporal_coherence:.4f}")
+                
+                # TensorBoard 로깅 (검증 메트릭)
+                writer.add_scalar('val/loss', val_loss, epoch)
+                writer.add_scalar('val/silhouette_score', silhouette, epoch)
+                writer.add_scalar('val/temporal_coherence', temporal_coherence, epoch)
+                writer.flush()  # 즉시 디스크에 기록
+                
+                # 최고 모델 저장 (검증 손실이 개선된 경우)
+                if val_loss > 0 and val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_checkpoint_path = save_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        loss=train_loss,
+                        val_loss=val_loss,
+                        config=model.get_config(),
+                        feature_names=feature_names,
+                        normalization_stats=normalization_stats,
+                        output_dir=output_dir
+                    )
+                    logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
             
-            # TensorBoard 로깅 (검증 메트릭)
-            writer.add_scalar('val/loss', val_loss, epoch)
-            writer.add_scalar('val/silhouette_score', silhouette, epoch)
-            writer.add_scalar('val/temporal_coherence', temporal_coherence, epoch)
-            
-            # 최고 모델 저장 (검증 손실이 개선된 경우)
-            if val_loss > 0 and val_loss < best_val_loss:
-                best_val_loss = val_loss
-                best_checkpoint_path = save_checkpoint(
+            # 주기적 체크포인트 저장
+            if epoch % args.checkpoint_interval == 0:
+                checkpoint_path = save_checkpoint(
                     model=model,
                     optimizer=optimizer,
                     epoch=epoch,
@@ -684,45 +702,32 @@ def main():
                     normalization_stats=normalization_stats,
                     output_dir=output_dir
                 )
-                logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
         
-        # 주기적 체크포인트 저장
-        if epoch % args.checkpoint_interval == 0:
-            checkpoint_path = save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                loss=train_loss,
-                val_loss=val_loss,
-                config=model.get_config(),
-                feature_names=feature_names,
-                normalization_stats=normalization_stats,
-                output_dir=output_dir
-            )
+        # 최종 체크포인트 저장
+        final_checkpoint_path = save_checkpoint(
+            model=model,
+            optimizer=optimizer,
+            epoch=args.epochs,
+            loss=train_loss,
+            val_loss=val_loss,
+            config=model.get_config(),
+            feature_names=feature_names,
+            normalization_stats=normalization_stats,
+            output_dir=output_dir
+        )
+        
+        logger.info(f"\n{'='*80}")
+        logger.info("Training completed!")
+        logger.info(f"Best validation loss: {best_val_loss:.4f}")
+        logger.info(f"Final checkpoint: {final_checkpoint_path}")
+        logger.info(f"TensorBoard logs: {tensorboard_dir}")
+        logger.info(f"{'='*80}")
     
-    # 최종 체크포인트 저장
-    final_checkpoint_path = save_checkpoint(
-        model=model,
-        optimizer=optimizer,
-        epoch=args.epochs,
-        loss=train_loss,
-        val_loss=val_loss,
-        config=model.get_config(),
-        feature_names=feature_names,
-        normalization_stats=normalization_stats,
-        output_dir=output_dir
-    )
-    
-    logger.info(f"\n{'='*80}")
-    logger.info("Training completed!")
-    logger.info(f"Best validation loss: {best_val_loss:.4f}")
-    logger.info(f"Final checkpoint: {final_checkpoint_path}")
-    logger.info(f"TensorBoard logs: {tensorboard_dir}")
-    logger.info(f"{'='*80}")
-    
-    # 정리
-    writer.close()
-    data_loader.close()
+    finally:
+        # 정리 (에러 발생 시에도 실행)
+        logger.info("Closing TensorBoard writer and data loader...")
+        writer.close()
+        data_loader.close()
     
     return 0
 
@@ -731,5 +736,6 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except Exception as e:
+        logger.exception(f"오류 발생: {e}")
         print(f"오류 발생: {e}", file=sys.stderr)
         sys.exit(1)

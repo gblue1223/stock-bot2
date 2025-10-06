@@ -12,11 +12,7 @@
 ## Features
 
 ```bash
-날짜, 등락률, 누적거래대금, 거래회전율, 체결강도, 매도호가수량1, 매도호가수량2, 매도호가수량3, 매도호가수량4, 매도호가수량5, 매도호가수량6, 매도호가수량7, 매도호가수량8, 매도호가수량9, 매도호가수량10, 매수호가수량1, 매수호가수량2, 매수호가수량3, 매수호가수량4, 매수호가수량5, 매수호가수량6, 매수호가수량7, 매수호가수량8, 매수호가수량9, 매수호가수량10, 매도호가총잔량, 매수호가총잔량, 매도거래원수량1, 매도거래원수량2, 매도거래원수량3, 매도거래원수량4, 매도거래원수량5, 매도거래원별증감1, 매도거래원별증감2, 매도거래원별증감3, 매도거래원별증감4, 매도거래원별증감5, 매수거래원수량1, 매수거래원수량2, 매수거래원수량3, 매수거래원수량4, 매수거래원수량5, 매수거래원별증감1, 매수거래원별증감2, 매수거래원별증감3, 매수거래원별증감4, 매수거래원별증감5, 매도거래원1_scalar, 매도거래원2_scalar, 매도거래원3_scalar, 매도거래원4_scalar, 매도거래원5_scalar, 매수거래원1_scalar, 매수거래원2_scalar, 매수거래원3_scalar, 매수거래원4_scalar, 매수거래원5_scalar, 종목명_scalar, 시간_scalar, 시간_sin, 시간_cos
-```
-
-```bash
-날짜, 등락률, 누적거래대금, 거래회전율, 체결강도, 매도호가수량1, 매도호가수량2, 매도호가수량3, 매도호가수량4, 매도호가수량5, 매도호가수량6, 매도호가수량7, 매도호가수량8, 매도호가수량9, 매도호가수량10, 매도호가직전대비1, 매도호가직전대비2, 매도호가직전대비3, 매도호가직전대비4, 매도호가직전대비5, 매도호가직전대비6, 매도호가직전대비7, 매도호가직전대비8, 매도호가직전대비9, 매도호가직전대비10, 매수호가수량1, 매수호가수량2, 매수호가수량3, 매수호가수량4, 매수호가수량5, 매수호가수량6, 매수호가수량7, 매수호가수량8, 매수호가수량9, 매수호가수량10, 매수호가직전대비1, 매수호가직전대비2, 매수호가직전대비3, 매수호가직전대비4, 매수호가직전대비5, 매수호가직전대비6, 매수호가직전대비7, 매수호가직전대비8, 매수호가직전대비9, 매수호가직전대비10, 매도호가총잔량, 매도호가총잔량직전대비, 매수호가총잔량, 매수호가총잔량직전대비, 매도거래원1, 매도거래원2, 매도거래원3, 매도거래원4, 매도거래원5, 매도거래원수량1, 매도거래원수량2, 매도거래원수량3, 매도거래원수량4, 매도거래원수량5, 매도거래원별증감1, 매도거래원별증감2, 매도거래원별증감3, 매도거래원별증감4, 매도거래원별증감5, 매수거래원1, 매수거래원2, 매수거래원3, 매수거래원4, 매수거래원5, 매수거래원수량1, 매수거래원수량2, 매수거래원수량3, 매수거래원수량4, 매수거래원수량5, 매수거래원별증감1, 매수거래원별증감2, 매수거래원별증감3, 매수거래원별증감4, 매수거래원별증감5, 외국계매수추정합변동, 외국계매도추정합변동, 외국계매수추정합, 외국계매도추정합, 매도거래원1_scalar, 매도거래원2_scalar, 매도거래원3_scalar, 매도거래원4_scalar, 매도거래원5_scalar, 매수거래원1_scalar, 매수거래원2_scalar, 매수거래원3_scalar, 매수거래원4_scalar, 매수거래원5_scalar, 종목명_scalar, 시간_scalar, 시간_sin, 시간_cos
+날짜 번호 종목코드 종목명 시간 등락률 누적거래대금 거래회전율 체결강도 매도대기금액1 매도대기금액2 매도대기금액3 매도대기금액4 매도대기금액5 매도대기금액6 매도대기금액7 매도대기금액8 매도대기금액9 매도대기금액10 매수대기금액1 매수대기금액2 매수대기금액3 매수대기금액4 매수대기금액5 매수대기금액6 매수대기금액7 매수대기금액8 매수대기금액9 매수대기금액10 종목명_scalar 시간_sin 시간_cos 시간_scalar
 ```
 
 ## 데이터 정규화
@@ -59,25 +55,70 @@ python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 대조 학습(Contrastive Learning)을 사용하여 시간적으로 가까운 샘플은 유사하게, 먼 샘플은 다르게 임베딩합니다.
 
 ```bash
+# 9월 데이터로 초기 훈련
 python -m ai_trader.embedding.train_embedding \
   --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
   --table datasets \
-  --out models/embedding \
+  --out models/embedding_2024_09 \
   --seq-len 60 \
   --embedding-dim 128 \
-  --batch-size 128 \
-  --epochs 50 \
+  --batch-size 256 \
+  --epochs 30 \
   --lr 1e-4 \
   --device cuda \
   --positive-time-threshold 10 \
   --negative-time-threshold 60 \
   --temperature 0.07 \
   --num-heads 4 \
-  --val-every 5 \
-  --checkpoint-interval 10 \
+  --val-every 3 \
+  --checkpoint-interval 5 \
   --start-date 20240901 \
   --end-date 20240930 \
-  --num-workers 4
+  --num-workers 8 \
+  --max-samples 5000000
+
+# 10월 데이터로 fine-tuning
+python -m ai_trader.embedding.train_embedding \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/embedding_2024_10 \
+  --seq-len 60 \
+  --embedding-dim 128 \
+  --batch-size 256 \
+  --epochs 15 \
+  --lr 5e-5 \
+  --device cuda \
+  --positive-time-threshold 10 \
+  --negative-time-threshold 60 \
+  --temperature 0.07 \
+  --num-heads 4 \
+  --val-every 3 \
+  --checkpoint-interval 5 \
+  --start-date 20241001 \
+  --end-date 20241031 \
+  --num-workers 8 \
+  --max-samples 5000000 \
+  --resume models/embedding_2024_09/checkpoint_epoch30.pt
+
+# 변경 사항:
+  --epochs 15 (30→15, fine-tuning이므로 절반)
+  --lr 5e-5 (1e-4→5e-5, 학습률 절반)
+  --resume 이전 달 모델 로드
+
+# 월별 스크립트
+python scripts/train_embedding_monthly.py \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --start-year 2024 --start-month 9 \
+  --end-year 2024 --end-month 12 \
+  --output models/embedding \
+  --max-samples 5000000
+
+python scripts/train_embedding_monthly.py \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --quarterly \
+  --year 2024 --quarter 4 \
+  --output models/embedding \
+  --max-samples 5000000
 ```
 
 #### CLI 인수 설명
@@ -120,6 +161,72 @@ python -m ai_trader.embedding.train_embedding \
 - `--end-date`: 종료 날짜 (YYYYMMDD 형식, 예: 20240930)
 - `--stock-codes`: 훈련할 종목 코드 리스트 (예: 005930 000660)
 - `--max-samples`: 최대 샘플 수 (메모리 제한 시 사용, 예: 1000000)
+
+#### 대용량 데이터 훈련 전략 (12개월 5억 개 데이터)
+
+**권장 설정**:
+- 월별 최대 샘플: 500만 개 (`--max-samples 5000000`)
+- 배치 크기: 256 (`--batch-size 256`)
+- 워커 수: 8 (`--num-workers 8`)
+- 검증 주기: 3 에포크마다 (`--val-every 3`)
+
+**월별 순차 훈련 (자동화)**:
+```bash
+# 9월부터 12월까지 자동으로 순차 훈련
+python scripts/train_embedding_monthly.py \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --start-year 2024 --start-month 9 \
+  --end-year 2024 --end-month 12 \
+  --output models/embedding \
+  --max-samples 5000000
+```
+
+**분기별 재훈련**:
+```bash
+# Q4 (10-12월) 데이터로 전체 재훈련
+python scripts/train_embedding_monthly.py \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --quarterly \
+  --year 2024 --quarter 4 \
+  --output models/embedding \
+  --max-samples 5000000
+```
+
+**수동 월별 훈련**:
+```bash
+# 9월 초기 훈련
+python -m ai_trader.embedding.train_embedding \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/embedding_2024_09 \
+  --start-date 20240901 \
+  --end-date 20240930 \
+  --seq-len 60 \
+  --embedding-dim 128 \
+  --batch-size 256 \
+  --epochs 30 \
+  --lr 1e-4 \
+  --device cuda \
+  --num-workers 8 \
+  --max-samples 5000000
+
+# 10월 Fine-tuning
+python -m ai_trader.embedding.train_embedding \
+  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
+  --table datasets \
+  --out models/embedding_2024_10 \
+  --start-date 20241001 \
+  --end-date 20241031 \
+  --seq-len 60 \
+  --embedding-dim 128 \
+  --batch-size 256 \
+  --epochs 15 \
+  --lr 5e-5 \
+  --device cuda \
+  --num-workers 8 \
+  --max-samples 5000000 \
+  --resume models/embedding_2024_09/checkpoint_epoch30.pt
+```
 
 #### 메모리 절약 훈련 예제
 
