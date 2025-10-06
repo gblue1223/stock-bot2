@@ -471,7 +471,11 @@ def validate(
                 # 임베딩 및 메타데이터 수집
                 all_embeddings.append(anchor_emb.cpu().numpy())
                 all_stock_codes.extend(stock_codes)
-                all_timestamps.extend(timestamps)
+                # timestamps가 Tensor인 경우 리스트로 변환
+                if isinstance(timestamps, torch.Tensor):
+                    all_timestamps.extend(timestamps.cpu().tolist())
+                else:
+                    all_timestamps.extend(timestamps)
     
     avg_loss = total_loss / num_batches
     

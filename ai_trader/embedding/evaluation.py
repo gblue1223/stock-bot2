@@ -145,6 +145,9 @@ def compute_temporal_coherence(
             elif isinstance(t, str):
                 # 문자열 타임스탬프를 해시값으로 변환
                 numeric_timestamps.append(float(hash(t)))
+            elif hasattr(t, 'item'):
+                # PyTorch Tensor 또는 NumPy scalar
+                numeric_timestamps.append(float(t.item()))
             else:
                 raise ValueError(f"지원하지 않는 타임스탬프 타입: {type(t)}")
         
