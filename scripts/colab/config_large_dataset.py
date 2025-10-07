@@ -2,11 +2,11 @@ import os
 from pathlib import Path
 
 """
-대용량 데이터셋 (월별 3천만 개) 훈련을 위한 최적화된 설정
+대용량 데이터셋 (월별 5천만 개) 훈련을 위한 최적화된 설정
 
 데이터 규모:
 - 전체: 4억 개
-- 월별: 약 3천만 개
+- 월별: 약 5천만 개
 - 현재 문제: 50만 개만 사용 → 과적합 발생
 
 해결 전략:
@@ -141,7 +141,7 @@ def print_config():
     print("=" * 80)
     print("대용량 데이터셋 훈련 설정")
     print("=" * 80)
-    print(f"샘플 수: {MAX_SAMPLES:,} (월별 3천만 개 중 {MAX_SAMPLES/30000000*100:.1f}%)")
+    print(f"샘플 수: {MAX_SAMPLES:,} (월별 5천만 개 중 {MAX_SAMPLES/30000000*100:.1f}%)")
     print(f"배치 크기: {BATCH_SIZE}")
     print(f"에포크: {INITIAL_EPOCHS} (초기) / {FINETUNE_EPOCHS} (Fine-tuning)")
     print(f"학습률: {INITIAL_LR} (초기) / {FINETUNE_LR} (Fine-tuning)")
