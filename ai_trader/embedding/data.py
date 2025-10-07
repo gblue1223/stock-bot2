@@ -85,8 +85,7 @@ class EmbeddingDataLoader:
     def _get_feature_columns(self) -> List[str]:
         """
         특징 컬럼 목록 가져오기
-        
-        날짜, 종목코드, 번호를 제외한 모든 컬럼을 특징으로 사용
+        특정 컬럼를 제외한 모든 컬럼을 특징으로 사용
         """
         if self.feature_columns is not None:
             return self.feature_columns
@@ -117,7 +116,7 @@ class EmbeddingDataLoader:
         Returns:
             Dict with keys 'train', 'val', 'test', each containing:
                 - 'data': numpy array of shape (n_samples, n_features)
-                - 'metadata': dict with '종목코드', '날짜', '번호'
+                - 'metadata': dict with '종목코드', '날짜', '시간'
         """
         if not self.conn:
             self.connect()
@@ -144,12 +143,12 @@ class EmbeddingDataLoader:
             limit_clause = f"LIMIT {self.max_samples}" if self.max_samples else ""
             
             # 시간 순서로 정렬하여 데이터 로드
-            # 인덱스 활용: idx_datasets_code_date_time (종목코드, 날짜, 번호)
+            # 정렬 순서: 날짜 → 종목코드 → 시간
             query = f"""
-                SELECT 종목코드, 날짜, 번호, {', '.join(feature_cols)}
+                SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
                 FROM {self.table_name}
                 WHERE {where_clause}
-                ORDER BY 날짜, 번호
+                ORDER BY 날짜, 종목코드, 시간
                 {limit_clause}
             """
             
@@ -168,7 +167,7 @@ class EmbeddingDataLoader:
                 raise DataLoadError("No data found in database")
             
             # 메타데이터와 특징 분리
-            metadata = df[['종목코드', '날짜', '번호']].values
+            metadata = df[['종목코드', '날짜', '시간']].values
             features = df[feature_cols].values.astype(np.float32)
             
             # 데이터 정제: NaN/Inf 처리
@@ -337,7 +336,7 @@ class ContrastiveDataset(Dataset):
     
     Args:
         data: 특징 데이터 (n_samples, n_features)
-        metadata: 메타데이터 (n_samples, 3) - [종목코드, 날짜, 번호]
+        metadata: 메타데이터 (n_samples, 3) - [종목코드, 날짜, 시간]
         seq_len: 시퀀스 길이
         positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
         negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
@@ -429,7 +428,7 @@ class ContrastiveDataset(Dataset):
             긍정 쌍 인덱스 또는 None
         """
         stock_code = self.metadata[anchor_idx, 0]
-        anchor_time = int(self.metadata[anchor_idx, 2])  # 번호 (시간 순서)
+        anchor_time = int(self.metadata[anchor_idx, 2])  # 시간 (HHMMSSmmm)
         
         # 동일 종목의 인덱스들
         candidate_indices = self.stock_indices.get(stock_code, [])
