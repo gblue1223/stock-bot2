@@ -406,7 +406,7 @@ def train_epoch(
         
         # Mixed Precision Training
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 # Forward pass
                 anchor_emb = model(anchor)
                 positive_emb = model(positive)
