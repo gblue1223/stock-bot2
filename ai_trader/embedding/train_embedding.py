@@ -589,17 +589,26 @@ def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
         logger.warning("Data contains Inf values! Clipping to finite range.")
         data = np.nan_to_num(data, posinf=1e10, neginf=-1e10)
     
-    mean = np.mean(data, axis=0)
-    std = np.std(data, axis=0)
+    # Robust normalization: median과 IQR 사용
+    # 극단값에 덜 민감함
+    median = np.median(data, axis=0)
+    q75 = np.percentile(data, 75, axis=0)
+    q25 = np.percentile(data, 25, axis=0)
+    iqr = q75 - q25
     
-    # std가 0인 경우 1로 대체 (division by zero 방지)
-    std = np.where(std == 0, 1.0, std)
+    # IQR이 0인 경우 std 사용
+    iqr = np.where(iqr == 0, np.std(data, axis=0), iqr)
     
-    # std가 너무 작은 경우도 처리
-    std = np.where(std < 1e-6, 1.0, std)
+    # 여전히 0이면 1로 대체
+    iqr = np.where(iqr == 0, 1.0, iqr)
+    iqr = np.where(iqr < 1e-6, 1.0, iqr)
     
-    logger.info(f"Normalization stats - Mean range: [{np.min(mean):.4f}, {np.max(mean):.4f}]")
-    logger.info(f"Normalization stats - Std range: [{np.min(std):.4f}, {np.max(std):.4f}]")
+    # Mean과 Std 대신 Median과 IQR 사용
+    mean = median
+    std = iqr
+    
+    logger.info(f"Normalization stats - Median range: [{np.min(mean):.4f}, {np.max(mean):.4f}]")
+    logger.info(f"Normalization stats - IQR range: [{np.min(std):.4f}, {np.max(std):.4f}]")
     
     return {
         'mean': mean.tolist(),

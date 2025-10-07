@@ -168,6 +168,25 @@ class EmbeddingDataLoader:
             metadata = df[['종목코드', '날짜', '번호']].values
             features = df[feature_cols].values.astype(np.float32)
             
+            # 데이터 정제: NaN/Inf 처리
+            if np.any(np.isnan(features)):
+                logger.warning(f"Found {np.sum(np.isnan(features))} NaN values in features. Replacing with 0.")
+                features = np.nan_to_num(features, nan=0.0)
+            
+            if np.any(np.isinf(features)):
+                logger.warning(f"Found {np.sum(np.isinf(features))} Inf values in features. Clipping.")
+                features = np.nan_to_num(features, posinf=1e10, neginf=-1e10)
+            
+            # 극단값 클리핑 (정규화 전)
+            # 99.9 percentile 기준으로 클리핑
+            for i in range(features.shape[1]):
+                col = features[:, i]
+                p999 = np.percentile(col, 99.9)
+                p001 = np.percentile(col, 0.1)
+                features[:, i] = np.clip(col, p001, p999)
+            
+            logger.info(f"Data range after clipping: [{np.min(features):.4f}, {np.max(features):.4f}]")
+            
             # 시간 순서 기반 분할
             n_samples = len(features)
             train_end = int(n_samples * self.train_ratio)
