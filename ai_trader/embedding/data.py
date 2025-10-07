@@ -178,12 +178,28 @@ class EmbeddingDataLoader:
                 features = np.nan_to_num(features, posinf=1e10, neginf=-1e10)
             
             # 극단값 클리핑 (정규화 전)
-            # 99.9 percentile 기준으로 클리핑
+            # 각 피처별로 99 percentile 기준으로 강력하게 클리핑
+            logger.info("Applying robust clipping to features...")
             for i in range(features.shape[1]):
                 col = features[:, i]
-                p999 = np.percentile(col, 99.9)
-                p001 = np.percentile(col, 0.1)
-                features[:, i] = np.clip(col, p001, p999)
+                
+                # 더 강력한 클리핑: 99 percentile
+                p99 = np.percentile(col, 99)
+                p01 = np.percentile(col, 1)
+                
+                # 추가 안전장치: 절대값이 너무 크면 강제 클리핑
+                max_abs_value = max(abs(p99), abs(p01))
+                if max_abs_value > 10000:  # 1만 이상이면
+                    # IQR 기반 클리핑
+                    q75 = np.percentile(col, 75)
+                    q25 = np.percentile(col, 25)
+                    iqr = q75 - q25
+                    median = np.median(col)
+                    # median ± 3*IQR로 클리핑
+                    p99 = median + 3 * iqr
+                    p01 = median - 3 * iqr
+                
+                features[:, i] = np.clip(col, p01, p99)
             
             logger.info(f"Data range after clipping: [{np.min(features):.4f}, {np.max(features):.4f}]")
             
