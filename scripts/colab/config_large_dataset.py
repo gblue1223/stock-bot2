@@ -1,3 +1,6 @@
+import os
+from pathlib import Path
+
 """
 대용량 데이터셋 (월별 3천만 개) 훈련을 위한 최적화된 설정
 
@@ -116,6 +119,17 @@ DRIVE_ROOT = "/content/drive/MyDrive/ColabData"
 DB_PATH = f"{DRIVE_ROOT}/datasets/stockbot/datasets_norm_all.duckdb"
 OUTPUT_BASE = f"{DRIVE_ROOT}/models/stockbot/embedding"
 
+# 디렉토리 생성
+os.makedirs(OUTPUT_BASE, exist_ok=True)
+
+# 데이터베이스 파일 존재 확인
+if os.path.exists(DB_PATH):
+    print(f"✓ Database file found: {os.path.getsize(DB_PATH) / 1e9:.2f} GB")
+else:
+    print(f"⚠️  Database file not found!")
+    print(f"   Please upload datasets_norm_all.duckdb to:")
+    print(f"   {DB_PATH}")
+    
 # ========================================
 # 설정 요약 출력
 # ========================================
