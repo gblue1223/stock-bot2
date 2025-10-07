@@ -142,6 +142,7 @@ def print_config():
     print("대용량 데이터셋 훈련 설정")
     print("=" * 80)
     print(f"샘플 수: {MAX_SAMPLES:,} (월별 5천만 개 중 {MAX_SAMPLES/50000000*100:.1f}%)")
+    print(f"워커 수: {NUM_WORKERS}")
     print(f"배치 크기: {BATCH_SIZE}")
     print(f"에포크: {INITIAL_EPOCHS} (초기) / {FINETUNE_EPOCHS} (Fine-tuning)")
     print(f"학습률: {INITIAL_LR} (초기) / {FINETUNE_LR} (Fine-tuning)")
