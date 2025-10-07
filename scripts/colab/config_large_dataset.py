@@ -24,7 +24,8 @@ from pathlib import Path
 # 샘플 수 (메모리에 따라 조정)
 # Colab Pro (25GB RAM): 500만 ~ 1000만
 # Colab Pro+ (52GB RAM): 1000만 ~ 2000만
-MAX_SAMPLES = 10000000  # 1천만 샘플 (3천만의 33%)
+# A100 80GB 최적화: 5천만 샘플 전체 사용 가능
+MAX_SAMPLES = 50000000  # 5천만 샘플 (100%, 월별 전체 데이터)
 
 # 데이터 기간
 YEAR = 2024
@@ -48,13 +49,14 @@ WEIGHT_DECAY = 1e-4  # L2 regularization
 # ========================================
 
 # 배치 크기 (GPU 메모리에 따라)
-# V100 (16GB): 512
-# A100 (40GB): 1024
-BATCH_SIZE = 512  # 256 → 512 (2배 증가)
+# V100 (16GB): 512 ~ 768
+# A100 (40GB): 1024 ~ 2048
+# A100 (80GB): 4096 ~ 8192 (최적)
+BATCH_SIZE = 4096  # A100 80GB 최적화
 
-# 에포크 수
-INITIAL_EPOCHS = 20  # 30 → 20 (과적합 방지)
-FINETUNE_EPOCHS = 10  # 15 → 10
+# 에포크 수 (A100 80GB 최적화)
+INITIAL_EPOCHS = 15  # 대용량 데이터에 맞게 증가
+FINETUNE_EPOCHS = 10  # Fine-tuning도 충분히
 
 # 학습률 (NaN 방지를 위해 매우 보수적으로 설정)
 INITIAL_LR = 5e-5  # 1e-4 → 5e-5 (더 안정적)
@@ -85,15 +87,15 @@ HARD_NEGATIVE_RATIO = 0.5  # 50%는 hard negative
 # 데이터 로더 설정
 # ========================================
 
-NUM_WORKERS = 4  # 0 → 4 (데이터 로딩 속도 향상)
+NUM_WORKERS = 16  # A100 80GB: 더 많은 워커로 데이터 로딩 가속
 PIN_MEMORY = True
 
 # ========================================
 # 체크포인트 및 검증
 # ========================================
 
-CHECKPOINT_INTERVAL = 2  # 1 → 2 (덜 자주 저장)
-VAL_EVERY = 1  # 3 → 1 (매 에포크마다 검증)
+CHECKPOINT_INTERVAL = 3  # A100: 더 적게 저장 (속도 우선)
+VAL_EVERY = 2  # 2 에포크마다 검증 (속도 향상)
 
 # Early Stopping
 USE_EARLY_STOPPING = True
