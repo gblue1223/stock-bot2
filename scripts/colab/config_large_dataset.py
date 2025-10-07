@@ -56,9 +56,9 @@ BATCH_SIZE = 512  # 256 → 512 (2배 증가)
 INITIAL_EPOCHS = 20  # 30 → 20 (과적합 방지)
 FINETUNE_EPOCHS = 10  # 15 → 10
 
-# 학습률
-INITIAL_LR = 3e-4  # 1e-4 → 3e-4 (더 빠른 학습)
-FINETUNE_LR = 1e-4  # 5e-5 → 1e-4 (Fine-tuning도 조금 높게)
+# 학습률 (NaN 방지를 위해 보수적으로 설정)
+INITIAL_LR = 1e-4  # 안정적인 학습률
+FINETUNE_LR = 5e-5  # Fine-tuning 학습률
 
 # 학습률 스케줄러
 USE_LR_SCHEDULER = True

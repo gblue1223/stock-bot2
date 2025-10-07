@@ -421,6 +421,11 @@ def train_epoch(
             # Backward pass with gradient scaling
             optimizer.zero_grad()
             scaler.scale(loss).backward()
+            
+            # Gradient clipping (NaN 방지)
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
         else:
@@ -439,15 +444,28 @@ def train_epoch(
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping (NaN 방지)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
         
         # 통계 업데이트
-        total_loss += loss.item()
+        loss_value = loss.item()
+        
+        # NaN 체크
+        if np.isnan(loss_value) or np.isinf(loss_value):
+            logger.error(f"NaN/Inf loss detected at batch {batch_idx + 1}!")
+            logger.error(f"Loss value: {loss_value}")
+            logger.error("Training stopped to prevent further issues.")
+            raise ValueError(f"NaN/Inf loss detected: {loss_value}")
+        
+        total_loss += loss_value
         num_batches += 1
         
         # 진행 상황 출력
         if (batch_idx + 1) % 10 == 0:
-            logger.info(f"Epoch [{epoch}] Batch [{batch_idx + 1}/{len(dataloader)}] Loss: {loss.item():.4f}")
+            logger.info(f"Epoch [{epoch}] Batch [{batch_idx + 1}/{len(dataloader)}] Loss: {loss_value:.4f}")
     
     avg_loss = total_loss / num_batches
     return avg_loss
@@ -562,11 +580,26 @@ def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
     Returns:
         정규화 통계 (mean, std)
     """
+    # NaN/Inf 체크
+    if np.any(np.isnan(data)):
+        logger.warning("Data contains NaN values! Replacing with 0.")
+        data = np.nan_to_num(data, nan=0.0)
+    
+    if np.any(np.isinf(data)):
+        logger.warning("Data contains Inf values! Clipping to finite range.")
+        data = np.nan_to_num(data, posinf=1e10, neginf=-1e10)
+    
     mean = np.mean(data, axis=0)
     std = np.std(data, axis=0)
     
     # std가 0인 경우 1로 대체 (division by zero 방지)
     std = np.where(std == 0, 1.0, std)
+    
+    # std가 너무 작은 경우도 처리
+    std = np.where(std < 1e-6, 1.0, std)
+    
+    logger.info(f"Normalization stats - Mean range: [{np.min(mean):.4f}, {np.max(mean):.4f}]")
+    logger.info(f"Normalization stats - Std range: [{np.min(std):.4f}, {np.max(std):.4f}]")
     
     return {
         'mean': mean.tolist(),
@@ -685,7 +718,7 @@ def main():
     # Mixed Precision Training 초기화
     scaler = None
     if device.type == 'cuda':
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler('cuda')
         logger.info("Mixed Precision Training enabled (AMP)")
     
     # Early Stopping 초기화
