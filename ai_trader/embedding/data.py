@@ -97,7 +97,10 @@ class EmbeddingDataLoader:
             all_columns = columns_df['column_name'].tolist()
             
             # 메타데이터 컬럼 제외 (문자열 컬럼 및 식별자)
-            exclude_columns = {'날짜', '종목코드', '번호', '종목명'}
+            # 메타데이터 및 원본 시간 컬럼 제외
+            # '시간'은 HHMMSSmmm 형식(예: 093000123 = 9천만)이라 너무 큼
+            # 대신 '시간_sin', '시간_cos', '시간_scalar' 파생 피처 사용
+            exclude_columns = {'날짜', '종목코드', '번호', '종목명', '시간'}
             self.feature_columns = [col for col in all_columns if col not in exclude_columns]
             
             logger.info(f"Found {len(self.feature_columns)} feature columns")
@@ -178,28 +181,47 @@ class EmbeddingDataLoader:
                 features = np.nan_to_num(features, posinf=1e10, neginf=-1e10)
             
             # 극단값 클리핑 (정규화 전)
-            # 각 피처별로 99 percentile 기준으로 강력하게 클리핑
+            # 각 피처별로 강력하게 클리핑
             logger.info("Applying robust clipping to features...")
+            clip_info = []
+            
             for i in range(features.shape[1]):
                 col = features[:, i]
                 
-                # 더 강력한 클리핑: 99 percentile
-                p99 = np.percentile(col, 99)
-                p01 = np.percentile(col, 1)
+                # 95 percentile 기준 (더 강력한 클리핑)
+                p95 = np.percentile(col, 95)
+                p05 = np.percentile(col, 5)
                 
-                # 추가 안전장치: 절대값이 너무 크면 강제 클리핑
-                max_abs_value = max(abs(p99), abs(p01))
-                if max_abs_value > 10000:  # 1만 이상이면
-                    # IQR 기반 클리핑
+                # 절대적 상한선 설정: 10,000
+                # 거래량/거래대금 같은 큰 값도 이 범위 내로 제한
+                ABSOLUTE_MAX = 10000
+                
+                if abs(p95) > ABSOLUTE_MAX or abs(p05) > ABSOLUTE_MAX:
+                    # 매우 큰 값: IQR 기반으로 클리핑
                     q75 = np.percentile(col, 75)
                     q25 = np.percentile(col, 25)
                     iqr = q75 - q25
                     median = np.median(col)
-                    # median ± 3*IQR로 클리핑
-                    p99 = median + 3 * iqr
-                    p01 = median - 3 * iqr
+                    
+                    # median ± 2*IQR로 클리핑 (3 → 2로 더 강하게)
+                    p_upper = median + 2 * iqr
+                    p_lower = median - 2 * iqr
+                    
+                    # 그래도 너무 크면 절대 상한선 적용
+                    p_upper = min(p_upper, ABSOLUTE_MAX)
+                    p_lower = max(p_lower, -ABSOLUTE_MAX)
+                    
+                    clip_info.append(f"Feature {i}: [{p_lower:.2f}, {p_upper:.2f}]")
+                else:
+                    p_upper = p95
+                    p_lower = p05
                 
-                features[:, i] = np.clip(col, p01, p99)
+                features[:, i] = np.clip(col, p_lower, p_upper)
+            
+            if clip_info:
+                logger.info(f"Clipped {len(clip_info)} features with large values")
+                for info in clip_info[:5]:  # 처음 5개만 로깅
+                    logger.info(f"  {info}")
             
             logger.info(f"Data range after clipping: [{np.min(features):.4f}, {np.max(features):.4f}]")
             
