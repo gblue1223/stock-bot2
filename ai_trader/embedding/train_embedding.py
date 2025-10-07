@@ -47,6 +47,48 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class EarlyStopping:
+    """
+    Early Stopping 구현
+    
+    검증 손실이 개선되지 않으면 훈련을 조기 종료합니다.
+    """
+    def __init__(self, patience=5, min_delta=0.001):
+        """
+        Args:
+            patience: 개선이 없어도 기다릴 에포크 수
+            min_delta: 개선으로 간주할 최소 변화량
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        
+    def __call__(self, val_loss):
+        """
+        검증 손실을 확인하고 early stopping 여부 결정
+        
+        Args:
+            val_loss: 현재 검증 손실
+            
+        Returns:
+            True if early stopping should be triggered
+        """
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            logger.info(f"EarlyStopping counter: {self.counter}/{self.patience}")
+            if self.counter >= self.patience:
+                self.early_stop = True
+                return True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+        return False
+
+
 def parse_args():
     """CLI 인수 파싱"""
     parser = argparse.ArgumentParser(
@@ -334,10 +376,11 @@ def train_epoch(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-    epoch: int
+    epoch: int,
+    scaler: torch.cuda.amp.GradScaler = None
 ) -> float:
     """
-    한 에포크 훈련
+    한 에포크 훈련 (Mixed Precision 지원)
     
     Args:
         model: 모델
@@ -346,6 +389,7 @@ def train_epoch(
         optimizer: Optimizer
         device: 디바이스
         epoch: 현재 에포크
+        scaler: GradScaler for mixed precision (optional)
         
     Returns:
         평균 손실
@@ -360,22 +404,42 @@ def train_epoch(
         positive = positive.to(device)
         negative = negative.to(device)
         
-        # Forward pass
-        anchor_emb = model(anchor)
-        positive_emb = model(positive)
-        negative_emb = model(negative)
-        
-        # 부정 샘플을 배치 차원으로 변환 (InfoNCE 손실 함수 형식에 맞춤)
-        # (batch, embedding_dim) -> (batch, 1, embedding_dim)
-        negative_emb = negative_emb.unsqueeze(1)
-        
-        # 손실 계산
-        loss = criterion(anchor_emb, positive_emb, negative_emb)
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # Mixed Precision Training
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                # Forward pass
+                anchor_emb = model(anchor)
+                positive_emb = model(positive)
+                negative_emb = model(negative)
+                
+                # 부정 샘플을 배치 차원으로 변환
+                negative_emb = negative_emb.unsqueeze(1)
+                
+                # 손실 계산
+                loss = criterion(anchor_emb, positive_emb, negative_emb)
+            
+            # Backward pass with gradient scaling
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            # Standard training (no mixed precision)
+            # Forward pass
+            anchor_emb = model(anchor)
+            positive_emb = model(positive)
+            negative_emb = model(negative)
+            
+            # 부정 샘플을 배치 차원으로 변환
+            negative_emb = negative_emb.unsqueeze(1)
+            
+            # 손실 계산
+            loss = criterion(anchor_emb, positive_emb, negative_emb)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
         
         # 통계 업데이트
         total_loss += loss.item()
@@ -608,7 +672,25 @@ def main():
     
     # 손실 함수 및 Optimizer 초기화
     criterion = InfoNCELoss(temperature=args.temperature)
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    
+    # Learning Rate Scheduler 초기화
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.lr * 0.01
+    )
+    logger.info(f"Learning rate scheduler: CosineAnnealingLR (eta_min={args.lr * 0.01})")
+    
+    # Mixed Precision Training 초기화
+    scaler = None
+    if device.type == 'cuda':
+        scaler = torch.cuda.amp.GradScaler()
+        logger.info("Mixed Precision Training enabled (AMP)")
+    
+    # Early Stopping 초기화
+    early_stopping = EarlyStopping(patience=5, min_delta=0.001)
+    logger.info("Early Stopping enabled (patience=5, min_delta=0.001)")
     
     # 체크포인트 재개 (선택사항)
     start_epoch = 1
@@ -634,14 +716,19 @@ def main():
                 criterion=criterion,
                 optimizer=optimizer,
                 device=device,
-                epoch=epoch
+                epoch=epoch,
+                scaler=scaler  # Mixed Precision
             )
             
             logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
             
+            # Learning rate 업데이트
+            current_lr = optimizer.param_groups[0]['lr']
+            scheduler.step()
+            
             # TensorBoard 로깅 (훈련 손실은 항상 로깅)
             writer.add_scalar('train/loss', train_loss, epoch)
-            writer.add_scalar('learning_rate', args.lr, epoch)
+            writer.add_scalar('learning_rate', current_lr, epoch)
             writer.flush()  # 즉시 디스크에 기록
             
             # 검증 (val_every 주기마다 실행)
@@ -692,6 +779,15 @@ def main():
                         output_dir=output_dir
                     )
                     logger.info(f"New best model saved with val_loss: {val_loss:.4f}")
+                
+                # Early Stopping 체크
+                if early_stopping(val_loss):
+                    logger.info(f"\n{'='*80}")
+                    logger.info("Early Stopping triggered!")
+                    logger.info(f"Best validation loss: {early_stopping.best_loss:.4f}")
+                    logger.info(f"No improvement for {early_stopping.patience} epochs")
+                    logger.info(f"{'='*80}\n")
+                    break
             
             # 주기적 체크포인트 저장
             if epoch % args.checkpoint_interval == 0:

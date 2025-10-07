@@ -37,7 +37,7 @@ class TradingEmbeddingModel(nn.Module):
         seq_len: int = 60,
         num_heads: int = 4,
         conv_channels: Optional[list] = None,
-        dropout: float = 0.1
+        dropout: float = 0.2
     ):
         super().__init__()
         
