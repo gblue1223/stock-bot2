@@ -252,6 +252,13 @@ def parse_args():
         help='검증 주기 (에포크 단위, 기본값: 1 = 매 에포크마다 검증)'
     )
     
+    parser.add_argument(
+        '--log-interval',
+        type=int,
+        default=10,
+        help='로그 출력 간격 (배치 단위, 기본값: 10)'
+    )
+    
     # 데이터 필터링 설정
     parser.add_argument(
         '--start-date',
@@ -417,7 +424,9 @@ def train_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
     epoch: int,
-    scaler: torch.cuda.amp.GradScaler = None
+    scaler: torch.cuda.amp.GradScaler = None,
+    log_interval: int = 10,
+    chunk_info: tuple = None
 ) -> float:
     """
     한 에포크 훈련 (Mixed Precision 지원)
@@ -430,6 +439,8 @@ def train_epoch(
         device: 디바이스
         epoch: 현재 에포크
         scaler: GradScaler for mixed precision (optional)
+        log_interval: 로그 출력 간격 (배치 단위)
+        chunk_info: (chunk_idx, num_chunks) 튜플 (증분 학습용, optional)
         
     Returns:
         평균 손실
@@ -504,8 +515,12 @@ def train_epoch(
         num_batches += 1
         
         # 진행 상황 출력
-        if (batch_idx + 1) % 10 == 0:
-            logger.info(f"Epoch [{epoch}] Batch [{batch_idx + 1}/{len(dataloader)}] Loss: {loss_value:.4f}")
+        if (batch_idx + 1) % log_interval == 0:
+            if chunk_info:
+                chunk_idx, num_chunks = chunk_info
+                logger.info(f"Chunk [{chunk_idx + 1}/{num_chunks}] Batch [{batch_idx + 1}/{len(dataloader)}] Loss: {loss_value:.4f}")
+            else:
+                logger.info(f"Epoch [{epoch}] Batch [{batch_idx + 1}/{len(dataloader)}] Loss: {loss_value:.4f}")
     
     avg_loss = total_loss / num_batches
     return avg_loss
@@ -864,7 +879,9 @@ def train_incremental(args, device, output_dir, writer):
                 optimizer=optimizer,
                 device=device,
                 epoch=global_epoch,
-                scaler=torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+                scaler=torch.amp.GradScaler('cuda') if device.type == 'cuda' else None,
+                log_interval=args.log_interval,
+                chunk_info=(chunk_idx, num_chunks)
             )
             
             logger.info(f"Chunk {chunk_idx + 1}, Epoch {epoch} - Train Loss: {train_loss:.4f}")
@@ -1062,7 +1079,8 @@ def main():
                 optimizer=optimizer,
                 device=device,
                 epoch=epoch,
-                scaler=scaler  # Mixed Precision
+                scaler=scaler,  # Mixed Precision
+                log_interval=args.log_interval
             )
             
             logger.info(f"Epoch {epoch} - Train Loss: {train_loss:.4f}")
