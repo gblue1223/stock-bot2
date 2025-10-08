@@ -196,7 +196,7 @@ def parse_args():
         '--checkpoint-interval',
         type=int,
         default=5,
-        help='체크포인트 저장 간격 (에포크 단위)'
+        help='체크포인트 저장 간격 (일반 모드: 에포크 단위, 증분 모드: 청크 단위)'
     )
     
     parser.add_argument(
@@ -893,17 +893,20 @@ def train_incremental(args, device, output_dir, writer):
             # Learning rate 업데이트
             scheduler.step()
         
-        # 청크 완료 후 체크포인트 저장
-        checkpoint_path = output_dir / f'checkpoint_chunk{chunk_idx + 1}.pt'
-        torch.save({
-            'chunk': chunk_idx + 1,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'normalization_stats': normalization_stats,
-            'args': vars(args)
-        }, checkpoint_path)
-        logger.info(f"Checkpoint saved: {checkpoint_path}")
+        # 청크 완료 후 체크포인트 저장 (checkpoint_interval 간격으로)
+        if (chunk_idx + 1) % args.checkpoint_interval == 0 or (chunk_idx + 1) == num_chunks:
+            checkpoint_path = output_dir / f'checkpoint_chunk{chunk_idx + 1}.pt'
+            torch.save({
+                'chunk': chunk_idx + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'normalization_stats': normalization_stats,
+                'args': vars(args)
+            }, checkpoint_path)
+            logger.info(f"Checkpoint saved: {checkpoint_path}")
+        else:
+            logger.info(f"Skipping checkpoint save for chunk {chunk_idx + 1} (interval: {args.checkpoint_interval})")
     
     # 최종 모델 저장
     final_model_path = output_dir / 'final_model.pt'
