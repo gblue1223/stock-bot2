@@ -21,21 +21,29 @@ from .models import CNNLSTMAttn, ModelConfig
 
 
 def get_requested_features() -> list[str]:
+    """
+    Returns all columns needed for data loading and grouping.
+    Note: 날짜, 종목코드, 종목명, 시간 are used for grouping/filtering but excluded from model features.
+    Only their encoded versions (종목명_scalar, 시간_sin, etc.) are used as model inputs.
+    """
     return [
-        "날짜", "현재가", "등락률", "누적거래대금", "거래회전율", "체결강도",
-        "매도호가수량1", "매도호가수량2", "매도호가수량3", "매도호가수량4", "매도호가수량5",
-        "매도호가수량6", "매도호가수량7", "매도호가수량8", "매도호가수량9", "매도호가수량10",
-        "매수호가수량1", "매수호가수량2", "매수호가수량3", "매수호가수량4", "매수호가수량5",
-        "매수호가수량6", "매수호가수량7", "매수호가수량8", "매수호가수량9", "매수호가수량10",
-        "매도호가총잔량", "매수호가총잔량",
-        "매도거래원수량1", "매도거래원수량2", "매도거래원수량3", "매도거래원수량4", "매도거래원수량5",
-        "매도거래원별증감1", "매도거래원별증감2", "매도거래원별증감3", "매도거래원별증감4", "매도거래원별증감5",
-        "매수거래원수량1", "매수거래원수량2", "매수거래원수량3", "매수거래원수량4", "매수거래원수량5",
-        "매수거래원별증감1", "매수거래원별증감2", "매수거래원별증감3", "매수거래원별증감4", "매수거래원별증감5",
-        "매도거래원1_scalar", "매도거래원2_scalar", "매도거래원3_scalar", "매도거래원4_scalar", "매도거래원5_scalar",
-        "매수거래원1_scalar", "매수거래원2_scalar", "매수거래원3_scalar", "매수거래원4_scalar", "매수거래원5_scalar",
-        "종목명_scalar", "시간_scalar", "시간_sin", "시간_cos",
+        "날짜", "종목코드", "종목명", "시간", "등락률", "누적거래대금", "거래회전율", "체결강도", 
+        "매도대기금액1", "매도대기금액2", "매도대기금액3", "매도대기금액4", "매도대기금액5",
+        "매도대기금액6", "매도대기금액7", "매도대기금액8", "매도대기금액9", "매도대기금액10",
+        "매수대기금액1", "매수대기금액2", "매수대기금액3", "매수대기금액4", "매수대기금액5",
+        "매수대기금액6", "매수대기금액7", "매수대기금액8", "매수대기금액9", "매수대기금액10",
+        "종목명_scalar", "시간_sin", "시간_cos", "시간_scalar"
     ]
+
+
+def get_model_features(all_features: list[str]) -> list[str]:
+    """
+    Filters out non-numeric identifier columns that cannot be used as model inputs.
+    Excludes: 날짜, 종목코드, 종목명, 시간 (string/identifier columns)
+    Keeps: their encoded versions and all numeric features
+    """
+    exclude_cols = {"날짜", "종목코드", "종목명", "시간"}
+    return [c for c in all_features if c not in exclude_cols]
 
 
 def convert_date_to_month_inplace(df: pd.DataFrame) -> None:
@@ -476,10 +484,10 @@ def train(
     scheduler_patience: int = 3,         # ReduceLROnPlateau patience
 ):
     """
-    SQLite에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
+    DuckDB에 저장된 시계열 실수(REAL) 컬럼 데이터로 CNN+LSTM+어텐션 모델을 지도학습합니다.
 
     Parameters
-    - db_path (str): 데이터셋이 저장된 SQLite DB 파일 경로.
+    - db_path (str): 데이터셋이 저장된 DuckDB DB 파일 경로.
     - output_dir (str): 체크포인트(`model.pt`)와 학습 메타(`config.json`)를 저장할 디렉터리.
     - table (str, default="datasets"): DB에서 읽어올 테이블명.
     - code (Optional[str], default=None): 특정 종목 코드로 데이터 필터링(예: "005930"). None이면 전체(환경/데이터 로직에 따름).
@@ -832,12 +840,17 @@ def train(
                             # Keep only feature columns (exclude 번호)
                             feats = df_chunk[[c for c in avail_feats if c in df_chunk.columns]].copy()
                             feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                            
+                            # Filter out non-numeric identifier columns before model training
+                            # Keep 날짜, 종목명 for now as they may be needed for target_col lookup,
+                            # but will exclude them from model features later
+                            model_feats = feats[get_model_features(list(feats.columns))].copy()
 
                             # Lazy init model and features
                             if global_features is None:
-                                if feats.empty:
+                                if model_feats.empty:
                                     return (False, None)
-                                global_features = list(feats.columns)
+                                global_features = list(model_feats.columns)
                                 tgt = target_col or ("현재가" if "현재가" in global_features else global_features[0])
                                 # Safety: for direction3, enforce price-like target if possible
                                 if aux_task == "direction3":
@@ -875,14 +888,14 @@ def train(
                                     except Exception as e:
                                         print(f"Failed to load model state: {e}")
                                         print("Using fresh model...")
-                            # Align to global feature order
-                            feats = feats.reindex(columns=global_features, fill_value=0.0)
+                            # Align to global feature order (use model_feats which excludes string columns)
+                            model_feats = model_feats.reindex(columns=global_features, fill_value=0.0)
                             
                             # IMPORTANT: Do NOT re-normalize here. Datasets are already normalized
                             # by scripts/normalize_datasets.py. Per-chunk normalization causes scale
                             # drift across chunks and within concatenated tails, destabilizing loss.
                             # Use features as-is.
-                            feats_all = pd.concat([prev_tail_feats, feats], axis=0, ignore_index=True) if prev_tail_feats is not None else feats
+                            feats_all = pd.concat([prev_tail_feats, model_feats], axis=0, ignore_index=True) if prev_tail_feats is not None else model_feats
 
                             # Build sequences from concatenated features
                             T = len(feats_all)
@@ -1389,7 +1402,9 @@ def train(
             mask &= (df["날짜"] <= end_date)
         df = df.loc[mask]
 
-    feats = df[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # Filter out non-numeric identifier columns for model training
+    model_features = get_model_features(available_features)
+    feats = df[model_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     real_cols = list(feats.columns)
 
     # Target setup (기존 로직 유지: 지정 없고 '현재가'가 없으면 첫 feature 사용됨)
@@ -1418,7 +1433,7 @@ def train(
                     df_g = df_g.sort_values("번호")
                 elif {"날짜", "시간_scalar"}.issubset(df_g.columns):
                     df_g = df_g.sort_values(["날짜", "시간_scalar"]) 
-                feats_g = df_g[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                feats_g = df_g[model_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
                 Xg, yg = build_sequences_from_feats(feats_g, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
                 if Xg.size > 0:
                     X_chunks.append(Xg)
@@ -1434,7 +1449,7 @@ def train(
                     df_g = df_g.sort_values("번호")
                 elif {"날짜", "시간_scalar"}.issubset(df_g.columns):
                     df_g = df_g.sort_values(["날짜", "시간_scalar"]) 
-                feats_g = df_g[available_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+                feats_g = df_g[model_features].replace([np.inf, -np.inf], np.nan).fillna(0.0)
                 Xg, yg = build_sequences_from_feats(feats_g, tgt_col, seq_len, horizon, aux_task, direction3_threshold)
                 if Xg.size > 0:
                     X_chunks.append(Xg)
@@ -1682,8 +1697,8 @@ def train(
 
 
 def main():
-    p = argparse.ArgumentParser(description="SQLite REAL 컬럼 기반 CNN+LSTM+어텐션 지도학습")
-    p.add_argument("--db", default="datasets/datasets.db", help="데이터셋 SQLite DB 파일 경로. 기본값: datasets/datasets.db")
+    p = argparse.ArgumentParser(description="DuckDB REAL 컬럼 기반 CNN+LSTM+어텐션 지도학습")
+    p.add_argument("--db", default="datasets/datasets.db", help="데이터셋 DuckDB DB 파일 경로. 기본값: datasets/datasets.db")
     p.add_argument("--table", default="datasets", help="DB에서 사용할 테이블명. 기본값: datasets")
     p.add_argument("--code", default=None, help="특정 종목 코드로 필터링(예: 005930). 미지정 시 전체/로직에 따름")
     p.add_argument("--date", default=None, help="특정 일자(YYYYMMDD)로 필터링. 미지정 시 전체/로직에 따름")
