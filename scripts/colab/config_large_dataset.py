@@ -26,6 +26,7 @@ from pathlib import Path
 # Colab Pro+ (52GB RAM): 1000만 ~ 2000만
 # A100 80GB 최적화: 5천만 샘플 전체 사용 가능
 MAX_SAMPLES = 50000000  # 5천만 샘플 (100%, 월별 전체 데이터)
+MAX_CHUNKS = 10000000
 
 # 데이터 기간
 YEAR = 2024
@@ -36,7 +37,8 @@ END_MONTH = 12
 # 모델 아키텍처
 # ========================================
 
-SEQ_LEN = 60
+# 속도 최적화: 시퀀스 길이 감소 (가장 효과적!)
+SEQ_LEN = 30  # 60 → 30 (계산량 50% 감소)
 EMBEDDING_DIM = 128
 NUM_HEADS = 4
 
@@ -54,9 +56,9 @@ WEIGHT_DECAY = 1e-4  # L2 regularization
 # A100 (80GB): 4096 ~ 8192 (최적)
 BATCH_SIZE = 4096  # A100 80GB 최적화
 
-# 에포크 수 (A100 80GB 최적화)
-INITIAL_EPOCHS = 15  # 대용량 데이터에 맞게 증가
-FINETUNE_EPOCHS = 10  # Fine-tuning도 충분히
+# 에포크 수 (속도 우선)
+INITIAL_EPOCHS = 3  # 15 → 10 (속도 우선)
+FINETUNE_EPOCHS = 2   # 10 → 5
 
 # 학습률 (NaN 방지를 위해 매우 보수적으로 설정)
 INITIAL_LR = 5e-5  # 1e-4 → 5e-5 (더 안정적)
@@ -94,8 +96,10 @@ PIN_MEMORY = True
 # 체크포인트 및 검증
 # ========================================
 
-CHECKPOINT_INTERVAL = 3  # A100: 더 적게 저장 (속도 우선)
-VAL_EVERY = 2  # 2 에포크마다 검증 (속도 향상)
+CHECKPOINT = "/content/drive/MyDrive/models/embedding_2024_09"
+CHECKPOINT_INTERVAL = 1  # 3 → 5 (체크포인트 저장 시간 절약)
+VAL_EVERY = 1  # 2 → 3 (검증 시간 절약)
+LOG_INTERVAL = 50  # 로그 출력 간격 (10 → 50, I/O 감소)
 
 # Early Stopping
 USE_EARLY_STOPPING = True
