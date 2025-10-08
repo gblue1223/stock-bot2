@@ -147,11 +147,11 @@ def _build_union_schema(inputs: List[str], table: str, strict: bool = False) -> 
                     pass
         if not cols_types:
             return []
-        # Provide a stable column order: prioritize 날짜, 번호, then the rest alphabetically
+        # Provide a stable column order: prioritize 날짜, then the rest alphabetically
+        # Exclude 번호 column
         ordered_cols = []
-        for special in ["날짜", "번호"]:
-            if special in cols_types:
-                ordered_cols.append(special)
+        if "날짜" in cols_types:
+            ordered_cols.append("날짜")
         for c in sorted(k for k in cols_types.keys() if k not in {"날짜", "번호"}):
             ordered_cols.append(c)
         if strict and first_schema is not None:
@@ -267,7 +267,11 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
                 if dedup_keys:
                     _delete_existing_by_keys(conn, table, alias, dedup_keys)
                 # Insert by name; requires all columns exist in target
-                conn.execute(f"INSERT INTO {table} BY NAME SELECT * FROM {alias}.{table}")
+                # Exclude 번호 column if it exists
+                src_schema = _read_schema(conn, alias, table)
+                src_cols = [c for c, _ in src_schema if c != "번호"]
+                cols_list = ", ".join([f'"{c}"' for c in src_cols])
+                conn.execute(f"INSERT INTO {table} ({cols_list}) SELECT {cols_list} FROM {alias}.{table}")
                 inserted_so_far += file_rows
                 pct_after = idx / n * 100.0
                 global_pct_rows = (inserted_so_far / total_rows * 100.0) if total_rows > 0 else 0.0
@@ -279,11 +283,23 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
                     conn.execute(f"DETACH {alias}")
                 except Exception:
                     pass
+        # Sort the merged data by 날짜, 종목코드, 시간
+        print("데이터 정렬중: 날짜, 종목코드, 시간 순서로...")
+        try:
+            # Create a temporary sorted table
+            conn.execute(f"CREATE TABLE {table}_sorted AS SELECT * FROM {table} ORDER BY \"날짜\", \"종목코드\", \"시간\"")
+            # Drop original and rename
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {table}_sorted RENAME TO {table}")
+            print("데이터 정렬 완료")
+        except Exception as e:
+            print(f"경고: 데이터 정렬 실패: {type(e).__name__}: {e}")
+        
         # Create index after merge
         try:
-            print("인덱스 생성중: idx_datasets_code_date_time (종목코드, 날짜, 시간)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date_time ON datasets(\"종목코드\", \"날짜\", \"시간\")")
-            print("인덱스 생성 완료: idx_datasets_code_date_time (종목코드, 날짜, 시간)")
+            print("인덱스 생성중: idx_datasets_code_date_time (날짜, 종목코드, 시간)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date_time ON datasets(\"날짜\", \"종목코드\", \"시간\")")
+            print("인덱스 생성 완료: idx_datasets_code_date_time (날짜, 종목코드, 시간)")
         except Exception as e:
             print(f"경고: 인덱스 생성 실패: {type(e).__name__}: {e}")
         # Final checkpoint

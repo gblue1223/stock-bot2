@@ -14,9 +14,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-# Global sequential counter for '번호'
-NO_COUNTER: int = 1
-
 INPUT_TABLE = "datasets"  # 입력 DuckDB 테이블명
 TEXT_COLUMNS = {"종목코드", "종목명", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
 DROP_COLUMNS = {"종류", "씨리얼"}
@@ -222,7 +219,7 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
                 SELECT *
                 FROM {INPUT_TABLE}
                 WHERE "종목코드" = ? AND "날짜" = ?
-                ORDER BY "번호"
+                ORDER BY "시간"
             """
             df = conn.execute(query, [code, date]).df()
             
@@ -283,11 +280,6 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
 
             # 불필요 컬럼 제거
             df = df.drop(columns=[col for col in DROP_COLUMNS if col in df.columns], errors="ignore")
-            
-            # '번호' 숫자화 보정
-            if '번호' in df.columns:
-                df['번호'] = pd.to_numeric(df['번호'], errors='coerce')
-            
             return df
         finally:
             conn.close()
@@ -303,9 +295,6 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     # 최후 방어: 중복 컬럼 제거(이미 로드 시 처리했지만 합병 과정에서 생길 수 있음)
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()]
-    
-    # 번호 컬럼 기준으로 정렬
-    df = df.sort_values('번호').reset_index(drop=True)
     
     # 텍스트 컬럼과 숫자 컬럼 분리
     text_cols = [col for col in df.columns if col in TEXT_COLUMNS]
@@ -405,7 +394,6 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
         
         # 최종 컬럼 순서 맞추기
         df = df[["번호", *FINAL_COLUMNS]]
-        
         return df
     
     # 레거시: 여러 타입이 분리되어 있는 경우 (향후 확장용)
@@ -688,11 +676,11 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
                 else:
                     col_type = 'DOUBLE'
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN \"{col}\" {col_type}")
-        # Enforce VARCHAR for known text columns if mismatched (e.g., '종목명' mistakenly INT)
-        text_like = set(TEXT_COLUMNS) | {"날짜", "종목명"}
+        # Enforce VARCHAR for known text columns if mismatched (e.g., '종목코드' mistakenly INT)
+        text_like = set(TEXT_COLUMNS) | {"날짜", "종목코드", "시간"}
         # Drop dependent index before altering types to avoid catalog error
         try:
-            conn.execute("DROP INDEX IF EXISTS idx_datasets_code_date")
+            conn.execute("DROP INDEX IF EXISTS idx_datasets_code_date_time")
         except Exception:
             pass
         for col in (c for c in df.columns if c in text_like and c in existing_types):
@@ -700,7 +688,8 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
             if "CHAR" not in ctype and "STRING" not in ctype and "VARCHAR" not in ctype:
                 conn.execute(f"ALTER TABLE {table} ALTER COLUMN \"{col}\" TYPE VARCHAR")
     # Helpful index (recreate if dropped)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_datasets_code_date_time ON datasets(\"날짜\", \"종목코드\", \"시간\")")
 
 
 def _month_key_from_yyyymmdd(date_str: str) -> str:
@@ -723,12 +712,6 @@ def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: st
     try:
         with open(pkl_path, 'rb') as f:
             merged_df = _pickle.load(f)
-        # Overwrite/assign global sequential '번호'
-        global NO_COUNTER
-        n_rows = len(merged_df)
-        if n_rows > 0:
-            merged_df['번호'] = np.arange(NO_COUNTER, NO_COUNTER + n_rows, dtype=np.int64)
-            NO_COUNTER += n_rows
         conn = duckdb.connect(db_path)
         try:
             ensure_datasets_table_duckdb(conn, merged_df)
@@ -836,12 +819,6 @@ def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, ch
             # Load pickle and extract metadata
             with open(pkl_path, 'rb') as f:
                 merged_df = _pickle.load(f)
-            # Overwrite/assign global sequential '번호'
-            global NO_COUNTER
-            n_rows = len(merged_df)
-            if n_rows > 0:
-                merged_df['번호'] = np.arange(NO_COUNTER, NO_COUNTER + n_rows, dtype=np.int64)
-                NO_COUNTER += n_rows
             
             group_key = Path(pkl_path).stem
             parts = group_key.split('_')
