@@ -4,6 +4,7 @@
 대조 학습을 사용하여 매매 데이터로부터 임베딩 모델을 훈련합니다.
 
 사용 예시:
+    # 일반 훈련
     python -m ai_trader.embedding.train_embedding \
         --db "C:\\Users\\user\\Workspace\\datasets@20251005\\datasets_norm_all.duckdb" \
         --table datasets \
@@ -14,6 +15,31 @@
         --epochs 50 \
         --lr 1e-4 \
         --device cuda
+    
+    # 증분 학습 (전체 데이터 활용)
+    python -m ai_trader.embedding.train_embedding \
+        --db datasets_norm_all.duckdb \
+        --table datasets \
+        --out models/embedding_incremental \
+        --batch-size 4096 \
+        --epochs 10 \
+        --lr 5e-5 \
+        --max-samples 30000000 \
+        --incremental \
+        --chunk-size 10000000
+    
+    # 증분 학습 재개 (중단된 지점부터)
+    python -m ai_trader.embedding.train_embedding \
+        --db datasets_norm_all.duckdb \
+        --table datasets \
+        --out models/embedding_incremental \
+        --batch-size 4096 \
+        --epochs 10 \
+        --lr 5e-5 \
+        --max-samples 30000000 \
+        --incremental \
+        --chunk-size 10000000 \
+        --resume models/embedding_incremental/checkpoint_chunk2.pt
 """
 
 import argparse
@@ -177,7 +203,7 @@ def parse_args():
         '--resume',
         type=str,
         default=None,
-        help='재개할 체크포인트 경로 (선택사항)'
+        help='재개할 체크포인트 경로 또는 디렉토리 (디렉토리 지정 시 최신 청크 자동 탐색)'
     )
     
     # 모델 하이퍼파라미터 (추가)
@@ -253,7 +279,21 @@ def parse_args():
         '--max-samples',
         type=int,
         default=None,
-        help='최대 샘플 수 (메모리 제한 시 사용, 예: 1000000)'
+        help='최대 샘플 수 (일반: 로드할 샘플 수, 증분: 전체 샘플 수, 예: 30000000)'
+    )
+    
+    # 증분 학습 설정
+    parser.add_argument(
+        '--incremental',
+        action='store_true',
+        help='증분 학습 모드 활성화 (데이터를 청크로 나눠서 학습)'
+    )
+    
+    parser.add_argument(
+        '--chunk-size',
+        type=int,
+        default=10000000,
+        help='증분 학습 시 청크 크기 (기본값: 1천만, max-samples를 이 크기로 나눔)'
     )
     
     return parser.parse_args()
@@ -570,12 +610,53 @@ def validate(
     return avg_loss, all_embeddings, all_stock_codes, all_timestamps
 
 
-def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
+def find_latest_checkpoint(resume_path: str) -> Optional[str]:
     """
-    정규화 통계 계산
+    최신 체크포인트 파일 찾기
     
     Args:
-        data: 데이터 배열 (n_samples, n_features)
+        resume_path: 체크포인트 파일 경로 또는 디렉토리 경로
+        
+    Returns:
+        최신 체크포인트 파일 경로 또는 None
+    """
+    import re
+    
+    resume_path = Path(resume_path)
+    
+    # 파일이면 그대로 반환
+    if resume_path.is_file():
+        logger.info(f"Using checkpoint file: {resume_path}")
+        return str(resume_path)
+    
+    # 디렉토리면 최신 청크 파일 찾기
+    if resume_path.is_dir():
+        checkpoint_pattern = "checkpoint_chunk*.pt"
+        checkpoint_files = list(resume_path.glob(checkpoint_pattern))
+        
+        if not checkpoint_files:
+            logger.warning(f"No checkpoint files found in {resume_path}")
+            return None
+        
+        # 청크 번호로 정렬하여 최신 파일 찾기
+        def extract_chunk_number(path):
+            match = re.search(r'checkpoint_chunk(\d+)\.pt', path.name)
+            return int(match.group(1)) if match else 0
+        
+        latest_checkpoint = max(checkpoint_files, key=extract_chunk_number)
+        logger.info(f"Found latest checkpoint: {latest_checkpoint}")
+        return str(latest_checkpoint)
+    
+    logger.warning(f"Resume path not found: {resume_path}")
+    return None
+
+
+def compute_normalization_stats(data: np.ndarray) -> Dict[str, Any]:
+    """
+    정규화 통계 계산 (Robust Normalization)
+    
+    Args:
+        data: 입력 데이터 (n_samples, n_features)
         
     Returns:
         정규화 통계 (mean, std)
@@ -616,11 +697,233 @@ def compute_normalization_stats(data: np.ndarray) -> Dict[str, np.ndarray]:
     }
 
 
+def train_incremental(args, device, output_dir, writer):
+    """
+    증분 학습 함수 - 데이터를 청크로 나눠서 순차적으로 학습
+    
+    Args:
+        args: CLI 인수
+        device: torch device
+        output_dir: 출력 디렉토리
+        writer: TensorBoard writer
+    """
+    if not args.max_samples:
+        raise ValueError("증분 학습 모드에서는 --max-samples 인수가 필요합니다")
+    
+    chunk_size = args.chunk_size
+    total_samples = args.max_samples  # max_samples가 전체 샘플 수
+    num_chunks = (total_samples + chunk_size - 1) // chunk_size
+    
+    logger.info("=" * 80)
+    logger.info("증분 학습 모드")
+    logger.info("=" * 80)
+    logger.info(f"전체 샘플: {total_samples:,}")
+    logger.info(f"청크 크기: {chunk_size:,}")
+    logger.info(f"총 청크 수: {num_chunks}")
+    logger.info("=" * 80)
+    
+    model = None
+    optimizer = None
+    scheduler = None
+    normalization_stats = None
+    start_chunk_idx = 0
+    
+    # Resume 체크포인트 로드
+    if args.resume:
+        # 최신 체크포인트 찾기 (디렉토리 또는 파일)
+        checkpoint_path = find_latest_checkpoint(args.resume)
+        
+        if checkpoint_path is not None:
+            logger.info(f"Loading checkpoint from: {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            
+            start_chunk_idx = checkpoint.get('chunk', 0)
+            normalization_stats = checkpoint.get('normalization_stats')
+            
+            logger.info(f"Resuming from chunk {start_chunk_idx + 1}/{num_chunks}")
+            
+            # 모델 초기화 (첫 청크 데이터로 input_dim 확인 필요)
+            # 임시로 데이터 로더 생성
+            temp_loader = EmbeddingDataLoader(
+                db_path=args.db,
+                table_name=args.table,
+                seq_len=args.seq_len,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                stock_codes=args.stock_codes,
+                max_samples=1000,  # 작은 샘플로 빠르게
+                offset=0
+            )
+            temp_loader.connect()
+            feature_names = temp_loader._get_feature_columns()
+            input_dim = len(feature_names)
+            temp_loader.close()
+            
+            # 모델 재생성 및 가중치 로드
+            model = TradingEmbeddingModel(
+                input_dim=input_dim,
+                embedding_dim=args.embedding_dim,
+                seq_len=args.seq_len,
+                num_heads=args.num_heads
+            ).to(device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            
+            # Optimizer 재생성 및 상태 로드
+            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            # Scheduler 재생성 및 상태 로드
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs * num_chunks,
+                eta_min=args.lr * 0.01
+            )
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            
+            logger.info("Checkpoint loaded successfully!")
+            logger.info(f"Continuing from chunk {start_chunk_idx + 1}")
+        else:
+            logger.warning("No checkpoint found. Starting from scratch...")
+    
+    for chunk_idx in range(start_chunk_idx, num_chunks):
+        start_sample = chunk_idx * chunk_size
+        end_sample = min((chunk_idx + 1) * chunk_size, total_samples)
+        current_chunk_size = end_sample - start_sample
+        
+        logger.info("\n" + "=" * 80)
+        logger.info(f"청크 {chunk_idx + 1}/{num_chunks}")
+        logger.info(f"샘플 범위: {start_sample:,} ~ {end_sample:,} ({current_chunk_size:,} 샘플)")
+        logger.info("=" * 80)
+        
+        # 데이터 로더 초기화 (OFFSET과 LIMIT 사용)
+        data_loader = EmbeddingDataLoader(
+            db_path=args.db,
+            table_name=args.table,
+            seq_len=args.seq_len,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            stock_codes=args.stock_codes,
+            max_samples=current_chunk_size,
+            offset=start_sample  # 새 파라미터 필요
+        )
+        
+        # 데이터 로드
+        data_loader.load_and_split_data()
+        
+        # 첫 청크에서만 모델 초기화 및 정규화 통계 계산
+        if chunk_idx == 0:
+            feature_names = data_loader._get_feature_columns()
+            input_dim = len(feature_names)
+            
+            # 정규화 통계 계산
+            normalization_stats = compute_normalization_stats(data_loader.data_splits['train']['data'])
+            
+            # 모델 초기화
+            model = TradingEmbeddingModel(
+                input_dim=input_dim,
+                embedding_dim=args.embedding_dim,
+                seq_len=args.seq_len,
+                num_heads=args.num_heads
+            ).to(device)
+            
+            # Optimizer 초기화
+            criterion = InfoNCELoss(temperature=args.temperature)
+            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=args.epochs * num_chunks,  # 전체 청크 고려
+                eta_min=args.lr * 0.01
+            )
+            
+            logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+        
+        # DataLoader 생성
+        train_dataloader = data_loader.get_dataloader(
+            split='train',
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            return_metadata=False,
+            positive_time_threshold=args.positive_time_threshold,
+            negative_time_threshold=args.negative_time_threshold
+        )
+        
+        # 이 청크에 대해 훈련
+        logger.info(f"Training on chunk {chunk_idx + 1}/{num_chunks}...")
+        
+        for epoch in range(1, args.epochs + 1):
+            global_epoch = chunk_idx * args.epochs + epoch
+            
+            logger.info(f"\nChunk {chunk_idx + 1}/{num_chunks}, Epoch {epoch}/{args.epochs} (Global: {global_epoch})")
+            
+            # 훈련
+            train_loss = train_epoch(
+                model=model,
+                dataloader=train_dataloader,
+                criterion=criterion,
+                optimizer=optimizer,
+                device=device,
+                epoch=global_epoch,
+                scaler=torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+            )
+            
+            logger.info(f"Chunk {chunk_idx + 1}, Epoch {epoch} - Train Loss: {train_loss:.4f}")
+            
+            # TensorBoard 로깅
+            writer.add_scalar('train/loss', train_loss, global_epoch)
+            writer.add_scalar('train/chunk', chunk_idx + 1, global_epoch)
+            
+            # Learning rate 업데이트
+            scheduler.step()
+        
+        # 청크 완료 후 체크포인트 저장
+        checkpoint_path = output_dir / f'checkpoint_chunk{chunk_idx + 1}.pt'
+        torch.save({
+            'chunk': chunk_idx + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'normalization_stats': normalization_stats,
+            'args': vars(args)
+        }, checkpoint_path)
+        logger.info(f"Checkpoint saved: {checkpoint_path}")
+    
+    # 최종 모델 저장
+    final_model_path = output_dir / 'final_model.pt'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'normalization_stats': normalization_stats,
+        'args': vars(args)
+    }, final_model_path)
+    logger.info(f"Final model saved: {final_model_path}")
+    
+    return model, normalization_stats
+
+
 def main():
     """메인 훈련 함수"""
     # CLI 인수 파싱 및 검증
     args = parse_args()
     args = validate_args(args)
+    
+    # 증분 학습 모드 체크
+    if args.incremental:
+        logger.info("증분 학습 모드로 실행합니다...")
+        device = torch.device(args.device if torch.cuda.is_available() and args.device == 'cuda' else 'cpu')
+        output_dir = Path(args.out)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        tensorboard_dir = output_dir / 'tensorboard_logs'
+        tensorboard_dir.mkdir(parents=True, exist_ok=True)
+        writer = SummaryWriter(log_dir=str(tensorboard_dir))
+        
+        try:
+            train_incremental(args, device, output_dir, writer)
+        finally:
+            writer.close()
+        
+        logger.info("증분 학습 완료!")
+        return
     
     # 설정 출력
     logger.info("=" * 80)

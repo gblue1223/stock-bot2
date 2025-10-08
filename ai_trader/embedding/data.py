@@ -46,7 +46,8 @@ class EmbeddingDataLoader:
         start_date: str = None,
         end_date: str = None,
         stock_codes: list = None,
-        max_samples: int = None
+        max_samples: int = None,
+        offset: int = 0  # 증분 학습을 위한 오프셋
     ):
         self.db_path = db_path
         self.table_name = table_name
@@ -58,6 +59,7 @@ class EmbeddingDataLoader:
         self.end_date = end_date
         self.stock_codes = stock_codes
         self.max_samples = max_samples
+        self.offset = offset
         
         # 비율 검증
         if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
@@ -139,7 +141,8 @@ class EmbeddingDataLoader:
             
             where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
             
-            # LIMIT 절 구성
+            # OFFSET과 LIMIT 절 구성 (증분 학습 지원)
+            offset_clause = f"OFFSET {self.offset}" if self.offset > 0 else ""
             limit_clause = f"LIMIT {self.max_samples}" if self.max_samples else ""
             
             # 시간 순서로 정렬하여 데이터 로드
@@ -150,6 +153,7 @@ class EmbeddingDataLoader:
                 WHERE {where_clause}
                 ORDER BY 날짜, 종목코드, 시간
                 {limit_clause}
+                {offset_clause}
             """
             
             logger.info(f"Loading data from {self.table_name}...")
