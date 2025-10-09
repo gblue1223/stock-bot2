@@ -716,6 +716,11 @@ def train_incremental(args, device, output_dir, writer):
     """
     증분 학습 함수 - 데이터를 청크로 나눠서 순차적으로 학습
     
+    증분 학습 방식:
+    - 전체 데이터를 청크로 나누어 순차적으로 학습
+    - 각 청크마다 args.epochs 만큼 반복 학습 (catastrophic forgetting 방지)
+    - 이전 청크의 가중치를 유지하면서 새로운 청크 학습
+    
     Args:
         args: CLI 인수
         device: torch device
@@ -795,8 +800,12 @@ def train_incremental(args, device, output_dir, writer):
             )
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             
+            # Loss function 초기화 (빠뜨린 부분)
+            criterion = InfoNCELoss(temperature=args.temperature)
+            
             logger.info("Checkpoint loaded successfully!")
             logger.info(f"Continuing from chunk {start_chunk_idx + 1}")
+            logger.info(f"Current learning rate: {optimizer.param_groups[0]['lr']:.6f}")
         else:
             logger.warning("No checkpoint found. Starting from scratch...")
     
@@ -866,6 +875,9 @@ def train_incremental(args, device, output_dir, writer):
         # 이 청크에 대해 훈련
         logger.info(f"Training on chunk {chunk_idx + 1}/{num_chunks}...")
         
+        # 청크별 훈련 시작 시간 기록
+        chunk_start_time = datetime.now()
+        
         for epoch in range(1, args.epochs + 1):
             global_epoch = chunk_idx * args.epochs + epoch
             
@@ -889,33 +901,65 @@ def train_incremental(args, device, output_dir, writer):
             # TensorBoard 로깅
             writer.add_scalar('train/loss', train_loss, global_epoch)
             writer.add_scalar('train/chunk', chunk_idx + 1, global_epoch)
+            writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_epoch)
+            writer.flush()  # 즉시 디스크에 기록
             
             # Learning rate 업데이트
             scheduler.step()
+        
+        # 청크 완료 시간 계산
+        chunk_end_time = datetime.now()
+        chunk_duration = chunk_end_time - chunk_start_time
+        logger.info(f"Chunk {chunk_idx + 1} completed in {chunk_duration}")
         
         # 청크 완료 후 체크포인트 저장 (checkpoint_interval 간격으로)
         if (chunk_idx + 1) % args.checkpoint_interval == 0 or (chunk_idx + 1) == num_chunks:
             checkpoint_path = output_dir / f'checkpoint_chunk{chunk_idx + 1}.pt'
             torch.save({
                 'chunk': chunk_idx + 1,
+                'global_epoch': (chunk_idx + 1) * args.epochs,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'normalization_stats': normalization_stats,
-                'args': vars(args)
+                'feature_names': feature_names,
+                'args': vars(args),
+                'timestamp': datetime.now().isoformat()
             }, checkpoint_path)
             logger.info(f"Checkpoint saved: {checkpoint_path}")
         else:
             logger.info(f"Skipping checkpoint save for chunk {chunk_idx + 1} (interval: {args.checkpoint_interval})")
+        
+        # 메모리 정리
+        data_loader.close()
+        del data_loader
+        del train_dataloader
+        torch.cuda.empty_cache() if device.type == 'cuda' else None
     
     # 최종 모델 저장
     final_model_path = output_dir / 'final_model.pt'
     torch.save({
         'model_state_dict': model.state_dict(),
         'normalization_stats': normalization_stats,
-        'args': vars(args)
+        'feature_names': feature_names,
+        'config': {
+            'input_dim': input_dim,
+            'embedding_dim': args.embedding_dim,
+            'seq_len': args.seq_len,
+            'num_heads': args.num_heads
+        },
+        'args': vars(args),
+        'timestamp': datetime.now().isoformat()
     }, final_model_path)
     logger.info(f"Final model saved: {final_model_path}")
+    
+    logger.info("\n" + "=" * 80)
+    logger.info("증분 학습 완료 요약")
+    logger.info("=" * 80)
+    logger.info(f"총 청크 수: {num_chunks}")
+    logger.info(f"총 글로벌 에포크: {num_chunks * args.epochs}")
+    logger.info(f"최종 모델: {final_model_path}")
+    logger.info("=" * 80)
     
     return model, normalization_stats
 
