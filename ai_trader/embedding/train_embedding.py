@@ -232,16 +232,16 @@ def parse_args():
     # 대조 학습 쌍 생성 설정
     parser.add_argument(
         '--positive-time-threshold',
-        type=int,
-        default=10,
-        help='긍정 쌍 시간 임계값 (초, 기본값: 10)'
+        type=float,
+        default=0.05,
+        help='긍정 쌍 시간 임계값 (시간_scalar 사용 시 표준화된 값, 기본값: 0.05)'
     )
     
     parser.add_argument(
         '--negative-time-threshold',
-        type=int,
-        default=60,
-        help='부정 쌍 시간 임계값 (초, 기본값: 60)'
+        type=float,
+        default=0.5,
+        help='부정 쌍 시간 임계값 (시간_scalar 사용 시 표준화된 값, 기본값: 0.5)'
     )
     
     # 검증 및 체크포인트 설정 (추가)
