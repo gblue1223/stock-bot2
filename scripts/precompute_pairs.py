@@ -117,7 +117,9 @@ def precompute_pairs_for_split(
     seq_len: int,
     positive_time_threshold: int,
     negative_time_threshold: int,
-    num_threads: int = 1
+    num_threads: int = 1,
+    checkpoint_path: Path = None,
+    checkpoint_interval: int = 10000
 ) -> tuple:
     """
     특정 데이터 분할에 대한 긍정/부정 쌍 사전 계산
@@ -131,10 +133,32 @@ def precompute_pairs_for_split(
         positive_time_threshold: 긍정 쌍 시간 임계값
         negative_time_threshold: 부정 쌍 시간 임계값
         num_threads: 사용할 스레드 수 (기본값: 1 = 단일 스레드)
+        checkpoint_path: 체크포인트 파일 경로 (선택적)
+        checkpoint_interval: 체크포인트 저장 간격 (기본값: 10000)
     
     Returns:
         (positive_pairs_cache, negative_pairs_cache) 튜플
     """
+    # 체크포인트 로드 (재개 모드)
+    positive_pairs_cache = {}
+    negative_pairs_cache = {}
+    processed_indices = set()
+    
+    if checkpoint_path and checkpoint_path.exists():
+        logger.info(f"Loading checkpoint from {checkpoint_path}...")
+        try:
+            with open(checkpoint_path, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            positive_pairs_cache = checkpoint_data.get('positive_pairs_cache', {})
+            negative_pairs_cache = checkpoint_data.get('negative_pairs_cache', {})
+            processed_indices = set(checkpoint_data.get('processed_indices', []))
+            logger.info(f"Resumed from checkpoint: {len(processed_indices)} indices already processed")
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}")
+            logger.warning("Starting from scratch...")
+            positive_pairs_cache = {}
+            negative_pairs_cache = {}
+            processed_indices = set()
     # 종목별로 시간 정렬된 인덱스 생성
     logger.info("Sorting indices by time for each stock...")
     stock_time_sorted = {}
@@ -143,14 +167,18 @@ def precompute_pairs_for_split(
         stock_time_sorted[stock_code] = sorted_indices
     
     # 각 인덱스에 대해 긍정/부정 쌍 후보 계산
-    logger.info(f"Computing pairs for {len(valid_indices)} valid indices...")
+    remaining_indices = [idx for idx in valid_indices if idx not in processed_indices]
+    logger.info(f"Computing pairs for {len(remaining_indices)} remaining indices (total: {len(valid_indices)})...")
+    
+    if len(remaining_indices) == 0:
+        logger.info("All indices already processed!")
+        return positive_pairs_cache, negative_pairs_cache
     
     if num_threads <= 1:
-        # 단일 스레드 모드 (기존 방식)
-        positive_pairs_cache = {}
-        negative_pairs_cache = {}
+        # 단일 스레드 모드 (체크포인트 지원)
+        processed_count = len(processed_indices)
         
-        for idx in tqdm(valid_indices, desc="Computing pairs"):
+        for i, idx in enumerate(tqdm(remaining_indices, desc="Computing pairs")):
             stock_code = metadata[idx, 0]
             anchor_time = float(metadata[idx, 2])
             
@@ -191,17 +219,28 @@ def precompute_pairs_for_split(
                 negative_candidates = list(valid_indices[:100])
             
             negative_pairs_cache[idx] = negative_candidates
+            processed_indices.add(idx)
+            processed_count += 1
+            
+            # 체크포인트 저장
+            if checkpoint_path and processed_count % checkpoint_interval == 0:
+                logger.info(f"\nSaving checkpoint at {processed_count} indices...")
+                checkpoint_data = {
+                    'positive_pairs_cache': positive_pairs_cache,
+                    'negative_pairs_cache': negative_pairs_cache,
+                    'processed_indices': list(processed_indices),
+                    'total_indices': len(valid_indices)
+                }
+                with open(checkpoint_path, 'wb') as f:
+                    pickle.dump(checkpoint_data, f, protocol=pickle.HIGHEST_PROTOCOL)
     else:
-        # 멀티스레드 모드
+        # 멀티스레드 모드 (체크포인트 미지원)
         logger.info(f"Using {num_threads} threads for parallel processing...")
         
-        # 인덱스를 청크로 분할
-        chunk_size = max(1, len(valid_indices) // (num_threads * 4))  # 스레드당 4개 청크
-        chunks = [valid_indices[i:i + chunk_size] for i in range(0, len(valid_indices), chunk_size)]
+        # 남은 인덱스를 청크로 분할
+        chunk_size = max(1, len(remaining_indices) // (num_threads * 4))  # 스레드당 4개 청크
+        chunks = [remaining_indices[i:i + chunk_size] for i in range(0, len(remaining_indices), chunk_size)]
         logger.info(f"Split into {len(chunks)} chunks (chunk size: ~{chunk_size})")
-        
-        positive_pairs_cache = {}
-        negative_pairs_cache = {}
         
         # ThreadPoolExecutor로 병렬 처리
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
@@ -225,6 +264,13 @@ def precompute_pairs_for_split(
                 pos_pairs, neg_pairs = future.result()
                 positive_pairs_cache.update(pos_pairs)
                 negative_pairs_cache.update(neg_pairs)
+        
+        logger.warning("Note: Checkpointing is not supported in multi-threaded mode")
+    
+    # 최종 체크포인트 삭제 (완료 시)
+    if checkpoint_path and checkpoint_path.exists():
+        logger.info(f"Removing checkpoint file: {checkpoint_path}")
+        checkpoint_path.unlink()
     
     return positive_pairs_cache, negative_pairs_cache
 
@@ -274,10 +320,27 @@ def main():
     parser.add_argument('--stock_codes', type=str, nargs='+', default=None, help='Stock codes to filter')
     parser.add_argument('--max_samples', type=int, default=None, help='Maximum number of samples')
     parser.add_argument(
+        '--chunk_size',
+        type=int,
+        default=None,
+        help='Process data in chunks to avoid OOM (default: auto-detect based on max_samples)'
+    )
+    parser.add_argument(
         '--num_threads',
         type=int,
         default=None,
         help='Number of threads for parallel processing (default: CPU count)'
+    )
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Resume from existing checkpoint (skip already completed splits)'
+    )
+    parser.add_argument(
+        '--checkpoint-interval',
+        type=int,
+        default=10000,
+        help='Save intermediate checkpoint every N indices (default: 10000)'
     )
     
     args = parser.parse_args()
@@ -299,29 +362,109 @@ def main():
     num_threads = args.num_threads if args.num_threads else multiprocessing.cpu_count()
     logger.info(f"Number of threads: {num_threads}")
     
+    # 청크 크기 자동 설정 (OOM 방지)
+    chunk_size = args.chunk_size
+    if chunk_size is None and args.max_samples:
+        # max_samples가 크면 청크로 분할
+        if args.max_samples > 5_000_000:
+            chunk_size = 2_000_000
+            logger.info(f"Auto-detected chunk size: {chunk_size:,} (max_samples: {args.max_samples:,})")
+        elif args.max_samples > 2_000_000:
+            chunk_size = 1_000_000
+            logger.info(f"Auto-detected chunk size: {chunk_size:,} (max_samples: {args.max_samples:,})")
+    
+    if chunk_size:
+        logger.info(f"Using chunked processing with chunk size: {chunk_size:,}")
+        logger.info("This will process data in multiple passes to avoid OOM errors")
+    
     # 데이터 로더 생성 및 데이터 로드
     logger.info("\n" + "=" * 80)
     logger.info("Step 1: Loading data from database")
     logger.info("=" * 80)
     
-    data_loader = EmbeddingDataLoader(
-        db_path=args.db_path,
-        table_name=args.table_name,
-        seq_len=args.seq_len,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        stock_codes=args.stock_codes,
-        max_samples=args.max_samples
-    )
-    
-    data_loader.connect()
-    data_splits = data_loader.load_and_split_data()
+    # 청크 처리가 필요한 경우
+    if chunk_size and args.max_samples and args.max_samples > chunk_size:
+        logger.info(f"Processing in chunks: {args.max_samples // chunk_size + 1} chunks")
+        
+        # 청크별로 처리
+        num_chunks = (args.max_samples + chunk_size - 1) // chunk_size
+        all_data_splits = {'train': {'data': [], 'metadata': []},
+                          'val': {'data': [], 'metadata': []},
+                          'test': {'data': [], 'metadata': []}}
+        
+        for chunk_idx in range(num_chunks):
+            offset = chunk_idx * chunk_size
+            current_chunk_size = min(chunk_size, args.max_samples - offset)
+            
+            logger.info(f"\nProcessing chunk {chunk_idx + 1}/{num_chunks} (offset: {offset:,}, size: {current_chunk_size:,})")
+            
+            data_loader = EmbeddingDataLoader(
+                db_path=args.db_path,
+                table_name=args.table_name,
+                seq_len=args.seq_len,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+                test_ratio=args.test_ratio,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                stock_codes=args.stock_codes,
+                max_samples=current_chunk_size,
+                offset=offset
+            )
+            
+            data_loader.connect()
+            chunk_splits = data_loader.load_and_split_data()
+            data_loader.close()
+            
+            # 청크 데이터 병합
+            for split_name in ['train', 'val', 'test']:
+                all_data_splits[split_name]['data'].append(chunk_splits[split_name]['data'])
+                all_data_splits[split_name]['metadata'].append(chunk_splits[split_name]['metadata'])
+            
+            logger.info(f"Chunk {chunk_idx + 1} loaded successfully")
+        
+        # 모든 청크 병합
+        logger.info("\nMerging all chunks...")
+        data_splits = {}
+        for split_name in ['train', 'val', 'test']:
+            data_splits[split_name] = {
+                'data': np.vstack(all_data_splits[split_name]['data']),
+                'metadata': np.vstack(all_data_splits[split_name]['metadata'])
+            }
+            logger.info(f"{split_name}: {len(data_splits[split_name]['data']):,} samples")
+    else:
+        # 일반 처리 (청크 불필요)
+        data_loader = EmbeddingDataLoader(
+            db_path=args.db_path,
+            table_name=args.table_name,
+            seq_len=args.seq_len,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            stock_codes=args.stock_codes,
+            max_samples=args.max_samples
+        )
+        
+        data_loader.connect()
+        data_splits = data_loader.load_and_split_data()
+        data_loader.close()
     
     # 각 분할(train, val, test)에 대해 쌍 계산
     for split_name in ['train', 'val', 'test']:
+        output_file = output_dir / f"{split_name}_pairs.pkl"
+        
+        # 재개 모드: 이미 완료된 분할 건너뛰기
+        if args.resume and output_file.exists():
+            logger.info("\n" + "=" * 80)
+            logger.info(f"Step 2: Skipping {split_name} split (already exists)")
+            logger.info("=" * 80)
+            logger.info(f"Found existing file: {output_file}")
+            file_size_mb = output_file.stat().st_size / (1024 * 1024)
+            logger.info(f"File size: {file_size_mb:.2f} MB")
+            continue
+        
         logger.info("\n" + "=" * 80)
         logger.info(f"Step 2: Processing {split_name} split")
         logger.info("=" * 80)
@@ -340,6 +483,9 @@ def main():
         stock_indices = build_stock_index(valid_indices, metadata)
         logger.info(f"Number of stocks: {len(stock_indices)}")
         
+        # 체크포인트 경로 설정
+        checkpoint_file = output_dir / f"{split_name}_checkpoint.pkl"
+        
         # 긍정/부정 쌍 계산
         positive_pairs, negative_pairs = precompute_pairs_for_split(
             data=data,
@@ -349,11 +495,12 @@ def main():
             seq_len=args.seq_len,
             positive_time_threshold=args.positive_threshold,
             negative_time_threshold=args.negative_threshold,
-            num_threads=num_threads
+            num_threads=num_threads,
+            checkpoint_path=checkpoint_file if args.resume else None,
+            checkpoint_interval=args.checkpoint_interval
         )
         
         # 결과 저장
-        output_file = output_dir / f"{split_name}_pairs.pkl"
         logger.info(f"Saving precomputed pairs to {output_file}...")
         
         pairs_data = {
@@ -365,7 +512,8 @@ def main():
             'positive_threshold': args.positive_threshold,
             'negative_threshold': args.negative_threshold,
             'metadata_shape': metadata.shape,
-            'data_shape': data.shape
+            'data_shape': data.shape,
+            'completed': True  # 완료 플래그
         }
         
         with open(output_file, 'wb') as f:
@@ -380,8 +528,6 @@ def main():
         avg_negative = np.mean([len(v) for v in negative_pairs.values()])
         logger.info(f"Average positive pairs per sample: {avg_positive:.2f}")
         logger.info(f"Average negative pairs per sample: {avg_negative:.2f}")
-    
-    data_loader.close()
     
     logger.info("\n" + "=" * 80)
     logger.info("Precomputation Complete!")

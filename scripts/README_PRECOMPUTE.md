@@ -42,8 +42,9 @@ python scripts/precompute_pairs.py \
     --test_ratio 0.15 \
     --start_date 2024-09-01 \
     --end_date 2025-09-30 \
-    --max_samples 10000000 \
-    --num_threads 8
+    --max_samples 2000000000 \
+    --chunk_size 1000000 \
+    --num_threads 12
 ```
 
 ### 멀티스레드 사용
@@ -65,6 +66,46 @@ python scripts/precompute_pairs.py \
     --db_path data/trading_data.duckdb \
     --output_dir data/precomputed_pairs \
     --num_threads 1
+```
+
+### 중단 후 재개 (Resume)
+
+```bash
+# 중단된 작업 재개 (이미 완료된 split 건너뛰기)
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --resume
+
+# 예: train_pairs.pkl만 완료된 상태에서 재개하면
+# val_pairs.pkl, test_pairs.pkl만 처리
+```
+
+### 대용량 데이터 처리 (OOM 방지)
+
+```bash
+# 자동 청크 크기 (max_samples > 5M: 2M 청크, > 2M: 1M 청크)
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --max_samples 10000000
+
+# 수동 청크 크기 지정
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --max_samples 10000000 \
+    --chunk_size 1000000
+
+# 청크 처리 + 체크포인트 (가장 안전)
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --max_samples 10000000 \
+    --chunk_size 1000000 \
+    --num_threads 1 \
+    --resume \
+    --checkpoint-interval 5000
 ```
 
 ## 출력
@@ -140,12 +181,108 @@ train_loader = data_loader.get_dataloader(
 | 100만   | ~10-30분     | ~1-5초       | ~100-360x |
 | 1000만  | ~1-3시간     | ~10-30초     | ~120-360x |
 
+## 재개 기능 (Resume)
+
+작업이 중단되었을 때 `--resume` 플래그를 사용하여 이어서 작업할 수 있습니다.
+
+### 동작 방식
+
+**2단계 재개 시스템:**
+
+1. **Split 단위 재개**: 완료된 split(train/val/test) 파일 건너뛰기
+2. **인덱스 단위 재개**: Split 내에서 체크포인트로 중단 지점부터 재개
+
+### Split 단위 재개
+
+```bash
+# 1차 실행 (train만 완료하고 중단됨)
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --num_threads 8
+# 결과: train_pairs.pkl 생성됨
+
+# 2차 실행 (재개)
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --num_threads 8 \
+    --resume
+# 결과: train은 건너뛰고 val, test만 처리
+```
+
+### 인덱스 단위 재개 (체크포인트)
+
+```bash
+# 단일 스레드 모드에서 체크포인트 사용
+python scripts/precompute_pairs.py \
+    --db_path data/trading_data.duckdb \
+    --output_dir data/precomputed_pairs \
+    --num_threads 1 \
+    --resume \
+    --checkpoint-interval 10000
+
+# 중단 후 재개하면:
+# - train_checkpoint.pkl 파일에서 진행 상황 로드
+# - 이미 처리된 인덱스는 건너뛰고 나머지만 처리
+# - 10,000개 인덱스마다 자동 저장
+```
+
+### 체크포인트 파일
+
+- **위치**: `{output_dir}/{split_name}_checkpoint.pkl`
+- **내용**: 처리된 인덱스 목록 + 긍정/부정 쌍 캐시
+- **자동 삭제**: Split 완료 시 자동으로 삭제됨
+
+### 주의사항
+
+- ✅ **Split 단위 재개**: 모든 모드에서 지원
+- ✅ **인덱스 단위 재개**: 단일 스레드 모드(`--num_threads 1`)에서만 지원
+- ⚠️ **멀티스레드**: 체크포인트 미지원 (Split 단위 재개만 가능)
+- 💡 **권장**: 대용량 데이터는 단일 스레드 + 체크포인트 사용
+
+## OOM (Out of Memory) 방지
+
+### 자동 청크 크기 설정
+
+스크립트는 `max_samples` 값에 따라 자동으로 청크 크기를 설정합니다:
+
+| max_samples | 자동 chunk_size | 설명 |
+|-------------|----------------|------|
+| < 2M | 청크 없음 | 한 번에 로드 |
+| 2M - 5M | 1M | 2-5개 청크로 분할 |
+| > 5M | 2M | 여러 청크로 분할 |
+
+### 청크 처리 동작
+
+1. **데이터 로드**: 청크별로 데이터베이스에서 로드 (offset 사용)
+2. **Split 분할**: 각 청크를 train/val/test로 분할
+3. **병합**: 모든 청크의 split을 병합 (`np.vstack`)
+4. **쌍 계산**: 병합된 데이터로 긍정/부정 쌍 계산
+
+### 메모리 사용량 예측
+
+| 샘플 수 | 피처 수 | 예상 메모리 | 권장 설정 |
+|---------|---------|-----------|----------|
+| 1M | 50 | ~200MB | 청크 불필요 |
+| 5M | 50 | ~1GB | chunk_size=2M |
+| 10M | 50 | ~2GB | chunk_size=2M |
+| 30M | 50 | ~6GB | chunk_size=2M, 체크포인트 |
+
 ## 주의사항
 
 1. **데이터 일관성**: 데이터베이스가 변경되면 쌍을 다시 계산해야 합니다.
 2. **파라미터 일치**: `seq_len`, `positive_threshold`, `negative_threshold`가 일치해야 합니다.
 3. **디스크 공간**: 큰 데이터셋의 경우 수 GB의 디스크 공간이 필요합니다.
-4. **메모리**: 파일 로드 시 전체 캐시가 메모리에 로드됩니다.
+4. **메모리**: 
+   - 청크 처리 시: chunk_size에 비례
+   - 쌍 계산 시: 전체 데이터 메모리 필요
+   - 병합 시: 일시적으로 2배 메모리 사용
+5. **재개 기능**: 
+   - Split 단위: 모든 모드에서 지원
+   - 인덱스 단위: 단일 스레드 모드에서만 지원
+6. **체크포인트**: 멀티스레드 모드에서는 체크포인트가 저장되지 않습니다.
+7. **청크 처리**: max_samples > 2M일 때 자동 활성화 (수동 설정 가능)
 
 ## 예제
 
