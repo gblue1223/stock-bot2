@@ -27,25 +27,12 @@ python scripts/precompute_pairs.py \
     --output_dir data/precomputed_pairs
 ```
 
-### 전체 옵션
+### 주요 파라미터
 
-```bash
-python scripts/precompute_pairs.py \
-    --db_path "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-    --table_name datasets \
-    --output_dir "C:\Users\user\Workspace\datasets@20251005\precomputed_pairs" \
-    --seq_len 60 \
-    --positive_threshold 10 \
-    --negative_threshold 60 \
-    --train_ratio 0.7 \
-    --val_ratio 0.15 \
-    --test_ratio 0.15 \
-    --start_date 2024-09-01 \
-    --end_date 2025-09-30 \
-    --max_samples 2000000000 \
-    --chunk_size 1000000 \
-    --num_threads 12
-```
+- `--positive_threshold`: 긍정 쌍 시간 임계값 (기본값: **0.05**, train_embedding.py와 동일)
+- `--negative_threshold`: 부정 쌍 시간 임계값 (기본값: **0.5**, train_embedding.py와 동일)
+- `--chunk_size`: 청크 크기 (기본값: auto, max_samples에 따라 자동 설정)
+- `--num_threads`: 스레드 수 (기본값: CPU 코어 수)
 
 ### 멀티스레드 사용
 
