@@ -16,6 +16,16 @@
         --lr 1e-4 \
         --device cuda
     
+    # 사전 계산된 쌍 사용 (빠른 시작)
+    python -m ai_trader.embedding.train_embedding \
+        --db "C:\\Users\\user\\Workspace\\datasets@20251005\\datasets_norm_all.duckdb" \
+        --table datasets \
+        --out models/embedding \
+        --precomputed-pairs-dir data/precomputed_pairs \
+        --batch-size 128 \
+        --epochs 50 \
+        --device cuda
+    
     # 증분 학습 (전체 데이터 활용)
     python -m ai_trader.embedding.train_embedding \
         --db datasets_norm_all.duckdb \
@@ -301,6 +311,14 @@ def parse_args():
         type=int,
         default=10000000,
         help='증분 학습 시 청크 크기 (기본값: 1천만, max-samples를 이 크기로 나눔)'
+    )
+    
+    # 사전 계산된 쌍 설정
+    parser.add_argument(
+        '--precomputed-pairs-dir',
+        type=str,
+        default=None,
+        help='사전 계산된 긍정/부정 쌍 디렉토리 (예: data/precomputed_pairs)'
     )
     
     return parser.parse_args()
@@ -1043,15 +1061,23 @@ def main():
     logger.info("Computing normalization statistics...")
     normalization_stats = compute_normalization_stats(data_loader.data_splits['train']['data'])
     
+    # 사전 계산된 쌍 경로 설정
+    precomputed_train = None
+    precomputed_val = None
+    if args.precomputed_pairs_dir:
+        precomputed_train = os.path.join(args.precomputed_pairs_dir, 'train_pairs.pkl')
+        precomputed_val = os.path.join(args.precomputed_pairs_dir, 'val_pairs.pkl')
+        logger.info(f"Using precomputed pairs from: {args.precomputed_pairs_dir}")
+    
     # DataLoader 생성
     train_dataloader = data_loader.get_dataloader(
         split='train',
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        return_metadata=False,  # 훈련 시에는 메타데이터 불필요
         positive_time_threshold=args.positive_time_threshold,
-        negative_time_threshold=args.negative_time_threshold
+        negative_time_threshold=args.negative_time_threshold,
+        precomputed_pairs_path=precomputed_train
     )
     
     val_dataloader = data_loader.get_dataloader(
@@ -1059,9 +1085,9 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        return_metadata=True,  # 검증 시에는 메트릭 계산을 위해 메타데이터 필요
         positive_time_threshold=args.positive_time_threshold,
-        negative_time_threshold=args.negative_time_threshold
+        negative_time_threshold=args.negative_time_threshold,
+        precomputed_pairs_path=precomputed_val
     )
     
     logger.info(f"Train batches: {len(train_dataloader)}")

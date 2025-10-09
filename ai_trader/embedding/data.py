@@ -10,6 +10,8 @@ import numpy as np
 import duckdb
 import torch
 from torch.utils.data import Dataset, DataLoader
+import pickle
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -264,7 +266,8 @@ class EmbeddingDataLoader:
         split: str = 'train',
         return_metadata: bool = False,
         positive_time_threshold: int = 10,
-        negative_time_threshold: int = 60
+        negative_time_threshold: int = 60,
+        precomputed_pairs_path: str = None
     ) -> 'ContrastiveDataset':
         """
         특정 분할에 대한 Dataset 객체 반환
@@ -274,6 +277,7 @@ class EmbeddingDataLoader:
             return_metadata: 메타데이터 반환 여부 (기본값: False)
             positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
             negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
+            precomputed_pairs_path: 사전 계산된 쌍 파일 경로 (기본값: None)
             
         Returns:
             ContrastiveDataset 객체
@@ -287,7 +291,8 @@ class EmbeddingDataLoader:
             seq_len=self.seq_len,
             positive_time_threshold=positive_time_threshold,
             negative_time_threshold=negative_time_threshold,
-            return_metadata=return_metadata
+            return_metadata=return_metadata,
+            precomputed_pairs_path=precomputed_pairs_path
         )
     
     def get_dataloader(
@@ -298,7 +303,8 @@ class EmbeddingDataLoader:
         num_workers: int = 4,
         return_metadata: bool = False,
         positive_time_threshold: int = 10,
-        negative_time_threshold: int = 60
+        negative_time_threshold: int = 60,
+        precomputed_pairs_path: str = None
     ) -> DataLoader:
         """
         DataLoader 생성
@@ -311,6 +317,7 @@ class EmbeddingDataLoader:
             return_metadata: 메타데이터 반환 여부 (기본값: False)
             positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
             negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
+            precomputed_pairs_path: 사전 계산된 쌍 파일 경로 (기본값: None)
             
         Returns:
             PyTorch DataLoader
@@ -319,7 +326,8 @@ class EmbeddingDataLoader:
             split,
             return_metadata=return_metadata,
             positive_time_threshold=positive_time_threshold,
-            negative_time_threshold=negative_time_threshold
+            negative_time_threshold=negative_time_threshold,
+            precomputed_pairs_path=precomputed_pairs_path
         )
         return DataLoader(
             dataset,
@@ -358,7 +366,8 @@ class ContrastiveDataset(Dataset):
         seq_len: int = 60,
         positive_time_threshold: int = 10,
         negative_time_threshold: int = 60,
-        return_metadata: bool = False
+        return_metadata: bool = False,
+        precomputed_pairs_path: str = None
     ):
         self.data = data
         self.metadata = metadata
@@ -367,20 +376,31 @@ class ContrastiveDataset(Dataset):
         self.negative_time_threshold = negative_time_threshold
         self.return_metadata = return_metadata
         
-        # 시퀀스 생성을 위한 유효한 인덱스 계산
-        self.valid_indices = self._compute_valid_indices()
-        
-        # 종목별 인덱스 매핑 생성 (빠른 쌍 생성을 위해)
-        self.stock_indices = self._build_stock_index()
-        
-        logger.info(f"ContrastiveDataset initialized with {len(self.valid_indices)} valid sequences")
-        
-        # 긍정/부정 쌍 사전 계산 (성능 최적화)
-        logger.info("Precomputing positive/negative pairs...")
-        self.positive_pairs_cache = {}
-        self.negative_pairs_cache = {}
-        self._precompute_pairs()
-        logger.info("Pair precomputation complete!")
+        # 사전 계산된 쌍 로드 시도
+        if precomputed_pairs_path and Path(precomputed_pairs_path).exists():
+            logger.info(f"Loading precomputed pairs from {precomputed_pairs_path}...")
+            self._load_precomputed_pairs(precomputed_pairs_path)
+            logger.info(f"Loaded precomputed pairs for {len(self.valid_indices)} valid sequences")
+        else:
+            # 사전 계산된 쌍이 없으면 직접 계산
+            if precomputed_pairs_path:
+                logger.warning(f"Precomputed pairs file not found: {precomputed_pairs_path}")
+                logger.warning("Computing pairs on-the-fly (this may take a while)...")
+            
+            # 시퀀스 생성을 위한 유효한 인덱스 계산
+            self.valid_indices = self._compute_valid_indices()
+            
+            # 종목별 인덱스 매핑 생성 (빠른 쌍 생성을 위해)
+            self.stock_indices = self._build_stock_index()
+            
+            logger.info(f"ContrastiveDataset initialized with {len(self.valid_indices)} valid sequences")
+            
+            # 긍정/부정 쌍 사전 계산 (성능 최적화)
+            logger.info("Precomputing positive/negative pairs...")
+            self.positive_pairs_cache = {}
+            self.negative_pairs_cache = {}
+            self._precompute_pairs()
+            logger.info("Pair precomputation complete!")
     
     def _compute_valid_indices(self) -> np.ndarray:
         """
@@ -416,6 +436,30 @@ class ContrastiveDataset(Dataset):
             stock_indices[stock_code].append(idx)
         
         return stock_indices
+    
+    def _load_precomputed_pairs(self, pairs_path: str):
+        """
+        사전 계산된 긍정/부정 쌍 로드
+        
+        Args:
+            pairs_path: 사전 계산된 쌍 파일 경로 (.pkl)
+        """
+        with open(pairs_path, 'rb') as f:
+            pairs_data = pickle.load(f)
+        
+        # 데이터 검증
+        expected_seq_len = pairs_data.get('seq_len')
+        if expected_seq_len != self.seq_len:
+            logger.warning(f"Sequence length mismatch: expected {self.seq_len}, got {expected_seq_len}")
+        
+        # 캐시 로드
+        self.valid_indices = pairs_data['valid_indices']
+        self.stock_indices = pairs_data['stock_indices']
+        self.positive_pairs_cache = pairs_data['positive_pairs_cache']
+        self.negative_pairs_cache = pairs_data['negative_pairs_cache']
+        
+        logger.info(f"Loaded {len(self.positive_pairs_cache)} positive pair entries")
+        logger.info(f"Loaded {len(self.negative_pairs_cache)} negative pair entries")
     
     def _precompute_pairs(self):
         """
