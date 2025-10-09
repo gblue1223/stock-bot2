@@ -902,7 +902,6 @@ def train_incremental(args, device, output_dir, writer):
             writer.add_scalar('train/loss', train_loss, global_epoch)
             writer.add_scalar('train/chunk', chunk_idx + 1, global_epoch)
             writer.add_scalar('learning_rate', optimizer.param_groups[0]['lr'], global_epoch)
-            writer.flush()  # 즉시 디스크에 기록
             
             # Learning rate 업데이트
             scheduler.step()

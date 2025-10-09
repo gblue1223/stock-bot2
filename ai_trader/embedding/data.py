@@ -101,6 +101,7 @@ class EmbeddingDataLoader:
             # 메타데이터 및 원본 시간 컬럼 제외
             # '시간'은 HHMMSSmmm 형식(예: 093000123 = 9천만)이라 너무 큼
             # 대신 '시간_sin', '시간_cos', '시간_scalar' 파생 피처 사용
+            # 주의: '시간_scalar'는 메타데이터로 사용되므로 제외하지 않음
             exclude_columns = {'날짜', '종목코드', '번호', '종목명', '시간'}
             self.feature_columns = [col for col in all_columns if col not in exclude_columns]
             
@@ -325,7 +326,10 @@ class EmbeddingDataLoader:
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
-            pin_memory=True
+            pin_memory=True if torch.cuda.is_available() else False,
+            # Colab 최적화: num_workers > 0일 때만 활성화
+            persistent_workers=True if num_workers > 0 else False,
+            prefetch_factor=4 if num_workers > 0 else None
         )
 
 
@@ -342,8 +346,8 @@ class ContrastiveDataset(Dataset):
         data: 특징 데이터 (n_samples, n_features)
         metadata: 메타데이터 (n_samples, 3) - [종목코드, 날짜, 시간]
         seq_len: 시퀀스 길이
-        positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
-        negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
+        positive_time_threshold: 긍정 쌍 시간 임계값 (표준화된 시간 단위, 기본값: 10)
+        negative_time_threshold: 부정 쌍 시간 임계값 (표준화된 시간 단위, 기본값: 60)
         return_metadata: 메타데이터 반환 여부 (기본값: False)
     """
     
@@ -432,18 +436,19 @@ class ContrastiveDataset(Dataset):
             긍정 쌍 인덱스 또는 None
         """
         stock_code = self.metadata[anchor_idx, 0]
-        anchor_time = int(self.metadata[anchor_idx, 2])  # 시간 (HHMMSSmmm)
+        anchor_time = float(self.metadata[anchor_idx, 2])  # 시간_scalar (표준화된 값)
         
         # 동일 종목의 인덱스들
         candidate_indices = self.stock_indices.get(stock_code, [])
         
         # 시간 차이가 임계값 이내인 샘플 찾기
+        # 시간_scalar는 표준화된 값이므로 직접 비교 가능
         positive_candidates = []
         for idx in candidate_indices:
             if idx == anchor_idx:
                 continue
             
-            time_diff = abs(int(self.metadata[idx, 2]) - anchor_time)
+            time_diff = abs(float(self.metadata[idx, 2]) - anchor_time)
             if time_diff < self.positive_time_threshold:
                 positive_candidates.append(idx)
         
@@ -463,7 +468,7 @@ class ContrastiveDataset(Dataset):
             부정 쌍 인덱스
         """
         stock_code = self.metadata[anchor_idx, 0]
-        anchor_time = int(self.metadata[anchor_idx, 2])
+        anchor_time = float(self.metadata[anchor_idx, 2])  # 시간_scalar (표준화된 값)
         
         # 전략 1: 다른 종목 선택 (70% 확률)
         if np.random.random() < 0.7:
@@ -478,7 +483,7 @@ class ContrastiveDataset(Dataset):
         negative_candidates = []
         
         for idx in candidate_indices:
-            time_diff = abs(int(self.metadata[idx, 2]) - anchor_time)
+            time_diff = abs(float(self.metadata[idx, 2]) - anchor_time)
             if time_diff > self.negative_time_threshold:
                 negative_candidates.append(idx)
         

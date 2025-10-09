@@ -51,10 +51,11 @@ WEIGHT_DECAY = 1e-4  # L2 regularization
 # ========================================
 
 # 배치 크기 (GPU 메모리에 따라)
-# V100 (16GB): 512 ~ 768
-# A100 (40GB): 1024 ~ 2048
-# A100 (80GB): 4096 ~ 8192 (최적)
-BATCH_SIZE = 4096  # A100 80GB 최적화
+# V100 (16GB): 8192 ~ 12288
+# A100 (40GB): 16384 ~ 24576
+# A100 (80GB): 32768 ~ 65536 (최적)
+# 중요: 배치 크기가 클수록 GPU 활용도 향상!
+BATCH_SIZE = 16384  # A100 40GB 기준 (메모리 확인 후 32768로 증가 가능)
 
 # 에포크 수 (속도 우선)
 INITIAL_EPOCHS = 3  # 15 → 10 (속도 우선)
@@ -77,9 +78,14 @@ LR_WARMUP_EPOCHS = 2  # Warmup 기간
 # 낮을수록 엄격한 학습, 높을수록 부드러운 학습
 TEMPERATURE = 0.10  # 0.07 → 0.10 (과적합 방지)
 
-# 시간 임계값
-POSITIVE_TIME_THRESHOLD = 10  # 초
-NEGATIVE_TIME_THRESHOLD = 60  # 초
+# 시간 임계값 (시간_scalar는 표준화된 값이므로 조정 필요)
+# 시간_scalar는 장 시작 후 경과 시간(초)을 표준화한 값
+# 표준화 범위가 대략 [-2, 2]라고 가정하면:
+# - 0.05 ≈ 수 초 차이
+# - 0.3 ≈ 수십 초 차이
+# - 1.0 ≈ 수 분 차이
+POSITIVE_TIME_THRESHOLD = 0.05  # 표준화된 시간 단위 (매우 가까운 시간)
+NEGATIVE_TIME_THRESHOLD = 0.5   # 표준화된 시간 단위 (충분히 먼 시간)
 
 # Hard Negative Mining
 USE_HARD_NEGATIVES = True  # 어려운 negative 샘플 우선 선택
@@ -89,7 +95,9 @@ HARD_NEGATIVE_RATIO = 0.5  # 50%는 hard negative
 # 데이터 로더 설정
 # ========================================
 
-NUM_WORKERS = 12  # A100 80GB: 더 많은 워커로 데이터 로딩 가속
+# Colab 환경 최적화: CPU 코어가 2개뿐이므로 num_workers=0이 최적!
+# multiprocessing 오버헤드가 오히려 성능 저하 유발
+NUM_WORKERS = 0  # Colab: 단일 프로세스가 가장 빠름!
 PIN_MEMORY = True
 
 # ========================================
@@ -97,9 +105,9 @@ PIN_MEMORY = True
 # ========================================
 
 CHECKPOINT = "/content/drive/MyDrive/models/embedding_2024_09"
-CHECKPOINT_INTERVAL = 1  # 3 → 5 (체크포인트 저장 시간 절약)
-VAL_EVERY = 1  # 2 → 3 (검증 시간 절약)
-LOG_INTERVAL = 50  # 로그 출력 간격 (10 → 50, I/O 감소)
+CHECKPOINT_INTERVAL = 1  # 청크마다 저장 (Colab 세션 끊김 대비)
+VAL_EVERY = 1  # 매 에포크 검증 (학습 모니터링)
+LOG_INTERVAL = 100  # 로그 출력 간격 (50 → 100, I/O 더욱 감소)
 
 # Early Stopping
 USE_EARLY_STOPPING = True

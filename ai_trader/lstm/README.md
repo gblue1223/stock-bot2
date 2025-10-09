@@ -59,9 +59,9 @@ python -m ai_trader.lstm.train \
   --out models/lstm_sample_test \
   --seq-len 60 \
   --horizon 20 \
-  --chunk-size 500 \
+  --chunk-size 50000 \
   --device cuda \
-  --batch-size 128 \
+  --batch-size 512 \
   --epochs 3 \
   --lr 2e-5 \
   --weight-decay 1e-5 \
@@ -74,11 +74,9 @@ python -m ai_trader.lstm.train \
   --use-weighted-sampler \
   --direction3-threshold 0.015 \
   \
-  --progress-every 10000 \
-  --ckpt-every-chunks 50 \
+  --progress-every 1000 \
+  --ckpt-every-chunks 100 \
   --resume-from models/lstm_sample_test/checkpoints \
-  --auto-diagnosis warn \
-  --diag-warmup-chunks 30 \
   --code 000100 \
   --start-date 20240902 \
   --end-date 20240930
@@ -91,7 +89,7 @@ python -m ai_trader.lstm.train \
   --horizon 20 \
   --chunk-size 50000 \
   --device cuda \
-  --batch-size 128 \
+  --batch-size 512 \
   --epochs 10 \
   --lr 5e-5 \
   --weight-decay 1e-5 \
@@ -104,8 +102,8 @@ python -m ai_trader.lstm.train \
   --use-weighted-sampler \
   --direction3-threshold 0.015 \
   \
-  --progress-every 10000 \
-  --ckpt-every-chunks 50 \
+  --progress-every 1000 \
+  --ckpt-every-chunks 100 \
   --resume-from models/lstm/checkpoints \
   --auto-diagnosis warn \
   --diag-warmup-chunks 30
@@ -118,7 +116,7 @@ python -m ai_trader.lstm.train \
   --horizon 20 \
   --chunk-size 50000 \
   --device cuda \
-  --batch-size 128 \
+  --batch-size 512 \
   --epochs 10 \
   --lr 1e-4 \
   --weight-decay 1e-4 \
@@ -150,16 +148,23 @@ python -m ai_trader.lstm.train \
   --horizon 10 \
   --chunk-size 50000 \
   --device cuda \
-  --batch-size 128 \
+  --batch-size 512 \
   --epochs 10 \
   --lr 1e-4 \
-  --progress-every 100 \
-  --ckpt-every-chunks 50 \
+  --progress-every 1000 \
+  --ckpt-every-chunks 100 \
   --resume-from models/lstm/checkpoints \
   --target-col 등락률 \
   --aux-task regression \
   --loss huber \
   --huber-delta 1.0
+  \
+  --progress-every 1000 \
+  --ckpt-every-chunks 100 \
+  --resume-from models/lstm_sample_test/checkpoints \
+  --code 000100 \
+  --start-date 20240902 \
+  --end-date 20240930
 ```
 
 ### 로스 보기
