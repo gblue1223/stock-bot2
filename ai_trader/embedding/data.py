@@ -374,6 +374,13 @@ class ContrastiveDataset(Dataset):
         self.stock_indices = self._build_stock_index()
         
         logger.info(f"ContrastiveDataset initialized with {len(self.valid_indices)} valid sequences")
+        
+        # 긍정/부정 쌍 사전 계산 (성능 최적화)
+        logger.info("Precomputing positive/negative pairs...")
+        self.positive_pairs_cache = {}
+        self.negative_pairs_cache = {}
+        self._precompute_pairs()
+        logger.info("Pair precomputation complete!")
     
     def _compute_valid_indices(self) -> np.ndarray:
         """
@@ -410,6 +417,62 @@ class ContrastiveDataset(Dataset):
         
         return stock_indices
     
+    def _precompute_pairs(self):
+        """
+        모든 긍정/부정 쌍 후보를 사전 계산
+        
+        성능 최적화: __getitem__에서 매번 검색하는 대신 미리 계산
+        """
+        # 종목별로 시간 정렬된 인덱스 생성
+        stock_time_sorted = {}
+        for stock_code, indices in self.stock_indices.items():
+            # 시간 순으로 정렬
+            sorted_indices = sorted(indices, key=lambda i: float(self.metadata[i, 2]))
+            stock_time_sorted[stock_code] = sorted_indices
+        
+        # 각 인덱스에 대해 긍정/부정 쌍 후보 계산
+        for idx in self.valid_indices:
+            stock_code = self.metadata[idx, 0]
+            anchor_time = float(self.metadata[idx, 2])
+            
+            # 긍정 쌍 후보 찾기 (동일 종목, 가까운 시간)
+            positive_candidates = []
+            for candidate_idx in stock_time_sorted[stock_code]:
+                if candidate_idx == idx:
+                    continue
+                time_diff = abs(float(self.metadata[candidate_idx, 2]) - anchor_time)
+                if time_diff < self.positive_time_threshold:
+                    positive_candidates.append(candidate_idx)
+            
+            # 긍정 쌍이 없으면 자기 자신 사용
+            if not positive_candidates:
+                positive_candidates = [idx]
+            
+            self.positive_pairs_cache[idx] = positive_candidates
+            
+            # 부정 쌍 후보 찾기
+            negative_candidates = []
+            
+            # 전략 1: 다른 종목 (70%)
+            other_stocks = [s for s in self.stock_indices.keys() if s != stock_code]
+            if other_stocks:
+                for other_stock in other_stocks[:min(5, len(other_stocks))]:
+                    negative_candidates.extend(self.stock_indices[other_stock][:100])
+            
+            # 전략 2: 동일 종목, 먼 시간 (30%)
+            for candidate_idx in stock_time_sorted[stock_code]:
+                time_diff = abs(float(self.metadata[candidate_idx, 2]) - anchor_time)
+                if time_diff > self.negative_time_threshold:
+                    negative_candidates.append(candidate_idx)
+                    if len(negative_candidates) >= 100:
+                        break
+            
+            # 부정 쌍이 없으면 랜덤 샘플 사용
+            if not negative_candidates:
+                negative_candidates = list(self.valid_indices[:100])
+            
+            self.negative_pairs_cache[idx] = negative_candidates
+    
     def __len__(self) -> int:
         return len(self.valid_indices)
     
@@ -425,41 +488,22 @@ class ContrastiveDataset(Dataset):
         """
         return self.data[idx:idx+self.seq_len]
     
-    def _find_positive_pair(self, anchor_idx: int) -> Optional[int]:
+    def _find_positive_pair(self, anchor_idx: int) -> int:
         """
-        긍정 쌍 찾기: 동일 종목의 시간적으로 가까운 샘플
+        긍정 쌍 찾기: 사전 계산된 후보에서 랜덤 선택
         
         Args:
             anchor_idx: 앵커 샘플 인덱스
             
         Returns:
-            긍정 쌍 인덱스 또는 None
+            긍정 쌍 인덱스
         """
-        stock_code = self.metadata[anchor_idx, 0]
-        anchor_time = float(self.metadata[anchor_idx, 2])  # 시간_scalar (표준화된 값)
-        
-        # 동일 종목의 인덱스들
-        candidate_indices = self.stock_indices.get(stock_code, [])
-        
-        # 시간 차이가 임계값 이내인 샘플 찾기
-        # 시간_scalar는 표준화된 값이므로 직접 비교 가능
-        positive_candidates = []
-        for idx in candidate_indices:
-            if idx == anchor_idx:
-                continue
-            
-            time_diff = abs(float(self.metadata[idx, 2]) - anchor_time)
-            if time_diff < self.positive_time_threshold:
-                positive_candidates.append(idx)
-        
-        if positive_candidates:
-            return np.random.choice(positive_candidates)
-        
-        return None
+        candidates = self.positive_pairs_cache.get(anchor_idx, [anchor_idx])
+        return np.random.choice(candidates)
     
     def _find_negative_pair(self, anchor_idx: int) -> int:
         """
-        부정 쌍 찾기: 다른 종목 또는 먼 시간대의 샘플
+        부정 쌍 찾기: 사전 계산된 후보에서 랜덤 선택
         
         Args:
             anchor_idx: 앵커 샘플 인덱스
@@ -467,31 +511,8 @@ class ContrastiveDataset(Dataset):
         Returns:
             부정 쌍 인덱스
         """
-        stock_code = self.metadata[anchor_idx, 0]
-        anchor_time = float(self.metadata[anchor_idx, 2])  # 시간_scalar (표준화된 값)
-        
-        # 전략 1: 다른 종목 선택 (70% 확률)
-        if np.random.random() < 0.7:
-            # 다른 종목의 인덱스 중 랜덤 선택
-            other_stocks = [s for s in self.stock_indices.keys() if s != stock_code]
-            if other_stocks:
-                other_stock = np.random.choice(other_stocks)
-                return np.random.choice(self.stock_indices[other_stock])
-        
-        # 전략 2: 동일 종목이지만 먼 시간대 선택 (30% 확률)
-        candidate_indices = self.stock_indices.get(stock_code, [])
-        negative_candidates = []
-        
-        for idx in candidate_indices:
-            time_diff = abs(float(self.metadata[idx, 2]) - anchor_time)
-            if time_diff > self.negative_time_threshold:
-                negative_candidates.append(idx)
-        
-        if negative_candidates:
-            return np.random.choice(negative_candidates)
-        
-        # 폴백: 랜덤 샘플 선택
-        return np.random.choice(self.valid_indices)
+        candidates = self.negative_pairs_cache.get(anchor_idx, list(self.valid_indices[:100]))
+        return np.random.choice(candidates)
     
     def __getitem__(self, idx: int):
         """
@@ -510,13 +531,9 @@ class ContrastiveDataset(Dataset):
         # 앵커 시퀀스
         anchor = self._get_sequence(anchor_idx)
         
-        # 긍정 쌍 찾기
+        # 긍정 쌍 찾기 (사전 계산된 캐시 사용)
         positive_idx = self._find_positive_pair(anchor_idx)
-        if positive_idx is None:
-            # 긍정 쌍을 찾지 못한 경우, 앵커 자체를 사용
-            positive = anchor.copy()
-        else:
-            positive = self._get_sequence(positive_idx)
+        positive = self._get_sequence(positive_idx)
         
         # 부정 쌍 찾기
         negative_idx = self._find_negative_pair(anchor_idx)
