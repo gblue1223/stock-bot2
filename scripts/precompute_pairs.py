@@ -342,6 +342,17 @@ def main():
         default=10000,
         help='Save intermediate checkpoint every N indices (default: 10000)'
     )
+    parser.add_argument(
+        '--date-chunk-days',
+        type=int,
+        default=None,
+        help='Process data in date chunks (e.g., 30 days per chunk) instead of row-based chunks'
+    )
+    parser.add_argument(
+        '--skip-clipping',
+        action='store_true',
+        help='Skip data clipping to speed up processing (use if data is already normalized)'
+    )
     
     args = parser.parse_args()
     
@@ -358,32 +369,107 @@ def main():
     logger.info(f"Positive threshold: {args.positive_threshold}")
     logger.info(f"Negative threshold: {args.negative_threshold}")
     
-    # 스레드 수 설정
-    num_threads = args.num_threads if args.num_threads else multiprocessing.cpu_count()
-    logger.info(f"Number of threads: {num_threads}")
+    # 스레드 수 설정 (기본값: CPU 코어 수)
+    if args.num_threads is None:
+        num_threads = multiprocessing.cpu_count()
+        logger.info(f"Number of threads: {num_threads} (auto-detected)")
+    else:
+        num_threads = args.num_threads
+        logger.info(f"Number of threads: {num_threads}")
     
-    # 청크 크기 자동 설정 (OOM 방지)
-    chunk_size = args.chunk_size
-    if chunk_size is None and args.max_samples:
-        # max_samples가 크면 청크로 분할
-        if args.max_samples > 5_000_000:
-            chunk_size = 2_000_000
-            logger.info(f"Auto-detected chunk size: {chunk_size:,} (max_samples: {args.max_samples:,})")
-        elif args.max_samples > 2_000_000:
-            chunk_size = 1_000_000
-            logger.info(f"Auto-detected chunk size: {chunk_size:,} (max_samples: {args.max_samples:,})")
+    # 날짜 기반 청크 처리 우선 사용 (성능 최적화)
+    use_date_chunks = args.date_chunk_days is not None
     
-    if chunk_size:
-        logger.info(f"Using chunked processing with chunk size: {chunk_size:,}")
-        logger.info("This will process data in multiple passes to avoid OOM errors")
+    if use_date_chunks:
+        logger.info(f"Using date-based chunking: {args.date_chunk_days} days per chunk")
+        logger.info("This avoids OFFSET and significantly improves query performance")
+    else:
+        # 청크 크기 자동 설정 (OOM 방지)
+        chunk_size = args.chunk_size
+        if chunk_size is None and args.max_samples:
+            # max_samples가 크면 청크로 분할
+            if args.max_samples > 5_000_000:
+                chunk_size = 2_000_000
+                logger.info(f"Auto-detected chunk size: {chunk_size:,} (max_samples: {args.max_samples:,})")
+            elif args.max_samples > 2_000_000:
+                chunk_size = 1_000_000
+                logger.info(f"Auto-detected chunk size: {chunk_size:,} (max_samples: {args.max_samples:,})")
+        
+        if chunk_size:
+            logger.info(f"Using row-based chunking with chunk size: {chunk_size:,}")
+            logger.info("This will process data in multiple passes to avoid OOM errors")
     
     # 데이터 로더 생성 및 데이터 로드
     logger.info("\n" + "=" * 80)
     logger.info("Step 1: Loading data from database")
     logger.info("=" * 80)
     
-    # 청크 처리가 필요한 경우
-    if chunk_size and args.max_samples and args.max_samples > chunk_size:
+    # 날짜 기반 청크 처리
+    if use_date_chunks:
+        from datetime import datetime, timedelta
+        
+        # 날짜 범위 계산
+        start = datetime.strptime(args.start_date, '%Y-%m-%d') if args.start_date else None
+        end = datetime.strptime(args.end_date, '%Y-%m-%d') if args.end_date else None
+        
+        if not start or not end:
+            logger.error("--start_date and --end_date are required for date-based chunking")
+            return
+        
+        # 날짜 청크 생성
+        date_chunks = []
+        current = start
+        while current < end:
+            chunk_end = min(current + timedelta(days=args.date_chunk_days), end)
+            date_chunks.append((current.strftime('%Y-%m-%d'), chunk_end.strftime('%Y-%m-%d')))
+            current = chunk_end
+        
+        logger.info(f"Processing in {len(date_chunks)} date chunks")
+        
+        all_data_splits = {'train': {'data': [], 'metadata': []},
+                          'val': {'data': [], 'metadata': []},
+                          'test': {'data': [], 'metadata': []}}
+        
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(date_chunks):
+            logger.info(f"\nProcessing chunk {chunk_idx + 1}/{len(date_chunks)} (dates: {chunk_start} to {chunk_end})")
+            
+            data_loader = EmbeddingDataLoader(
+                db_path=args.db_path,
+                table_name=args.table_name,
+                seq_len=args.seq_len,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+                test_ratio=args.test_ratio,
+                start_date=chunk_start,
+                end_date=chunk_end,
+                stock_codes=args.stock_codes,
+                max_samples=args.max_samples,
+                skip_clipping=args.skip_clipping
+            )
+            
+            data_loader.connect()
+            chunk_splits = data_loader.load_and_split_data()
+            data_loader.close()
+            
+            # 청크 데이터 병합
+            for split_name in ['train', 'val', 'test']:
+                all_data_splits[split_name]['data'].append(chunk_splits[split_name]['data'])
+                all_data_splits[split_name]['metadata'].append(chunk_splits[split_name]['metadata'])
+            
+            logger.info(f"Chunk {chunk_idx + 1} loaded successfully")
+        
+        # 모든 청크 병합
+        logger.info("\nMerging all chunks...")
+        data_splits = {}
+        for split_name in ['train', 'val', 'test']:
+            data_splits[split_name] = {
+                'data': np.vstack(all_data_splits[split_name]['data']),
+                'metadata': np.vstack(all_data_splits[split_name]['metadata'])
+            }
+            logger.info(f"{split_name}: {len(data_splits[split_name]['data']):,} samples")
+    
+    # 행 기반 청크 처리
+    elif chunk_size and args.max_samples and args.max_samples > chunk_size:
         logger.info(f"Processing in chunks: {args.max_samples // chunk_size + 1} chunks")
         
         # 청크별로 처리
@@ -409,7 +495,8 @@ def main():
                 end_date=args.end_date,
                 stock_codes=args.stock_codes,
                 max_samples=current_chunk_size,
-                offset=offset
+                offset=offset,
+                skip_clipping=args.skip_clipping
             )
             
             data_loader.connect()
@@ -444,7 +531,8 @@ def main():
             start_date=args.start_date,
             end_date=args.end_date,
             stock_codes=args.stock_codes,
-            max_samples=args.max_samples
+            max_samples=args.max_samples,
+            skip_clipping=args.skip_clipping
         )
         
         data_loader.connect()

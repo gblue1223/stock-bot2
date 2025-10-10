@@ -49,7 +49,8 @@ class EmbeddingDataLoader:
         end_date: str = None,
         stock_codes: list = None,
         max_samples: int = None,
-        offset: int = 0  # 증분 학습을 위한 오프셋
+        offset: int = 0,  # 증분 학습을 위한 오프셋
+        skip_clipping: bool = False  # 클리핑 건너뛰기 옵션
     ):
         self.db_path = db_path
         self.table_name = table_name
@@ -62,6 +63,7 @@ class EmbeddingDataLoader:
         self.stock_codes = stock_codes
         self.max_samples = max_samples
         self.offset = offset
+        self.skip_clipping = skip_clipping
         
         # 비율 검증
         if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
@@ -133,10 +135,14 @@ class EmbeddingDataLoader:
             where_clauses = []
             
             if self.start_date:
-                where_clauses.append(f"날짜 >= '{self.start_date}'")
+                # 날짜 형식 변환: YYYY-MM-DD -> YYYYMMDD (문자열)
+                start_date_str = self.start_date.replace('-', '')
+                where_clauses.append(f"날짜 >= '{start_date_str}'")
             
             if self.end_date:
-                where_clauses.append(f"날짜 <= '{self.end_date}'")
+                # 날짜 형식 변환: YYYY-MM-DD -> YYYYMMDD (문자열)
+                end_date_str = self.end_date.replace('-', '')
+                where_clauses.append(f"날짜 <= '{end_date_str}'")
             
             if self.stock_codes:
                 codes_str = "', '".join(self.stock_codes)
@@ -144,8 +150,7 @@ class EmbeddingDataLoader:
             
             where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
             
-            # OFFSET과 LIMIT 절 구성 (증분 학습 지원)
-            offset_clause = f"OFFSET {self.offset}" if self.offset > 0 else ""
+            # LIMIT 절만 사용 (OFFSET은 성능 저하 유발)
             limit_clause = f"LIMIT {self.max_samples}" if self.max_samples else ""
             
             # 시간 순서로 정렬하여 데이터 로드
@@ -156,7 +161,6 @@ class EmbeddingDataLoader:
                 WHERE {where_clause}
                 ORDER BY 날짜, 종목코드, 시간
                 {limit_clause}
-                {offset_clause}
             """
             
             logger.info(f"Loading data from {self.table_name}...")
@@ -171,6 +175,17 @@ class EmbeddingDataLoader:
             logger.info(f"Loaded {len(df)} rows")
             
             if len(df) == 0:
+                # 데이터가 없을 때 실제 날짜 범위 확인
+                try:
+                    date_range_query = f"SELECT MIN(날짜) as min_date, MAX(날짜) as max_date FROM {self.table_name}"
+                    date_range = self.conn.execute(date_range_query).fetchdf()
+                    if len(date_range) > 0:
+                        logger.error(f"No data found for the specified filters.")
+                        logger.error(f"Database date range: {date_range['min_date'].iloc[0]} to {date_range['max_date'].iloc[0]}")
+                        if self.start_date or self.end_date:
+                            logger.error(f"Requested date range: {self.start_date or 'start'} to {self.end_date or 'end'}")
+                except Exception as e:
+                    logger.warning(f"Could not retrieve date range: {e}")
                 raise DataLoadError("No data found in database")
             
             # 메타데이터와 특징 분리
@@ -186,50 +201,54 @@ class EmbeddingDataLoader:
                 logger.warning(f"Found {np.sum(np.isinf(features))} Inf values in features. Clipping.")
                 features = np.nan_to_num(features, posinf=1e10, neginf=-1e10)
             
-            # 극단값 클리핑 (정규화 전)
-            # 각 피처별로 강력하게 클리핑
-            logger.info("Applying robust clipping to features...")
-            clip_info = []
-            
-            for i in range(features.shape[1]):
-                col = features[:, i]
+            # 극단값 클리핑 (선택적)
+            if not self.skip_clipping:
+                # 각 피처별로 강력하게 클리핑
+                logger.info("Applying robust clipping to features...")
+                clip_info = []
                 
-                # 95 percentile 기준 (더 강력한 클리핑)
-                p95 = np.percentile(col, 95)
-                p05 = np.percentile(col, 5)
-                
-                # 절대적 상한선 설정: 10,000
-                # 거래량/거래대금 같은 큰 값도 이 범위 내로 제한
-                ABSOLUTE_MAX = 10000
-                
-                if abs(p95) > ABSOLUTE_MAX or abs(p05) > ABSOLUTE_MAX:
-                    # 매우 큰 값: IQR 기반으로 클리핑
-                    q75 = np.percentile(col, 75)
-                    q25 = np.percentile(col, 25)
-                    iqr = q75 - q25
-                    median = np.median(col)
+                for i in range(features.shape[1]):
+                    col = features[:, i]
                     
-                    # median ± 2*IQR로 클리핑 (3 → 2로 더 강하게)
-                    p_upper = median + 2 * iqr
-                    p_lower = median - 2 * iqr
+                    # 95 percentile 기준 (더 강력한 클리핑)
+                    p95 = np.percentile(col, 95)
+                    p05 = np.percentile(col, 5)
                     
-                    # 그래도 너무 크면 절대 상한선 적용
-                    p_upper = min(p_upper, ABSOLUTE_MAX)
-                    p_lower = max(p_lower, -ABSOLUTE_MAX)
+                    # 절대적 상한선 설정: 10,000
+                    # 거래량/거래대금 같은 큰 값도 이 범위 내로 제한
+                    ABSOLUTE_MAX = 10000
                     
-                    clip_info.append(f"Feature {i}: [{p_lower:.2f}, {p_upper:.2f}]")
-                else:
-                    p_upper = p95
-                    p_lower = p05
+                    if abs(p95) > ABSOLUTE_MAX or abs(p05) > ABSOLUTE_MAX:
+                        # 매우 큰 값: IQR 기반으로 클리핑
+                        q75 = np.percentile(col, 75)
+                        q25 = np.percentile(col, 25)
+                        iqr = q75 - q25
+                        median = np.median(col)
+                        
+                        # median ± 2*IQR로 클리핑 (3 → 2로 더 강하게)
+                        p_upper = median + 2 * iqr
+                        p_lower = median - 2 * iqr
+                        
+                        # 그래도 너무 크면 절대 상한선 적용
+                        p_upper = min(p_upper, ABSOLUTE_MAX)
+                        p_lower = max(p_lower, -ABSOLUTE_MAX)
+                        
+                        clip_info.append(f"Feature {i}: [{p_lower:.2f}, {p_upper:.2f}]")
+                    else:
+                        p_upper = p95
+                        p_lower = p05
+                    
+                    features[:, i] = np.clip(col, p_lower, p_upper)
                 
-                features[:, i] = np.clip(col, p_lower, p_upper)
-            
-            if clip_info:
-                logger.info(f"Clipped {len(clip_info)} features with large values")
-                for info in clip_info[:5]:  # 처음 5개만 로깅
-                    logger.info(f"  {info}")
-            
-            logger.info(f"Data range after clipping: [{np.min(features):.4f}, {np.max(features):.4f}]")
+                if clip_info:
+                    logger.info(f"Clipped {len(clip_info)} features with large values")
+                    for info in clip_info[:5]:  # 처음 5개만 로깅
+                        logger.info(f"  {info}")
+                
+                logger.info(f"Data range after clipping: [{np.min(features):.4f}, {np.max(features):.4f}]")
+            else:
+                logger.info("Skipping clipping (skip_clipping=True)")
+                logger.info(f"Data range: [{np.min(features):.4f}, {np.max(features):.4f}]")
             
             # 시간 순서 기반 분할
             n_samples = len(features)
