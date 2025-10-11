@@ -404,7 +404,7 @@ def fine_tune_for_trading_task(pretrained_model_path: str,
         }
     
     # Load pre-trained model
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
     base_model = load_pretrained_model(pretrained_model_path, device)
     
     # Create task head

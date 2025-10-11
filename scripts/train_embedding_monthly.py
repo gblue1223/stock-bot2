@@ -1,7 +1,8 @@
 """
-월별 임베딩 모델 훈련 스크립트
+월별 AutoEncoder 임베딩 모델 훈련 스크립트
 
 12개월 5억 개 데이터를 효율적으로 훈련하기 위한 자동화 스크립트
+AutoEncoder + Fine-tuning 방식 사용
 """
 
 import argparse
@@ -50,46 +51,34 @@ def train_month(
     
     # 기본 인수
     cmd = [
-        "python", "-m", "ai_trader.embedding.train_embedding",
+        "python", "examples/autoencoder_training_example.py",
         "--db", db_path,
-        "--table", "datasets",
-        "--out", output_dir,
+        "--output-dir", output_dir,
         "--seq-len", "60",
         "--embedding-dim", "128",
         "--batch-size", "256",
         "--device", "cuda",
-        "--positive-time-threshold", "10",
-        "--negative-time-threshold", "60",
-        "--temperature", "0.07",
-        "--num-heads", "4",
-        "--val-every", "3",
-        "--checkpoint-interval", "5",
-        "--start-date", start_date,
-        "--end-date", end_date,
-        "--num-workers", "8",
-        "--max-samples", str(max_samples)
+        "--model-type", "masked",
+        "--mask-ratio", "0.15",
+        "--hidden-dim", "256",
+        "--fine-tune",
+        "--limit", str(max_samples)
     ]
     
-    # 초기 훈련 vs Fine-tuning
+    # 초기 훈련 vs 점진적 학습
     if is_initial:
         cmd.extend([
-            "--epochs", "30",
-            "--lr", "1e-4"
+            "--epochs", "50"
         ])
         print(f"\n{'='*80}")
-        print(f"초기 훈련: {year}년 {month}월 ({start_date} ~ {end_date})")
+        print(f"초기 AutoEncoder 훈련: {year}년 {month}월 ({start_date} ~ {end_date})")
         print(f"{'='*80}\n")
     else:
         cmd.extend([
-            "--epochs", "15",
-            "--lr", "5e-5"
+            "--epochs", "30"
         ])
-        if resume_from:
-            cmd.extend(["--resume", resume_from])
         print(f"\n{'='*80}")
-        print(f"Fine-tuning: {year}년 {month}월 ({start_date} ~ {end_date})")
-        if resume_from:
-            print(f"이전 모델: {resume_from}")
+        print(f"점진적 AutoEncoder 훈련: {year}년 {month}월 ({start_date} ~ {end_date})")
         print(f"{'='*80}\n")
     
     # 훈련 실행
@@ -136,26 +125,19 @@ def train_quarterly(
     output_dir = f"{base_output_dir}_{year}_Q{quarter}"
     
     cmd = [
-        "python", "-m", "ai_trader.embedding.train_embedding",
+        "python", "examples/autoencoder_training_example.py",
         "--db", db_path,
-        "--table", "datasets",
-        "--out", output_dir,
+        "--output-dir", output_dir,
         "--seq-len", "60",
         "--embedding-dim", "128",
         "--batch-size", "256",
-        "--epochs", "20",
-        "--lr", "1e-4",
+        "--epochs", "40",
         "--device", "cuda",
-        "--positive-time-threshold", "10",
-        "--negative-time-threshold", "60",
-        "--temperature", "0.07",
-        "--num-heads", "4",
-        "--val-every", "2",
-        "--checkpoint-interval", "5",
-        "--start-date", start_date,
-        "--end-date", end_date,
-        "--num-workers", "8",
-        "--max-samples", str(max_samples)
+        "--model-type", "masked",
+        "--mask-ratio", "0.15",
+        "--hidden-dim", "256",
+        "--fine-tune",
+        "--limit", str(max_samples)
     ]
     
     print(f"\n{'='*80}")
@@ -180,27 +162,27 @@ def main():
         epilog="""
 사용 예제:
 
-  # 9월부터 12월까지 순차 훈련
+  # 9월부터 12월까지 순차 AutoEncoder 훈련
   python scripts/train_embedding_monthly.py \\
     --db "C:\\Users\\user\\Workspace\\datasets@20251005\\datasets_norm_all.duckdb" \\
     --start-year 2024 --start-month 9 \\
     --end-year 2024 --end-month 12 \\
-    --output models/embedding
+    --output models/autoencoder
 
   # 특정 월만 훈련
   python scripts/train_embedding_monthly.py \\
     --db "C:\\Users\\user\\Workspace\\datasets@20251005\\datasets_norm_all.duckdb" \\
     --start-year 2024 --start-month 10 \\
     --end-year 2024 --end-month 10 \\
-    --output models/embedding \\
-    --resume models/embedding_2024_09/checkpoint_epoch30.pt
+    --output models/autoencoder \\
+    --resume models/autoencoder_2024_09/best_model.pt
 
   # 분기별 재훈련
   python scripts/train_embedding_monthly.py \\
     --db "C:\\Users\\user\\Workspace\\datasets@20251005\\datasets_norm_all.duckdb" \\
     --quarterly \\
     --year 2024 --quarter 4 \\
-    --output models/embedding
+    --output models/autoencoder
         """
     )
     
@@ -214,8 +196,8 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        default='models/embedding',
-        help='출력 디렉토리 (기본값: models/embedding)'
+        default='models/autoencoder',
+        help='출력 디렉토리 (기본값: models/autoencoder)'
     )
     
     parser.add_argument(
@@ -331,9 +313,9 @@ def main():
         
         # 다음 달을 위한 체크포인트 경로 설정
         if is_initial:
-            prev_checkpoint = f"{output_dir}/checkpoint_epoch30.pt"
+            prev_checkpoint = f"{output_dir}/best_model.pt"
         else:
-            prev_checkpoint = f"{output_dir}/checkpoint_epoch15.pt"
+            prev_checkpoint = f"{output_dir}/best_model.pt"
     
     print(f"\n{'='*80}")
     print(f"✓ 전체 훈련 완료!")

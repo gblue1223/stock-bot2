@@ -1,7 +1,8 @@
 """
-임베딩 모델 훈련을 위한 데이터 로더
+AutoEncoder 임베딩 모델 훈련을 위한 데이터 로더
 
-DuckDB에서 매매 데이터를 로드하고 대조 학습을 위한 긍정/부정 쌍을 생성합니다.
+DuckDB에서 매매 데이터를 로드하고 시계열 시퀀스를 생성합니다.
+AutoEncoder 및 Fine-tuning을 위한 데이터 처리를 지원합니다.
 """
 
 import logging
@@ -21,12 +22,12 @@ class DataLoadError(Exception):
     pass
 
 
-class EmbeddingDataLoader:
+class AutoEncoderDataLoader:
     """
-    임베딩 모델 훈련을 위한 데이터 로더
+    AutoEncoder 임베딩 모델 훈련을 위한 데이터 로더
     
     DuckDB에서 데이터를 로드하고 시간 순서 기반으로 훈련/검증/테스트 세트로 분할합니다.
-    대조 학습을 위한 긍정/부정 쌍을 생성합니다.
+    시계열 시퀀스를 생성하여 AutoEncoder 훈련을 지원합니다.
     
     Args:
         db_path: DuckDB 데이터베이스 경로
@@ -283,35 +284,29 @@ class EmbeddingDataLoader:
     def get_dataset(
         self,
         split: str = 'train',
-        return_metadata: bool = False,
-        positive_time_threshold: int = 10,
-        negative_time_threshold: int = 60,
-        precomputed_pairs_path: str = None
-    ) -> 'ContrastiveDataset':
+        stride: int = 1,
+        return_metadata: bool = False
+    ) -> 'TimeSeriesSequenceDataset':
         """
         특정 분할에 대한 Dataset 객체 반환
         
         Args:
             split: 'train', 'val', 또는 'test'
+            stride: 시퀀스 생성 시 스트라이드 (기본값: 1)
             return_metadata: 메타데이터 반환 여부 (기본값: False)
-            positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
-            negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
-            precomputed_pairs_path: 사전 계산된 쌍 파일 경로 (기본값: None)
             
         Returns:
-            ContrastiveDataset 객체
+            TimeSeriesSequenceDataset 객체
         """
         if split not in self.data_splits:
             raise ValueError(f"Invalid split: {split}. Must be one of {list(self.data_splits.keys())}")
         
-        return ContrastiveDataset(
+        return TimeSeriesSequenceDataset(
             data=self.data_splits[split]['data'],
             metadata=self.data_splits[split]['metadata'],
             seq_len=self.seq_len,
-            positive_time_threshold=positive_time_threshold,
-            negative_time_threshold=negative_time_threshold,
-            return_metadata=return_metadata,
-            precomputed_pairs_path=precomputed_pairs_path
+            stride=stride,
+            return_metadata=return_metadata
         )
     
     def get_dataloader(
@@ -320,10 +315,8 @@ class EmbeddingDataLoader:
         batch_size: int = 128,
         shuffle: bool = True,
         num_workers: int = 4,
-        return_metadata: bool = False,
-        positive_time_threshold: int = 10,
-        negative_time_threshold: int = 60,
-        precomputed_pairs_path: str = None
+        stride: int = 1,
+        return_metadata: bool = False
     ) -> DataLoader:
         """
         DataLoader 생성
@@ -333,20 +326,16 @@ class EmbeddingDataLoader:
             batch_size: 배치 크기
             shuffle: 셔플 여부
             num_workers: 워커 프로세스 수
+            stride: 시퀀스 생성 시 스트라이드 (기본값: 1)
             return_metadata: 메타데이터 반환 여부 (기본값: False)
-            positive_time_threshold: 긍정 쌍 시간 임계값 (초, 기본값: 10)
-            negative_time_threshold: 부정 쌍 시간 임계값 (초, 기본값: 60)
-            precomputed_pairs_path: 사전 계산된 쌍 파일 경로 (기본값: None)
             
         Returns:
             PyTorch DataLoader
         """
         dataset = self.get_dataset(
             split,
-            return_metadata=return_metadata,
-            positive_time_threshold=positive_time_threshold,
-            negative_time_threshold=negative_time_threshold,
-            precomputed_pairs_path=precomputed_pairs_path
+            stride=stride,
+            return_metadata=return_metadata
         )
         return DataLoader(
             dataset,
@@ -354,27 +343,25 @@ class EmbeddingDataLoader:
             shuffle=shuffle,
             num_workers=num_workers,
             pin_memory=True if torch.cuda.is_available() else False,
-            # Colab 최적화: num_workers > 0일 때만 활성화
+            # 최적화: num_workers > 0일 때만 활성화
             persistent_workers=True if num_workers > 0 else False,
             prefetch_factor=4 if num_workers > 0 else None
         )
 
 
 
-class ContrastiveDataset(Dataset):
+class TimeSeriesSequenceDataset(Dataset):
     """
-    대조 학습을 위한 Dataset
+    AutoEncoder 훈련을 위한 시계열 시퀀스 Dataset
     
-    긍정 쌍과 부정 쌍을 생성하여 대조 학습을 지원합니다.
-    - 긍정 쌍: 동일 종목의 시간적으로 가까운 샘플 (시간 차이 < 10초)
-    - 부정 쌍: 다른 종목 또는 먼 시간대의 샘플 (시간 차이 > 60초)
+    시계열 데이터에서 슬라이딩 윈도우 방식으로 시퀀스를 생성합니다.
+    동일 종목, 동일 날짜 내에서만 시퀀스를 생성하여 데이터 일관성을 보장합니다.
     
     Args:
         data: 특징 데이터 (n_samples, n_features)
         metadata: 메타데이터 (n_samples, 3) - [종목코드, 날짜, 시간]
-        seq_len: 시퀀스 길이
-        positive_time_threshold: 긍정 쌍 시간 임계값 (표준화된 시간 단위, 기본값: 10)
-        negative_time_threshold: 부정 쌍 시간 임계값 (표준화된 시간 단위, 기본값: 60)
+        seq_len: 시퀀스 길이 (기본값: 60)
+        stride: 슬라이딩 윈도우 스트라이드 (기본값: 1)
         return_metadata: 메타데이터 반환 여부 (기본값: False)
     """
     
@@ -383,234 +370,142 @@ class ContrastiveDataset(Dataset):
         data: np.ndarray,
         metadata: np.ndarray,
         seq_len: int = 60,
-        positive_time_threshold: int = 10,
-        negative_time_threshold: int = 60,
-        return_metadata: bool = False,
-        precomputed_pairs_path: str = None
+        stride: int = 1,
+        return_metadata: bool = False
     ):
         self.data = data
         self.metadata = metadata
         self.seq_len = seq_len
-        self.positive_time_threshold = positive_time_threshold
-        self.negative_time_threshold = negative_time_threshold
+        self.stride = stride
         self.return_metadata = return_metadata
         
-        # 사전 계산된 쌍 로드 시도
-        if precomputed_pairs_path and Path(precomputed_pairs_path).exists():
-            logger.info(f"Loading precomputed pairs from {precomputed_pairs_path}...")
-            self._load_precomputed_pairs(precomputed_pairs_path)
-            logger.info(f"Loaded precomputed pairs for {len(self.valid_indices)} valid sequences")
-        else:
-            # 사전 계산된 쌍이 없으면 직접 계산
-            if precomputed_pairs_path:
-                logger.warning(f"Precomputed pairs file not found: {precomputed_pairs_path}")
-                logger.warning("Computing pairs on-the-fly (this may take a while)...")
-            
-            # 시퀀스 생성을 위한 유효한 인덱스 계산
-            self.valid_indices = self._compute_valid_indices()
-            
-            # 종목별 인덱스 매핑 생성 (빠른 쌍 생성을 위해)
-            self.stock_indices = self._build_stock_index()
-            
-            logger.info(f"ContrastiveDataset initialized with {len(self.valid_indices)} valid sequences")
-            
-            # 긍정/부정 쌍 사전 계산 (성능 최적화)
-            logger.info("Precomputing positive/negative pairs...")
-            self.positive_pairs_cache = {}
-            self.negative_pairs_cache = {}
-            self._precompute_pairs()
-            logger.info("Pair precomputation complete!")
+        # 유효한 시퀀스 인덱스 계산
+        self.valid_indices = self._compute_valid_indices()
+        
+        logger.info(f"TimeSeriesSequenceDataset initialized with {len(self.valid_indices)} valid sequences")
+        logger.info(f"Sequence length: {seq_len}, Stride: {stride}")
     
-    def _compute_valid_indices(self) -> np.ndarray:
+    def _compute_valid_indices(self) -> List[int]:
         """
         시퀀스 생성이 가능한 유효한 인덱스 계산
         
-        시퀀스 길이만큼의 데이터가 있어야 함
+        동일 종목, 동일 날짜 내에서만 시퀀스를 생성합니다.
+        
+        Returns:
+            유효한 시작 인덱스 리스트
         """
         n_samples = len(self.data)
         valid_indices = []
         
-        for i in range(n_samples - self.seq_len + 1):
-            # 동일 종목, 동일 날짜인지 확인
-            stock_codes = self.metadata[i:i+self.seq_len, 0]
-            dates = self.metadata[i:i+self.seq_len, 1]
+        i = 0
+        while i <= n_samples - self.seq_len:
+            # 시퀀스 범위의 메타데이터 확인
+            seq_metadata = self.metadata[i:i+self.seq_len]
+            stock_codes = seq_metadata[:, 0]
+            dates = seq_metadata[:, 1]
             
+            # 동일 종목, 동일 날짜인지 확인
             if len(np.unique(stock_codes)) == 1 and len(np.unique(dates)) == 1:
                 valid_indices.append(i)
+                i += self.stride
+            else:
+                # 다른 종목이나 날짜가 나타나면 해당 위치로 점프
+                # 다음 유효한 시작점 찾기
+                next_valid = i + 1
+                while (next_valid < n_samples and 
+                       (self.metadata[next_valid, 0] == stock_codes[0] and 
+                        self.metadata[next_valid, 1] == dates[0])):
+                    next_valid += 1
+                i = next_valid
         
-        return np.array(valid_indices)
-    
-    def _build_stock_index(self) -> Dict[str, List[int]]:
-        """
-        종목별 인덱스 매핑 생성
-        
-        Returns:
-            Dict[종목코드, List[인덱스]]
-        """
-        stock_indices = {}
-        for idx in self.valid_indices:
-            stock_code = self.metadata[idx, 0]
-            if stock_code not in stock_indices:
-                stock_indices[stock_code] = []
-            stock_indices[stock_code].append(idx)
-        
-        return stock_indices
-    
-    def _load_precomputed_pairs(self, pairs_path: str):
-        """
-        사전 계산된 긍정/부정 쌍 로드
-        
-        Args:
-            pairs_path: 사전 계산된 쌍 파일 경로 (.pkl)
-        """
-        with open(pairs_path, 'rb') as f:
-            pairs_data = pickle.load(f)
-        
-        # 데이터 검증
-        expected_seq_len = pairs_data.get('seq_len')
-        if expected_seq_len != self.seq_len:
-            logger.warning(f"Sequence length mismatch: expected {self.seq_len}, got {expected_seq_len}")
-        
-        # 캐시 로드
-        self.valid_indices = pairs_data['valid_indices']
-        self.stock_indices = pairs_data['stock_indices']
-        self.positive_pairs_cache = pairs_data['positive_pairs_cache']
-        self.negative_pairs_cache = pairs_data['negative_pairs_cache']
-        
-        logger.info(f"Loaded {len(self.positive_pairs_cache)} positive pair entries")
-        logger.info(f"Loaded {len(self.negative_pairs_cache)} negative pair entries")
-    
-    def _precompute_pairs(self):
-        """
-        모든 긍정/부정 쌍 후보를 사전 계산
-        
-        성능 최적화: __getitem__에서 매번 검색하는 대신 미리 계산
-        """
-        # 종목별로 시간 정렬된 인덱스 생성
-        stock_time_sorted = {}
-        for stock_code, indices in self.stock_indices.items():
-            # 시간 순으로 정렬
-            sorted_indices = sorted(indices, key=lambda i: float(self.metadata[i, 2]))
-            stock_time_sorted[stock_code] = sorted_indices
-        
-        # 각 인덱스에 대해 긍정/부정 쌍 후보 계산
-        for idx in self.valid_indices:
-            stock_code = self.metadata[idx, 0]
-            anchor_time = float(self.metadata[idx, 2])
-            
-            # 긍정 쌍 후보 찾기 (동일 종목, 가까운 시간)
-            positive_candidates = []
-            for candidate_idx in stock_time_sorted[stock_code]:
-                if candidate_idx == idx:
-                    continue
-                time_diff = abs(float(self.metadata[candidate_idx, 2]) - anchor_time)
-                if time_diff < self.positive_time_threshold:
-                    positive_candidates.append(candidate_idx)
-            
-            # 긍정 쌍이 없으면 자기 자신 사용
-            if not positive_candidates:
-                positive_candidates = [idx]
-            
-            self.positive_pairs_cache[idx] = positive_candidates
-            
-            # 부정 쌍 후보 찾기
-            negative_candidates = []
-            
-            # 전략 1: 다른 종목 (70%)
-            other_stocks = [s for s in self.stock_indices.keys() if s != stock_code]
-            if other_stocks:
-                for other_stock in other_stocks[:min(5, len(other_stocks))]:
-                    negative_candidates.extend(self.stock_indices[other_stock][:100])
-            
-            # 전략 2: 동일 종목, 먼 시간 (30%)
-            for candidate_idx in stock_time_sorted[stock_code]:
-                time_diff = abs(float(self.metadata[candidate_idx, 2]) - anchor_time)
-                if time_diff > self.negative_time_threshold:
-                    negative_candidates.append(candidate_idx)
-                    if len(negative_candidates) >= 100:
-                        break
-            
-            # 부정 쌍이 없으면 랜덤 샘플 사용
-            if not negative_candidates:
-                negative_candidates = list(self.valid_indices[:100])
-            
-            self.negative_pairs_cache[idx] = negative_candidates
+        return valid_indices
     
     def __len__(self) -> int:
         return len(self.valid_indices)
     
-    def _get_sequence(self, idx: int) -> np.ndarray:
+    def _get_sequence(self, start_idx: int) -> np.ndarray:
         """
-        주어진 인덱스에서 시퀀스 추출
+        주어진 시작 인덱스에서 시퀀스 추출
         
         Args:
-            idx: 시작 인덱스
+            start_idx: 시작 인덱스
             
         Returns:
             시퀀스 데이터 (seq_len, n_features)
         """
-        return self.data[idx:idx+self.seq_len]
-    
-    def _find_positive_pair(self, anchor_idx: int) -> int:
-        """
-        긍정 쌍 찾기: 사전 계산된 후보에서 랜덤 선택
-        
-        Args:
-            anchor_idx: 앵커 샘플 인덱스
-            
-        Returns:
-            긍정 쌍 인덱스
-        """
-        candidates = self.positive_pairs_cache.get(anchor_idx, [anchor_idx])
-        return np.random.choice(candidates)
-    
-    def _find_negative_pair(self, anchor_idx: int) -> int:
-        """
-        부정 쌍 찾기: 사전 계산된 후보에서 랜덤 선택
-        
-        Args:
-            anchor_idx: 앵커 샘플 인덱스
-            
-        Returns:
-            부정 쌍 인덱스
-        """
-        candidates = self.negative_pairs_cache.get(anchor_idx, list(self.valid_indices[:100]))
-        return np.random.choice(candidates)
+        return self.data[start_idx:start_idx + self.seq_len]
     
     def __getitem__(self, idx: int):
         """
-        배치 아이템 반환: (앵커, 긍정, 부정) 또는 (앵커, 긍정, 부정, 종목코드, 타임스탬프)
+        배치 아이템 반환
         
         Args:
             idx: 인덱스
             
         Returns:
-            return_metadata=False: (anchor, positive, negative) 튜플
-            return_metadata=True: (anchor, positive, negative, stock_code, timestamp) 튜플
-            각 텐서 shape: (seq_len, n_features)
+            return_metadata=False: 시퀀스 텐서 (seq_len, n_features)
+            return_metadata=True: (시퀀스, 종목코드, 날짜, 시작시간) 튜플
         """
-        anchor_idx = self.valid_indices[idx]
+        start_idx = self.valid_indices[idx]
         
-        # 앵커 시퀀스
-        anchor = self._get_sequence(anchor_idx)
-        
-        # 긍정 쌍 찾기 (사전 계산된 캐시 사용)
-        positive_idx = self._find_positive_pair(anchor_idx)
-        positive = self._get_sequence(positive_idx)
-        
-        # 부정 쌍 찾기
-        negative_idx = self._find_negative_pair(anchor_idx)
-        negative = self._get_sequence(negative_idx)
+        # 시퀀스 추출
+        sequence = self._get_sequence(start_idx)
         
         # Tensor로 변환
-        anchor_tensor = torch.from_numpy(anchor).float()
-        positive_tensor = torch.from_numpy(positive).float()
-        negative_tensor = torch.from_numpy(negative).float()
+        sequence_tensor = torch.from_numpy(sequence).float()
         
         if self.return_metadata:
-            # 메타데이터 추출 (앵커 기준)
-            stock_code = str(self.metadata[anchor_idx, 0])
-            timestamp = float(self.metadata[anchor_idx, 2])  # 번호를 타임스탬프로 사용
-            return anchor_tensor, positive_tensor, negative_tensor, stock_code, timestamp
+            # 메타데이터 추출 (시퀀스 시작점 기준)
+            stock_code = str(self.metadata[start_idx, 0])
+            date = str(self.metadata[start_idx, 1])
+            start_time = float(self.metadata[start_idx, 2])
+            return sequence_tensor, stock_code, date, start_time
         else:
-            return anchor_tensor, positive_tensor, negative_tensor
+            return sequence_tensor
+
+
+class TradingTaskDataset(Dataset):
+    """
+    Fine-tuning을 위한 트레이딩 태스크 Dataset
+    
+    시계열 시퀀스와 해당하는 트레이딩 라벨(분류/회귀)을 제공합니다.
+    
+    Args:
+        sequences: 시퀀스 데이터 (n_samples, seq_len, n_features)
+        labels: 라벨 데이터 (n_samples,) 또는 (n_samples, n_classes)
+        task_type: 태스크 타입 ('classification', 'regression', 'ranking')
+    """
+    
+    def __init__(
+        self,
+        sequences: np.ndarray,
+        labels: np.ndarray,
+        task_type: str = 'classification'
+    ):
+        self.sequences = torch.from_numpy(sequences).float()
+        self.task_type = task_type
+        
+        if task_type == 'classification' and labels.ndim == 1:
+            self.labels = torch.from_numpy(labels).long()
+        else:
+            self.labels = torch.from_numpy(labels).float()
+    
+    def __len__(self) -> int:
+        return len(self.sequences)
+    
+    def __getitem__(self, idx: int):
+        """
+        배치 아이템 반환: (시퀀스, 라벨)
+        
+        Args:
+            idx: 인덱스
+            
+        Returns:
+            (sequence_tensor, label_tensor) 튜플
+        """
+        return self.sequences[idx], self.labels[idx]
+
+
+# 하위 호환성을 위한 별칭
+EmbeddingDataLoader = AutoEncoderDataLoader
+ContrastiveDataset = TimeSeriesSequenceDataset  # 기존 코드 호환성

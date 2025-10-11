@@ -1,210 +1,279 @@
 """
-임베딩 손실 함수 테스트
+AutoEncoder 훈련 및 Fine-tuning 테스트
 """
 
 import torch
+import torch.nn.functional as F
 import pytest
-from ai_trader.embedding.losses import InfoNCELoss, TripletLoss
+import numpy as np
+from ai_trader.embedding.autoencoder_trainer import AutoEncoderTrainer, TimeSeriesDataset, train_autoencoder_embedding
+from ai_trader.embedding.autoencoder_model import AutoEncoderEmbedding, MaskedAutoEncoder
+from ai_trader.embedding.fine_tuning import FineTunedEmbedding, TradingTaskHead, FineTuner
 
 
-def test_infonce_loss_output_shape():
-    """InfoNCE 손실 함수 출력 형태 검증"""
-    loss_fn = InfoNCELoss(temperature=0.07)
+def test_time_series_dataset():
+    """TimeSeriesDataset 테스트"""
+    # 더미 데이터 생성
+    data = np.random.randn(1000, 50).astype(np.float32)
+    seq_len = 60
+    stride = 1
     
-    batch_size = 32
-    embedding_dim = 128
-    num_negatives = 10
+    dataset = TimeSeriesDataset(data, seq_len, stride)
     
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = torch.randn(batch_size, embedding_dim)
-    negatives = torch.randn(batch_size, num_negatives, embedding_dim)
+    # 데이터셋 길이 검증
+    expected_length = max(0, (len(data) - seq_len) // stride + 1)
+    assert len(dataset) == expected_length
     
-    loss = loss_fn(anchor, positive, negatives)
-    
-    # 손실은 스칼라여야 함
-    assert loss.shape == torch.Size([])
-    assert loss.item() >= 0  # 손실은 항상 양수
+    # 샘플 형태 검증
+    if len(dataset) > 0:
+        sample = dataset[0]
+        assert sample.shape == (seq_len, 50)
+        assert sample.dtype == torch.float32
 
 
-def test_infonce_loss_reduction():
-    """InfoNCE 손실 함수 reduction 모드 검증"""
-    batch_size = 16
-    embedding_dim = 64
-    num_negatives = 5
+def test_time_series_dataset_stride():
+    """TimeSeriesDataset stride 파라미터 테스트"""
+    data = np.random.randn(100, 10).astype(np.float32)
+    seq_len = 20
     
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = torch.randn(batch_size, embedding_dim)
-    negatives = torch.randn(batch_size, num_negatives, embedding_dim)
+    # stride=1
+    dataset_stride1 = TimeSeriesDataset(data, seq_len, stride=1)
     
-    # Mean reduction
-    loss_fn_mean = InfoNCELoss(temperature=0.1, reduction='mean')
-    loss_mean = loss_fn_mean(anchor, positive, negatives)
-    assert loss_mean.shape == torch.Size([])
+    # stride=5
+    dataset_stride5 = TimeSeriesDataset(data, seq_len, stride=5)
     
-    # Sum reduction
-    loss_fn_sum = InfoNCELoss(temperature=0.1, reduction='sum')
-    loss_sum = loss_fn_sum(anchor, positive, negatives)
-    assert loss_sum.shape == torch.Size([])
-    
-    # None reduction
-    loss_fn_none = InfoNCELoss(temperature=0.1, reduction='none')
-    loss_none = loss_fn_none(anchor, positive, negatives)
-    assert loss_none.shape == torch.Size([batch_size])
+    # stride가 클수록 데이터셋 크기가 작아야 함
+    assert len(dataset_stride5) <= len(dataset_stride1)
 
 
-def test_infonce_loss_temperature_effect():
-    """Temperature 파라미터 효과 검증"""
-    batch_size = 8
-    embedding_dim = 32
-    num_negatives = 4
+def test_autoencoder_trainer_initialization():
+    """AutoEncoderTrainer 초기화 테스트"""
+    model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=60)
+    trainer = AutoEncoderTrainer(model, device='cpu')
     
-    # 동일한 데이터로 다른 temperature 테스트
-    torch.manual_seed(42)
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = torch.randn(batch_size, embedding_dim)
-    negatives = torch.randn(batch_size, num_negatives, embedding_dim)
-    
-    # 낮은 temperature
-    loss_fn_low = InfoNCELoss(temperature=0.01)
-    loss_low = loss_fn_low(anchor, positive, negatives)
-    
-    # 높은 temperature
-    loss_fn_high = InfoNCELoss(temperature=1.0)
-    loss_high = loss_fn_high(anchor, positive, negatives)
-    
-    # Temperature가 다르면 손실 값도 달라야 함
-    assert loss_low.item() != loss_high.item()
+    assert trainer.model == model
+    assert trainer.device == 'cpu'
+    assert trainer.current_epoch == 0
+    assert trainer.best_loss == float('inf')
 
 
-def test_infonce_loss_perfect_positive():
-    """완벽한 긍정 쌍에 대한 손실 검증"""
-    batch_size = 4
-    embedding_dim = 16
-    num_negatives = 3
+def test_autoencoder_trainer_loss_computation():
+    """AutoEncoderTrainer 손실 계산 테스트"""
+    # 표준 AutoEncoder
+    model = AutoEncoderEmbedding(input_dim=20, embedding_dim=64, seq_len=30)
+    trainer = AutoEncoderTrainer(model, device='cpu')
     
-    # 앵커와 긍정이 동일한 경우
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = anchor.clone()  # 완벽한 긍정 쌍
-    negatives = torch.randn(batch_size, num_negatives, embedding_dim)
+    batch = torch.randn(8, 30, 20)
+    loss, metrics = trainer.compute_loss(batch)
     
-    loss_fn = InfoNCELoss(temperature=0.07)
-    loss = loss_fn(anchor, positive, negatives)
-    
-    # 완벽한 긍정 쌍이므로 손실이 낮아야 함
-    assert loss.item() < 2.0  # 경험적 임계값
-
-
-def test_infonce_loss_symmetric():
-    """대칭적 InfoNCE 손실 검증"""
-    batch_size = 8
-    embedding_dim = 32
-    num_negatives = 5
-    
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = torch.randn(batch_size, embedding_dim)
-    negatives = torch.randn(batch_size, num_negatives, embedding_dim)
-    
-    loss_fn = InfoNCELoss(temperature=0.07)
-    
-    # 대칭적 손실 계산
-    loss_symmetric = loss_fn.forward_symmetric(anchor, positive, negatives)
-    
-    # 일반 손실 계산
-    loss_forward = loss_fn(anchor, positive, negatives)
-    loss_backward = loss_fn(positive, anchor, negatives)
-    expected_symmetric = (loss_forward + loss_backward) / 2.0
-    
-    # 대칭적 손실이 올바르게 계산되었는지 확인
-    assert torch.allclose(loss_symmetric, expected_symmetric, atol=1e-6)
-
-
-def test_triplet_loss_output_shape():
-    """Triplet Loss 출력 형태 검증"""
-    loss_fn = TripletLoss(margin=1.0, distance_metric='euclidean')
-    
-    batch_size = 16
-    embedding_dim = 64
-    
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = torch.randn(batch_size, embedding_dim)
-    negative = torch.randn(batch_size, embedding_dim)
-    
-    loss = loss_fn(anchor, positive, negative)
-    
-    # 손실은 스칼라여야 함
-    assert loss.shape == torch.Size([])
+    assert isinstance(loss, torch.Tensor)
+    assert loss.dim() == 0  # 스칼라
     assert loss.item() >= 0
+    assert 'reconstruction_loss' in metrics
+    
+    # Masked AutoEncoder
+    masked_model = MaskedAutoEncoder(input_dim=20, embedding_dim=64, seq_len=30, mask_ratio=0.15)
+    masked_trainer = AutoEncoderTrainer(masked_model, device='cpu')
+    
+    masked_loss, masked_metrics = masked_trainer.compute_loss(batch)
+    
+    assert isinstance(masked_loss, torch.Tensor)
+    assert masked_loss.dim() == 0
+    assert masked_loss.item() >= 0
+    assert 'reconstruction_loss' in masked_metrics
+    assert 'mask_ratio' in masked_metrics
 
 
-def test_triplet_loss_distance_metrics():
-    """Triplet Loss 거리 메트릭 검증"""
-    batch_size = 8
-    embedding_dim = 32
+def test_autoencoder_trainer_optimizer_creation():
+    """AutoEncoderTrainer optimizer 생성 테스트"""
+    model = AutoEncoderEmbedding(input_dim=30, embedding_dim=64, seq_len=40)
+    trainer = AutoEncoderTrainer(model, device='cpu')
     
-    anchor = torch.randn(batch_size, embedding_dim)
-    positive = torch.randn(batch_size, embedding_dim)
-    negative = torch.randn(batch_size, embedding_dim)
+    config = {
+        'optimizer': 'adamw',
+        'learning_rate': 1e-3,
+        'weight_decay': 1e-4,
+        'scheduler': 'cosine',
+        'max_epochs': 50
+    }
     
-    # Euclidean distance
-    loss_fn_euclidean = TripletLoss(margin=1.0, distance_metric='euclidean')
-    loss_euclidean = loss_fn_euclidean(anchor, positive, negative)
+    optimizer, scheduler = trainer.create_optimizer(config)
     
-    # Cosine distance
-    loss_fn_cosine = TripletLoss(margin=1.0, distance_metric='cosine')
-    loss_cosine = loss_fn_cosine(anchor, positive, negative)
-    
-    # 두 메트릭 모두 유효한 손실을 반환해야 함
-    assert loss_euclidean.item() >= 0
-    assert loss_cosine.item() >= 0
+    assert optimizer is not None
+    assert scheduler is not None
+    assert optimizer.param_groups[0]['lr'] == 1e-3
+    assert optimizer.param_groups[0]['weight_decay'] == 1e-4
 
 
-def test_triplet_loss_margin_effect():
-    """Triplet Loss 마진 효과 검증"""
-    batch_size = 4
-    embedding_dim = 16
+def test_trading_task_head():
+    """TradingTaskHead 테스트"""
+    embedding_dim = 128
     
-    # 긍정 샘플이 앵커에 가깝고, 부정 샘플이 먼 경우
-    anchor = torch.zeros(batch_size, embedding_dim)
-    positive = torch.ones(batch_size, embedding_dim) * 0.1  # 가까움
-    negative = torch.ones(batch_size, embedding_dim) * 10.0  # 멀음
+    # 분류 헤드
+    classification_head = TradingTaskHead(
+        embedding_dim=embedding_dim,
+        task_type='classification',
+        num_classes=3,
+        hidden_dim=64
+    )
     
-    # 작은 마진
-    loss_fn_small = TripletLoss(margin=0.1)
-    loss_small = loss_fn_small(anchor, positive, negative)
+    embeddings = torch.randn(16, embedding_dim)
+    output = classification_head(embeddings)
+    assert output.shape == (16, 3)
     
-    # 큰 마진
-    loss_fn_large = TripletLoss(margin=5.0)
-    loss_large = loss_fn_large(anchor, positive, negative)
+    # 회귀 헤드
+    regression_head = TradingTaskHead(
+        embedding_dim=embedding_dim,
+        task_type='regression',
+        hidden_dim=64
+    )
     
-    # 큰 마진일수록 손실이 커야 함 (같은 데이터에 대해)
-    assert loss_large.item() >= loss_small.item()
+    output = regression_head(embeddings)
+    assert output.shape == (16, 1)
+    
+    # 랭킹 헤드
+    ranking_head = TradingTaskHead(
+        embedding_dim=embedding_dim,
+        task_type='ranking',
+        hidden_dim=64
+    )
+    
+    output = ranking_head(embeddings)
+    assert output.shape == (16, 1)
 
 
-def test_infonce_loss_gradient_flow():
-    """InfoNCE 손실의 그래디언트 흐름 검증"""
-    batch_size = 8
-    embedding_dim = 32
-    num_negatives = 5
+def test_finetuned_embedding():
+    """FineTunedEmbedding 테스트"""
+    # 기본 AutoEncoder 모델
+    base_model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=60)
     
-    anchor = torch.randn(batch_size, embedding_dim, requires_grad=True)
-    positive = torch.randn(batch_size, embedding_dim, requires_grad=True)
-    negatives = torch.randn(batch_size, num_negatives, embedding_dim, requires_grad=True)
+    # 태스크 헤드
+    task_head = TradingTaskHead(
+        embedding_dim=128,
+        task_type='classification',
+        num_classes=3
+    )
     
-    loss_fn = InfoNCELoss(temperature=0.07)
-    loss = loss_fn(anchor, positive, negatives)
+    # Fine-tuned 모델
+    finetuned_model = FineTunedEmbedding(
+        base_model=base_model,
+        task_head=task_head,
+        freeze_encoder=False
+    )
     
-    # 역전파
+    # 테스트 입력
+    x = torch.randn(8, 60, 50)
+    task_output, embeddings = finetuned_model(x)
+    
+    assert task_output.shape == (8, 3)  # 분류 출력
+    assert embeddings.shape == (8, 128)  # 임베딩
+
+
+def test_finetuned_embedding_frozen_encoder():
+    """인코더가 고정된 FineTunedEmbedding 테스트"""
+    base_model = AutoEncoderEmbedding(input_dim=30, embedding_dim=64, seq_len=40)
+    task_head = TradingTaskHead(embedding_dim=64, task_type='regression')
+    
+    finetuned_model = FineTunedEmbedding(
+        base_model=base_model,
+        task_head=task_head,
+        freeze_encoder=True
+    )
+    
+    # 인코더 파라미터가 고정되었는지 확인
+    for param in finetuned_model.encoder.parameters():
+        assert not param.requires_grad, "Encoder parameters should be frozen"
+    
+    # 태스크 헤드 파라미터는 학습 가능해야 함
+    for param in finetuned_model.task_head.parameters():
+        assert param.requires_grad, "Task head parameters should be trainable"
+
+
+def test_fine_tuner_loss_computation():
+    """FineTuner 손실 계산 테스트"""
+    base_model = AutoEncoderEmbedding(input_dim=20, embedding_dim=32, seq_len=30)
+    task_head = TradingTaskHead(embedding_dim=32, task_type='classification', num_classes=3)
+    finetuned_model = FineTunedEmbedding(base_model, task_head)
+    
+    trainer = FineTuner(finetuned_model, device='cpu')
+    
+    batch_x = torch.randn(8, 30, 20)
+    batch_y = torch.randint(0, 3, (8,))
+    
+    loss, metrics = trainer.compute_loss_and_metrics(batch_x, batch_y, 'classification')
+    
+    assert isinstance(loss, torch.Tensor)
+    assert loss.dim() == 0
+    assert loss.item() >= 0
+    assert 'accuracy' in metrics
+    assert 0 <= metrics['accuracy'] <= 1
+
+
+def test_fine_tuner_regression_loss():
+    """FineTuner 회귀 손실 테스트"""
+    base_model = AutoEncoderEmbedding(input_dim=15, embedding_dim=32, seq_len=25)
+    task_head = TradingTaskHead(embedding_dim=32, task_type='regression')
+    finetuned_model = FineTunedEmbedding(base_model, task_head)
+    
+    trainer = FineTuner(finetuned_model, device='cpu')
+    
+    batch_x = torch.randn(8, 25, 15)
+    batch_y = torch.randn(8)
+    
+    loss, metrics = trainer.compute_loss_and_metrics(batch_x, batch_y, 'regression')
+    
+    assert isinstance(loss, torch.Tensor)
+    assert loss.dim() == 0
+    assert loss.item() >= 0
+    assert 'r2' in metrics
+    assert 'mse' in metrics
+
+
+def test_train_autoencoder_embedding_function():
+    """train_autoencoder_embedding 함수 테스트"""
+    # 더미 데이터 생성
+    train_data = np.random.randn(1000, 30).astype(np.float32)
+    val_data = np.random.randn(200, 30).astype(np.float32)
+    
+    config = {
+        'model_type': 'standard',
+        'embedding_dim': 64,
+        'hidden_dim': 128,
+        'seq_len': 40,
+        'batch_size': 32,
+        'max_epochs': 2,  # 빠른 테스트를 위해 적은 에포크
+        'learning_rate': 1e-3
+    }
+    
+    model, trainer, history = train_autoencoder_embedding(
+        train_data, val_data, config, output_dir='test_models'
+    )
+    
+    assert isinstance(model, AutoEncoderEmbedding)
+    assert isinstance(trainer, AutoEncoderTrainer)
+    assert len(history) == config['max_epochs']
+    assert all('train_loss' in entry for entry in history)
+    assert all('val_loss' in entry for entry in history)
+
+
+def test_reconstruction_loss_gradient_flow():
+    """재구성 손실의 그래디언트 흐름 테스트"""
+    model = AutoEncoderEmbedding(input_dim=20, embedding_dim=32, seq_len=25)
+    
+    x = torch.randn(4, 25, 20, requires_grad=True)
+    reconstruction, embedding = model(x)
+    
+    # 재구성 손실 계산
+    loss = F.mse_loss(reconstruction, x)
     loss.backward()
     
     # 그래디언트가 계산되었는지 확인
-    assert anchor.grad is not None
-    assert positive.grad is not None
-    assert negatives.grad is not None
+    assert x.grad is not None
     
-    # 그래디언트가 0이 아닌지 확인
-    assert torch.any(anchor.grad != 0)
-    assert torch.any(positive.grad != 0)
-    assert torch.any(negatives.grad != 0)
+    # 모델 파라미터에 그래디언트가 있는지 확인
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"Gradient not computed for {name}"
+        assert torch.any(param.grad != 0), f"Gradient is zero for {name}"
 
 
 if __name__ == '__main__':
