@@ -39,7 +39,7 @@ class SimpleContrastiveModel(nn.Module):
         return self.encoder(pooled)
 
 
-class ContrastiveDataset(Dataset):
+class TimeSeriesSequenceDataset(Dataset):
     """Dataset for contrastive learning with positive/negative pairs."""
     
     def __init__(self, data: np.ndarray, seq_len: int = 60):
@@ -177,7 +177,7 @@ def benchmark_contrastive(data: np.ndarray, config: dict, device: str = 'cuda'):
     ).to(device)
     
     # Create dataset and dataloader
-    dataset = ContrastiveDataset(data, seq_len)
+    dataset = TimeSeriesSequenceDataset(data, seq_len)
     dataloader = DataLoader(
         dataset,
         batch_size=config['batch_size'],

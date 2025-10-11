@@ -598,8 +598,3 @@ class BatchCollator:
             all_sequences = all_sequences[indices]
         
         return all_sequences
-
-
-# 하위 호환성을 위한 별칭
-EmbeddingDataLoader = AutoEncoderDataLoader
-ContrastiveDataset = TimeSeriesSequenceDataset  # 기존 코드 호환성

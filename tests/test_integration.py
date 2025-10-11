@@ -18,7 +18,7 @@ import duckdb
 
 from ai_trader.embedding.models import TradingEmbeddingModel
 from ai_trader.embedding.losses import InfoNCELoss
-from ai_trader.embedding.data import EmbeddingDataLoader
+from ai_trader.embedding.data import AutoEncoderDataLoader
 from ai_trader.grpo.env import GRPOScalpingEnv
 from ai_trader.grpo.policy import GRPOPolicy
 from ai_trader.grpo.grpo import GRPOTrainer
@@ -118,7 +118,7 @@ def trained_embedding_model(test_db_path, temp_dir):
     output_dir.mkdir(exist_ok=True)
     
     # 데이터 로더 초기화
-    data_loader = EmbeddingDataLoader(
+    data_loader = AutoEncoderDataLoader(
         db_path=test_db_path,
         table_name='datasets',
         seq_len=60
@@ -510,7 +510,7 @@ class TestPipelineCompatibility:
         DuckDB 데이터 로더가 기존 시스템과 호환되는지 확인합니다.
         """
         # 데이터 로더 초기화
-        data_loader = EmbeddingDataLoader(
+        data_loader = AutoEncoderDataLoader(
             db_path=test_db_path,
             table_name='datasets',
             seq_len=60

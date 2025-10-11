@@ -6,7 +6,7 @@ import pytest
 import numpy as np
 import tempfile
 import duckdb
-from ai_trader.embedding.data import EmbeddingDataLoader, ContrastiveDataset, DataLoadError
+from ai_trader.embedding.data import AutoEncoderDataLoader, TimeSeriesSequenceDataset, DataLoadError
 
 
 @pytest.fixture
@@ -63,7 +63,7 @@ def sample_db():
 
 def test_data_loader_initialization(sample_db):
     """데이터 로더 초기화 테스트"""
-    loader = EmbeddingDataLoader(
+    loader = AutoEncoderDataLoader(
         db_path=sample_db,
         table_name='datasets',
         seq_len=10
@@ -78,7 +78,7 @@ def test_data_loader_initialization(sample_db):
 
 def test_data_loader_connection(sample_db):
     """데이터베이스 연결 테스트"""
-    loader = EmbeddingDataLoader(db_path=sample_db)
+    loader = AutoEncoderDataLoader(db_path=sample_db)
     loader.connect()
     
     assert loader.conn is not None
@@ -88,7 +88,7 @@ def test_data_loader_connection(sample_db):
 
 def test_load_and_split_data(sample_db):
     """데이터 로드 및 분할 테스트"""
-    loader = EmbeddingDataLoader(
+    loader = AutoEncoderDataLoader(
         db_path=sample_db,
         seq_len=10,
         train_ratio=0.7,
@@ -130,7 +130,7 @@ def test_contrastive_dataset():
         for i in range(n_samples)
     ])
     
-    dataset = ContrastiveDataset(
+    dataset = TimeSeriesSequenceDataset(
         data=data,
         metadata=metadata,
         seq_len=10
@@ -160,7 +160,7 @@ def test_positive_pair_generation():
         for i in range(n_samples)
     ])
     
-    dataset = ContrastiveDataset(
+    dataset = TimeSeriesSequenceDataset(
         data=data,
         metadata=metadata,
         seq_len=10,
@@ -194,7 +194,7 @@ def test_negative_pair_generation():
         for i in range(n_samples)
     ])
     
-    dataset = ContrastiveDataset(
+    dataset = TimeSeriesSequenceDataset(
         data=data,
         metadata=metadata,
         seq_len=10,
@@ -218,7 +218,7 @@ def test_negative_pair_generation():
 def test_invalid_split_ratios():
     """잘못된 분할 비율 테스트"""
     with pytest.raises(ValueError):
-        EmbeddingDataLoader(
+        AutoEncoderDataLoader(
             db_path='dummy.db',
             train_ratio=0.5,
             val_ratio=0.3,
@@ -228,7 +228,7 @@ def test_invalid_split_ratios():
 
 def test_invalid_db_path():
     """존재하지 않는 데이터베이스 경로 테스트"""
-    loader = EmbeddingDataLoader(db_path='nonexistent.db')
+    loader = AutoEncoderDataLoader(db_path='nonexistent.db')
     
     with pytest.raises(DataLoadError):
         loader.connect()

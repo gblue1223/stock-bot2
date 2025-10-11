@@ -24,7 +24,7 @@ import numpy as np
 
 from ai_trader.embedding.models import TradingEmbeddingModel
 from ai_trader.embedding.losses import InfoNCELoss
-from ai_trader.embedding.data import EmbeddingDataLoader
+from ai_trader.embedding.data import AutoEncoderDataLoader
 from ai_trader.embedding.evaluation import (
     compute_silhouette_score,
     compute_temporal_coherence
@@ -195,7 +195,7 @@ def main():
     if rank == 0:
         logger.info("데이터 로더 초기화...")
     
-    data_loader = EmbeddingDataLoader(
+    data_loader = AutoEncoderDataLoader(
         db_path=args.db,
         table_name=args.table,
         seq_len=args.seq_len,

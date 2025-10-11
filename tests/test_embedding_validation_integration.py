@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from ai_trader.embedding.models import TradingEmbeddingModel
 from ai_trader.embedding.losses import InfoNCELoss
-from ai_trader.embedding.data import ContrastiveDataset
+from ai_trader.embedding.data import TimeSeriesSequenceDataset
 from ai_trader.embedding.train_embedding import (
     compute_silhouette_score,
     compute_temporal_coherence
@@ -40,7 +40,7 @@ class TestValidationIntegration:
         metadata = np.array(list(zip(stock_codes, dates, numbers)))
         
         # Dataset 생성 (메타데이터 반환 활성화)
-        dataset = ContrastiveDataset(
+        dataset = TimeSeriesSequenceDataset(
             data=data,
             metadata=metadata,
             seq_len=seq_len,
@@ -89,7 +89,7 @@ class TestValidationIntegration:
         metadata = np.array(list(zip(stock_codes, dates, numbers)))
         
         # Dataset 생성
-        dataset = ContrastiveDataset(
+        dataset = TimeSeriesSequenceDataset(
             data=data,
             metadata=metadata,
             seq_len=seq_len,

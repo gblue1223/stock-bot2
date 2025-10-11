@@ -69,7 +69,7 @@ import numpy as np
 
 from ai_trader.embedding.models import TradingEmbeddingModel
 from ai_trader.embedding.losses import InfoNCELoss
-from ai_trader.embedding.data import EmbeddingDataLoader
+from ai_trader.embedding.data import AutoEncoderDataLoader
 from ai_trader.embedding.evaluation import (
     compute_silhouette_score,
     compute_temporal_coherence
@@ -782,7 +782,7 @@ def train_incremental(args, device, output_dir, writer):
             
             # 모델 초기화 (첫 청크 데이터로 input_dim 확인 필요)
             # 임시로 데이터 로더 생성
-            temp_loader = EmbeddingDataLoader(
+            temp_loader = AutoEncoderDataLoader(
                 db_path=args.db,
                 table_name=args.table,
                 seq_len=args.seq_len,
@@ -838,7 +838,7 @@ def train_incremental(args, device, output_dir, writer):
         logger.info("=" * 80)
         
         # 데이터 로더 초기화 (OFFSET과 LIMIT 사용)
-        data_loader = EmbeddingDataLoader(
+        data_loader = AutoEncoderDataLoader(
             db_path=args.db,
             table_name=args.table,
             seq_len=args.seq_len,
@@ -1038,7 +1038,7 @@ def main():
     
     # 데이터 로더 초기화
     logger.info("Initializing data loader...")
-    data_loader = EmbeddingDataLoader(
+    data_loader = AutoEncoderDataLoader(
         db_path=args.db,
         table_name=args.table,
         seq_len=args.seq_len,

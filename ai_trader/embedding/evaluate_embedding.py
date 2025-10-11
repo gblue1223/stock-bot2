@@ -21,7 +21,7 @@ import torch
 import numpy as np
 
 from ai_trader.embedding.models import TradingEmbeddingModel
-from ai_trader.embedding.data import EmbeddingDataLoader
+from ai_trader.embedding.data import AutoEncoderDataLoader
 from ai_trader.embedding.evaluation import evaluate_embedding_quality
 
 # 로깅 설정
@@ -229,7 +229,7 @@ def main():
     
     # 데이터 로더 초기화
     logger.info("Initializing data loader...")
-    data_loader = EmbeddingDataLoader(
+    data_loader = AutoEncoderDataLoader(
         db_path=args.db,
         table_name=args.table,
         seq_len=config['seq_len']
