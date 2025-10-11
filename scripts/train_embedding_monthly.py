@@ -1,8 +1,14 @@
 """
-월별 AutoEncoder 임베딩 모델 훈련 스크립트
+월별 AutoEncoder 임베딩 모델 훈련 스크립트 (최적화 버전)
 
 12개월 5억 개 데이터를 효율적으로 훈련하기 위한 자동화 스크립트
 AutoEncoder + Fine-tuning 방식 사용
+
+최적화 기능:
+- 사전 처리된 캐시 배치 사용
+- 점진적 학습 지원
+- GPU 메모리 최적화
+- 병렬 데이터 로딩
 """
 
 import argparse
@@ -32,7 +38,9 @@ def train_month(
     base_output_dir: str,
     resume_from: str = None,
     is_initial: bool = False,
-    max_samples: int = 5000000
+    max_samples: int = 5000000,
+    use_preprocessed: bool = False,
+    preprocessed_dir: str = None
 ):
     """
     특정 월 데이터로 훈련

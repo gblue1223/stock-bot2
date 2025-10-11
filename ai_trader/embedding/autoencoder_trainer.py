@@ -266,8 +266,8 @@ class AutoEncoderTrainer:
         self.logger.info("Training completed!")
         return self.training_history
     
-    def save_checkpoint(self, output_dir: str, is_best: bool = False):
-        """Save model checkpoint."""
+    def save_checkpoint(self, output_dir: str, is_best: bool = False, save_optimizer: bool = True):
+        """Save model checkpoint with optimization options."""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
         
@@ -285,13 +285,27 @@ class AutoEncoderTrainer:
             }
         }
         
+        # 옵티마이저 상태 저장 (점진적 학습용)
+        if save_optimizer and hasattr(self, 'optimizer'):
+            checkpoint['optimizer_state_dict'] = self.optimizer.state_dict()
+            if hasattr(self, 'scheduler') and self.scheduler:
+                checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        
         if is_best:
             torch.save(checkpoint, output_path / 'best_model.pt')
         else:
             torch.save(checkpoint, output_path / f'checkpoint_epoch_{self.current_epoch}.pt')
+        
+        # 경량화된 추론 전용 모델 저장
+        if is_best:
+            inference_checkpoint = {
+                'model_state_dict': self.model.state_dict(),
+                'model_config': checkpoint['model_config']
+            }
+            torch.save(inference_checkpoint, output_path / 'inference_model.pt')
     
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load model checkpoint."""
+    def load_checkpoint(self, checkpoint_path: str, load_optimizer: bool = True):
+        """Load model checkpoint with optimizer state."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -299,7 +313,40 @@ class AutoEncoderTrainer:
         self.best_loss = checkpoint['best_loss']
         self.training_history = checkpoint.get('training_history', [])
         
+        # 옵티마이저 상태 복원 (점진적 학습용)
+        if load_optimizer and hasattr(self, 'optimizer') and 'optimizer_state_dict' in checkpoint:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            self.logger.info("Loaded optimizer state")
+        
+        if load_optimizer and hasattr(self, 'scheduler') and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            self.logger.info("Loaded scheduler state")
+        
         self.logger.info(f"Loaded checkpoint from epoch {self.current_epoch}")
+    
+    def resume_training(self, checkpoint_path: str, new_data: np.ndarray, 
+                       val_data: Optional[np.ndarray] = None, config: dict = None):
+        """
+        점진적 학습: 기존 모델에서 새로운 데이터로 계속 훈련
+        
+        Args:
+            checkpoint_path: 재개할 체크포인트 경로
+            new_data: 새로운 훈련 데이터
+            val_data: 새로운 검증 데이터
+            config: 훈련 설정
+        """
+        if config is None:
+            config = {}
+        
+        # 체크포인트 로드
+        self.load_checkpoint(checkpoint_path, load_optimizer=True)
+        
+        # 새로운 데이터로 훈련 계속
+        self.logger.info(f"Resuming training from epoch {self.current_epoch}")
+        self.logger.info(f"New training data shape: {new_data.shape}")
+        
+        # 기존 훈련 함수 호출
+        return self.train(new_data, val_data, config)
 
 
 def train_autoencoder_embedding(train_data: np.ndarray, 

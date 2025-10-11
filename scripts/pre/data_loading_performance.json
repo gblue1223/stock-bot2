@@ -1,0 +1,75 @@
+{
+  "basic_dataset": {
+    "dataset_size": 5000,
+    "samples_loaded": 1000,
+    "elapsed_time": 0.2870783805847168,
+    "throughput": 3483.369238614261,
+    "sample_shape": [
+      60,
+      60
+    ]
+  },
+  "cached_dataset": {
+    "dataset_size": 5000,
+    "samples_loaded": 1000,
+    "elapsed_time": 0.05376172065734863,
+    "throughput": 18600.595140425645,
+    "sample_shape": [
+      60,
+      60
+    ]
+  },
+  "dataloader_comparison": {
+    "32": {
+      "basic": {
+        "time": 0.0,
+        "throughput": 0,
+        "samples": 640
+      },
+      "cached": {
+        "time": 0.05360102653503418,
+        "throughput": 11940.069833955315,
+        "samples": 640
+      },
+      "speedup": 0.0
+    },
+    "64": {
+      "basic": {
+        "time": 0.0,
+        "throughput": 0,
+        "samples": 1280
+      },
+      "cached": {
+        "time": 0.10092043876647949,
+        "throughput": 12683.258373081402,
+        "samples": 1280
+      },
+      "speedup": 0.0
+    },
+    "128": {
+      "basic": {
+        "time": 0.0,
+        "throughput": 0,
+        "samples": 2560
+      },
+      "cached": {
+        "time": 0.1593921184539795,
+        "throughput": 16061.019985371086,
+        "samples": 2560
+      },
+      "speedup": 0.0
+    }
+  },
+  "test_info": {
+    "n_sequences": 5000,
+    "sequence_shape": [
+      5000,
+      60,
+      60
+    ],
+    "metadata_shape": [
+      5000,
+      3
+    ]
+  }
+}
