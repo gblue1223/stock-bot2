@@ -155,6 +155,7 @@ def save_results(
     """Save fine-tuned model and results."""
     logger.info(f"Saving results to {output_dir}")
     
+    # Ensure output directory exists
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')

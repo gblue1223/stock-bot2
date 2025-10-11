@@ -249,6 +249,10 @@ class FineTuner:
         additional_info: Optional[Dict] = None
     ) -> None:
         """Save model checkpoint."""
+        
+        # Create parent directory if it doesn't exist
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
