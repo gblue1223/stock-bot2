@@ -220,8 +220,12 @@ class FineTuner:
             if val_loss < self.best_loss:
                 self.best_loss = val_loss
                 if save_path:
-                    self.save_checkpoint(save_path, epoch, initial_val_loss)
-                logger.info(f"New best model saved! Loss: {val_loss:.6f}")
+                    try:
+                        self.save_checkpoint(save_path, epoch, initial_val_loss)
+                        logger.info(f"New best model saved! Loss: {val_loss:.6f}")
+                    except Exception as e:
+                        logger.error(f"Failed to save checkpoint: {e}")
+                        logger.info(f"Continuing training without saving...")
         
         total_time = time.time() - self.start_time
         
