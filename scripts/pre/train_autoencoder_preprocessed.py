@@ -66,6 +66,9 @@ class PreprocessedAutoEncoderTrainer(AutoEncoderTrainer):
         pbar = tqdm(dataloader, desc=f"Epoch {self.current_epoch}")
         
         for batch in pbar:
+            # Handle both tuple (from TensorDataset) and tensor (from custom datasets)
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]  # TensorDataset returns (tensor,)
             batch = batch.to(self.device)
             batch_size = batch.size(0)
             
@@ -83,11 +86,12 @@ class PreprocessedAutoEncoderTrainer(AutoEncoderTrainer):
             total_sequences += batch_size
             
             # Update progress bar
-            pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
-                'avg_loss': f"{total_loss/num_batches:.4f}",
-                'sequences': f"{total_sequences:,}"
-            })
+            if hasattr(pbar, 'set_postfix'):
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.4f}",
+                    'avg_loss': f"{total_loss/num_batches:.4f}",
+                    'sequences': f"{total_sequences:,}"
+                })
         
         avg_loss = total_loss / num_batches
         logging.info(f"Epoch {self.current_epoch}: processed {total_sequences:,} sequences, avg_loss={avg_loss:.4f}")
@@ -102,6 +106,9 @@ class PreprocessedAutoEncoderTrainer(AutoEncoderTrainer):
         
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validation"):
+                # Handle both tuple (from TensorDataset) and tensor (from custom datasets)
+                if isinstance(batch, (list, tuple)):
+                    batch = batch[0]  # TensorDataset returns (tensor,)
                 batch = batch.to(self.device)
                 loss, metrics = self.compute_loss(batch, mask_ratio)
                 total_loss += loss.item()
