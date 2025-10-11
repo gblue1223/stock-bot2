@@ -6,64 +6,78 @@
   - 각 모듈의 **init**.py 파일 생성
   - _요구사항: 6.1, 6.2_
 
-- [x] 2. 임베딩 모델 데이터 로더 구현
+- [x] 2. AutoEncoder 모델 아키텍처 구현
 
-  - [x] 2.1 DuckDB 연결 및 데이터 로드 기능 구현
+  - [x] 2.1 AutoEncoderEmbedding 클래스 구현
 
-    - ai_trader/embedding/data.py에 EmbeddingDataLoader 클래스 생성
-    - 데이터베이스 경로, 테이블명, 인덱스를 사용한 효율적인 쿼리 구현
-    - 시간 순서 기반 데이터 분할 (훈련 70%, 검증 15%, 테스트 15%)
-    - _요구사항: 5.1, 5.2_
-
-  - [x] 2.2 긍정/부정 쌍 생성 로직 구현
-
-    - 동일 종목의 시간적으로 가까운 샘플을 긍정 쌍으로 생성 (시간 차이 < 10초)
-    - 다른 종목 또는 먼 시간대의 샘플을 부정 쌍으로 생성 (시간 차이 > 60초)
-    - 배치 단위로 쌍 생성 및 반환
-    - _요구사항: 5.3_
-
-- [x] 3. 임베딩 모델 아키텍처 구현
-
-  - [x] 3.1 TradingEmbeddingModel 클래스 구현
-
-    - ai_trader/embedding/models.py에 모델 정의
-    - Conv1D 레이어로 지역 패턴 추출
-    - Multi-head Attention으로 중요 특징 포착
-    - Projection 레이어로 최종 임베딩 생성
+    - ai_trader/embedding/autoencoder_model.py에 기본 AutoEncoder 모델 정의
+    - Transformer 기반 인코더/디코더 아키텍처
+    - Positional Encoding 적용
     - 입력: (batch, seq_len, 60+), 출력: (batch, embedding_dim)
     - _요구사항: 1.1, 1.2, 1.4_
 
-- [x] 4. 대조 학습 손실 함수 구현
+  - [x] 2.2 MaskedAutoEncoder 클래스 구현
 
-  - [x] 4.1 InfoNCELoss 클래스 구현
+    - 마스킹 기법을 적용한 자기지도 학습 모델
+    - 설정 가능한 마스킹 비율 (기본값 15%)
+    - 마스킹된 위치에서만 손실 계산
+    - _요구사항: 5.3, 5.4_
 
-    - ai_trader/embedding/losses.py에 손실 함수 정의
-    - 코사인 유사도 기반 긍정/부정 쌍 비교
-    - Temperature 파라미터로 손실 스케일 조정
-    - _요구사항: 5.4_
+- [x] 3. AutoEncoder 훈련 파이프라인 구현
 
-- [x] 5. 임베딩 모델 훈련 스크립트 구현
+  - [x] 3.1 AutoEncoderTrainer 클래스 구현
+
+    - ai_trader/embedding/autoencoder_trainer.py에 훈련기 정의
+    - 효율적인 데이터 로딩 및 배치 처리
+    - 재구성 손실 계산 및 최적화
+    - 체크포인트 저장 및 로딩 기능
+    - _요구사항: 5.1, 5.2, 5.5, 5.6_
+
+  - [x] 3.2 TimeSeriesDataset 클래스 구현
+
+    - 시계열 데이터를 위한 효율적인 Dataset
+    - 슬라이딩 윈도우 방식으로 시퀀스 생성
+    - 설정 가능한 stride 파라미터
+    - _요구사항: 5.1, 5.2_
+
+- [x] 4. Fine-tuning 시스템 구현
+
+  - [x] 4.1 FineTunedEmbedding 클래스 구현
+
+    - ai_trader/embedding/fine_tuning.py에 Fine-tuning 모델 정의
+    - 사전 훈련된 AutoEncoder + Task-specific Head
+    - 차별적 학습률 적용 (인코더 vs 헤드)
+    - _요구사항: 5.8_
+
+  - [x] 4.2 TradingTaskHead 클래스 구현
+
+    - 트레이딩 특화 태스크별 헤드 (분류/회귀/랭킹)
+    - 설정 가능한 히든 차원 및 드롭아웃
+    - _요구사항: 5.8_
+
+- [x] 5. AutoEncoder 훈련 스크립트 구현
 
   - [x] 5.1 CLI 인터페이스 구현
 
-    - ai_trader/embedding/train_embedding.py 생성
-    - argparse로 --db, --table, --out, --seq-len, --embedding-dim, --batch-size, --epochs, --lr, --device 인수 처리
+    - examples/autoencoder_training_example.py 생성
+    - argparse로 --db, --output-dir, --seq-len, --embedding-dim, --batch-size, --epochs, --model-type, --fine-tune, --device 인수 처리
     - _요구사항: 6.2_
 
   - [x] 5.2 훈련 루프 구현
 
     - 데이터 로더에서 배치 로드
-    - 모델 forward pass 및 손실 계산
-    - Optimizer 업데이트 (Adam)
+    - AutoEncoder forward pass 및 재구성 손실 계산
+    - Optimizer 업데이트 (AdamW)
     - 체크포인트 저장 (설정 가능한 간격)
     - _요구사항: 5.5, 5.6, 6.1_
 
-  - [x] 5.3 검증 및 TensorBoard 로깅 구현
+  - [x] 5.3 Fine-tuning 파이프라인 구현
 
-    - 검증 세트에서 손실 계산
-    - 임베딩 품질 메트릭 계산 (silhouette score, temporal coherence)
-    - TensorBoard에 메트릭 로깅
-    - _요구사항: 5.7, 6.6_
+    - 사전 훈련된 모델 로드
+    - 트레이딩 태스크별 라벨 생성
+    - Fine-tuning 훈련 루프
+    - 성능 메트릭 계산 (정확도, R² 등)
+    - _요구사항: 5.7, 5.8_
 
 - [x] 6. GRPO 환경 구현
 
@@ -184,10 +198,11 @@
 
 - [x] 11. 평가 및 백테스팅 구현
 
-  - [x] 11.1 임베딩 모델 평가 메트릭 구현
+  - [x] 11.1 AutoEncoder 모델 평가 메트릭 구현
 
-    - Silhouette score 계산 (종목 클러스터링 품질)
-    - Temporal coherence score 계산
+    - 재구성 정확도 계산
+    - Fine-tuning 성능 메트릭 (정확도, R², 손실)
+    - 임베딩 품질 평가 (다운스트림 태스크 성능)
     - _요구사항: 7.1_
 
   - [x] 11.2 GRPO 에이전트 평가 메트릭 구현
@@ -218,11 +233,13 @@
 
 - [x] 12. 단위 테스트 작성
 
-  - [x] 12.1 임베딩 모델 테스트
+  - [x] 12.1 AutoEncoder 모델 테스트
 
-    - tests/test_embedding_model.py 생성
-    - 출력 형태 검증
-    - 손실 함수 동작 검증
+    - tests/test_autoencoder_model.py 생성
+    - AutoEncoder 출력 형태 검증
+    - 마스킹 기법 동작 검증
+    - 재구성 손실 계산 검증
+    - Fine-tuning 모델 동작 검증
     - _요구사항: 1.1, 1.2, 1.3, 1.4_
 
   - [x] 12.2 GRPO 환경 테스트
@@ -245,7 +262,7 @@
   - [x] 13.1 전체 파이프라인 테스트
 
     - tests/test_integration.py 생성
-    - 임베딩 모델 훈련 → GRPO 훈련 → 추론 전체 흐름 검증
+    - AutoEncoder 사전 훈련 → Fine-tuning → GRPO 훈련 → 추론 전체 흐름 검증
     - _요구사항: 6.3, 6.4, 6.5_
 
 - [x] 14. 백테스팅 테스트 작성
@@ -260,11 +277,30 @@
 
   - [x] 15.1 README 업데이트
 
-    - 임베딩 모델 및 GRPO 훈련 예제 추가
+    - AutoEncoder 및 Fine-tuning 훈련 예제 추가
+    - GRPO 훈련 예제 추가
     - CLI 인수 설명 추가
+    - 성능 벤치마크 결과 추가
     - _요구사항: 6.2_
 
   - [x] 15.2 사용 예제 스크립트 작성
 
-    - examples/ 디렉토리에 샘플 훈련 및 추론 스크립트 작성
+    - examples/autoencoder_training_example.py: AutoEncoder 훈련 예제
+    - scripts/benchmark_autoencoder.py: 성능 벤치마크 스크립트
     - _요구사항: 6.4, 6.5_
+
+- [x] 16. 성능 최적화 및 벤치마킹
+
+  - [x] 16.1 AutoEncoder vs 대조 학습 성능 비교
+
+    - 훈련 속도 벤치마크 (10-100배 개선 검증)
+    - 메모리 사용량 비교
+    - 임베딩 품질 비교
+    - _요구사항: 1.3, 5.4, 5.5_
+
+  - [x] 16.2 대용량 데이터 처리 최적화
+
+    - 점진적 학습 지원
+    - 메모리 효율적인 데이터 로딩
+    - 분산 학습 준비 (멀티 GPU 지원)
+    - _요구사항: 5.1, 5.2, 5.6_

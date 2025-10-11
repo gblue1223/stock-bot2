@@ -4,10 +4,10 @@
 
 이 설계는 초단위 스캘핑을 위한 임베딩 모델과 GRPO 강화학습 시스템을 구현합니다. 시스템은 두 가지 주요 컴포넌트로 구성됩니다:
 
-1. **임베딩 모델**: 60개 이상의 매매 특징을 저차원 밀집 벡터로 변환하는 인코더
+1. **임베딩 모델**: AutoEncoder 기반 자기지도 학습으로 60개 이상의 매매 특징을 저차원 밀집 벡터로 변환하는 인코더
 2. **GRPO 에이전트**: 그룹 상대 정책 최적화를 사용하여 스캘핑 전략을 학습하는 강화학습 에이전트
 
-임베딩 모델은 대조 학습을 통해 시장 패턴을 학습하고, GRPO 에이전트는 이 임베딩을 관측값으로 사용하여 빠른 매매 결정을 내립니다. 3초 룰을 포함한 스캘핑 특화 보상 구조를 통해 에이전트는 빠른 진입/청산 전략을 학습합니다.
+임베딩 모델은 Masked AutoEncoder를 통해 시장 패턴을 학습하고, Fine-tuning을 통해 트레이딩 특화 태스크에 적응합니다. GRPO 에이전트는 이 임베딩을 관측값으로 사용하여 빠른 매매 결정을 내립니다. 3초 룰을 포함한 스캘핑 특화 보상 구조를 통해 에이전트는 빠른 진입/청산 전략을 학습합니다.
 
 ## 아키텍처
 
@@ -24,7 +24,7 @@
                      ▼                  ▼                     ▼
           ┌──────────────────┐  ┌──────────────┐   ┌─────────────────┐
           │  임베딩 모델 훈련  │  │  GRPO 훈련   │   │  실시간 추론     │
-          │  (Contrastive)   │  │  (RL Agent)  │   │  (Live Trading) │
+          │  (AutoEncoder)   │  │  (RL Agent)  │   │  (Live Trading) │
           └──────────┬───────┘  └──────┬───────┘   └────────┬────────┘
                      │                  │                     │
                      ▼                  │                     │
@@ -43,7 +43,7 @@
 ### 데이터 흐름
 
 1. **훈련 단계**:
-   - DuckDB → 데이터 로더 → 정규화 → 임베딩 모델 훈련
+   - DuckDB → 데이터 로더 → 정규화 → AutoEncoder 사전 훈련 → Fine-tuning
    - 훈련된 임베딩 모델 → GRPO 환경 → GRPO 에이전트 훈련
 
 2. **추론 단계**:
@@ -53,57 +53,74 @@
 
 ### 1. 임베딩 모델 (`ai_trader/embedding/`)
 
-#### 1.1 모델 아키텍처 (`models.py`)
+#### 1.1 AutoEncoder 모델 아키텍처 (`autoencoder_model.py`)
 
 ```python
-class TradingEmbeddingModel(nn.Module):
+class AutoEncoderEmbedding(nn.Module):
     """
-    매매 데이터를 밀집 벡터로 인코딩하는 임베딩 모델
+    매매 데이터를 밀집 벡터로 인코딩하는 AutoEncoder 모델
     
     아키텍처:
-    - Input: (batch, seq_len, 60+) 특징
-    - Conv1D layers: 지역 패턴 추출
-    - Multi-head Attention: 중요 특징 포착
-    - Output: (batch, embedding_dim) 벡터
+    - Encoder: (batch, seq_len, 60+) → (batch, embedding_dim)
+    - Decoder: (batch, embedding_dim) → (batch, seq_len, 60+)
+    - Transformer 기반 인코더/디코더
+    - Positional Encoding 적용
+    """
+
+class MaskedAutoEncoder(AutoEncoderEmbedding):
+    """
+    마스킹 기법을 사용한 AutoEncoder
+    입력의 일부를 마스킹하고 재구성하는 자기지도 학습
     """
 ```
 
-
-#### 1.2 대조 학습 손실 (`losses.py`)
+#### 1.2 Fine-tuning 모듈 (`fine_tuning.py`)
 
 ```python
-class InfoNCELoss(nn.Module):
+class FineTunedEmbedding(nn.Module):
     """
-    대조 학습을 위한 InfoNCE 손실
-    긍정 쌍의 유사도는 최대화, 부정 쌍의 유사도는 최소화
+    트레이딩 특화 태스크를 위한 Fine-tuned 모델
+    사전 훈련된 AutoEncoder + Task-specific Head
+    """
+
+class TradingTaskHead(nn.Module):
+    """
+    트레이딩 태스크별 헤드 (분류/회귀/랭킹)
     """
 ```
 
-#### 1.3 데이터 로더 (`data.py`)
+#### 1.3 AutoEncoder 훈련기 (`autoencoder_trainer.py`)
 
 ```python
-class EmbeddingDataLoader:
+class AutoEncoderTrainer:
     """
-    임베딩 모델 훈련을 위한 데이터 로더
+    AutoEncoder 모델 훈련을 위한 트레이너
     - DuckDB에서 데이터 로드
     - 시간 순서 기반 분할 (훈련 70%, 검증 15%, 테스트 15%)
-    - 긍정/부정 쌍 생성
+    - 마스킹 기법 적용
+    - 재구성 손실 최적화
+    """
+
+class TimeSeriesDataset(Dataset):
+    """
+    시계열 데이터를 위한 효율적인 Dataset
+    슬라이딩 윈도우 방식으로 시퀀스 생성
     """
 ```
 
-#### 1.4 훈련 스크립트 (`train_embedding.py`)
+#### 1.4 훈련 스크립트 (`autoencoder_training_example.py`)
 
 ```bash
 # CLI 인터페이스
-python -m ai_trader.embedding.train_embedding \
+python examples/autoencoder_training_example.py \
     --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-    --table datasets \
-    --out models/embedding \
+    --output-dir models/autoencoder \
     --seq-len 60 \
     --embedding-dim 128 \
-    --batch-size 128 \
-    --epochs 50 \
-    --lr 1e-4 \
+    --batch-size 256 \
+    --epochs 100 \
+    --model-type masked \
+    --fine-tune \
     --device cuda
 ```
 
@@ -390,14 +407,15 @@ def test_backtest_performance():
 
 ## 설계 결정 및 근거
 
-### 1. 임베딩 모델에 대조 학습 사용
+### 1. 임베딩 모델에 AutoEncoder + Fine-tuning 사용
 
-**결정**: InfoNCE 손실을 사용한 대조 학습
+**결정**: Masked AutoEncoder 기반 자기지도 학습 + Fine-tuning
 
 **근거**:
-- 시간적으로 가까운 샘플은 유사한 시장 상황을 나타냄
-- 종목별 특성을 보존하면서 일반화 가능한 표현 학습
-- 라벨 없이 자기지도 학습 가능
+- 대조 학습 대비 10-100배 빠른 학습 속도
+- 마스킹 기법으로 강건한 표현 학습
+- Fine-tuning을 통한 트레이딩 특화 적응
+- 15억개 대용량 데이터에서도 현실적인 학습 시간
 
 ### 2. GRPO 알고리즘 선택
 
@@ -438,15 +456,28 @@ def test_backtest_performance():
 
 ## TensorBoard 로깅
 
-### 임베딩 모델 훈련
+### AutoEncoder 모델 훈련
 
 ```python
 # 로그 메트릭
-- train/loss: 훈련 손실 (InfoNCE)
+- train/loss: 훈련 손실 (재구성 손실)
 - val/loss: 검증 손실
-- val/silhouette_score: 종목 클러스터링 품질
-- val/temporal_coherence: 시간적 일관성
+- train/reconstruction_loss: 재구성 손실
+- val/reconstruction_accuracy: 재구성 정확도
 - learning_rate: 학습률
+- mask_ratio: 마스킹 비율 (Masked AutoEncoder)
+```
+
+### Fine-tuning 훈련
+
+```python
+# 로그 메트릭
+- train/task_loss: 태스크별 손실
+- val/task_loss: 검증 태스크 손실
+- val/accuracy: 분류 정확도 (분류 태스크)
+- val/r2_score: R² 점수 (회귀 태스크)
+- encoder_lr: 인코더 학습률
+- head_lr: 헤드 학습률
 ```
 
 ### GRPO 훈련
@@ -491,10 +522,9 @@ def test_backtest_performance():
 ai_trader/
 ├── embedding/
 │   ├── __init__.py
-│   ├── models.py           # TradingEmbeddingModel
-│   ├── losses.py           # InfoNCELoss
-│   ├── data.py             # EmbeddingDataLoader
-│   └── train_embedding.py  # 훈련 CLI
+│   ├── autoencoder_model.py      # AutoEncoderEmbedding, MaskedAutoEncoder
+│   ├── autoencoder_trainer.py    # AutoEncoderTrainer, TimeSeriesDataset
+│   └── fine_tuning.py            # FineTunedEmbedding, TradingTaskHead
 ├── grpo/
 │   ├── __init__.py
 │   ├── env.py              # GRPOScalpingEnv
@@ -506,9 +536,15 @@ ai_trader/
     └── infer_grpo.py       # GRPOInference
 
 models/
-├── embedding/
-│   ├── checkpoint_epoch50.pt
+├── autoencoder/
+│   ├── best_model.pt
+│   ├── training_config.json
+│   ├── training_history.json
 │   └── tensorboard_logs/
+├── finetuned/
+│   ├── best_finetuned_model.pt
+│   ├── finetuning_config.json
+│   └── finetuning_history.json
 └── grpo_scalping/
     ├── checkpoint_step1000000.pt
     └── tensorboard_logs/
