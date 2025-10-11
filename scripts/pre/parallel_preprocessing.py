@@ -46,7 +46,7 @@ def process_month_data(args_tuple: Tuple) -> dict:
     try:
         # 전처리 명령어 구성
         cmd = [
-            "python", "scripts/preprocess_for_autoencoder.py",
+            "python", "scripts/pre/preprocess_for_autoencoder.py",
             "--db", db_path,
             "--output-dir", output_dir,
             "--seq-len", str(seq_len),

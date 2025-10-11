@@ -17,13 +17,20 @@ import numpy as np
 import psutil
 
 # 프로젝트 모듈 import
+import sys
+from pathlib import Path
+
+# 프로젝트 루트를 sys.path에 추가
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 try:
     from ai_trader.embedding.data import AutoEncoderDataLoader
     from ai_trader.embedding.fast_data_loader import FastAutoEncoderDataLoader
-    from scripts.preprocess_for_autoencoder import AutoEncoderPreprocessor
+    from scripts.pre.preprocess_for_autoencoder import AutoEncoderPreprocessor
 except ImportError as e:
     print(f"모듈 import 오류: {e}")
-    print("프로젝트 루트 디렉토리에서 실행해주세요")
+    print("필요한 모듈이 설치되지 않았거나 경로가 잘못되었습니다.")
     sys.exit(1)
 
 logger = logging.getLogger(__name__)
