@@ -220,6 +220,13 @@ def parse_args():
     )
     
     parser.add_argument(
+        '--max-episode-steps',
+        type=int,
+        default=None,
+        help='에피소드당 최대 스텝 수 (기본값: None, 제한 없음)'
+    )
+    
+    parser.add_argument(
         '--resume',
         type=str,
         default=None,
@@ -400,6 +407,7 @@ def main():
         quick_exit_penalty=args.quick_exit_penalty,
         max_holding_time=args.max_holding_time,
         holding_penalty_rate=args.holding_penalty_rate,
+        max_episode_steps=args.max_episode_steps,
         device=args.device
     )
     
