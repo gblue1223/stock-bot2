@@ -154,6 +154,8 @@ class GRPOTrainer:
                 # 환경에서 스텝 실행
                 next_state, reward, terminated, truncated, step_info = self.env.step(action)
                 done = terminated or truncated
+                if done:
+                    logger.info(f"Episode finished: episode={episode_idx}, step={self.env.current_step}")
                 
                 # 데이터 저장
                 states.append(state)
@@ -878,7 +880,13 @@ class GRPOTrainer:
                 with torch.no_grad():
                     # 정책에서 행동 확률 분포 얻기
                     if hasattr(self.policy, 'forward'):
-                        action_probs = self.policy(states_tensor)
+                        result = self.policy(states_tensor)
+                        if isinstance(result, tuple):
+                            action_logits, _ = result  # (action_logits, state_value) 튜플
+                            action_probs = torch.softmax(action_logits, dim=-1)
+                        else:
+                            action_probs = result
+                        
                         # 엔트로피 계산: -sum(p * log(p))
                         entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()
                         group_entropies.append(entropy.item())
