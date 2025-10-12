@@ -37,6 +37,7 @@ class GRPOScalpingEnv(gym.Env):
         table_name: 테이블명 (기본값: 'datasets')
         seq_len: 시퀀스 길이 (기본값: 60)
         embedding_dim: 임베딩 차원 (기본값: 128)
+        expected_features: 예상 특징 수 (기본값: 28, 임베딩 모델과 일치해야 함)
         transaction_cost_rate: 거래 비용 비율 (기본값: 0.00215 = 0.215%)
         quick_exit_threshold: 빠른 손절 시간 임계값 (초, 기본값: 1.5)
         quick_exit_penalty: 빠른 손절 룰 위반 페널티 (기본값: 0.01)
@@ -54,6 +55,7 @@ class GRPOScalpingEnv(gym.Env):
         table_name: str = 'datasets',
         seq_len: int = 60,
         embedding_dim: int = 128,
+        expected_features: int = 28,
         transaction_cost_rate: float = 0.00215,
         quick_exit_threshold: float = 1.5,
         quick_exit_penalty: float = 0.01,
@@ -72,6 +74,7 @@ class GRPOScalpingEnv(gym.Env):
         self.table_name = table_name
         self.seq_len = seq_len
         self.embedding_dim = embedding_dim
+        self.expected_features = expected_features
         
         # 거래 비용 설정
         self.transaction_cost_rate = transaction_cost_rate
@@ -152,7 +155,18 @@ class GRPOScalpingEnv(gym.Env):
                     else:
                         logger.debug(f"Excluding non-numeric column: {col} (type: {col_type})")
             
-            logger.info(f"Selected {len(feature_columns)} numeric feature columns")
+            # 임베딩 모델과 호환성을 위해 정확한 수의 특징만 사용
+            # 임베딩 모델이 특정 수의 특징으로 훈련되었으므로 이에 맞춤
+            expected_features = self.expected_features
+            if len(feature_columns) > expected_features:
+                logger.warning(f"Found {len(feature_columns)} features, but embedding model expects {expected_features}. "
+                             f"Using first {expected_features} features.")
+                feature_columns = feature_columns[:expected_features]
+            elif len(feature_columns) < expected_features:
+                logger.error(f"Found only {len(feature_columns)} features, but embedding model expects {expected_features}")
+                raise RuntimeError(f"Insufficient features: found {len(feature_columns)}, expected {expected_features}")
+            
+            logger.info(f"Selected {len(feature_columns)} numeric feature columns (matching embedding model)")
             return feature_columns
         except Exception as e:
             logger.error(f"Failed to get feature columns: {e}")

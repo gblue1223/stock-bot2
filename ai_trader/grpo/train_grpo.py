@@ -382,6 +382,10 @@ def main():
     # 임베딩 차원 추출
     embedding_dim = embedding_model.embedding_dim
     
+    # 임베딩 모델의 입력 차원 추출
+    input_dim = embedding_model.encoder.input_projection.in_features
+    logger.info(f"Detected embedding model input dimension: {input_dim}")
+    
     # GRPO 환경 생성
     logger.info("Creating GRPO environment...")
     env = GRPOScalpingEnv(
@@ -390,6 +394,7 @@ def main():
         table_name=args.table,
         seq_len=args.seq_len,
         embedding_dim=embedding_dim,
+        expected_features=input_dim,  # 임베딩 모델의 입력 차원과 일치
         transaction_cost_rate=args.transaction_cost_rate,
         quick_exit_threshold=args.quick_exit_threshold,
         quick_exit_penalty=args.quick_exit_penalty,
