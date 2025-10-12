@@ -17,7 +17,7 @@ from pathlib import Path
 
 from ai_trader.grpo.backtest import BacktestSimulator, run_backtest
 from ai_trader.inference.infer_grpo import GRPOInference
-from ai_trader.embedding.models import TradingEmbeddingModel
+from ai_trader.embedding import AutoEncoderEmbedding
 from ai_trader.grpo.policy import GRPOPolicy
 
 
@@ -80,12 +80,11 @@ def temp_db_with_realistic_data():
     import shutil
     shutil.rmtree(temp_dir, ignore_errors=True)
 
-
 @pytest.fixture
 def trained_models(tmp_path):
-    """훈련된 모델 체크포인트 생성"""
+    """훈련된 모델 체럭포인트 생성"""
     # 임베딩 모델 생성
-    embedding_model = TradingEmbeddingModel(
+    embedding_model = AutoEncoderEmbedding(
         input_dim=60,
         embedding_dim=128,
         seq_len=60,

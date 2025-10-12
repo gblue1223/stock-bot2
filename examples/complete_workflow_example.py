@@ -22,55 +22,126 @@ logger = logging.getLogger(__name__)
 
 
 def step1_train_embedding(args):
-    """Step 1: 임베딩 모델 훈련"""
+    """Step 1: AutoEncoder 임베딩 모델 훈련"""
     logger.info("=" * 80)
-    logger.info("STEP 1: 임베딩 모델 훈련")
+    logger.info("STEP 1: AutoEncoder 임베딩 모델 훈련")
     logger.info("=" * 80)
     
-    from ai_trader.embedding.train_embedding import main as train_embedding
+    from ai_trader.embedding import train_autoencoder_embedding
+    import numpy as np
     
-    # 임베딩 모델 훈련 인수 설정
-    embedding_args = [
-        '--db', args.db,
-        '--table', args.table,
-        '--out', str(Path(args.out) / 'embedding'),
-        '--seq-len', str(args.seq_len),
-        '--embedding-dim', str(args.embedding_dim),
-        '--batch-size', str(args.batch_size),
-        '--epochs', str(args.embedding_epochs),
-        '--lr', str(args.embedding_lr),
-        '--device', args.device,
-        '--val-every', '5',
-        '--ckpt-every', '10'
-    ]
+    # 데이터 로드
+    from ai_trader.embedding.data import AutoEncoderDataLoader
+    data_loader = AutoEncoderDataLoader(
+        db_path=args.db,
+        table_name=args.table,
+        seq_len=args.seq_len
+    )
+    data_loader.load_and_split_data()
     
-    logger.info(f"Training embedding model with args: {' '.join(embedding_args)}")
+    train_data = data_loader.data_splits['train']['data']
+    val_data = data_loader.data_splits['val']['data']
     
-    # 임베딩 모델 훈련 실행
-    sys.argv = ['train_embedding.py'] + embedding_args
-    train_embedding()
+    # AutoEncoder 훈련 설정
+    config = {
+        'model_type': 'masked',
+        'embedding_dim': args.embedding_dim,
+        'seq_len': args.seq_len,
+        'batch_size': args.batch_size,
+        'max_epochs': args.embedding_epochs,
+        'learning_rate': args.embedding_lr,
+        'mask_ratio': 0.15,
+        'device': args.device
+    }
     
-    embedding_checkpoint = Path(args.out) / 'embedding' / f'checkpoint_epoch{args.embedding_epochs}.pt'
-    logger.info(f"✓ Embedding model trained: {embedding_checkpoint}")
+    output_dir = Path(args.out) / 'embedding'
+    output_dir.mkdir(parents=True, exist_ok=True)
     
+    logger.info(f"Training AutoEncoder with config: {config}")
+    
+    # AutoEncoder 훈련 실행
+    model, trainer, history = train_autoencoder_embedding(
+        train_data, val_data, config, output_dir=str(output_dir)
+    )
+    
+    embedding_checkpoint = output_dir / 'best_model.pt'
+    logger.info(f"✓ AutoEncoder model trained: {embedding_checkpoint}")
+    
+    data_loader.close()
     return embedding_checkpoint
 
 
 def step2_evaluate_embedding(embedding_checkpoint, args):
-    """Step 2: 임베딩 모델 평가"""
+    """Step 2: AutoEncoder 임베딩 모델 평가"""
     logger.info("=" * 80)
-    logger.info("STEP 2: 임베딩 모델 평가")
+    logger.info("STEP 2: AutoEncoder 임베딩 모델 평가")
     logger.info("=" * 80)
     
-    from ai_trader.embedding.evaluate_embedding import evaluate_embedding_model
+    import torch
+    from ai_trader.embedding import AutoEncoderEmbedding
+    from ai_trader.embedding.data import AutoEncoderDataLoader
+    from ai_trader.embedding.evaluation import evaluate_embedding_quality
     
-    # 임베딩 모델 평가
-    metrics = evaluate_embedding_model(
-        checkpoint_path=str(embedding_checkpoint),
+    # 모델 로드
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    checkpoint = torch.load(embedding_checkpoint, map_location=device)
+    
+    model = AutoEncoderEmbedding(
+        input_dim=checkpoint['config']['input_dim'],
+        embedding_dim=checkpoint['config']['embedding_dim'],
+        seq_len=checkpoint['config']['seq_len']
+    ).to(device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model.eval()
+    
+    # 데이터 로드
+    data_loader = AutoEncoderDataLoader(
         db_path=args.db,
         table_name=args.table,
+        seq_len=checkpoint['config']['seq_len']
+    )
+    data_loader.load_and_split_data()
+    
+    test_dataloader = data_loader.get_dataloader(
         split='test',
-        device=args.device
+        batch_size=args.batch_size,
+        shuffle=False,
+        return_metadata=True
+    )
+    
+    # 임베딩 생성 및 평가
+    all_embeddings = []
+    all_stock_codes = []
+    all_timestamps = []
+    
+    with torch.no_grad():
+        for batch_data in test_dataloader:
+            if len(batch_data) == 4:
+                sequence, stock_code, date, start_time = batch_data
+                stock_codes = [stock_code] if isinstance(stock_code, str) else stock_code
+                timestamps = [start_time] if isinstance(start_time, (int, float)) else start_time
+            else:
+                sequence = batch_data
+                stock_codes = []
+                timestamps = []
+            
+            sequence = sequence.to(device)
+            _, embedding = model(sequence)
+            
+            all_embeddings.append(embedding.cpu().numpy())
+            if stock_codes:
+                all_stock_codes.extend(stock_codes)
+            if timestamps:
+                all_timestamps.extend(timestamps)
+    
+    import numpy as np
+    all_embeddings = np.vstack(all_embeddings)
+    
+    # 평가 메트릭 계산
+    metrics = evaluate_embedding_quality(
+        embeddings=all_embeddings,
+        stock_codes=all_stock_codes,
+        timestamps=all_timestamps
     )
     
     logger.info("Embedding evaluation metrics:")
@@ -84,6 +155,7 @@ def step2_evaluate_embedding(embedding_checkpoint, args):
         logger.warning("⚠ Embedding quality may need improvement")
         logger.warning("  Consider training for more epochs or adjusting hyperparameters")
     
+    data_loader.close()
     return metrics
 
 

@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 import tempfile
 
-from ai_trader.embedding.models import TradingEmbeddingModel
+from ai_trader.embedding import AutoEncoderEmbedding
 from ai_trader.grpo.policy import GRPOPolicy
 from ai_trader.inference.infer_grpo import GRPOInference
 
@@ -19,7 +19,7 @@ from ai_trader.inference.infer_grpo import GRPOInference
 def temp_model_paths():
     """임시 모델 체크포인트 생성"""
     # 임베딩 모델 생성 및 저장
-    embedding_model = TradingEmbeddingModel(
+    embedding_model = AutoEncoderEmbedding(
         input_dim=60,
         embedding_dim=128,
         seq_len=60

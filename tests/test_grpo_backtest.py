@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ai_trader.grpo.backtest import BacktestSimulator
 from ai_trader.inference.infer_grpo import GRPOInference
-from ai_trader.embedding.models import TradingEmbeddingModel
+from ai_trader.embedding import AutoEncoderEmbedding
 from ai_trader.grpo.policy import GRPOPolicy
 
 
@@ -64,12 +64,11 @@ def temp_db():
     import shutil
     shutil.rmtree(temp_dir, ignore_errors=True)
 
-
 @pytest.fixture
 def mock_inference_engine(tmp_path):
     """모의 추론 엔진 생성"""
     # 임베딩 모델 생성
-    embedding_model = TradingEmbeddingModel(
+    embedding_model = AutoEncoderEmbedding(
         input_dim=4,
         embedding_dim=16,
         seq_len=10,

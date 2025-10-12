@@ -2,11 +2,11 @@
 
 **혁신적인 AutoEncoder + Fine-tuning 기반 임베딩**
 
-대조 학습의 속도 문제를 해결한 차세대 임베딩 시스템입니다. 15억개 데이터도 몇 주 안에 학습 가능하며, 2.87ms 초고속 추론을 제공합니다.
+AutoEncoder 기반 자기지도 학습으로 15억개 데이터도 몇 주 안에 학습 가능하며, 2.87ms 초고속 추론을 제공합니다.
 
 ## ✨ 핵심 혁신
 
-- **🚀 10-100배 빠른 학습**: 대조 학습 대비 혁신적 속도 개선
+- **🚀 빠른 학습**: 효율적인 AutoEncoder 기반 학습
 - **⚡ 2.87ms 추론**: 목표 10ms 대비 3배 빠른 실시간 성능
 - **🧠 Masked AutoEncoder**: 마스킹 기법으로 강건한 표현 학습
 - **🎯 Fine-tuning**: 트레이딩 특화 태스크 적응
@@ -98,15 +98,15 @@ with torch.no_grad():
 
 ## 🧠 AutoEncoder 모델
 
-### 대조 학습 vs AutoEncoder 비교
+### AutoEncoder 기반 임베딩
 
-| 항목 | 대조 학습 | AutoEncoder + Fine-tuning | 개선도 |
-|------|-----------|---------------------------|--------|
-| **학습 속도** | 몇 년 (15억 데이터) | **몇 주** | **10-100배** |
-| **추론 속도** | ~10ms | **2.87ms** | **3.5배** |
-| **구현 복잡도** | 높음 (쌍 생성) | **낮음** (재구성) | **단순화** |
-| **메모리 사용** | 높음 | **효율적** | **최적화** |
-| **확장성** | 제한적 | **우수** | **무제한** |
+| 항목 | AutoEncoder + Fine-tuning |
+|------|---------------------------|
+| **학습 속도** | **몇 주** (15억 데이터) |
+| **추론 속도** | **2.87ms** |
+| **구현 복잡도** | **낮음** (재구성) |
+| **메모리 사용** | **효율적** |
+| **확장성** | **우수** |
 
 ### Masked AutoEncoder
 
@@ -429,115 +429,29 @@ python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 
 ### 임베딩 모델 훈련
 
-대조 학습(Contrastive Learning)을 사용하여 시간적으로 가까운 샘플은 유사하게, 먼 샘플은 다르게 임베딩합니다.
+AutoEncoder를 사용하여 매매 데이터를 저차원 임베딩으로 변환합니다. 자세한 훈련 방법은 `examples/autoencoder_training_example.py`를 참조하세요.
 
 ```bash
-# 9월 데이터로 초기 훈련
-python -m ai_trader.embedding.train_embedding \
+# AutoEncoder 사전 훈련
+python examples/autoencoder_training_example.py \
   --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-  --table datasets \
-  --out models/embedding_2024_09 \
+  --output-dir models/autoencoder \
   --seq-len 60 \
   --embedding-dim 128 \
   --batch-size 256 \
-  --epochs 30 \
-  --lr 1e-4 \
-  --device cuda \
-  --positive-time-threshold 10 \
-  --negative-time-threshold 60 \
-  --temperature 0.07 \
-  --num-heads 4 \
-  --val-every 3 \
-  --checkpoint-interval 5 \
-  --start-date 20240901 \
-  --end-date 20240930 \
-  --num-workers 8 \
-  --max-samples 5000000
+  --epochs 50 \
+  --model-type masked \
+  --mask-ratio 0.15 \
+  --device cuda
 
-# 10월 데이터로 fine-tuning
-python -m ai_trader.embedding.train_embedding \
-  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-  --table datasets \
-  --out models/embedding_2024_10 \
-  --seq-len 60 \
-  --embedding-dim 128 \
-  --batch-size 256 \
-  --epochs 15 \
-  --lr 5e-5 \
-  --device cuda \
-  --positive-time-threshold 10 \
-  --negative-time-threshold 60 \
-  --temperature 0.07 \
-  --num-heads 4 \
-  --val-every 3 \
-  --checkpoint-interval 5 \
-  --start-date 20241001 \
-  --end-date 20241031 \
-  --num-workers 8 \
-  --max-samples 5000000 \
-  --resume models/embedding_2024_09/checkpoint_epoch30.pt
-
-# 변경 사항:
-  --epochs 15 (30→15, fine-tuning이므로 절반)
-  --lr 5e-5 (1e-4→5e-5, 학습률 절반)
-  --resume 이전 달 모델 로드
-
-# 월별 스크립트
-python scripts/train_embedding_monthly.py \
-  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-  --start-year 2024 --start-month 9 \
-  --end-year 2024 --end-month 12 \
-  --output models/embedding \
-  --max-samples 5000000
-
-python scripts/train_embedding_monthly.py \
-  --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-  --quarterly \
-  --year 2024 --quarter 4 \
-  --output models/embedding \
-  --max-samples 5000000
+# Fine-tuning for Trading
+python examples/autoencoder_training_example.py \
+  --db "datasets_norm_all.duckdb" \
+  --output-dir models/autoencoder \
+  --fine-tune \
+  --epochs 50 \
+  --device cuda
 ```
-
-#### CLI 인수 설명
-
-**필수 인수:**
-
-- `--db`: DuckDB 데이터베이스 경로
-- `--table`: 데이터베이스 테이블 이름
-- `--out`: 모델 체크포인트 저장 디렉토리
-
-**모델 설정:**
-
-- `--seq-len`: 입력 시퀀스 길이 (기본값: 60)
-- `--embedding-dim`: 임베딩 벡터 차원 (기본값: 128, 권장: 128-256)
-- `--num-heads`: Multi-head Attention 헤드 수 (기본값: 4)
-
-**훈련 설정:**
-
-- `--batch-size`: 배치 크기 (기본값: 128)
-- `--epochs`: 훈련 에포크 수 (기본값: 50)
-- `--lr`: 학습률 (기본값: 1e-4)
-- `--device`: 디바이스 (cuda/cpu, 기본값: cuda)
-- `--num-workers`: 데이터 로더 워커 프로세스 수 (기본값: 4)
-
-**대조 학습 설정:**
-
-- `--temperature`: InfoNCE 손실 온도 파라미터 (기본값: 0.07, 권장: 0.05-0.1)
-- `--positive-time-threshold`: 긍정 쌍 시간 임계값 (초, 기본값: 10)
-- `--negative-time-threshold`: 부정 쌍 시간 임계값 (초, 기본값: 60)
-
-**체크포인트 및 로깅:**
-
-- `--checkpoint-interval`: 체크포인트 저장 간격 (에포크, 기본값: 5)
-- `--val-every`: 검증 주기 (에포크, 기본값: 1 = 매 에포크마다 검증)
-- `--resume`: 재개할 체크포인트 경로 (선택사항)
-
-**데이터 필터링 (메모리 절약):**
-
-- `--start-date`: 시작 날짜 (YYYYMMDD 형식, 예: 20240901)
-- `--end-date`: 종료 날짜 (YYYYMMDD 형식, 예: 20240930)
-- `--stock-codes`: 훈련할 종목 코드 리스트 (예: 005930 000660)
-- `--max-samples`: 최대 샘플 수 (메모리 제한 시 사용, 예: 1000000)
 
 #### 대용량 데이터 훈련 전략 (12개월 5억 개 데이터)
 

@@ -1,6 +1,6 @@
 """
 Example script for training AutoEncoder-based embeddings.
-Demonstrates fast training on large datasets as alternative to contrastive learning.
+Demonstrates fast training on large datasets with efficient self-supervised learning.
 """
 
 import argparse

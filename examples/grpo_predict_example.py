@@ -22,7 +22,7 @@ def main():
     if not Path(embedding_model_path).exists():
         print(f"Error: Embedding model not found at {embedding_model_path}")
         print("Please train the embedding model first using:")
-        print("  python -m ai_trader.embedding.train_embedding")
+        print("  python examples/autoencoder_training_example.py")
         return
     
     if not Path(policy_path).exists():

@@ -12,24 +12,20 @@ import duckdb
 from unittest.mock import Mock, MagicMock, patch
 
 from ai_trader.grpo.env import GRPOScalpingEnv
-from ai_trader.embedding.models import TradingEmbeddingModel
-
+from ai_trader.embedding import AutoEncoderEmbedding
 
 @pytest.fixture
 def mock_embedding_model():
     """Mock 임베딩 모델 생성 - 실제 모델 인스턴스 사용"""
     # 실제 임베딩 모델 생성 (테스트용 작은 크기)
     # 테스트 DB 특징 수: 28 (등락률, 누적거래대금, 거래회전율, 체결강도 + 매도/매수대기금액1-10 + 종목명_scalar, 시간_sin, 시간_cos, 시간_scalar2)
-    model = TradingEmbeddingModel(
+    model = AutoEncoderEmbedding(
         input_dim=28,  # 테스트 데이터의 특징 수에 맞춤
         embedding_dim=128,
-        seq_len=60,
-        num_heads=2,
-        conv_channels=[32, 64]
+        seq_len=60
     )
     model.eval()
     return model
-
 
 @pytest.fixture
 def mock_db_path():

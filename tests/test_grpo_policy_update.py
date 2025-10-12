@@ -15,13 +15,13 @@ import torch.nn as nn
 from ai_trader.grpo.policy import GRPOPolicy
 from ai_trader.grpo.grpo import GRPOTrainer
 from ai_trader.grpo.env import GRPOScalpingEnv
-from ai_trader.embedding.models import TradingEmbeddingModel
+from ai_trader.embedding import AutoEncoderEmbedding
 
 
 @pytest.fixture
 def embedding_model():
     """임베딩 모델 픽스처"""
-    model = TradingEmbeddingModel(
+    model = AutoEncoderEmbedding(
         input_dim=60,
         embedding_dim=32,
         seq_len=60

@@ -118,7 +118,7 @@ def test_load_and_split_data(sample_db):
 
 
 def test_contrastive_dataset():
-    """대조 학습 데이터셋 테스트"""
+    """시계열 데이터셋 테스트"""
     # 샘플 데이터 생성
     n_samples = 200
     n_features = 4

@@ -1,6 +1,6 @@
 """
 AutoEncoder-based embedding model for fast training on large datasets.
-Alternative to contrastive learning with 10-100x faster training speed.
+Provides efficient self-supervised learning with 10-100x faster training speed.
 """
 
 import torch
@@ -121,7 +121,7 @@ class TimeSeriesDecoder(nn.Module):
 class AutoEncoderEmbedding(nn.Module):
     """
     AutoEncoder-based embedding model for time series.
-    Much faster than contrastive learning while maintaining quality.
+    Efficient self-supervised learning while maintaining quality.
     """
     
     def __init__(self, input_dim: int, embedding_dim: int = 128, 

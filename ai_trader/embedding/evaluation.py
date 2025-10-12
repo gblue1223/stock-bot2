@@ -74,8 +74,7 @@ def compute_silhouette_score(
     
     try:
         # Silhouette score 계산 (코사인 유사도 사용)
-        # 코사인 유사도는 임베딩 공간에서 방향의 유사성을 측정하므로
-        # 대조 학습으로 훈련된 임베딩 평가에 적합합니다
+        # 코사인 유사도는 임베딩 공간에서 방향의 유사성을 측정합니다
         score = silhouette_score(embeddings, labels, metric='cosine')
         return float(score)
     except Exception as e:
