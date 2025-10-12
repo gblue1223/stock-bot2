@@ -227,6 +227,14 @@ def parse_args():
     )
     
     parser.add_argument(
+        '--quick-exit-mode',
+        type=str,
+        default='penalty_only',
+        choices=['penalty_only', 'force_close'],
+        help='빠른 손절 룰 동작 모드 (penalty_only: 페널티만, force_close: 강제 청산)'
+    )
+    
+    parser.add_argument(
         '--resume',
         type=str,
         default=None,
@@ -408,6 +416,7 @@ def main():
         max_holding_time=args.max_holding_time,
         holding_penalty_rate=args.holding_penalty_rate,
         max_episode_steps=args.max_episode_steps,
+        quick_exit_mode=args.quick_exit_mode,
         device=args.device
     )
     

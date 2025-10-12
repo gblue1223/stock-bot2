@@ -44,6 +44,9 @@ class GRPOScalpingEnv(gym.Env):
         max_holding_time: 최대 보유 시간 (초, 기본값: 60)
         holding_penalty_rate: 장기 보유 페널티 비율 (기본값: 0.001)
         max_episode_steps: 에피소드당 최대 스텝 수 (기본값: None, 제한 없음)
+        quick_exit_mode: 빠른 손절 룰 동작 모드 (기본값: 'penalty_only')
+            - 'penalty_only': 페널티만 부여, 정책이 학습
+            - 'force_close': 강제 청산 (이전 동작)
         device: 디바이스 ('cpu' 또는 'cuda')
     """
     
@@ -63,6 +66,7 @@ class GRPOScalpingEnv(gym.Env):
         max_holding_time: float = 60.0,
         holding_penalty_rate: float = 0.001,
         max_episode_steps: Optional[int] = None,
+        quick_exit_mode: str = 'penalty_only',
         device: str = 'cpu'
     ):
         super().__init__()
@@ -85,6 +89,12 @@ class GRPOScalpingEnv(gym.Env):
         # 빠른 손절 룰 설정
         self.quick_exit_threshold = quick_exit_threshold
         self.quick_exit_penalty = quick_exit_penalty
+        self.quick_exit_mode = quick_exit_mode
+        
+        # 동작 모드 검증
+        if quick_exit_mode not in ['penalty_only', 'force_close']:
+            raise ValueError(f"Invalid quick_exit_mode: {quick_exit_mode}. "
+                           f"Must be 'penalty_only' or 'force_close'")
         
         # 보유 시간 페널티 설정
         self.max_holding_time = max_holding_time
@@ -128,6 +138,7 @@ class GRPOScalpingEnv(gym.Env):
         
         logger.info(f"GRPOScalpingEnv initialized with embedding_dim={embedding_dim}, "
                    f"quick_exit_threshold={quick_exit_threshold}s, "
+                   f"quick_exit_mode={quick_exit_mode}, "
                    f"transaction_cost={transaction_cost_rate*100:.3f}%")
     
     def _connect_db(self):
@@ -219,9 +230,9 @@ class GRPOScalpingEnv(gym.Env):
             try:
                 # 랜덤 종목 및 날짜 선택
                 query = f"""
-                    SELECT DISTINCT 종목코드, 날짜, 시간, COUNT(*) as count
+                    SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
                     FROM {self.table_name}
-                    GROUP BY 종목코드, 날짜, 시간
+                    GROUP BY 종목코드, 날짜
                     HAVING COUNT(*) >= ?
                     ORDER BY RANDOM()
                     LIMIT 1
@@ -233,9 +244,9 @@ class GRPOScalpingEnv(gym.Env):
                     logger.warning(f"No stock/date combination with {min_required} samples found, trying with lower requirement")
                     min_required = self.seq_len + 10
                     query = f"""
-                        SELECT DISTINCT 종목코드, 날짜, 시간, COUNT(*) as count
+                        SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
                         FROM {self.table_name}
-                        GROUP BY 종목코드, 날짜, 시간
+                        GROUP BY 종목코드, 날짜
                         HAVING COUNT(*) >= ?
                         ORDER BY RANDOM()
                         LIMIT 1
@@ -453,6 +464,92 @@ class GRPOScalpingEnv(gym.Env):
         
         return reward, reward_components
     
+    def _check_quick_exit_penalty_only(self, holding_time: float) -> Tuple[float, bool]:
+        """
+        빠른 손절 룰 체크 (penalty_only 모드)
+        
+        임계값을 초과하고 손실 중이면 페널티만 부여.
+        강제 청산하지 않고 정책이 학습하도록 유도.
+        
+        Args:
+            holding_time: 보유 시간 (초)
+            
+        Returns:
+            (reward, quick_exit_triggered) 튜플
+        """
+        reward = 0.0
+        quick_exit_triggered = False
+        
+        # 임계값을 초과하고 손실 중이면 페널티
+        if holding_time > self.quick_exit_threshold and self.current_price < self.entry_price:
+            quick_exit_triggered = True
+            self.quick_exit_violations += 1
+            reward = -self.quick_exit_penalty
+            
+            logger.debug(f"Quick exit penalty: price={self.current_price:.4f}, "
+                       f"entry_price={self.entry_price:.4f}, "
+                       f"holding_time={holding_time:.2f}s, "
+                       f"penalty={self.quick_exit_penalty:.4f}")
+        
+        return reward, quick_exit_triggered
+    
+    def _check_quick_exit_force_close(self, holding_time: float) -> Tuple[float, bool]:
+        """
+        빠른 손절 룰 체크 (force_close 모드)
+        
+        임계값 이내에 가격이 상승하지 않으면 자동 매도.
+        과도한 거래를 유발할 수 있음 (이전 동작).
+        
+        Args:
+            holding_time: 보유 시간 (초)
+            
+        Returns:
+            (reward, quick_exit_triggered) 튜플
+        """
+        reward = 0.0
+        quick_exit_triggered = False
+        
+        # 임계값 이내이고 가격이 상승하지 않으면 강제 매도
+        if holding_time <= self.quick_exit_threshold and self.current_price <= self.entry_price:
+            quick_exit_triggered = True
+            self.quick_exit_violations += 1
+            
+            # 자동 매도 및 페널티 적용
+            reward, reward_components = self._calculate_reward(
+                self.entry_price,
+                self.current_price,
+                holding_time
+            )
+            
+            # 빠른 손절 룰 위반 페널티 추가
+            reward -= self.quick_exit_penalty
+            
+            # 거래 기록
+            trade_info = {
+                'entry_price': self.entry_price,
+                'exit_price': self.current_price,
+                'holding_time': holding_time,
+                'profit_rate': reward_components['profit_rate'],
+                'reward': reward,
+                'reward_components': reward_components,
+                'quick_exit_violation': True,
+                'quick_exit_penalty': self.quick_exit_penalty
+            }
+            self.episode_trades.append(trade_info)
+            
+            logger.debug(f"Quick exit rule triggered (force close): price={self.current_price:.4f}, "
+                       f"entry_price={self.entry_price:.4f}, "
+                       f"holding_time={holding_time:.2f}s, "
+                       f"penalty={self.quick_exit_penalty:.4f}, "
+                       f"reward={reward:.4f}")
+            
+            # 포지션 청산
+            self.position = 0
+            self.entry_price = 0.0
+            self.entry_time = 0.0
+        
+        return reward, quick_exit_triggered
+    
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         행동 실행
@@ -509,49 +606,18 @@ class GRPOScalpingEnv(gym.Env):
                 self.entry_time = 0.0
         
         elif action == 0:  # 보유
-            # 빠른 손절 룰 체크: 매수 후 설정 가능한 시간 임계값 이내에 가격이 상승하지 않으면 자동 매도
+            # 빠른 손절 룰 체크 (모드에 따라 다르게 동작)
             if self.position == 1:
                 holding_time = self.current_time - self.entry_time
                 
-                # 임계값 이내이고 가격이 상승하지 않았는지 체크
-                if holding_time <= self.quick_exit_threshold and self.current_price <= self.entry_price:
-                    # 빠른 손절 룰 위반
-                    quick_exit_triggered = True
-                    self.quick_exit_violations += 1
-                    
-                    # 자동 매도 및 페널티 적용
-                    reward, reward_components = self._calculate_reward(
-                        self.entry_price,
-                        self.current_price,
-                        holding_time
-                    )
-                    
-                    # 빠른 손절 룰 위반 페널티 추가
-                    reward -= self.quick_exit_penalty
-                    
-                    # 거래 기록
-                    trade_info = {
-                        'entry_price': self.entry_price,
-                        'exit_price': self.current_price,
-                        'holding_time': holding_time,
-                        'profit_rate': reward_components['profit_rate'],
-                        'reward': reward,
-                        'reward_components': reward_components,
-                        'quick_exit_violation': True,
-                        'quick_exit_penalty': self.quick_exit_penalty
-                    }
-                    self.episode_trades.append(trade_info)
-                    
-                    logger.debug(f"Quick exit rule triggered: price={self.current_price:.4f}, "
-                               f"entry_price={self.entry_price:.4f}, "
-                               f"holding_time={holding_time:.2f}s, "
-                               f"penalty={self.quick_exit_penalty:.4f}, "
-                               f"reward={reward:.4f}")
-                    
-                    # 포지션 청산
-                    self.position = 0
-                    self.entry_price = 0.0
-                    self.entry_time = 0.0
+                # 빠른 손절 룰 체크 (모드 선택)
+                if self.quick_exit_mode == 'penalty_only':
+                    # 페널티만 부여 (권장, 학습 효과적)
+                    reward, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
+                elif self.quick_exit_mode == 'force_close':
+                    # 강제 청산 (이전 동작, 과도한 거래 유발)
+                    reward, quick_exit_triggered = self._check_quick_exit_force_close(holding_time)
+                # else: reward = 0.0 유지 (정상 보유)
         
         # 보상 기록
         self.episode_rewards.append(reward)
@@ -591,12 +657,16 @@ class GRPOScalpingEnv(gym.Env):
             logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
         
         # 현재 가격 및 시간 업데이트
-        if not terminated:
+        if not (terminated or truncated):
+            # 에피소드가 계속되는 경우에만 업데이트
             self.current_price = self._get_current_price()
             self.current_time = float(self.episode_metadata[self.current_step, 2])
         
         # 다음 관측값
-        observation = self._get_current_observation() if not terminated else np.zeros(self.embedding_dim, dtype=np.float32)
+        if not (terminated or truncated):
+            observation = self._get_current_observation()
+        else:
+            observation = np.zeros(self.embedding_dim, dtype=np.float32)
         
         # 정보
         info = {
@@ -607,8 +677,8 @@ class GRPOScalpingEnv(gym.Env):
             'quick_exit_triggered': quick_exit_triggered
         }
         
-        if terminated:
-            # 에피소드 종료 시 메타데이터 추가
+        if terminated or truncated:
+            # 에피소드 종료 시 메타데이터 추가 (terminated, truncated 모두 포함)
             episode_metadata = self._calculate_episode_metadata()
             info['episode'] = episode_metadata
         

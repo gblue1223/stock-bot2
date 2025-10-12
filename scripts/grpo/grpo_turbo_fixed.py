@@ -78,8 +78,6 @@ def main():
         
         embedding_model.load_state_dict(checkpoint['model_state_dict'])
         embedding_model.to(device)
-        embedding_model.eval()
-        
         logger.info("✅ Embedding model loaded")
         
         # 2. 수정된 환경 생성
@@ -92,20 +90,22 @@ def main():
             embedding_dim=128,
             expected_features=28,
             # 🔧 수정된 설정
-            transaction_cost_rate=0.00215,
+            transaction_cost_rate=0.0005,    # 0.00215 → 0.0005 (0.05%, 주석과 일치)
             quick_exit_threshold=2.0,        # 1.5초 → 2.0초 (더 관대)
             quick_exit_penalty=0.005,        # 0.01 → 0.005 (페널티 감소)
             max_holding_time=30.0,           # 60초 → 30초 (진짜 스캘핑)
             holding_penalty_rate=0.0005,     # 0.001 → 0.0005 (페널티 감소)
+            max_episode_steps=1000,
+            quick_exit_mode='penalty_only',  # 페널티만 부여 (강제 청산 안함)
             device=device
         )
         
         logger.info("✅ FIXED environment created")
         logger.info("🔧 Key changes:")
         logger.info("  - Transaction cost: 0.215% → 0.05%")
-        logger.info("  - Quick exit threshold: 1.5s → 2.0s")
         logger.info("  - Max holding time: 60s → 30s")
         logger.info("  - Penalties reduced by 50%")
+        logger.info("  - Quick exit mode: penalty_only (no forced close)")
         
         # 3. 정책 생성
         logger.info("🧠 Creating policy...")
