@@ -142,8 +142,8 @@ class GRPOScalpingEnv(gym.Env):
             all_columns = columns_df['column_name'].tolist()
             column_types = columns_df['column_type'].tolist()
             
-            # 메타데이터 컬럼 및 문자열 컬럼 제외
-            exclude_columns = {'날짜', '종목코드', '시간', '종목명'}  # 시간 컬럼도 제외
+            # 메타데이터 컬럼 및 문자열 컬럼 제외 (번호 컬럼 명시적 제외)
+            exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호'}  # '번호' 컬럼 명시적 제외
             
             # 숫자형 컬럼만 선택
             feature_columns = []
@@ -156,31 +156,25 @@ class GRPOScalpingEnv(gym.Env):
                         logger.debug(f"Excluding non-numeric column: {col} (type: {col_type})")
             
             # 임베딩 모델과 호환성을 위해 정확한 수의 특징만 사용
-            # 임베딩 모델이 특정 수의 특징으로 훈련되었으므로 이에 맞춤
             expected_features = self.expected_features
             
             # 상세 로그: 발견된 모든 피처 출력
-            logger.info(f"Found {len(feature_columns)} numeric features in database: {', '.join(feature_columns)}")
+            logger.info(f"Found {len(feature_columns)} numeric features in database (after excluding metadata): {', '.join(feature_columns)}")
             
-            if len(feature_columns) > expected_features:
-                # 불일치 시 '종목코드'를 우선적으로 제외
-                if '종목코드' in feature_columns:
-                    feature_columns.remove('종목코드')
-                    logger.warning(f"Removed '종목코드' from features to match embedding model requirements")
-                    logger.info(f"After removing '종목코드': {len(feature_columns)} features")
-                else:
-                    if '번호' in feature_columns:
-                        feature_columns.remove('번호')
-                        logger.warning(f"Removed '번호' from features to match embedding model requirements")
-                        logger.info(f"After removing '번호': {len(feature_columns)} features")
-                
-                # 여전히 피처가 많으면 나머지 제외
-                if len(feature_columns) > expected_features:
-                    excluded_features = feature_columns[expected_features:]
-                    logger.warning(f"Found {len(feature_columns)} features, but embedding model expects {expected_features}. "
-                                 f"Using first {expected_features} features.")
-                    logger.warning(f"EXCLUDED features ({len(excluded_features)}): {', '.join(excluded_features)}")
-                    feature_columns = feature_columns[:expected_features]
+            # 정확히 28개 피처가 되도록 처리
+            if len(feature_columns) == expected_features:
+                logger.info(f"✅ Perfect match: {len(feature_columns)} features = {expected_features} expected")
+            elif len(feature_columns) > expected_features:
+                # 추가 제거가 필요한 경우
+                excluded_features = feature_columns[expected_features:]
+                logger.warning(f"Found {len(feature_columns)} features, but embedding model expects {expected_features}.")
+                logger.warning(f"EXCLUDED additional features ({len(excluded_features)}): {', '.join(excluded_features)}")
+                logger.info(f"💡 Consider retraining embedding model with {len(feature_columns)} features for better performance")
+                feature_columns = feature_columns[:expected_features]
+            elif len(feature_columns) < expected_features:
+                logger.error(f"❌ Insufficient features: found {len(feature_columns)}, expected {expected_features}")
+                logger.error(f"Available features: {', '.join(feature_columns)}")
+                raise RuntimeError(f"Cannot proceed with {len(feature_columns)} features when {expected_features} are required")
             elif len(feature_columns) < expected_features:
                 logger.error(f"Found only {len(feature_columns)} features, but embedding model expects {expected_features}")
                 raise RuntimeError(f"Insufficient features: found {len(feature_columns)}, expected {expected_features}")
