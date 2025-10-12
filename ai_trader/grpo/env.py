@@ -43,6 +43,7 @@ class GRPOScalpingEnv(gym.Env):
         quick_exit_penalty: 빠른 손절 룰 위반 페널티 (기본값: 0.01)
         max_holding_time: 최대 보유 시간 (초, 기본값: 60)
         holding_penalty_rate: 장기 보유 페널티 비율 (기본값: 0.001)
+        max_episode_steps: 에피소드당 최대 스텝 수 (기본값: None, 제한 없음)
         device: 디바이스 ('cpu' 또는 'cuda')
     """
     
@@ -61,6 +62,7 @@ class GRPOScalpingEnv(gym.Env):
         quick_exit_penalty: float = 0.01,
         max_holding_time: float = 60.0,
         holding_penalty_rate: float = 0.001,
+        max_episode_steps: Optional[int] = None,
         device: str = 'cpu'
     ):
         super().__init__()
@@ -87,6 +89,9 @@ class GRPOScalpingEnv(gym.Env):
         # 보유 시간 페널티 설정
         self.max_holding_time = max_holding_time
         self.holding_penalty_rate = holding_penalty_rate
+        
+        # 에피소드 길이 제한
+        self.max_episode_steps = max_episode_steps
         
         # 관측 공간: 임베딩 벡터
         self.observation_space = spaces.Box(
@@ -191,6 +196,7 @@ class GRPOScalpingEnv(gym.Env):
         에피소드 시작 지점 샘플링
         
         다양한 시장 상황을 가진 시작 지점을 DuckDB에서 샘플링합니다.
+        max_episode_steps가 설정된 경우, 전체 데이터에서 랜덤한 구간을 선택합니다.
         
         Returns:
             (data, metadata) 튜플
@@ -202,18 +208,24 @@ class GRPOScalpingEnv(gym.Env):
         max_attempts = 10  # 최대 시도 횟수 제한
         attempt = 0
         
+        # 필요한 최소 데이터 길이 계산
+        if self.max_episode_steps is not None:
+            # max_episode_steps가 설정된 경우, seq_len + max_episode_steps만큼 필요
+            min_required = self.seq_len + self.max_episode_steps + 100
+        else:
+            min_required = self.seq_len + 100
+        
         while attempt < max_attempts:
             try:
                 # 랜덤 종목 및 날짜 선택
                 query = f"""
-                    SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
+                    SELECT DISTINCT 종목코드, 날짜, 시간, COUNT(*) as count
                     FROM {self.table_name}
-                    GROUP BY 종목코드, 날짜
+                    GROUP BY 종목코드, 날짜, 시간
                     HAVING COUNT(*) >= ?
                     ORDER BY RANDOM()
                     LIMIT 1
                 """
-                min_required = self.seq_len + 100
                 result = self.conn.execute(query, [min_required]).fetchdf()
                 
                 if len(result) == 0:
@@ -221,9 +233,9 @@ class GRPOScalpingEnv(gym.Env):
                     logger.warning(f"No stock/date combination with {min_required} samples found, trying with lower requirement")
                     min_required = self.seq_len + 10
                     query = f"""
-                        SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
+                        SELECT DISTINCT 종목코드, 날짜, 시간, COUNT(*) as count
                         FROM {self.table_name}
-                        GROUP BY 종목코드, 날짜
+                        GROUP BY 종목코드, 날짜, 시간
                         HAVING COUNT(*) >= ?
                         ORDER BY RANDOM()
                         LIMIT 1
@@ -251,7 +263,26 @@ class GRPOScalpingEnv(gym.Env):
                     metadata = df[['종목코드', '날짜', '시간']].values
                     features = df[feature_cols].values.astype(np.float32)
                     
-                    logger.debug(f"Sampled episode: stock={stock_code}, date={date}, length={len(features)}")
+                    # max_episode_steps가 설정된 경우, 랜덤한 시작 지점 선택
+                    if self.max_episode_steps is not None:
+                        # 가능한 시작 지점 범위 계산
+                        max_start_idx = len(features) - (self.seq_len + self.max_episode_steps)
+                        if max_start_idx > 0:
+                            # 랜덤 시작 지점 선택
+                            start_idx = np.random.randint(0, max_start_idx)
+                            end_idx = start_idx + self.seq_len + self.max_episode_steps
+                            
+                            features = features[start_idx:end_idx]
+                            metadata = metadata[start_idx:end_idx]
+                            
+                            logger.debug(f"Sampled episode: stock={stock_code}, date={date}, "
+                                       f"total_length={len(df)}, selected_range=[{start_idx}:{end_idx}], "
+                                       f"selected_length={len(features)}")
+                        else:
+                            # 데이터가 충분하지 않으면 전체 사용
+                            logger.debug(f"Sampled episode: stock={stock_code}, date={date}, length={len(features)}")
+                    else:
+                        logger.debug(f"Sampled episode: stock={stock_code}, date={date}, length={len(features)}")
                     
                     return features, metadata
                 else:
@@ -531,29 +562,33 @@ class GRPOScalpingEnv(gym.Env):
         # 에피소드 종료 체크
         if self.current_step >= self.episode_length - 1:
             terminated = True
+        
+        # 최대 스텝 수 체크 (설정된 경우)
+        if self.max_episode_steps is not None and self.current_step >= self.max_episode_steps:
+            truncated = True
+        
+        # 에피소드 종료 시 포지션 강제 청산
+        if (terminated or truncated) and self.position == 1:
+            holding_time = self.current_time - self.entry_time
+            final_reward, final_components = self._calculate_reward(
+                self.entry_price,
+                self.current_price,
+                holding_time
+            )
+            self.episode_rewards.append(final_reward)
             
-            # 포지션이 남아있으면 강제 청산
-            if self.position == 1:
-                holding_time = self.current_time - self.entry_time
-                final_reward, final_components = self._calculate_reward(
-                    self.entry_price,
-                    self.current_price,
-                    holding_time
-                )
-                self.episode_rewards.append(final_reward)
-                
-                # 강제 청산 거래 기록
-                self.episode_trades.append({
-                    'entry_price': self.entry_price,
-                    'exit_price': self.current_price,
-                    'holding_time': holding_time,
-                    'profit_rate': final_components['profit_rate'],
-                    'reward': final_reward,
-                    'reward_components': final_components,
-                    'forced_liquidation': True
-                })
-                
-                logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
+            # 강제 청산 거래 기록
+            self.episode_trades.append({
+                'entry_price': self.entry_price,
+                'exit_price': self.current_price,
+                'holding_time': holding_time,
+                'profit_rate': final_components['profit_rate'],
+                'reward': final_reward,
+                'reward_components': final_components,
+                'forced_liquidation': True
+            })
+            
+            logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
         
         # 현재 가격 및 시간 업데이트
         if not terminated:
