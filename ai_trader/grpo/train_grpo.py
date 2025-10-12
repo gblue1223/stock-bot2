@@ -390,6 +390,7 @@ def main():
         table_name=args.table,
         seq_len=args.seq_len,
         embedding_dim=embedding_dim,
+        expected_features=config.get('input_dim', 28),  # 임베딩 모델의 입력 차원과 일치
         transaction_cost_rate=args.transaction_cost_rate,
         quick_exit_threshold=args.quick_exit_threshold,
         quick_exit_penalty=args.quick_exit_penalty,
