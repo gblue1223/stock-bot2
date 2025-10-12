@@ -697,11 +697,18 @@ class GRPOTrainer:
         Returns:
             훈련 메트릭 딕셔너리
         """
+        import time
+        
         logger.info(f"Starting GRPO training for {total_episodes} episodes...")
         
         num_iterations = total_episodes // (self.episodes_per_group * self.num_groups)
+        logger.info(f"Total iterations: {num_iterations}")
+        
+        start_time = time.time()
+        iteration_times = []
         
         for iteration in range(num_iterations):
+            iteration_start_time = time.time()
             # 1. 롤아웃 수집
             num_episodes = self.episodes_per_group * self.num_groups
             episodes = self.collect_rollouts(num_episodes)
@@ -732,9 +739,33 @@ class GRPOTrainer:
                 formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
                 self.save_checkpoint(formatted_checkpoint_path, iteration + 1)
             
-            logger.info(f"Iteration {iteration + 1}/{num_iterations}: "
-                       f"timesteps={self.total_timesteps}, "
-                       f"policy_loss={update_metrics['policy_loss']:.4f}")
+            # 7. 진행률 및 예상 시간 계산
+            iteration_elapsed = time.time() - iteration_start_time
+            iteration_times.append(iteration_elapsed)
+            
+            # 최근 10개 iteration의 평균 시간으로 예상 시간 계산
+            recent_times = iteration_times[-10:]
+            avg_iteration_time = np.mean(recent_times)
+            remaining_iterations = num_iterations - (iteration + 1)
+            estimated_remaining_time = avg_iteration_time * remaining_iterations
+            
+            # 진행률 계산
+            progress_pct = (iteration + 1) / num_iterations * 100
+            
+            # 시간 포맷팅
+            elapsed_time = time.time() - start_time
+            elapsed_str = self._format_time(elapsed_time)
+            remaining_str = self._format_time(estimated_remaining_time)
+            
+            # 평균 보상 계산
+            mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
+            
+            logger.info(f"Iteration {iteration + 1}/{num_iterations} ({progress_pct:.1f}%) | "
+                       f"Timesteps: {self.total_timesteps} | "
+                       f"Mean Reward: {mean_reward:.4f} | "
+                       f"Policy Loss: {update_metrics['policy_loss']:.4f} | "
+                       f"Elapsed: {elapsed_str} | "
+                       f"ETA: {remaining_str}")
         
         logger.info("GRPO training completed!")
         
@@ -948,6 +979,27 @@ class GRPOTrainer:
         
         logger.info(f"Checkpoint loaded from {checkpoint_path}, "
                    f"timesteps={self.total_timesteps}, updates={self.num_updates}")
+    
+    def _format_time(self, seconds: float) -> str:
+        """
+        시간을 읽기 쉬운 형식으로 포맷팅
+        
+        Args:
+            seconds: 초 단위 시간
+            
+        Returns:
+            포맷팅된 시간 문자열 (예: "1h 23m 45s")
+        """
+        if seconds < 60:
+            return f"{int(seconds)}s"
+        elif seconds < 3600:
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            return f"{minutes}m {secs}s"
+        else:
+            hours = int(seconds // 3600)
+            minutes = int((seconds % 3600) // 60)
+            return f"{hours}h {minutes}m"
     
     def close(self):
         """훈련기 종료"""

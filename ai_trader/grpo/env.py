@@ -160,9 +160,7 @@ class GRPOScalpingEnv(gym.Env):
             expected_features = self.expected_features
             
             # 상세 로그: 발견된 모든 피처 출력
-            logger.info(f"Found {len(feature_columns)} numeric features in database:")
-            for idx, col in enumerate(feature_columns, 1):
-                logger.info(f"  [{idx:2d}] {col}")
+            logger.info(f"Found {len(feature_columns)} numeric features in database: {', '.join(feature_columns)}")
             
             if len(feature_columns) > expected_features:
                 # 불일치 시 '종목코드'를 우선적으로 제외
@@ -187,9 +185,7 @@ class GRPOScalpingEnv(gym.Env):
                 logger.error(f"Found only {len(feature_columns)} features, but embedding model expects {expected_features}")
                 raise RuntimeError(f"Insufficient features: found {len(feature_columns)}, expected {expected_features}")
             
-            logger.info(f"Selected {len(feature_columns)} numeric feature columns (matching embedding model):")
-            for idx, col in enumerate(feature_columns, 1):
-                logger.info(f"  [{idx:2d}] {col}")
+            logger.info(f"Selected {len(feature_columns)} numeric feature columns (matching embedding model): {', '.join(feature_columns)}")
             return feature_columns
         except Exception as e:
             logger.error(f"Failed to get feature columns: {e}")
