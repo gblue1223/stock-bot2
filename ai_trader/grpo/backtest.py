@@ -109,7 +109,7 @@ class BacktestSimulator:
             all_columns = columns_df['column_name'].tolist()
             
             # 메타데이터 컬럼 제외
-            exclude_columns = {'날짜', '종목코드', '번호'}
+            exclude_columns = {'날짜', '종목코드', '시간'}
             feature_columns = [col for col in all_columns if col not in exclude_columns]
             
             return feature_columns
@@ -134,14 +134,14 @@ class BacktestSimulator:
         Returns:
             (data, metadata) 튜플
             - data: (n_samples, n_features)
-            - metadata: (n_samples, 3) - [종목코드, 날짜, 번호]
+            - metadata: (n_samples, 3) - [종목코드, 날짜, 시간]
         """
         feature_cols = self._get_feature_columns()
         
         try:
             # 쿼리 구성
             query = f"""
-                SELECT 종목코드, 날짜, 번호, {', '.join(feature_cols)}
+                SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
                 FROM {self.table_name}
                 WHERE 1=1
             """
@@ -162,7 +162,7 @@ class BacktestSimulator:
                 query += f" AND 종목코드 IN ({placeholders})"
                 params.extend(stock_codes)
             
-            query += " ORDER BY 종목코드, 날짜, 번호"
+            query += " ORDER BY 종목코드, 날짜, 시간"
             
             # 데이터 로드
             df = self.conn.execute(query, params).fetchdf()
@@ -171,7 +171,7 @@ class BacktestSimulator:
                 raise RuntimeError("No test data found")
             
             # 메타데이터와 특징 분리
-            metadata = df[['종목코드', '날짜', '번호']].values
+            metadata = df[['종목코드', '날짜', '시간']].values
             features = df[feature_cols].values.astype(np.float32)
             
             logger.info(f"Loaded test data: {len(features)} samples, "
@@ -346,7 +346,7 @@ class BacktestSimulator:
         
         Args:
             data: 특징 데이터 (n_samples, n_features)
-            metadata: 메타데이터 (n_samples, 3) - [종목코드, 날짜, 번호]
+            metadata: 메타데이터 (n_samples, 3) - [종목코드, 날짜, 시간]
             deterministic: 결정적 행동 선택 여부
             verbose: 진행 상황 출력 여부
             

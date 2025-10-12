@@ -137,11 +137,22 @@ class GRPOScalpingEnv(gym.Env):
             query = f"DESCRIBE {self.table_name}"
             columns_df = self.conn.execute(query).fetchdf()
             all_columns = columns_df['column_name'].tolist()
+            column_types = columns_df['column_type'].tolist()
             
-            # 메타데이터 컬럼 제외
-            exclude_columns = {'날짜', '종목코드', '번호'}
-            feature_columns = [col for col in all_columns if col not in exclude_columns]
+            # 메타데이터 컬럼 및 문자열 컬럼 제외
+            exclude_columns = {'날짜', '종목코드', '시간', '종목명'}  # 시간 컬럼도 제외
             
+            # 숫자형 컬럼만 선택
+            feature_columns = []
+            for col, col_type in zip(all_columns, column_types):
+                if col not in exclude_columns:
+                    # 숫자형 타입만 포함 (VARCHAR, TEXT 등 문자열 타입 제외)
+                    if any(numeric_type in col_type.upper() for numeric_type in ['DOUBLE', 'FLOAT', 'INTEGER', 'BIGINT', 'DECIMAL']):
+                        feature_columns.append(col)
+                    else:
+                        logger.debug(f"Excluding non-numeric column: {col} (type: {col_type})")
+            
+            logger.info(f"Selected {len(feature_columns)} numeric feature columns")
             return feature_columns
         except Exception as e:
             logger.error(f"Failed to get feature columns: {e}")
@@ -156,50 +167,78 @@ class GRPOScalpingEnv(gym.Env):
         Returns:
             (data, metadata) 튜플
             - data: (episode_length, n_features)
-            - metadata: (episode_length, 3) - [종목코드, 날짜, 번호]
+            - metadata: (episode_length, 3) - [종목코드, 날짜, 시간]
         """
         feature_cols = self._get_feature_columns()
         
-        try:
-            # 랜덤 종목 및 날짜 선택
-            query = f"""
-                SELECT DISTINCT 종목코드, 날짜
-                FROM {self.table_name}
-                ORDER BY RANDOM()
-                LIMIT 1
-            """
-            result = self.conn.execute(query).fetchdf()
-            
-            if len(result) == 0:
-                raise RuntimeError("No data found in database")
-            
-            stock_code = result['종목코드'].iloc[0]
-            date = result['날짜'].iloc[0]
-            
-            # 해당 종목/날짜의 데이터 로드
-            query = f"""
-                SELECT 종목코드, 날짜, 번호, {', '.join(feature_cols)}
-                FROM {self.table_name}
-                WHERE 종목코드 = ? AND 날짜 = ?
-                ORDER BY 번호
-            """
-            df = self.conn.execute(query, [stock_code, date]).fetchdf()
-            
-            if len(df) < self.seq_len + 100:  # 최소 에피소드 길이 확보
-                # 데이터가 부족하면 다시 샘플링
-                return self._sample_episode_start()
-            
-            # 메타데이터와 특징 분리
-            metadata = df[['종목코드', '날짜', '번호']].values
-            features = df[feature_cols].values.astype(np.float32)
-            
-            logger.debug(f"Sampled episode: stock={stock_code}, date={date}, length={len(features)}")
-            
-            return features, metadata
-            
-        except Exception as e:
-            logger.error(f"Failed to sample episode start: {e}")
-            raise RuntimeError(f"Cannot sample episode start: {e}")
+        max_attempts = 10  # 최대 시도 횟수 제한
+        attempt = 0
+        
+        while attempt < max_attempts:
+            try:
+                # 랜덤 종목 및 날짜 선택
+                query = f"""
+                    SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
+                    FROM {self.table_name}
+                    GROUP BY 종목코드, 날짜
+                    HAVING COUNT(*) >= ?
+                    ORDER BY RANDOM()
+                    LIMIT 1
+                """
+                min_required = self.seq_len + 100
+                result = self.conn.execute(query, [min_required]).fetchdf()
+                
+                if len(result) == 0:
+                    # 충분한 데이터가 있는 조합이 없으면 요구사항을 낮춤
+                    logger.warning(f"No stock/date combination with {min_required} samples found, trying with lower requirement")
+                    min_required = self.seq_len + 10
+                    query = f"""
+                        SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
+                        FROM {self.table_name}
+                        GROUP BY 종목코드, 날짜
+                        HAVING COUNT(*) >= ?
+                        ORDER BY RANDOM()
+                        LIMIT 1
+                    """
+                    result = self.conn.execute(query, [min_required]).fetchdf()
+                    
+                    if len(result) == 0:
+                        raise RuntimeError(f"No data found with minimum {min_required} samples per stock/date")
+                
+                stock_code = str(result['종목코드'].iloc[0])
+                date = int(result['날짜'].iloc[0])
+                available_count = int(result['count'].iloc[0])
+                
+                # 해당 종목/날짜의 데이터 로드
+                query = f"""
+                    SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
+                    FROM {self.table_name}
+                    WHERE 종목코드 = ? AND 날짜 = ?
+                    ORDER BY 시간
+                """
+                df = self.conn.execute(query, [stock_code, date]).fetchdf()
+                
+                if len(df) >= self.seq_len + 10:  # 최소 요구사항 충족
+                    # 메타데이터와 특징 분리
+                    metadata = df[['종목코드', '날짜', '시간']].values
+                    features = df[feature_cols].values.astype(np.float32)
+                    
+                    logger.debug(f"Sampled episode: stock={stock_code}, date={date}, length={len(features)}")
+                    
+                    return features, metadata
+                else:
+                    logger.warning(f"Insufficient data for stock={stock_code}, date={date}: {len(df)} samples")
+                    attempt += 1
+                    continue
+                    
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1} failed to sample episode start: {e}")
+                attempt += 1
+                if attempt >= max_attempts:
+                    raise RuntimeError(f"Cannot sample episode start after {max_attempts} attempts: {e}")
+                continue
+        
+        raise RuntimeError(f"Cannot sample episode start after {max_attempts} attempts")
     
     def _get_embedding(self, sequence: np.ndarray) -> np.ndarray:
         """
@@ -215,8 +254,15 @@ class GRPOScalpingEnv(gym.Env):
             # (seq_len, n_features) -> (1, seq_len, n_features)
             seq_tensor = torch.from_numpy(sequence).float().unsqueeze(0).to(self.device)
             
-            # 임베딩 생성
-            embedding = self.embedding_model(seq_tensor)  # (1, embedding_dim)
+            # 임베딩 생성 - MaskedAutoEncoder는 (reconstruction, embedding, mask) 튜플을 반환
+            result = self.embedding_model(seq_tensor)
+            
+            if isinstance(result, tuple):
+                # MaskedAutoEncoder의 경우: (reconstruction, embedding, mask)
+                _, embedding, _ = result
+            else:
+                # 일반 AutoEncoder의 경우: embedding만 반환
+                embedding = result
             
             # (1, embedding_dim) -> (embedding_dim,)
             embedding = embedding.squeeze(0).cpu().numpy()
@@ -273,7 +319,7 @@ class GRPOScalpingEnv(gym.Env):
         self.entry_price = 0.0
         self.entry_time = 0.0
         
-        # 현재 가격 및 시간 (메타데이터의 번호를 시간으로 사용)
+        # 현재 가격 및 시간 (메타데이터의 시간 컬럼 사용)
         self.current_price = self._get_current_price()
         self.current_time = float(self.episode_metadata[self.current_step, 2])
         
