@@ -31,7 +31,7 @@ import torch
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from ai_trader.embedding.models import TradingEmbeddingModel
+from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
 from ai_trader.grpo.env import GRPOScalpingEnv
 from ai_trader.grpo.policy import GRPOPolicy
 from ai_trader.grpo.grpo import GRPOTrainer
@@ -232,7 +232,7 @@ def parse_args():
 def load_embedding_model(
     checkpoint_path: str,
     device: str
-) -> TradingEmbeddingModel:
+) -> MaskedAutoEncoder:
     """
     임베딩 모델 로드
     
@@ -252,17 +252,19 @@ def load_embedding_model(
         # 모델 설정 추출
         config = checkpoint.get('config', {})
         
-        # 모델 생성
-        model = TradingEmbeddingModel(
-            input_dim=config.get('input_dim', 60),
+        # 모델 생성 (MaskedAutoEncoder)
+        model = MaskedAutoEncoder(
+            input_dim=config.get('input_dim', 28),
             embedding_dim=config.get('embedding_dim', 128),
+            hidden_dim=config.get('hidden_dim', 256),
             seq_len=config.get('seq_len', 60),
-            num_heads=config.get('num_heads', 4),
-            conv_channels=config.get('conv_channels', None)
+            num_layers=config.get('num_layers', 3),
+            dropout=config.get('dropout', 0.1),
+            mask_ratio=config.get('mask_ratio', 0.15)
         )
         
         # 가중치 로드
-        model.load_state_dict(checkpoint['state_dict'])
+        model.load_state_dict(checkpoint['model_state_dict'])
         model.to(device)
         model.eval()
         
