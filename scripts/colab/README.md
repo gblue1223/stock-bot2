@@ -1,12 +1,14 @@
-# 🚀 Google Colab AutoEncoder Training
+# 🚀 Google Colab Training Notebooks
 
-이 디렉토리는 Google Colab에서 Stock Bot AutoEncoder를 훈련하기 위한 노트북과 스크립트를 포함합니다.
+이 디렉토리는 Google Colab에서 Stock Bot 모델을 훈련하기 위한 노트북과 스크립트를 포함합니다.
 
 ## 📁 파일 구조
 
 ```
 scripts/colab/
-├── autoencoder_training_complete.ipynb  # 완전한 Jupyter 노트북 (권장)
+├── autoencoder_training_complete.ipynb  # AutoEncoder 훈련 노트북
+├── grpo_training_complete.ipynb         # GRPO 강화학습 훈련 노트북
+├── autoencoder_finetuning.ipynb         # AutoEncoder Fine-tuning 노트북
 ├── notebook_summary.md                  # 노트북 완성 요약
 └── README.md                            # 이 파일
 ```
@@ -15,24 +17,41 @@ scripts/colab/
 
 ### 1. 데이터 준비
 
-먼저 전처리된 데이터를 Google Drive에 업로드해야 합니다:
+#### AutoEncoder 훈련용 데이터
+
+전처리된 HDF5 배치 파일을 Google Drive에 업로드:
 
 ```
 Google Drive/
 └── MyDrive/
-    └── stock_bot_data/
-        └── pre_training_data/
-            ├── 2024_09/
-            │   ├── batch_000000.h5
-            │   ├── batch_000001.h5
-            │   └── ...
-            ├── 2024_10/
-            └── ...
+    └── models/
+        └── stockbot/
+            └── pre_training_data/
+                ├── 2024_09/
+                │   ├── batch_000000.h5
+                │   ├── batch_000001.h5
+                │   └── ...
+                ├── 2024_10/
+                └── ...
+```
+
+#### GRPO 훈련용 데이터
+
+정규화된 DuckDB 데이터베이스를 Google Drive에 업로드:
+
+```
+Google Drive/
+└── MyDrive/
+    └── models/
+        └── stockbot/
+            ├── datasets_norm_all.duckdb  # GRPO 훈련용
+            └── autoencoder_colab_XXXXXX/
+                └── model.pt              # 훈련된 임베딩 모델
 ```
 
 ### 2. Colab에서 실행
 
-**방법 1: 완전한 Jupyter 노트북 사용 (권장)**
+#### AutoEncoder 훈련
 
 1. Google Colab (https://colab.research.google.com/) 접속
 2. 파일 > 노트북 업로드 > `autoencoder_training_complete.ipynb` 선택
@@ -41,7 +60,17 @@ Google Drive/
    - 🔑 아이콘 클릭 → "Add new secret"
    - Name: `GITHUB_TOKEN`
    - Value: your_personal_access_token
-5. 셀을 순서대로 실행 (모든 코드가 포함되어 있음)
+5. 셀을 순서대로 실행
+
+#### GRPO 훈련
+
+1. **먼저 AutoEncoder 훈련 완료 필요**
+2. `grpo_training_complete.ipynb` 업로드
+3. GPU 런타임 선택 (T4 이상 권장)
+4. 노트북 내 경로 설정:
+   - `EMBEDDING_MODEL_PATH`: 훈련된 AutoEncoder 모델 경로
+   - `DB_PATH`: DuckDB 데이터베이스 경로
+5. 셀을 순서대로 실행
 
 **방법 2: 수동 노트북 생성 (고급 사용자용)**
 
@@ -51,7 +80,7 @@ Google Drive/
 
 ### 3. 실행 단계
 
-**완전한 노트북 실행 (autoencoder_training_complete.ipynb):**
+#### AutoEncoder 훈련 (autoencoder_training_complete.ipynb)
 
 1. **환경 설정**: 패키지 설치 및 GPU 확인
 2. **Drive 마운트**: Google Drive 연결 및 데이터 확인
@@ -63,9 +92,22 @@ Google Drive/
 8. **결과 시각화**: 훈련 곡선 및 재구성 샘플 플롯
 9. **모델 저장**: 최종 모델 및 결과 Google Drive에 저장
 
+#### GRPO 훈련 (grpo_training_complete.ipynb)
+
+1. **환경 설정**: PyTorch, DuckDB 등 패키지 설치
+2. **Drive 마운트**: 임베딩 모델 및 데이터베이스 확인
+3. **GitHub 클론**: 최신 GRPO 코드 다운로드
+4. **훈련 설정**: GRPO 하이퍼파라미터 구성 (GPU 메모리에 따라 자동 조정)
+5. **CLI 훈련 실행**: `train_grpo.py` CLI 스크립트 실행
+6. **TensorBoard 모니터링**: 실시간 훈련 진행 상황 확인
+7. **백테스트**: 훈련된 정책 성능 평가
+8. **모델 저장**: 체크포인트 및 로그를 Google Drive에 저장
+
 ## ⚙️ 설정 옵션
 
-### GPU 메모리에 따른 설정
+### AutoEncoder 설정
+
+#### GPU 메모리에 따른 설정
 
 **T4 GPU (15GB):**
 
@@ -88,6 +130,46 @@ CONFIG = {
     'max_batches_per_month': 100,
     'embedding_dim': 128,
     'hidden_dim': 256
+}
+```
+
+### GRPO 설정
+
+#### GPU 메모리에 따른 설정
+
+**T4 GPU (15GB):**
+
+```python
+CONFIG = {
+    'episodes_per_group': 8,
+    'num_groups': 3,
+    'total_timesteps': 500000,
+    'hidden_dim': 256
+}
+```
+
+**V100 GPU (32GB):**
+
+```python
+CONFIG = {
+    'episodes_per_group': 16,
+    'num_groups': 6,
+    'total_timesteps': 2000000,
+    'hidden_dim': 256
+}
+```
+
+#### 주요 하이퍼파라미터
+
+```python
+CONFIG = {
+    'learning_rate': 3e-4,          # 학습률
+    'gamma': 0.99,                  # 할인 계수
+    'clip_epsilon': 0.2,            # PPO 클리핑
+    'kl_target': 0.01,              # KL 발산 목표
+    'quick_exit_threshold': 1.5,    # 빠른 손절 임계값 (초)
+    'quick_exit_penalty': 0.01,     # 빠른 손절 페널티
+    'transaction_cost_rate': 0.00215 # 거래 비용 (0.215%)
 }
 ```
 
@@ -138,22 +220,44 @@ CONFIG['train_months'] = ['2024_09', '2024_10', '2024_11', '2025_01']
 
 ## 📊 예상 성능
 
-### 훈련 시간
+### AutoEncoder 훈련
 
-- **T4 GPU**: 약 4-6시간 (20 에포크)
-- **V100 GPU**: 약 2-3시간 (20 에포크)
+#### 훈련 시간
 
-### 메모리 사용량
+- **T4 GPU**: 약 4-6시간 (15 에포크)
+- **V100 GPU**: 약 2-3시간 (15 에포크)
+
+#### 메모리 사용량
 
 - **모델**: ~600MB
 - **배치 데이터**: ~2-4GB
 - **총 GPU 메모리**: ~6-8GB
 
-### 예상 결과
+#### 예상 결과
 
 - **초기 손실**: ~1.5
 - **최종 손실**: ~0.3-0.5
 - **압축률**: 28차원 → 128차원 임베딩
+
+### GRPO 훈련
+
+#### 훈련 시간
+
+- **T4 GPU**: 약 8-12시간 (1M timesteps)
+- **V100 GPU**: 약 4-6시간 (1M timesteps)
+
+#### 메모리 사용량
+
+- **정책 네트워크**: ~100MB
+- **환경 및 버퍼**: ~2-3GB
+- **총 GPU 메모리**: ~4-6GB
+
+#### 예상 성능 지표
+
+- **승률 (Win Rate)**: > 50%
+- **샤프 비율 (Sharpe Ratio)**: > 1.0
+- **최대 낙폭 (Max Drawdown)**: < 10%
+- **평균 보유 시간**: < 30초
 
 ## 🆕 새로운 기능
 
@@ -281,8 +385,32 @@ start_epoch = checkpoint['epoch'] + 1
 
 ## 🎯 다음 단계
 
-훈련 완료 후:
+### AutoEncoder 훈련 완료 후
 
 1. **모델 평가**: 임베딩 품질 분석
-2. **GRPO 준비**: 임베딩을 상태 표현으로 사용
-3. **배포**: 추론 서버 구축
+2. **GRPO 훈련**: 임베딩을 상태 표현으로 사용하여 강화학습 시작
+3. **Fine-tuning**: 필요시 새 데이터로 추가 학습
+
+### GRPO 훈련 완료 후
+
+1. **백테스트**: 다양한 시장 상황에서 성능 검증
+2. **하이퍼파라미터 튜닝**: 성능 개선을 위한 파라미터 조정
+3. **실전 배포**: 실시간 거래 시스템에 통합
+
+## 📝 노트북 사용 팁
+
+### GRPO 훈련 노트북 특징
+
+- **CLI 기반**: 직접 코드를 작성하지 않고 `train_grpo.py` CLI를 사용
+- **자동 설정**: GPU 메모리에 따라 하이퍼파라미터 자동 조정
+- **TensorBoard 통합**: 실시간 훈련 모니터링
+- **백테스트 포함**: 훈련 후 즉시 성능 평가 가능
+
+### 권장 워크플로우
+
+1. **AutoEncoder 먼저 훈련** (4-6시간)
+2. **임베딩 품질 확인**
+3. **GRPO 훈련 시작** (8-12시간)
+4. **TensorBoard로 모니터링**
+5. **백테스트로 성능 검증**
+6. **필요시 하이퍼파라미터 조정 후 재훈련**
