@@ -158,15 +158,33 @@ class GRPOScalpingEnv(gym.Env):
             # 임베딩 모델과 호환성을 위해 정확한 수의 특징만 사용
             # 임베딩 모델이 특정 수의 특징으로 훈련되었으므로 이에 맞춤
             expected_features = self.expected_features
+            
+            # 상세 로그: 발견된 모든 피처 출력
+            logger.info(f"Found {len(feature_columns)} numeric features in database:")
+            for idx, col in enumerate(feature_columns, 1):
+                logger.info(f"  [{idx:2d}] {col}")
+            
             if len(feature_columns) > expected_features:
-                logger.warning(f"Found {len(feature_columns)} features, but embedding model expects {expected_features}. "
-                             f"Using first {expected_features} features.")
-                feature_columns = feature_columns[:expected_features]
+                # 불일치 시 '종목코드'를 우선적으로 제외
+                if '종목코드' in feature_columns:
+                    feature_columns.remove('종목코드')
+                    logger.warning(f"Removed '종목코드' from features to match embedding model requirements")
+                    logger.info(f"After removing '종목코드': {len(feature_columns)} features")
+                
+                # 여전히 피처가 많으면 나머지 제외
+                if len(feature_columns) > expected_features:
+                    excluded_features = feature_columns[expected_features:]
+                    logger.warning(f"Found {len(feature_columns)} features, but embedding model expects {expected_features}. "
+                                 f"Using first {expected_features} features.")
+                    logger.warning(f"EXCLUDED features ({len(excluded_features)}): {', '.join(excluded_features)}")
+                    feature_columns = feature_columns[:expected_features]
             elif len(feature_columns) < expected_features:
                 logger.error(f"Found only {len(feature_columns)} features, but embedding model expects {expected_features}")
                 raise RuntimeError(f"Insufficient features: found {len(feature_columns)}, expected {expected_features}")
             
-            logger.info(f"Selected {len(feature_columns)} numeric feature columns (matching embedding model)")
+            logger.info(f"Selected {len(feature_columns)} numeric feature columns (matching embedding model):")
+            for idx, col in enumerate(feature_columns, 1):
+                logger.info(f"  [{idx:2d}] {col}")
             return feature_columns
         except Exception as e:
             logger.error(f"Failed to get feature columns: {e}")
