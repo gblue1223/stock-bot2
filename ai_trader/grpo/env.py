@@ -170,6 +170,11 @@ class GRPOScalpingEnv(gym.Env):
                     feature_columns.remove('종목코드')
                     logger.warning(f"Removed '종목코드' from features to match embedding model requirements")
                     logger.info(f"After removing '종목코드': {len(feature_columns)} features")
+                else:
+                    if '번호' in feature_columns:
+                        feature_columns.remove('번호')
+                        logger.warning(f"Removed '번호' from features to match embedding model requirements")
+                        logger.info(f"After removing '번호': {len(feature_columns)} features")
                 
                 # 여전히 피처가 많으면 나머지 제외
                 if len(feature_columns) > expected_features:
