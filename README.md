@@ -383,7 +383,7 @@ python scripts/data/normalize_datasets.py \
   --workers 12 \
   --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
   --checkpoint-interval 50 \
-  --ignoring-stocks-csv scripts/ignoring_stocks.csv \
+  --ignoring-stocks-csv scripts/data/ignoring_stocks.csv \
   --trade-threshold 3000.0 \
   --qualifying-minutes 1
 
