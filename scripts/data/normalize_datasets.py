@@ -22,7 +22,7 @@ IGNORING_STOCKS_SET: set[str] = set()
 # Default minimum required per-minute cumulative traded value (누적거래대금)
 DEFAULT_TRADE_VALUE_PER_MINUTE: float = 3000.0
 # Default minimum number of minutes that must satisfy the trade value threshold
-DEFAULT_MIN_QUALIFYING_MINUTES: int = 2
+DEFAULT_MIN_QUALIFYING_MINUTES: int = 1
 
 
 # Final column order required
@@ -173,17 +173,52 @@ def _clean_column_name(col: str) -> str:
 
 
 def _count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: float) -> Optional[int]:
-    """Return count of minutes where 누적거래대금 increases by at least `trade_threshold_per_minute`."""
+    """
+    각 분(minute) 단위로 누적거래대금이 임계값 이상 증가한 분의 개수를 계산합니다.
+    
+    이 함수는 데이터가 충분한 유동성을 가지고 있는지 검증하기 위해 사용됩니다.
+    각 분마다 누적거래대금의 증가량(해당 분 내 최대값 - 최소값)을 계산하고,
+    이 증가량이 임계값 이상인 분의 개수를 반환합니다.
+    
+    매개변수:
+    - df: 종목 데이터프레임 ('누적거래대금', '시간' 컬럼 필요)
+    - trade_threshold_per_minute: 분당 최소 누적거래대금 증가량 임계값 (백만원 단위)
+    
+    반환값:
+    - int: 임계값을 충족한 분의 개수
+    - None: 필수 컬럼이 없거나 유효한 데이터가 없는 경우
+    
+    처리 로직:
+    1. 필수 컬럼('누적거래대금', '시간') 존재 여부 확인
+    2. 누적거래대금과 시간을 수치형으로 변환 (변환 실패 시 NaN)
+    3. 유효한 값만 필터링 (NaN 제거)
+    4. 시간 순서대로 정렬 (mergesort로 안정 정렬 보장)
+    5. 시간을 초 단위에서 분 단위로 변환 (// 60)
+    6. 각 분별로 그룹화하여 누적거래대금의 최대값 - 최소값 계산
+    7. 각 분의 증가량이 임계값 이상인 분의 개수 집계
+    
+    예시:
+    - trade_threshold_per_minute=3000 (300만원)일 때
+    - 09:00분에 거래대금이 100억 -> 105억으로 증가 (50억 증가) -> 조건 충족
+    - 09:01분에 거래대금이 105억 -> 105.2억으로 증가 (2억 증가) -> 조건 미충족
+    - 결과: 1개 분이 조건을 충족
+    """
+    # 1. 필수 컬럼 존재 여부 확인
     if '누적거래대금' not in df.columns or '시간' not in df.columns:
         return None
 
+    # 2. 데이터 타입 변환: 문자열이나 기타 타입을 수치형으로 변환
+    # errors='coerce': 변환 실패 시 NaN으로 대체
     trade_values = pd.to_numeric(df['누적거래대금'], errors='coerce')
+    
+    # 시간을 초 단위로 변환 (HHMMSSmmm 형식 -> 초)
     time_secs = df['시간'].apply(_time_ms_to_seconds)
     time_secs = pd.to_numeric(time_secs, errors='coerce')
 
+    # 3. 유효한 데이터 필터링: NaN이 아닌 값만 선택
     mask = trade_values.notna() & time_secs.notna()
     if mask.sum() == 0:
-        return None
+        return None  # 유효한 데이터가 없으면 None 반환
 
     trade_values = trade_values[mask].astype(float)
     time_secs = time_secs[mask].astype(int)
@@ -191,13 +226,21 @@ def _count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: flo
     if trade_values.empty:
         return None
 
+    # 4. 시간 순서대로 정렬
+    # kind="mergesort": 안정 정렬 알고리즘 사용 (동일한 값의 원래 순서 유지)
     order = np.argsort(time_secs.values, kind="mergesort")
     trade_values = trade_values.iloc[order]
     time_secs = time_secs.iloc[order]
 
+    # 5. 초 단위를 분 단위로 변환 (예: 540초 -> 9분)
     minutes = (time_secs // 60).astype(int)
+    
+    # 6. 분별로 그룹화하여 각 분의 거래대금 증가량 계산
+    # 각 분 내에서: 최대 누적거래대금 - 최소 누적거래대금 = 해당 분의 순 증가량
     df_group = pd.DataFrame({'minute': minutes.values, 'trade': trade_values.values})
     deltas = df_group.groupby('minute')['trade'].agg(lambda s: float(s.max() - s.min()))
+    
+    # 7. 임계값 이상 증가한 분의 개수 집계
     qualifying = (deltas >= trade_threshold_per_minute).sum()
 
     return int(qualifying)
@@ -1353,7 +1396,7 @@ def main():
     parser.add_argument("--single-output", action="store_true",
                         help="월별 샤드 대신 하나의 DuckDB 파일(-o)에 모든 결과를 순차 반영합니다")
     parser.add_argument("--trade-threshold", type=float, default=DEFAULT_TRADE_VALUE_PER_MINUTE,
-                        help=f"누적거래대금 1분 필터 기준값. 0 이하이면 필터 비활성화 (기본: {DEFAULT_TRADE_VALUE_PER_MINUTE})")
+                        help=f"누적거래대금 'qualifying-minutes'분 필터 기준값. 0 이하이면 필터 비활성화 (기본: {DEFAULT_TRADE_VALUE_PER_MINUTE})")
     parser.add_argument("--qualifying-minutes", type=int, default=DEFAULT_MIN_QUALIFYING_MINUTES,
                         help=f"필터 활성화 시 기준을 충족해야 하는 분 수(기본: {DEFAULT_MIN_QUALIFYING_MINUTES})")
     

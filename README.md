@@ -364,28 +364,30 @@ DEVICE="cuda"  # 또는 "cpu"
 ## 데이터 정규화
 
 ```bash
-python scripts/generate_datasets.py \
+python scripts/data/generate_datasets.py \
   "D:\Workspace\Project\stock-bot\hoga-crawler\data" \
   -o "C:\Users\user\Workspace\datasets@raw\datasets.duckdb" \
   --workers 12 \
   --tmp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
   --checkpoint-interval 50
 
-python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
+python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
   --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
   --temp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
   --threads 4 \
   --memory-limit 64GB
 
-python scripts/normalize_datasets.py \
+python scripts/data/normalize_datasets.py \
   "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
   -o "C:\Users\user\Workspace\datasets\datasets_norm.duckdb" \
   --workers 12 \
   --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
   --checkpoint-interval 50 \
-  --ignoring-stocks-csv scripts/ignoring_stocks.csv
+  --ignoring-stocks-csv scripts/ignoring_stocks.csv \
+  --trade-threshold 3000.0 \
+  --qualifying-minutes 1
 
-python scripts/merge_datasets.py "C:\Users\user\Workspace\datasets" \
+python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
   --out "C:\Users\user\Workspace\datasets\datasets_norm_all.duckdb" \
   --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
   --threads 4 \
