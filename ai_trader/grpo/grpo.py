@@ -527,11 +527,43 @@ class GRPOTrainer:
         # 2. 참조 정책 저장 (KL 발산 계산용)
         if self.reference_policy is None:
             # 첫 업데이트 시 참조 정책 초기화
-            self.reference_policy = type(self.policy)(
-                embedding_dim=self.policy.embedding_dim,
-                hidden_dim=self.policy.hidden_dim,
-                action_dim=self.policy.action_dim
-            ).to(self.device)
+            # 정책 클래스에 따라 다른 초기화 방법 사용
+            policy_class = type(self.policy)
+            
+            # 정책 클래스별 초기화 파라미터 결정
+            # 순서 중요: 더 구체적인 속성부터 체크
+            if hasattr(self.policy, 'input_dim'):
+                # DirectFeaturePolicy
+                self.reference_policy = policy_class(
+                    input_dim=self.policy.input_dim,
+                    hidden_dim=self.policy.hidden_dim,
+                    action_dim=self.policy.action_dim
+                ).to(self.device)
+            elif hasattr(self.policy, 'feature_dim'):
+                # NormalizedFeaturePolicy
+                self.reference_policy = policy_class(
+                    feature_dim=self.policy.feature_dim,
+                    hidden_dim=self.policy.hidden_dim,
+                    action_dim=self.policy.action_dim
+                ).to(self.device)
+            elif hasattr(self.policy, 'indicator_dim'):
+                # TechnicalIndicatorPolicy
+                self.reference_policy = policy_class(
+                    indicator_dim=self.policy.indicator_dim,
+                    hidden_dim=self.policy.hidden_dim,
+                    action_dim=self.policy.action_dim
+                ).to(self.device)
+            elif hasattr(self.policy, 'embedding_dim'):
+                # 기존 GRPOPolicy (마지막에 체크)
+                self.reference_policy = policy_class(
+                    embedding_dim=self.policy.embedding_dim,
+                    hidden_dim=self.policy.hidden_dim,
+                    action_dim=self.policy.action_dim
+                ).to(self.device)
+            else:
+                # 기본값으로 현재 정책을 복사
+                import copy
+                self.reference_policy = copy.deepcopy(self.policy)
         
         # 현재 정책을 참조 정책으로 복사
         self.reference_policy.load_state_dict(self.policy.state_dict())
@@ -759,12 +791,20 @@ class GRPOTrainer:
             elapsed_str = self._format_time(elapsed_time)
             remaining_str = self._format_time(estimated_remaining_time)
             
-            # 평균 보상 계산
+            # 평균 보상 및 추가 메트릭 계산
             mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
+            
+            # 추가 메트릭 계산
+            mean_win_rate = np.mean([ep['metadata'].get('win_rate', 0.0) for ep in episodes])
+            mean_trades = np.mean([ep['metadata'].get('num_trades', 0) for ep in episodes])
+            mean_sharpe = np.mean([ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes])
             
             logger.info(f"Iteration {iteration + 1}/{num_iterations} ({progress_pct:.1f}%) | "
                        f"Timesteps: {self.total_timesteps} | "
                        f"Mean Reward: {mean_reward:.4f} | "
+                       f"Win Rate: {mean_win_rate:.1%} | "
+                       f"Trades: {mean_trades:.0f} | "
+                       f"Sharpe: {mean_sharpe:.2f} | "
                        f"Policy Loss: {update_metrics['policy_loss']:.4f} | "
                        f"Elapsed: {elapsed_str} | "
                        f"ETA: {remaining_str}")

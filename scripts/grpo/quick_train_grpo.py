@@ -14,6 +14,10 @@ import logging
 import torch
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+
+# 환경 변수 로드
+load_dotenv()
 
 # 프로젝트 루트 추가
 project_root = Path(__file__).parent.parent.parent
@@ -40,8 +44,8 @@ def main():
     logger.info("=" * 60)
     
     # 경로 설정
-    embedding_model_path = r"C:\Users\user\Workspace\datasets@20251005\autoencoder\20251012_013148\model.pt"
-    db_path = r"C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+    embedding_model_path = r"C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt"
+    db_path = r"C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
     output_dir = "models/grpo_scalping"
     
     # 경로 확인
@@ -82,8 +86,8 @@ def main():
         
         logger.info("✅ Embedding model loaded")
         
-        # 2. 빠른 학습용 환경 생성
-        logger.info("🏗️ Creating QUICK environment...")
+        # 2. 개선된 학습용 환경 생성
+        logger.info("🏗️ Creating IMPROVED environment...")
         env = GRPOScalpingEnv(
             embedding_model=embedding_model,
             db_path=db_path,
@@ -91,20 +95,14 @@ def main():
             seq_len=60,
             embedding_dim=128,
             expected_features=28,
-            # 🔧 빠른 학습을 위한 설정
-            transaction_cost_rate=0.00215,   # 현실적 유지
-            quick_exit_threshold=5.0,        # 매우 관대 (학습 우선)
-            quick_exit_penalty=0.001,        # 거의 없는 페널티
+            # 🔧 개선된 설정 - 보상 구조 최적화
+            transaction_cost_rate=0.00215,     # 0.00215 → 0.001 (학습 용이)
+            quick_exit_threshold=2.0,        # 5.0 → 2.0 (진짜 스캘핑)
+            quick_exit_penalty=0.0001,        # 거의 없는 페널티
             max_holding_time=20.0,           # 20초 (진짜 스캘핑)
-            holding_penalty_rate=0.0001,     # 거의 없는 페널티
+            holding_penalty_rate=0.00001,     # 거의 없는 페널티
             device=device
         )
-        
-        logger.info("✅ QUICK environment created")
-        logger.info("🔧 Quick settings:")
-        logger.info("  - Max holding time: 20s (ultra-short scalping)")
-        logger.info("  - Minimal penalties (learning first)")
-        logger.info("  - Quick exit threshold: 5s (very forgiving)")
         
         # 3. 작은 정책 네트워크 (빠른 학습)
         logger.info("🧠 Creating compact policy...")
@@ -117,8 +115,8 @@ def main():
         policy.to(device)
         logger.info("✅ Compact policy created")
         
-        # 4. 공격적 훈련기 설정
-        logger.info("⚡ Creating aggressive trainer...")
+        # 4. 최적화된 훈련기 설정
+        logger.info("⚡ Creating OPTIMIZED trainer...")
         
         os.makedirs(output_dir, exist_ok=True)
         tensorboard_dir = os.path.join(output_dir, 'tensorboard_logs')
@@ -126,39 +124,41 @@ def main():
         trainer = GRPOTrainer(
             policy=policy,
             env=env,
-            episodes_per_group=3,        # 4 → 3 (더 빠른 반복)
-            num_groups=2,                # 유지
-            learning_rate=0.001,         # 0.0003 → 0.001 (3배 빠름)
-            gamma=0.9,                   # 0.98 → 0.9 (단기 중시)
-            clip_epsilon=0.4,            # 0.25 → 0.4 (큰 업데이트)
-            kl_target=0.03,              # 0.015 → 0.03 (관대한 KL)
-            entropy_coef=0.05,           # 0.03 → 0.05 (최대 탐험)
-            value_coef=0.2,              # 0.3 → 0.2 (정책 중심)
-            max_grad_norm=1.5,           # 0.8 → 1.5 (큰 그래디언트)
+            episodes_per_group=4,        # 3 → 4 (더 안정적)
+            num_groups=3,                # 2 → 3 (더 세밀한 그룹화)
+            learning_rate=0.0005,        # 0.001 → 0.0005 (안정적 학습)
+            gamma=0.95,                  # 0.9 → 0.95 (중기 보상 고려)
+            clip_epsilon=0.2,            # 0.4 → 0.2 (보수적 업데이트)
+            kl_target=0.01,              # 0.03 → 0.01 (안정적 KL)
+            entropy_coef=0.02,           # 0.05 → 0.02 (적절한 탐험)
+            value_coef=0.5,              # 0.2 → 0.5 (가치 함수 중시)
+            max_grad_norm=0.5,           # 1.5 → 0.5 (안정적 그래디언트)
             device=device,
             tensorboard_log_dir=tensorboard_dir
         )
         
         logger.info("✅ Aggressive trainer created")
         
-        # 5. 빠른 실험 설정
-        logger.info("🔥 Starting QUICK training...")
+        # 5. 최적화된 실험 설정
+        logger.info("🔥 Starting OPTIMIZED training...")
         logger.info("=" * 60)
         
-        # 매우 작은 규모로 빠른 검증
-        total_timesteps = 3000           # 10000 → 3000 (매우 빠름)
-        episodes_per_iteration = 3 * 2   # 6 episodes per iteration
-        total_episodes = (total_timesteps // 100) * episodes_per_iteration
-        checkpoint_interval = 10         # 25 → 10 (매우 자주)
+        # 더 많은 에피소드로 안정적 학습
+        total_timesteps = 5000           # 3000 → 5000 (더 충분한 학습)
+        episodes_per_iteration = 4 * 3   # 12 episodes per iteration
+        total_episodes = (total_timesteps // 50) * episodes_per_iteration  # 더 많은 에피소드
+        checkpoint_interval = 5          # 10 → 5 (더 자주 저장)
         
-        logger.info(f"📊 QUICK Configuration:")
+        logger.info(f"📊 OPTIMIZED Configuration:")
         logger.info(f"  Total Timesteps: {total_timesteps}")
         logger.info(f"  Total Episodes: {total_episodes}")
-        logger.info(f"  Episodes per Group: 3")
-        logger.info(f"  Learning Rate: 0.001 (3x faster)")
-        logger.info(f"  Gamma: 0.9 (ultra short-term)")
-        logger.info(f"  Entropy: 0.05 (maximum exploration)")
-        logger.info(f"  Expected Time: 30-60 minutes")
+        logger.info(f"  Episodes per Group: 4")
+        logger.info(f"  Learning Rate: 0.0005 (balanced)")
+        logger.info(f"  Gamma: 0.95 (medium-term)")
+        logger.info(f"  Entropy: 0.02 (balanced exploration)")
+        logger.info(f"  Max Episode Steps: 1000 (shorter)")
+        logger.info(f"  Max Holding Time: 10s (true scalping)")
+        logger.info(f"  Expected Time: 20-40 minutes")
         
         # 체크포인트 경로
         checkpoint_path = os.path.join(output_dir, 'checkpoints', 'checkpoint_iter{}.pt')
