@@ -31,7 +31,7 @@ def process_month_data(args_tuple: Tuple) -> dict:
     db_path, year, month, output_base_dir, seq_len, batch_size, max_samples = args_tuple
     
     # 월별 출력 디렉토리
-    output_dir = f"{output_base_dir}_{year}_{month:02d}"
+    output_dir = f"{output_base_dir}/{year}_{month:02d}"
     
     # 날짜 범위 계산
     start_date = datetime(year, month, 1)
@@ -46,7 +46,7 @@ def process_month_data(args_tuple: Tuple) -> dict:
     try:
         # 전처리 명령어 구성
         cmd = [
-            "python", "scripts/pre/preprocess_for_autoencoder.py",
+            ".venv64/Scripts/python", "scripts/pre/preprocess_for_autoencoder.py",
             "--db", db_path,
             "--output-dir", output_dir,
             "--seq-len", str(seq_len),

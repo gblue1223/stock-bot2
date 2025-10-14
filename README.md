@@ -46,20 +46,20 @@
 
 ## 🚀 빠른 시작
 
-### 1단계: AutoEncoder 사전 훈련
+### 1단계: AutoEncoder 훈련
 
 ```bash
-# Masked AutoEncoder로 빠른 사전 훈련 (기존 대비 10-100배 빠름)
-python examples/autoencoder_training_example.py \
-    --db "C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb" \
-    --output-dir models/autoencoder \
+# 사전 훈련 데이터 생성
+$ python scripts/pre/parallel_preprocessing.py \
+    --db "C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb" \
     --seq-len 60 \
-    --embedding-dim 128 \
-    --batch-size 256 \
-    --epochs 50 \
-    --model-type masked \
-    --fine-tune \
-    --device cuda
+    --batch-size 5000 \
+    --start-year 2024 --start-month 9 \
+    --end-year 2025 --end-month 9 \
+    --output "C:\Users\user\Workspace\datasets@20251013\pre_training_data" \
+    --max-workers 2
+
+# autoencoder_training_complete.ipynb 실행
 ```
 
 ### 2단계: 트레이딩 특화 Fine-tuning
@@ -356,7 +356,7 @@ pip install -e .
 
 ```bash
 # .env 파일 생성
-DB_PATH="C:\Users\user\Workspace\datasets@20251005\datasets_norm_all.duckdb"
+DB_PATH="C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
 MODEL_DIR="models"
 DEVICE="cuda"  # 또는 "cpu"
 ```

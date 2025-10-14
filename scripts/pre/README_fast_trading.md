@@ -61,23 +61,25 @@ python examples/autoencoder_training_example.py \
 #### 사용법
 ```bash
 # 단일 월 전처리
-python scripts/preprocess_for_autoencoder.py \
-    --db "datasets_norm_all.duckdb" \
-    --output-dir preprocessed_2024_10 \
+python scripts/pre/preprocess_for_autoencoder.py \
+    --db "C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb" \
+    --output-dir "C:\Users\user\Workspace\datasets@20251013\pre_training_data\2024_09" \
     --seq-len 60 \
-    --batch-size 10000 \
-    --start-date 2024-10-01 \
-    --end-date 2024-10-31 \
+    --batch-size 5000 \
+    --start-date 2024-09-01 \
+    --end-date 2024-09-30 \
     --compute-norm-params \
     --create-batches
 
 # 병렬 전처리 (권장)
-python scripts/parallel_preprocessing.py \
-    --db "datasets_norm_all.duckdb" \
+python scripts/pre/parallel_preprocessing.py \
+    --db "C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb" \
+    --seq-len 60 \
+    --batch-size 5000 \
     --start-year 2024 --start-month 9 \
-    --end-year 2024 --end-month 12 \
-    --output preprocessed_data \
-    --max-workers 4
+    --end-year 2025 --end-month 9 \
+    --output "C:\Users\user\Workspace\datasets@20251013\pre_training_data" \
+    --max-workers 2
 ```
 
 ### 2. 고속 데이터 로더
@@ -188,7 +190,7 @@ python examples/autoencoder_training_example.py \
 
 ```bash
 # 1. 9월 초기 훈련
-python scripts/preprocess_for_autoencoder.py \
+python scripts/pre/preprocess_for_autoencoder.py \
     --db "datasets_norm_all.duckdb" \
     --output-dir preprocessed_2024_09 \
     --start-date 2024-09-01 --end-date 2024-09-30 \
@@ -201,7 +203,7 @@ python examples/autoencoder_training_example.py \
     --use-fast-loader
 
 # 2. 10월 점진적 학습
-python scripts/preprocess_for_autoencoder.py \
+python scripts/pre/preprocess_for_autoencoder.py \
     --db "datasets_norm_all.duckdb" \
     --output-dir preprocessed_2024_10 \
     --start-date 2024-10-01 --end-date 2024-10-31 \
@@ -219,7 +221,7 @@ python examples/autoencoder_training_example.py \
 
 ```bash
 # 매일 새로운 데이터로 빠른 업데이트
-python scripts/preprocess_for_autoencoder.py \
+python scripts/pre/preprocess_for_autoencoder.py \
     --db "datasets_norm_all.duckdb" \
     --output-dir preprocessed_today \
     --start-date 2024-12-11 --end-date 2024-12-11 \
