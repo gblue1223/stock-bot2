@@ -1395,11 +1395,11 @@ def main():
                         help="무시할 종목명 리스트 CSV 경로 (기본: scripts/ignoring_stocks.csv, '종목명' 컬럼 필요)")
     parser.add_argument("--single-output", action="store_true",
                         help="월별 샤드 대신 하나의 DuckDB 파일(-o)에 모든 결과를 순차 반영합니다")
-    parser.add_argument("--trade-threshold", type=float, default=DEFAULT_TRADE_VALUE_PER_MINUTE,
+    parser.add_argument("--trade-threshold-per-minute", type=float, default=DEFAULT_TRADE_VALUE_PER_MINUTE,
                         help=f"누적거래대금 'qualifying-minutes'분 필터 기준값. 0 이하이면 필터 비활성화 (기본: {DEFAULT_TRADE_VALUE_PER_MINUTE})")
     parser.add_argument("--qualifying-minutes", type=int, default=DEFAULT_MIN_QUALIFYING_MINUTES,
                         help=f"필터 활성화 시 기준을 충족해야 하는 분 수(기본: {DEFAULT_MIN_QUALIFYING_MINUTES})")
-    
+
     args = parser.parse_args()
 
     if not args.compact_only:
@@ -1426,7 +1426,7 @@ def main():
         time_end=args.time_end,
         ignoring_stocks_csv=args.ignoring_stocks_csv,
         single_output=args.single_output,
-        trade_threshold_per_minute=args.trade_threshold,
+        trade_threshold_per_minute=args.trade_threshold_per_minute,
         min_qualifying_minutes=args.qualifying_minutes,
     )
 
