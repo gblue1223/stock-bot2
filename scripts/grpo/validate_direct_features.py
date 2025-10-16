@@ -22,7 +22,8 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 # direct_features_train에서 환경과 정책 가져오기
-from scripts.grpo.direct_features_train import DirectFeatureEnv, DirectFeaturePolicy, Action, Position
+from ai_trader.grpo.environments.direct_feature_env import DirectFeatureEnv, Action
+from ai_trader.grpo.policies.direct_feature_policy import DirectFeaturePolicy
 
 # 로깅 설정
 logging.basicConfig(
@@ -277,7 +278,7 @@ def main():
     """메인 함수"""
     
     # 경로 설정
-    model_path = "models/grpo_direct_features/direct_features_model.pt"
+    model_path = "models/grpo_direct_features@20251016/direct_features_model.pt"
     db_path = r"C:\Users\user\Workspace\datasets@20251016\datasets_raw_all.duckdb"
     
     # 경로 확인

@@ -11,7 +11,7 @@ GRPO 모듈 - Group Relative Policy Optimization
 - GRPOEvaluationMetrics: 평가 메트릭 계산기
 """
 
-from ai_trader.grpo.env import GRPOScalpingEnv
+from ai_trader.grpo.environments import GRPOScalpingEnv
 from ai_trader.grpo.evaluation import GRPOEvaluationMetrics, evaluate_grpo_agent
 
 __all__ = ['GRPOScalpingEnv', 'GRPOEvaluationMetrics', 'evaluate_grpo_agent']

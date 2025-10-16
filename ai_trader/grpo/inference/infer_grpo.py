@@ -16,8 +16,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from ai_trader.embedding.models import TradingEmbeddingModel
-from ai_trader.grpo.policy import GRPOPolicy
+from ai_trader.embedding import AutoEncoderEmbedding
+from ai_trader.grpo.policies import GRPOPolicy
+from ai_trader.grpo.policies.direct_feature_policy import DirectFeaturePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -26,24 +27,26 @@ class GRPOInference:
     """
     실시간 매매를 위한 GRPO 추론 엔진
     
+    DirectFeaturePolicy와 GRPOPolicy 모두 지원 (기본값: DirectFeaturePolicy)
+    
     최적화:
     - TorchScript 컴파일로 추론 속도 향상
-    - 임베딩 캐시로 중복 계산 방지
+    - 임베딩 캐시로 중복 계산 방지 (GRPOPolicy만)
     - 목표 지연 시간: < 10ms per sample
     
     Args:
-        embedding_model_path: 임베딩 모델 체크포인트 경로
-        policy_path: 정책 체크포인트 경로
+        policy_path: 정책 체크포인트 경로 (필수)
+        embedding_model_path: 임베딩 모델 체크포인트 경로 (GRPOPolicy 사용 시 필수)
         device: 디바이스 ('cuda' 또는 'cpu')
         use_torchscript: TorchScript 컴파일 사용 여부 (기본값: True)
-        cache_size: 임베딩 캐시 크기 (기본값: 1000)
-        normalization_stats: 정규화 통계 (mean, std)
+        cache_size: 임베딩 캐시 크기 (기본값: 1000, GRPOPolicy만 사용)
+        normalization_stats: 정규화 통계 (mean, std, GRPOPolicy만 사용)
     """
     
     def __init__(
         self,
-        embedding_model_path: Union[str, Path],
         policy_path: Union[str, Path],
+        embedding_model_path: Optional[Union[str, Path]] = None,
         device: str = 'cuda',
         use_torchscript: bool = True,
         cache_size: int = 1000,
@@ -58,13 +61,19 @@ class GRPOInference:
         # 정규화 통계 설정 (임베딩 모델 로드 전에 초기화)
         self.normalization_stats = normalization_stats
         
-        # 임베딩 모델 로드
-        self.embedding_model = self._load_embedding_model(embedding_model_path)
-        logger.info("Embedding model loaded successfully")
+        # 정책 로드 (먼저 로드하여 타입 확인)
+        self.policy, self.policy_type = self._load_policy(policy_path)
+        logger.info(f"Policy loaded successfully: {self.policy_type}")
         
-        # 정책 로드
-        self.policy = self._load_policy(policy_path)
-        logger.info("Policy loaded successfully")
+        # 임베딩 모델 로드 (DirectFeaturePolicy는 필요 없음)
+        if self.policy_type == 'DirectFeaturePolicy':
+            self.embedding_model = None
+            logger.info("DirectFeaturePolicy: Skipping embedding model")
+        else:
+            if embedding_model_path is None:
+                raise ValueError("embedding_model_path is required for GRPOPolicy")
+            self.embedding_model = self._load_embedding_model(embedding_model_path)
+            logger.info("Embedding model loaded successfully")
         
         # 정규화 통계 설정 (임베딩 모델 로드 후 업데이트될 수 있음)
         if normalization_stats is not None:
@@ -124,12 +133,13 @@ class GRPOInference:
         config = checkpoint.get('config', {})
         
         # 모델 생성
-        model = TradingEmbeddingModel(
+        model = AutoEncoderEmbedding(
             input_dim=config.get('input_dim', 60),
             embedding_dim=config.get('embedding_dim', 128),
+            hidden_dim=config.get('hidden_dim', 256),
             seq_len=config.get('seq_len', 60),
-            num_heads=config.get('num_heads', 4),
-            conv_channels=config.get('conv_channels', None)
+            num_layers=config.get('num_layers', 3),
+            dropout=config.get('dropout', 0.1)
         )
         
         # 가중치 로드
@@ -137,13 +147,17 @@ class GRPOInference:
         model.to(self.device)
         model.eval()
         
+        # 모델 속성 저장 (TorchScript 컴파일에 필요)
+        model.seq_len = config.get('seq_len', 60)
+        model.input_dim = config.get('input_dim', 60)
+        
         # 정규화 통계 추출 (제공되지 않은 경우)
         if self.normalization_stats is None and 'normalization_stats' in checkpoint:
             self.normalization_stats = checkpoint['normalization_stats']
         
         return model
     
-    def _load_policy(self, policy_path: Union[str, Path]) -> nn.Module:
+    def _load_policy(self, policy_path: Union[str, Path]) -> Tuple[nn.Module, str]:
         """
         정책 로드
         
@@ -151,53 +165,114 @@ class GRPOInference:
             policy_path: 정책 체크포인트 경로
             
         Returns:
-            로드된 정책
+            (로드된 정책, 정책 타입)
         """
         checkpoint = torch.load(policy_path, map_location=self.device, weights_only=False)
         
         # 설정 추출
         config = checkpoint.get('config', {})
         
-        # 정책 생성
-        policy = GRPOPolicy(
-            embedding_dim=config.get('embedding_dim', 128),
-            hidden_dim=config.get('hidden_dim', 256),
-            action_dim=config.get('action_dim', 3)
-        )
+        # 정책 타입 감지
+        policy_type = config.get('policy_type')
+        
+        # policy_type이 없으면 state_dict 키로 추론
+        if policy_type is None:
+            state_dict_key = 'policy_state_dict' if 'policy_state_dict' in checkpoint else 'state_dict'
+            state_dict = checkpoint.get(state_dict_key, {})
+            
+            # input_projection이 있으면 DirectFeaturePolicy
+            if any('input_projection' in k for k in state_dict.keys()):
+                policy_type = 'DirectFeaturePolicy'
+                logger.info("Auto-detected policy type: DirectFeaturePolicy")
+            else:
+                policy_type = 'GRPOPolicy'
+                logger.info("Auto-detected policy type: GRPOPolicy")
+        
+        # state_dict 가져오기
+        if 'policy_state_dict' in checkpoint:
+            state_dict = checkpoint['policy_state_dict']
+        elif 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        else:
+            raise KeyError("Neither 'policy_state_dict' nor 'state_dict' found in checkpoint")
+        
+        # 정책 타입에 따라 생성 (config에 없으면 state_dict에서 차원 추론)
+        if policy_type == 'DirectFeaturePolicy':
+            # state_dict에서 실제 차원 추론
+            if 'input_dim' not in config:
+                # input_projection.weight: (hidden_dim, input_dim)
+                input_dim = state_dict['input_projection.weight'].shape[1]
+                hidden_dim = state_dict['input_projection.weight'].shape[0]
+                logger.info(f"Inferred from state_dict: input_dim={input_dim}, hidden_dim={hidden_dim}")
+            else:
+                input_dim = config.get('input_dim', 3600)
+                hidden_dim = config.get('hidden_dim', 128)
+            
+            policy = DirectFeaturePolicy(
+                input_dim=input_dim,
+                hidden_dim=hidden_dim,
+                action_dim=config.get('action_dim', 3)
+            )
+        else:
+            # state_dict에서 실제 차원 추론
+            if 'embedding_dim' not in config:
+                # fc1.weight: (hidden_dim, embedding_dim)
+                embedding_dim = state_dict['fc1.weight'].shape[1]
+                hidden_dim = state_dict['fc1.weight'].shape[0]
+                logger.info(f"Inferred from state_dict: embedding_dim={embedding_dim}, hidden_dim={hidden_dim}")
+            else:
+                embedding_dim = config.get('embedding_dim', 128)
+                hidden_dim = config.get('hidden_dim', 256)
+            
+            policy = GRPOPolicy(
+                embedding_dim=embedding_dim,
+                hidden_dim=hidden_dim,
+                action_dim=config.get('action_dim', 3)
+            )
         
         # 가중치 로드
-        policy.load_state_dict(checkpoint['state_dict'])
+        policy.load_state_dict(state_dict)
+        
         policy.to(self.device)
         policy.eval()
         
-        return policy
+        return policy, policy_type
     
     def _compile_models(self):
         """
         TorchScript로 모델 컴파일하여 추론 속도 향상
         """
         try:
-            # 임베딩 모델 컴파일
-            example_input = torch.randn(
-                1, 
-                self.embedding_model.seq_len, 
-                self.embedding_model.input_dim,
-                device=self.device
-            )
-            self.embedding_model = torch.jit.trace(
-                self.embedding_model, 
-                example_input
-            )
+            # 임베딩 모델 컴파일 (GRPOPolicy만)
+            if self.policy_type == 'GRPOPolicy' and self.embedding_model is not None:
+                example_input = torch.randn(
+                    1, 
+                    self.embedding_model.seq_len, 
+                    self.embedding_model.input_dim,
+                    device=self.device
+                )
+                # encoder만 trace (encode 메서드 사용)
+                self.embedding_model.encoder = torch.jit.trace(
+                    self.embedding_model.encoder, 
+                    example_input
+                )
             
             # 정책 컴파일
-            example_embedding = torch.randn(
-                1, 
-                self.policy.embedding_dim,
-                device=self.device
-            )
+            if hasattr(self.policy, 'embedding_dim'):
+                example_input = torch.randn(
+                    1, 
+                    self.policy.embedding_dim,
+                    device=self.device
+                )
+            else:
+                example_input = torch.randn(
+                    1, 
+                    self.policy.input_dim,
+                    device=self.device
+                )
             self.policy = torch.jit.trace(
                 self.policy,
-                example_embedding
+                example_input
             )
             
             logger.info("Models successfully compiled with TorchScript")
@@ -317,7 +392,7 @@ class GRPOInference:
         
         # 임베딩 생성
         with torch.no_grad():
-            embedding = self.embedding_model(normalized_seq)  # (1, embedding_dim)
+            embedding = self.embedding_model.encode(normalized_seq)  # (1, embedding_dim)
         
         # 배치 차원 제거: (1, embedding_dim) -> (embedding_dim,)
         embedding = embedding.squeeze(0)
@@ -337,7 +412,7 @@ class GRPOInference:
         
         이 메서드는 다음 단계를 수행합니다:
         1. 입력 시퀀스 정규화
-        2. 임베딩 생성 (캐시 활용)
+        2. 임베딩 생성 (GRPOPolicy) 또는 평탄화 (DirectFeaturePolicy)
         3. 정책 실행 및 행동 반환
         
         목표 지연 시간: < 10ms
@@ -367,15 +442,26 @@ class GRPOInference:
         if sequence.device != self.device:
             sequence = sequence.to(self.device)
         
-        # 임베딩 생성 (캐시 활용)
-        embedding = self._generate_embedding(sequence)
-        
-        # 배치 차원 추가: (embedding_dim,) -> (1, embedding_dim)
-        embedding = embedding.unsqueeze(0)
+        # 정책 타입에 따라 입력 처리
+        if self.policy_type == 'DirectFeaturePolicy':
+            # 직접 특징 사용: 시퀀스를 평탄화
+            if sequence.dim() == 2:
+                # (seq_len, input_dim) -> (seq_len * input_dim,)
+                policy_input = sequence.flatten()
+            else:
+                raise ValueError(f"Expected 2D sequence for DirectFeaturePolicy, got {sequence.dim()}D")
+            
+            # 배치 차원 추가: (input_dim,) -> (1, input_dim)
+            policy_input = policy_input.unsqueeze(0)
+        else:
+            # GRPOPolicy: 임베딩 생성 (캐시 활용)
+            embedding = self._generate_embedding(sequence)
+            # 배치 차원 추가: (embedding_dim,) -> (1, embedding_dim)
+            policy_input = embedding.unsqueeze(0)
         
         # 정책 실행
         with torch.no_grad():
-            action_logits, _ = self.policy(embedding)
+            action_logits, _ = self.policy(policy_input)
             action_probs = torch.softmax(action_logits, dim=-1)
             
             if deterministic:
@@ -434,16 +520,23 @@ class GRPOInference:
         if sequences.device != self.device:
             sequences = sequences.to(self.device)
         
-        # 정규화
-        normalized_seqs = self._normalize_input(sequences)
-        
-        # 임베딩 생성 (배치)
-        with torch.no_grad():
-            embeddings = self.embedding_model(normalized_seqs)  # (batch_size, embedding_dim)
+        # 정책 타입에 따라 입력 처리
+        if self.policy_type == 'DirectFeaturePolicy':
+            # 직접 특징 사용: 시퀀스를 평탄화
+            if sequences.dim() == 3:
+                # (batch_size, seq_len, input_dim) -> (batch_size, seq_len * input_dim)
+                policy_input = sequences.flatten(start_dim=1)
+            else:
+                raise ValueError(f"Expected 3D sequences for batch DirectFeaturePolicy, got {sequences.dim()}D")
+        else:
+            # GRPOPolicy: 정규화 및 임베딩 생성
+            normalized_seqs = self._normalize_input(sequences)
+            with torch.no_grad():
+                policy_input = self.embedding_model.encode(normalized_seqs)  # (batch_size, embedding_dim)
         
         # 정책 실행 (배치)
         with torch.no_grad():
-            action_logits, _ = self.policy(embeddings)
+            action_logits, _ = self.policy(policy_input)
             action_probs = torch.softmax(action_logits, dim=-1)
             
             if deterministic:

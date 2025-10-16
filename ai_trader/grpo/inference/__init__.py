@@ -9,7 +9,7 @@
 - TradeLogger: 실시간 거래 로거
 """
 
-from ai_trader.inference.infer_grpo import GRPOInference
-from ai_trader.inference.trade_logger import TradeLogger
+from ai_trader.grpo.inference.infer_grpo import GRPOInference
+from ai_trader.grpo.inference.trade_logger import TradeLogger
 
 __all__ = ['GRPOInference', 'TradeLogger']

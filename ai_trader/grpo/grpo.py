@@ -989,6 +989,21 @@ class GRPOTrainer:
             checkpoint_path: 체크포인트 저장 경로
             iteration: 현재 반복 횟수
         """
+        # 정책 타입 및 설정 정보 추출
+        policy_class_name = self.policy.__class__.__name__
+        policy_config = {
+            'policy_type': policy_class_name,
+            'action_dim': self.policy.action_dim if hasattr(self.policy, 'action_dim') else 3,
+            'hidden_dim': self.policy.hidden_dim if hasattr(self.policy, 'hidden_dim') else 128,
+        }
+        
+        # DirectFeaturePolicy의 경우 input_dim 저장
+        if hasattr(self.policy, 'input_dim'):
+            policy_config['input_dim'] = self.policy.input_dim
+        # GRPOPolicy의 경우 embedding_dim 저장
+        if hasattr(self.policy, 'embedding_dim'):
+            policy_config['embedding_dim'] = self.policy.embedding_dim
+        
         checkpoint = {
             'iteration': iteration,
             'total_timesteps': self.total_timesteps,
@@ -1004,7 +1019,8 @@ class GRPOTrainer:
                 'kl_target': self.kl_target,
                 'entropy_coef': self.entropy_coef,
                 'value_coef': self.value_coef,
-                'max_grad_norm': self.max_grad_norm
+                'max_grad_norm': self.max_grad_norm,
+                **policy_config  # 정책 설정 병합
             }
         }
         
