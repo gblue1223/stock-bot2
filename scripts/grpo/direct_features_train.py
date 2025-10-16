@@ -19,6 +19,7 @@ import time
 import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
+from enum import IntEnum
 
 # 환경 변수 로드
 load_dotenv()
@@ -36,6 +37,19 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+class Position(IntEnum):
+    """포지션 상태"""
+    NONE = 0      # 포지션 없음
+    LONG = 1      # 매수 포지션
+
+
+class Action(IntEnum):
+    """행동 타입"""
+    HOLD = 0      # 보유
+    BUY = 1       # 매수
+    SELL = 2      # 매도
 
 
 class DirectFeatureEnv:
@@ -76,13 +90,18 @@ class DirectFeatureEnv:
         
         # 에피소드 상태
         self.current_step = 0
-        self.position = 0  # 0: 포지션 없음, 1: 매수 포지션
-        self.entry_price = 0.0
-        self.current_price = 0.0
+        self.position = Position.NONE
+        self.entry_step = 0  # 진입 시점
+        self.cumulative_return = 0.0  # 누적 수익률
         
         # 현재 에피소드 데이터
         self.episode_data = None
         self.episode_length = 0
+        
+        # 에피소드 통계 추적
+        self.num_trades = 0  # 완료된 거래 수
+        self.winning_trades = 0  # 수익 거래 수
+        self.trade_returns = []  # 각 거래의 수익률
         
         logger.info(f"DirectFeatureEnv initialized: seq_len={seq_len}, "
                    f"features={expected_features}, obs_dim={obs_dim}")
@@ -99,29 +118,36 @@ class DirectFeatureEnv:
     def _get_feature_columns(self) -> list:
         """특징 컬럼 목록 가져오기"""
         try:
+            # 사용할 특정 컬럼 목록 정의
+            feature_columns = [
+                '등락률',
+                '누적거래대금',
+                '거래회전율',
+                '체결강도',
+                '매도대기금액1', '매도대기금액2', '매도대기금액3', '매도대기금액4', '매도대기금액5',
+                '매도대기금액6', '매도대기금액7', '매도대기금액8', '매도대기금액9', '매도대기금액10',
+                '매수대기금액1', '매수대기금액2', '매수대기금액3', '매수대기금액4', '매수대기금액5',
+                '매수대기금액6', '매수대기금액7', '매수대기금액8', '매수대기금액9', '매수대기금액10'
+            ]
+            
+            # 테이블에 컬럼이 존재하는지 확인
             query = f"DESCRIBE {self.table_name}"
             columns_df = self.conn.execute(query).fetchdf()
-            all_columns = columns_df['column_name'].tolist()
-            column_types = columns_df['column_type'].tolist()
+            available_columns = set(columns_df['column_name'].tolist())
             
-            # 메타데이터 컬럼 제외
-            exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호'}
+            # 존재하는 컬럼만 필터링
+            valid_columns = [col for col in feature_columns if col in available_columns]
             
-            # 숫자형 컬럼만 선택
-            feature_columns = []
-            for col, col_type in zip(all_columns, column_types):
-                if col not in exclude_columns:
-                    if any(numeric_type in col_type.upper() for numeric_type in ['DOUBLE', 'FLOAT', 'INTEGER', 'BIGINT', 'DECIMAL']):
-                        feature_columns.append(col)
+            if len(valid_columns) != len(feature_columns):
+                missing = set(feature_columns) - set(valid_columns)
+                logger.warning(f"Missing columns: {missing}")
             
-            # 정확히 expected_features 개수만 사용
-            if len(feature_columns) >= self.expected_features:
-                feature_columns = feature_columns[:self.expected_features]
-            else:
-                raise RuntimeError(f"Insufficient features: found {len(feature_columns)}, expected {self.expected_features}")
+            if len(valid_columns) == 0:
+                raise RuntimeError("No valid feature columns found in table")
             
-            logger.info(f"Selected {len(feature_columns)} feature columns")
-            return feature_columns
+            logger.info(f"Selected {len(valid_columns)} feature columns: {valid_columns[:5]}...")
+            return valid_columns
+            
         except Exception as e:
             logger.error(f"Failed to get feature columns: {e}")
             raise RuntimeError(f"Cannot get feature columns: {e}")
@@ -133,7 +159,7 @@ class DirectFeatureEnv:
         min_required = self.seq_len + self.max_episode_steps + 10
         
         try:
-            # 랜덤 종목 및 날짜 선택
+            # 랜덤 종목 및 날짜 선택 (시간 필터링 적용)
             query = f"""
                 SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
                 FROM {self.table_name}
@@ -150,11 +176,11 @@ class DirectFeatureEnv:
             stock_code = str(result['종목코드'].iloc[0])
             date = int(result['날짜'].iloc[0])
             
-            # 해당 종목/날짜의 데이터 로드
+            # 해당 종목/날짜의 데이터 로드 (시간 필터링 적용)
             query = f"""
                 SELECT {', '.join(feature_cols)}
                 FROM {self.table_name}
-                WHERE 종목코드 = ? AND 날짜 = ?
+                WHERE 종목코드 = ? AND 날짜 = ? 
                 ORDER BY 시간
             """
             df = self.conn.execute(query, [stock_code, date]).fetchdf()
@@ -204,11 +230,14 @@ class DirectFeatureEnv:
         
         # 에피소드 상태 초기화
         self.current_step = self.seq_len - 1  # 최소 seq_len만큼의 히스토리 필요
-        self.position = 0
-        self.entry_price = 0.0
+        self.position = Position.NONE
+        self.entry_step = 0
+        self.cumulative_return = 0.0
         
-        # 현재 가격 (첫 번째 특징이 가격이라고 가정)
-        self.current_price = float(self.episode_data[self.current_step, 0])
+        # 에피소드 통계 초기화
+        self.num_trades = 0
+        self.winning_trades = 0
+        self.trade_returns = []
         
         # 초기 관측값
         observation = self._get_current_observation()
@@ -223,31 +252,48 @@ class DirectFeatureEnv:
         terminated = False
         truncated = False
         
-        # 행동 실행
-        if action == 1:  # 매수
-            if self.position == 0:
-                self.position = 1
-                self.entry_price = self.current_price
+        # 현재 등락률 (첫 번째 특징) - 백분율로 변환 (0.01 = 1%)
+        current_return = float(self.episode_data[self.current_step, 0]) / 100.0
         
-        elif action == 2:  # 매도
-            if self.position == 1:
-                # 수익률 계산
-                profit_rate = (self.current_price - self.entry_price) / self.entry_price
+        # 행동 실행
+        if action == Action.BUY:
+            if self.position == Position.NONE:
+                self.position = Position.LONG
+                self.entry_step = self.current_step
+                self.cumulative_return = 0.0
+                # 매수 행동에 작은 보상 (탐험 장려)
+                reward = 0.01
+        
+        elif action == Action.SELL:
+            if self.position == Position.LONG:
+                # 진입 이후 누적 수익률 계산
+                profit_rate = self.cumulative_return
                 
-                # 단순한 보상: 수익이면 +1, 손실이면 -1
-                if profit_rate > 0.001:  # 0.1% 이상 수익
-                    reward = 1.0
-                elif profit_rate < -0.001:  # 0.1% 이상 손실
-                    reward = -1.0
-                else:
-                    reward = 0.0
+                # 거래 통계 업데이트
+                self.num_trades += 1
+                self.trade_returns.append(profit_rate)
+                if profit_rate > 0:
+                    self.winning_trades += 1
+                
+                # 수익률에 비례한 보상 (스케일 조정)
+                reward = profit_rate * 100.0  # 1% 수익 = +1.0 보상
                 
                 # 거래비용 차감
-                reward -= self.transaction_cost_rate
+                reward -= self.transaction_cost_rate * 10.0  # 비용도 스케일 조정
                 
                 # 포지션 청산
-                self.position = 0
-                self.entry_price = 0.0
+                self.position = Position.NONE
+                self.entry_step = 0
+                self.cumulative_return = 0.0
+            else:
+                # 포지션 없이 매도 시도 시 작은 페널티
+                reward = -0.01
+        
+        # 포지션 보유 중이면 수익률 누적 및 즉각적 피드백
+        if self.position == Position.LONG:
+            self.cumulative_return += current_return
+            # 보유 중 수익/손실에 대한 즉각적 피드백 (작은 스케일)
+            reward += current_return * 10.0  # 0.1% 변동 = 0.01 보상/페널티
         
         # 다음 스텝으로 이동
         self.current_step += 1
@@ -257,16 +303,17 @@ class DirectFeatureEnv:
             terminated = True
         
         # 에피소드 종료 시 포지션 강제 청산
-        if terminated and self.position == 1:
-            profit_rate = (self.current_price - self.entry_price) / self.entry_price
+        if terminated and self.position == Position.LONG:
+            # 강제 청산도 거래로 카운트
+            profit_rate = self.cumulative_return
+            self.num_trades += 1
+            self.trade_returns.append(profit_rate)
             if profit_rate > 0:
-                reward += 0.5  # 작은 보상
-            else:
-                reward -= 0.5  # 작은 페널티
-        
-        # 현재 가격 업데이트
-        if not terminated:
-            self.current_price = float(self.episode_data[self.current_step, 0])
+                self.winning_trades += 1
+            
+            # 강제 청산 시 현재 수익률 기반 보상
+            reward += self.cumulative_return * 50.0  # 강제 청산 페널티 감소
+            self.position = Position.NONE
         
         # 다음 관측값
         if not terminated:
@@ -274,11 +321,31 @@ class DirectFeatureEnv:
         else:
             observation = np.zeros(self.observation_space.shape[0], dtype=np.float32)
         
+        # 에피소드 종료 시 통계 계산
         info = {
             'step': self.current_step,
             'position': self.position,
-            'current_price': self.current_price
+            'cumulative_return': self.cumulative_return
         }
+        
+        if terminated:
+            # 에피소드 레벨 메트릭 계산
+            win_rate = self.winning_trades / self.num_trades if self.num_trades > 0 else 0.0
+            
+            # 샤프 비율 계산 (수익률의 평균 / 표준편차)
+            if len(self.trade_returns) > 1:
+                mean_return = np.mean(self.trade_returns)
+                std_return = np.std(self.trade_returns)
+                sharpe_ratio = mean_return / std_return if std_return > 0 else 0.0
+            else:
+                sharpe_ratio = 0.0
+            
+            info['episode'] = {
+                'num_trades': self.num_trades,
+                'win_rate': win_rate,
+                'sharpe_ratio': sharpe_ratio,
+                'total_return': sum(self.trade_returns) if self.trade_returns else 0.0
+            }
         
         return observation, reward, terminated, truncated, info
     
@@ -396,7 +463,7 @@ def main():
     logger.info("=" * 60)
     
     # 경로 설정
-    db_path = r"C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
+    db_path = r"C:\Users\user\Workspace\datasets@20251016\datasets_raw_all.duckdb"
     output_dir = "models/grpo_direct_features"
     
     # 경로 확인
@@ -416,9 +483,9 @@ def main():
         logger.info("🎯 Creating DIRECT FEATURES environment...")
         env = DirectFeatureEnv(
             db_path=db_path,
-            table_name='datasets',
+            table_name='datasets_raw',
             seq_len=30,                  # 더 짧은 시퀀스 (계산 효율성)
-            expected_features=28,
+            expected_features=24,        # 24개 특징 (등락률 + 누적거래대금 + 거래회전율 + 체결강도 + 매도10 + 매수10)
             transaction_cost_rate=0.00215,
             max_episode_steps=100,       # 짧은 에피소드
             device=device
@@ -456,11 +523,11 @@ def main():
             env=env,
             episodes_per_group=4,        # 작은 그룹
             num_groups=2,                # 단순한 그룹화
-            learning_rate=0.0003,        # 보수적 학습률
-            gamma=0.99,                  # 표준 할인율
+            learning_rate=0.001,         # 더 높은 학습률 (빠른 학습)
+            gamma=0.95,                  # 더 짧은 시야 (단기 거래)
             clip_epsilon=0.2,            # 표준 클리핑
             kl_target=0.01,              # 표준 KL
-            entropy_coef=0.05,           # 적당한 탐험
+            entropy_coef=0.2,            # 높은 탐험 (행동 다양성)
             value_coef=0.5,              # 가치 함수 중시
             max_grad_norm=0.5,           # 안정적 그래디언트
             device=device,

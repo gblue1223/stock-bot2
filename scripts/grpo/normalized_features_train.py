@@ -321,17 +321,19 @@ class NormalizedFeatureEnv:
                 # 정규화된 데이터에서의 보상 계산
                 current_features = self.episode_features[self.current_step]
                 
-                # 기본 수익 보상
-                if profit > 0.05:  # 정규화된 값에서 0.05 이상 상승
-                    reward = 2.0
-                elif profit > 0.02:  # 0.02 이상 상승
-                    reward = 1.0
-                elif profit < -0.05:  # 0.05 이상 하락
-                    reward = -2.0
-                elif profit < -0.02:  # 0.02 이상 하락
-                    reward = -1.0
+                # 개선된 수익 보상 (더 세밀한 구간)
+                if profit > 0.01:  # 0.05 → 0.01 (더 낮은 임계값)
+                    reward = 5.0 * profit  # 수익에 비례한 보상
+                elif profit > 0.005:
+                    reward = 3.0 * profit
+                elif profit > 0:
+                    reward = 1.0 * profit
+                elif profit > -0.005:
+                    reward = 2.0 * profit  # 작은 손실은 덜 페널티
+                elif profit > -0.01:
+                    reward = 3.0 * profit
                 else:
-                    reward = 0.0
+                    reward = 5.0 * profit  # 큰 손실은 강한 페널티
                 
                 # 특징 기반 보너스
                 # 단기 변화율이 양수이고 실제로 수익이 났을 때 보너스
@@ -655,13 +657,13 @@ def main():
         trainer = GRPOTrainer(
             policy=policy,
             env=env,
-            episodes_per_group=6,        # 4 → 6 (더 많은 샘플)
-            num_groups=3,                # 2 → 3 (더 세밀한 그룹화)
-            learning_rate=0.0003,        # 0.0005 → 0.0003 (더 안정적)
+            episodes_per_group=6,        # 더 많은 샘플
+            num_groups=3,                # 세밀한 그룹화
+            learning_rate=0.0005,        # 0.0003 → 0.0005 (더 빠른 학습)
             gamma=0.99,
             clip_epsilon=0.2,
             kl_target=0.01,
-            entropy_coef=0.02,           # 0.03 → 0.02 (탐험 감소)
+            entropy_coef=0.05,           # 0.02 → 0.05 (더 많은 탐험)
             value_coef=0.5,
             max_grad_norm=0.5,
             device=device,
