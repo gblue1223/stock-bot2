@@ -843,7 +843,6 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
 
 def normalize_datasets(input_db: str, output_db: str, *,
                        skip_existing: bool = True,
-                       compact_only: bool = False,
                        force_recreate: bool = False,
                        workers: int = 1,
                        group_workers: int = 1,
@@ -858,35 +857,6 @@ def normalize_datasets(input_db: str, output_db: str, *,
     - `checkpoint-interval`마다 CHECKPOINT 실행
     - 작업 중단 복구를 위해 temp 디렉토리에 단계별 체크포인트(.pkl)를 사용하고 시작 시 반영
     """
-    # compact-only 모드: 입력 DB를 읽지 않고 지정한 DB에 대해 최적화만 수행
-    if compact_only:
-        print("compact-only 모드: 입력 DB 처리 없이 출력 DB 최적화만 수행합니다.")
-        p = Path(output_db)
-        stem = p.stem
-        suffix = p.suffix or ".duckdb"
-        parent = p.parent
-        month_files = sorted(parent.glob(f"{stem}_*{suffix}"))
-        months: List[str] = []
-        for f in month_files:
-            m = f.stem.replace(f"{stem}_", "")
-            if re.fullmatch(r"\d{6}", m):
-                months.append(m)
-        if not months and os.path.exists(output_db):
-            _parallel_checkpoint_months(output_db, [], 1)
-            try:
-                conn = duckdb.connect(output_db)
-                try:
-                    conn.execute("CHECKPOINT")
-                finally:
-                    conn.close()
-                print(f"DB 유지보수 완료: {output_db}")
-            except Exception as e:
-                print(f"경고: 단일 DB 체크포인트 실패: {type(e).__name__}: {e}")
-            return
-        _parallel_checkpoint_months(output_db, months, workers)
-        print("월별 DB 유지보수 완료")
-        return
-
     # 입력 DB 검증
     if not os.path.exists(input_db):
         print(f"입력 DuckDB 파일이 존재하지 않습니다: {input_db}")
@@ -1037,8 +1007,6 @@ def main():
                         help="이미 DB에 해당 (종목코드, 날짜) 그룹이 존재하면 스킵합니다 (기본: 활성화)")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
                         help="이미 존재하는 그룹도 다시 처리합니다")
-    parser.add_argument("--compact-only", action="store_true",
-                        help="입력 DB 처리 없이 지정한 DuckDB에 대해 PRAGMA optimize/checkpoint만 수행합니다")
     parser.add_argument("--force-recreate", action="store_true",
                         help="출력 DuckDB 파일이 존재하면 삭제 후 새로 생성합니다 (손상/버전 문제 해결용)")
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1,
@@ -1052,16 +1020,10 @@ def main():
      
     args = parser.parse_args()
      
-    if not args.compact_only:
-        if not os.path.exists(args.input_db):
-            print(f"입력 DuckDB 파일이 존재하지 않습니다: {args.input_db}")
-            return
-     
     normalize_datasets(
         args.input_db,
         args.output,
         skip_existing=args.skip_existing,
-        compact_only=args.compact_only,
         force_recreate=args.force_recreate,
         workers=args.workers,
         group_workers=args.group_workers,

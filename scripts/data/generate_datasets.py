@@ -298,6 +298,23 @@ def _monthly_db_path(base_db_path: str, yyyymm: str) -> str:
     return str(p.with_name(f"{stem}_{yyyymm}{suffix}"))
 
 
+def _valid_yyyymmdd(s: Optional[str]) -> Optional[str]:
+    """Return s if it matches YYYYMMDD (8 digits), else None."""
+    if s is None:
+        return None
+    s = s.strip()
+    return s if re.fullmatch(r"\d{8}", s) else None
+
+
+def _date_in_range(date: str, start: Optional[str], end: Optional[str]) -> bool:
+    """Check if YYYYMMDD `date` is within [start, end] (inclusive). None means open bound."""
+    if start is not None and date < start:
+        return False
+    if end is not None and date > end:
+        return False
+    return True
+
+
 def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: str, group_key: str):
     """Open a DuckDB connection to db_path and ingest the pickle contents, then remove the pickle."""
     try:
@@ -663,12 +680,13 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
 
 def generate_datasets(input_folder: str, output_db: str, *,
                       skip_existing: bool = True,
-                      compact_only: bool = False,
                       force_recreate: bool = False,
                       workers: int = 1,
                       group_workers: int = 1,
                       tmp_dir: Optional[str] = None,
-                      checkpoint_interval: int = 20):
+                      checkpoint_interval: int = 20,
+                      start_date: Optional[str] = None,
+                      end_date: Optional[str] = None):
     """
     메인 데이터 생성 함수 (정규화 없음, DuckDB 전용)
     - 입력 폴더를 스캔하여 유효 CSV 그룹을 찾음
@@ -677,39 +695,8 @@ def generate_datasets(input_folder: str, output_db: str, *,
     - 각 월 내부에서는 최대 `group_workers`개의 그룹을 병렬 처리
     - `checkpoint-interval`마다 CHECKPOINT 실행
     - 작업 중단 복구를 위해 temp 디렉토리에 단계별 체크포인트(.pkl)를 사용하고 시작 시 반영
+    - 선택적으로 `start_date` ~ `end_date` (YYYYMMDD) 범위의 날짜만 처리
     """
-    # compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화만 수행
-    if compact_only:
-        print("compact-only 모드: CSV 처리 없이 DB 최적화만 수행합니다.")
-        # 기본 파일(stem.suffix)뿐 아니라 월별 샤드(stem_YYYYMM.suffix)에 대해서도 실행
-        p = Path(output_db)
-        stem = p.stem
-        suffix = p.suffix or ".duckdb"
-        parent = p.parent
-        # 발견된 월별 파일로부터 월 추출
-        month_files = sorted(parent.glob(f"{stem}_*{suffix}"))
-        months: List[str] = []
-        for f in month_files:
-            m = f.stem.replace(f"{stem}_", "")
-            if re.fullmatch(r"\d{6}", m):
-                months.append(m)
-        if not months and os.path.exists(output_db):
-            # 월별 샤드가 없고 단일 DB만 있는 경우 해당 파일에 대해 실행
-            _parallel_checkpoint_months(output_db, [], 1)  # no-op path; fall back to single file below
-            try:
-                conn = duckdb.connect(output_db)
-                try:
-                    conn.execute("CHECKPOINT")
-                finally:
-                    conn.close()
-                print(f"DB 유지보수 완료: {output_db}")
-            except Exception as e:
-                print(f"경고: 단일 DB 체크포인트 실패: {type(e).__name__}: {e}")
-            return
-        # 병렬로 월별 체크포인트 수행
-        _parallel_checkpoint_months(output_db, months, workers)
-        print("월별 DB 유지보수 완료")
-        return
 
     # 입력 폴더 검증
     folder = Path(input_folder)
@@ -736,6 +723,29 @@ def generate_datasets(input_folder: str, output_db: str, *,
     if not complete_groups:
         print("처리할 유효 CSV 그룹을 찾지 못했습니다.")
         return
+
+    # 날짜 범위 필터링 (옵션)
+    if start_date or end_date:
+        s = _valid_yyyymmdd(start_date)
+        e = _valid_yyyymmdd(end_date)
+        if start_date and s is None:
+            print(f"경고: start-date 형식이 잘못되었습니다(YYYYMMDD 기대): {start_date} -> 무시합니다")
+        if end_date and e is None:
+            print(f"경고: end-date 형식이 잘못되었습니다(YYYYMMDD 기대): {end_date} -> 무시합니다")
+        # 범위가 뒤바뀐 경우 자동 수정
+        if s is not None and e is not None and s > e:
+            print(f"경고: start-date({s}) > end-date({e}) 이므로 서로 교체합니다.")
+            s, e = e, s
+        filt: Dict[str, Dict[str, str]] = {}
+        for group_key, files in complete_groups.items():
+            parts = group_key.split("_")
+            date = parts[-1]
+            if _date_in_range(date, s, e):
+                filt[group_key] = files
+        complete_groups = filt
+        if not complete_groups:
+            print("지정한 날짜 범위에 해당하는 그룹이 없습니다.")
+            return
 
     # 그룹을 월별로 묶기
     monthly_groups: Dict[str, List[Tuple[str, Dict[str, str]]]] = {}
@@ -870,9 +880,6 @@ def main():
                         help="이미 DB에 해당 (종목코드, 날짜) 그룹이 존재하면 스킵합니다 (기본: 활성화)")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
                         help="이미 존재하는 그룹도 다시 처리합니다")
-    # Compact-only 모드: CSV를 읽지 않고 지정한 DB에 대해 최적화만 수행
-    parser.add_argument("--compact-only", action="store_true",
-                        help="CSV 처리 없이 지정한 DuckDB에 대해 PRAGMA optimize/checkpoint만 수행합니다")
     # Force recreate DB if exists (useful when file is corrupted or version-mismatched)
     parser.add_argument("--force-recreate", action="store_true",
                         help="출력 DuckDB 파일이 존재하면 삭제 후 새로 생성합니다 (손상/버전 문제 해결용)")
@@ -885,25 +892,25 @@ def main():
                         help="임시 결과 저장 디렉토리 (기본: <output>.tmp)")
     parser.add_argument("--checkpoint-interval", type=int, default=100,
                         help="몇 개 그룹 처리마다 DuckDB CHECKPOINT를 실행할지 지정 (0이면 비활성화, 기본: 100)")
+    # 날짜 범위 옵션
+    parser.add_argument("--start-date", dest="start_date", default=None,
+                        help="처리 시작 날짜 (YYYYMMDD)")
+    parser.add_argument("--end-date", dest="end_date", default=None,
+                        help="처리 종료 날짜 (YYYYMMDD)")
      
     args = parser.parse_args()
-     
-    # compact-only인 경우 입력 폴더 존재 여부는 체크하지 않음
-    if not args.compact_only:
-        if not os.path.exists(args.input_folder):
-            print(f"입력 폴더가 존재하지 않습니다: {args.input_folder}")
-            return
      
     generate_datasets(
         args.input_folder,
         args.output,
         skip_existing=args.skip_existing,
-        compact_only=args.compact_only,
         force_recreate=args.force_recreate,
         workers=args.workers,
         group_workers=args.group_workers,
         tmp_dir=args.tmp_dir,
         checkpoint_interval=args.checkpoint_interval,
+        start_date=args.start_date,
+        end_date=args.end_date,
     )
 
 
