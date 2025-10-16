@@ -5,11 +5,14 @@
 실시간 매매 결정을 내리는 추론 파이프라인을 제공합니다.
 
 주요 컴포넌트:
-- GRPOInference: 실시간 추론 엔진
+- GRPOInference: 기본 실시간 추론 엔진
+- EnhancedGRPOInference: 개선된 추론 엔진 (필터링 + 리스크 관리)
 - TradeLogger: 실시간 거래 로거
+- Position: 포지션 정보 클래스
 """
 
 from ai_trader.grpo.inference.infer_grpo import GRPOInference
+from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
 from ai_trader.grpo.inference.trade_logger import TradeLogger
 
-__all__ = ['GRPOInference', 'TradeLogger']
+__all__ = ['GRPOInference', 'EnhancedGRPOInference', 'Position', 'Action', 'TradeLogger']
