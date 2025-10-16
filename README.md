@@ -366,10 +366,12 @@ DEVICE="cuda"  # 또는 "cpu"
 ```bash
 python scripts/data/generate_datasets.py \
   "D:\Workspace\Project\stock-bot\hoga-crawler\data" \
-  -o "C:\Users\user\Workspace\datasets@raw\datasets.duckdb" \
+  -o "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
   --workers 12 \
   --tmp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
-  --checkpoint-interval 50
+  --checkpoint-interval 50 \
+  --single-output \
+  --start-date 20250922 --end-date 20250930
 
 python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
   --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \

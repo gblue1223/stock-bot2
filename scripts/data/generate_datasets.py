@@ -611,7 +611,7 @@ def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: i
                 print(f"  [{i}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {msg}")
 
 
-def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20):
+def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20, *, single_output: bool = False):
     """Scan tmp_root for any leftover .pkl files and ingest them in the current process.
     This supports resume-on-start and graceful Ctrl+C handling.
     """
@@ -656,7 +656,7 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
     for i, (group_key, code, date, pkl_path) in enumerate(prepared, 1):
         try:
             yyyymm = _month_key_from_yyyymmdd(date)
-            db_path = _monthly_db_path(base_db_path, yyyymm)
+            db_path = base_db_path if single_output else _monthly_db_path(base_db_path, yyyymm)
             _ingest_pickle_into_db_path(db_path, pkl_path, code, date, group_key)
             # per-month checkpoint interval
             if checkpoint_interval > 0:
@@ -686,7 +686,8 @@ def generate_datasets(input_folder: str, output_db: str, *,
                       tmp_dir: Optional[str] = None,
                       checkpoint_interval: int = 20,
                       start_date: Optional[str] = None,
-                      end_date: Optional[str] = None):
+                      end_date: Optional[str] = None,
+                      single_output: bool = False):
     """
     메인 데이터 생성 함수 (정규화 없음, DuckDB 전용)
     - 입력 폴더를 스캔하여 유효 CSV 그룹을 찾음
@@ -715,7 +716,8 @@ def generate_datasets(input_folder: str, output_db: str, *,
         except Exception:
             pass
     # 이전 실행의 완료된 체크포인트 반영
-    _sweep_and_ingest_tmp(output_db, _tmp_base, workers=group_workers, checkpoint_interval=checkpoint_interval)
+    # 이전 실행의 완료된 체크포인트 반영 (single-output 모드 고려)
+    _sweep_and_ingest_tmp(output_db, _tmp_base, workers=group_workers, checkpoint_interval=checkpoint_interval, single_output=single_output)
 
     # CSV 그룹 스캔
     print("CSV 파일 스캔 및 그룹화 중...")
@@ -755,16 +757,24 @@ def generate_datasets(input_folder: str, output_db: str, *,
         yyyymm = _month_key_from_yyyymmdd(date)
         monthly_groups.setdefault(yyyymm, []).append((group_key, files))
 
-    # force-recreate: 대상 월 DB 삭제
+    # force-recreate 처리
     if force_recreate:
-        for yyyymm in monthly_groups.keys():
-            db_path = _monthly_db_path(output_db, yyyymm)
-            if os.path.exists(db_path):
+        if single_output:
+            if os.path.exists(output_db):
                 try:
-                    os.remove(db_path)
-                    print(f"삭제 후 재생성 예정: {db_path}")
+                    os.remove(output_db)
+                    print(f"삭제 후 재생성 예정(단일): {output_db}")
                 except Exception as e:
-                    print(f"경고: DB 삭제 실패 {db_path}: {type(e).__name__}: {e}")
+                    print(f"경고: 단일 DB 삭제 실패 {output_db}: {type(e).__name__}: {e}")
+        else:
+            for yyyymm in monthly_groups.keys():
+                db_path = _monthly_db_path(output_db, yyyymm)
+                if os.path.exists(db_path):
+                    try:
+                        os.remove(db_path)
+                        print(f"삭제 후 재생성 예정: {db_path}")
+                    except Exception as e:
+                        print(f"경고: DB 삭제 실패 {db_path}: {type(e).__name__}: {e}")
 
     # skip-existing: 각 월 DB에서 이미 존재하는 (종목코드, 날짜) 그룹 제거
     def _filter_skip_existing_for_month(yyyymm: str, groups: List[Tuple[str, Dict[str, str]]]) -> List[Tuple[str, Dict[str, str]]]:
@@ -803,12 +813,50 @@ def generate_datasets(input_folder: str, output_db: str, *,
             # 보수적으로 모두 처리
             return groups
 
-    for yyyymm in list(monthly_groups.keys()):
-        orig_n = len(monthly_groups[yyyymm])
-        monthly_groups[yyyymm] = _filter_skip_existing_for_month(yyyymm, monthly_groups[yyyymm])
-        if len(monthly_groups[yyyymm]) == 0:
-            print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
-            del monthly_groups[yyyymm]
+    if single_output:
+        # 단일 DB 파일에서 스킵 여부 확인
+        if skip_existing and os.path.exists(output_db):
+            try:
+                conn = duckdb.connect(output_db)
+                try:
+                    try:
+                        conn.execute("DESCRIBE datasets")
+                        table_exists = True
+                    except Exception:
+                        table_exists = False
+                    if table_exists:
+                        for yyyymm in list(monthly_groups.keys()):
+                            orig_n = len(monthly_groups[yyyymm])
+                            keep: List[Tuple[str, Dict[str, str]]] = []
+                            for group_key, files in monthly_groups[yyyymm]:
+                                parts = group_key.split('_')
+                                code = parts[0]
+                                date = parts[-1]
+                                try:
+                                    q = conn.execute("SELECT 1 FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=? LIMIT 1", [code, date]).fetchone()
+                                except Exception:
+                                    q = None
+                                if q is None:
+                                    keep.append((group_key, files))
+                            monthly_groups[yyyymm] = keep
+                            if len(keep) == 0:
+                                print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
+                                del monthly_groups[yyyymm]
+                finally:
+                    conn.close()
+            except Exception:
+                # 에러 시 보수적으로 전부 처리
+                pass
+        else:
+            # 출력 DB가 없거나 skip 비활성화면 그대로 진행
+            pass
+    else:
+        for yyyymm in list(monthly_groups.keys()):
+            orig_n = len(monthly_groups[yyyymm])
+            monthly_groups[yyyymm] = _filter_skip_existing_for_month(yyyymm, monthly_groups[yyyymm])
+            if len(monthly_groups[yyyymm]) == 0:
+                print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
+                del monthly_groups[yyyymm]
 
     if not monthly_groups:
         print("처리할 신규 그룹이 없습니다.")
@@ -822,7 +870,7 @@ def generate_datasets(input_folder: str, output_db: str, *,
     # 월 목록 및 병렬 처리 설정
     months = sorted(monthly_groups.keys())
     max_workers = max(1, int(workers))
-    used_workers = min(max_workers, len(months))
+    used_workers = 1 if single_output else min(max_workers, len(months))
 
     print(f"월별 처리 시작: 대상 {len(months)}개월, 병렬 workers={used_workers}")
 
@@ -831,7 +879,7 @@ def generate_datasets(input_folder: str, output_db: str, *,
         with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
             futs = {}
             for yyyymm in months:
-                db_path = _monthly_db_path(output_db, yyyymm)
+                db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
                 groups = monthly_groups[yyyymm]
                 fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
                 futs[fut] = (yyyymm, len(groups), db_path)
@@ -849,16 +897,24 @@ def generate_datasets(input_folder: str, output_db: str, *,
     else:
         # 직렬 처리
         for yyyymm in months:
-            db_path = _monthly_db_path(output_db, yyyymm)
+            db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
             groups = monthly_groups[yyyymm]
             processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
             print(f"월 처리 완료: {yyyymm} ({processed}/{len(groups)}) -> {db_path}")
 
     # 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행 (선택적)
     try:
-        processed_months = months
-        if processed_months:
-            _parallel_checkpoint_months(output_db, processed_months, max_workers)
+        if single_output:
+            # 단일 파일만 체크포인트
+            conn = duckdb.connect(output_db)
+            try:
+                conn.execute("CHECKPOINT")
+            finally:
+                conn.close()
+        else:
+            processed_months = months
+            if processed_months:
+                _parallel_checkpoint_months(output_db, processed_months, max_workers)
     except Exception:
         pass
 
@@ -897,9 +953,11 @@ def main():
                         help="처리 시작 날짜 (YYYYMMDD)")
     parser.add_argument("--end-date", dest="end_date", default=None,
                         help="처리 종료 날짜 (YYYYMMDD)")
-     
+    parser.add_argument("--single-output", dest="single_output", action="store_true",
+                        help="모든 월 데이터를 단일 출력 DuckDB 파일에 순차적으로 append 합니다 (병렬 월 처리 비활성화)")
+
     args = parser.parse_args()
-     
+
     generate_datasets(
         args.input_folder,
         args.output,
@@ -911,6 +969,7 @@ def main():
         checkpoint_interval=args.checkpoint_interval,
         start_date=args.start_date,
         end_date=args.end_date,
+        single_output=args.single_output,
     )
 
 
