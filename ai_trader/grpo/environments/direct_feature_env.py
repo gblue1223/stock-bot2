@@ -1,41 +1,14 @@
-#!/usr/bin/env python3
 """
-직접 특징 사용 GRPO 훈련 - 임베딩 우회
+직접 특징 사용 GRPO 환경
 
-핵심 아이디어:
-1. 임베딩 사용하지 않음
-2. 원본 특징을 직접 정책에 입력
-3. 단순하지만 효과적인 접근법
-4. 거래 관련성 문제 해결
+임베딩 없이 원본 특징을 직접 사용하는 단순한 환경
 """
 
-import os
-import sys
 import logging
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import time
 import numpy as np
-from pathlib import Path
-from dotenv import load_dotenv
+import duckdb
 from enum import IntEnum
 
-# 환경 변수 로드
-load_dotenv()
-
-# 프로젝트 루트 추가
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
-
-from ai_trader.grpo.grpo import GRPOTrainer
-import duckdb
-
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -159,7 +132,7 @@ class DirectFeatureEnv:
         min_required = self.seq_len + self.max_episode_steps + 10
         
         try:
-            # 랜덤 종목 및 날짜 선택 (시간 필터링 적용)
+            # 랜덤 종목 및 날짜 선택
             query = f"""
                 SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
                 FROM {self.table_name}
@@ -176,7 +149,7 @@ class DirectFeatureEnv:
             stock_code = str(result['종목코드'].iloc[0])
             date = int(result['날짜'].iloc[0])
             
-            # 해당 종목/날짜의 데이터 로드 (시간 필터링 적용)
+            # 해당 종목/날짜의 데이터 로드
             query = f"""
                 SELECT {', '.join(feature_cols)}
                 FROM {self.table_name}
@@ -353,267 +326,3 @@ class DirectFeatureEnv:
         """환경 종료"""
         if self.conn:
             self.conn.close()
-
-
-class DirectFeaturePolicy(nn.Module):
-    """
-    직접 특징 사용 정책 네트워크
-    
-    임베딩 없이 평탄화된 시퀀스를 직접 입력으로 사용
-    """
-    
-    def __init__(
-        self,
-        input_dim: int,  # seq_len * features
-        hidden_dim: int = 128,
-        action_dim: int = 3
-    ):
-        super().__init__()
-        
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.action_dim = action_dim
-        # GRPO 훈련기 호환성을 위한 속성
-        self.embedding_dim = input_dim
-        
-        # 입력 차원 축소
-        self.input_projection = nn.Linear(input_dim, hidden_dim)
-        
-        # 공유 특징 추출 레이어
-        self.fc1 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        
-        # 정책 헤드 (행동 확률)
-        self.policy_head = nn.Linear(hidden_dim // 2, action_dim)
-        
-        # 가치 헤드 (상태 가치)
-        self.value_head = nn.Linear(hidden_dim // 2, 1)
-        
-        logger.info(f"DirectFeaturePolicy initialized: input_dim={input_dim}, "
-                   f"hidden_dim={hidden_dim}, action_dim={action_dim}")
-    
-    def forward(self, state):
-        """정책 네트워크 forward pass"""
-        # 입력 차원 축소
-        x = F.relu(self.input_projection(state))
-        
-        # 공유 특징 추출
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        
-        # 정책 헤드: 행동 로짓
-        action_logits = self.policy_head(x)
-        
-        # 가치 헤드: 상태 가치
-        state_value = self.value_head(x)
-        
-        return action_logits, state_value
-    
-    def get_action(self, state, deterministic=False):
-        """정책에서 행동 샘플링"""
-        from torch.distributions import Categorical
-        
-        # Forward pass
-        action_logits, _ = self.forward(state)
-        
-        # 행동 확률 분포 생성
-        action_probs = F.softmax(action_logits, dim=-1)
-        dist = Categorical(action_probs)
-        
-        if deterministic:
-            # 최대 확률 행동 선택
-            action = torch.argmax(action_probs, dim=-1)
-        else:
-            # 확률적 샘플링
-            action = dist.sample()
-        
-        # 로그 확률 계산
-        log_prob = dist.log_prob(action)
-        
-        return action, log_prob
-    
-    def evaluate_actions(self, states, actions):
-        """주어진 상태와 행동에 대한 로그 확률, 엔트로피, 가치 계산"""
-        from torch.distributions import Categorical
-        
-        # Forward pass
-        action_logits, state_values = self.forward(states)
-        
-        # 행동 확률 분포 생성
-        action_probs = F.softmax(action_logits, dim=-1)
-        dist = Categorical(action_probs)
-        
-        # 로그 확률 계산
-        log_probs = dist.log_prob(actions)
-        
-        # 엔트로피 계산
-        entropy = dist.entropy()
-        
-        # 가치를 1D로 변환
-        values = state_values.squeeze(-1)
-        
-        return log_probs, entropy, values
-
-
-def main():
-    """직접 특징 사용 GRPO 훈련"""
-    
-    logger.info("🎯 Starting DIRECT FEATURES GRPO Training...")
-    logger.info("🔧 임베딩 우회 - 원본 특징 직접 사용")
-    logger.info("=" * 60)
-    
-    # 경로 설정
-    db_path = r"C:\Users\user\Workspace\datasets@20251016\datasets_raw_all.duckdb"
-    output_dir = "models/grpo_direct_features"
-    
-    # 경로 확인
-    logger.info("🔍 Checking files...")
-    if not os.path.exists(db_path):
-        logger.error(f"❌ Database not found: {db_path}")
-        return False
-    
-    logger.info("✅ Database found")
-    
-    # GPU 확인
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    logger.info(f"🖥️ Using device: {device}")
-    
-    try:
-        # 1. 직접 특징 환경 생성
-        logger.info("🎯 Creating DIRECT FEATURES environment...")
-        env = DirectFeatureEnv(
-            db_path=db_path,
-            table_name='datasets_raw',
-            seq_len=30,                  # 더 짧은 시퀀스 (계산 효율성)
-            expected_features=24,        # 24개 특징 (등락률 + 누적거래대금 + 거래회전율 + 체결강도 + 매도10 + 매수10)
-            transaction_cost_rate=0.00215,
-            max_episode_steps=100,       # 짧은 에피소드
-            device=device
-        )
-        
-        logger.info("✅ DIRECT FEATURES environment created")
-        logger.info("🎯 Direct features settings:")
-        logger.info("  - No embedding (direct raw features)")
-        logger.info("  - Sequence length: 30 (efficient)")
-        logger.info("  - Transaction cost: 0.1% (low)")
-        logger.info("  - Episode steps: 100 (short)")
-        logger.info(f"  - Observation dim: {env.observation_space.shape[0]}")
-        
-        # 2. 직접 특징 정책 네트워크
-        logger.info("🧠 Creating DIRECT FEATURES policy...")
-        
-        input_dim = env.observation_space.shape[0]  # seq_len * features
-        policy = DirectFeaturePolicy(
-            input_dim=input_dim,
-            hidden_dim=64,   # 작은 네트워크
-            action_dim=3
-        )
-        
-        policy.to(device)
-        logger.info("✅ DIRECT FEATURES policy created")
-        
-        # 3. 보수적 훈련기 설정
-        logger.info("🎯 Creating CONSERVATIVE trainer...")
-        
-        os.makedirs(output_dir, exist_ok=True)
-        tensorboard_dir = os.path.join(output_dir, 'tensorboard_logs')
-        
-        trainer = GRPOTrainer(
-            policy=policy,
-            env=env,
-            episodes_per_group=4,        # 작은 그룹
-            num_groups=2,                # 단순한 그룹화
-            learning_rate=0.001,         # 더 높은 학습률 (빠른 학습)
-            gamma=0.95,                  # 더 짧은 시야 (단기 거래)
-            clip_epsilon=0.2,            # 표준 클리핑
-            kl_target=0.01,              # 표준 KL
-            entropy_coef=0.2,            # 높은 탐험 (행동 다양성)
-            value_coef=0.5,              # 가치 함수 중시
-            max_grad_norm=0.5,           # 안정적 그래디언트
-            device=device,
-            tensorboard_log_dir=tensorboard_dir
-        )
-        
-        logger.info("✅ CONSERVATIVE trainer created")
-        
-        # 4. 훈련 설정
-        logger.info("🎯 Starting DIRECT FEATURES training...")
-        logger.info("=" * 60)
-        
-        # 적당한 규모
-        total_timesteps = 2000           # 적당한 규모
-        episodes_per_iteration = 4 * 2   # 8 episodes per iteration
-        total_episodes = (total_timesteps // 25) * episodes_per_iteration
-        checkpoint_interval = 5          # 자주 저장
-        
-        logger.info(f"📊 DIRECT FEATURES Configuration:")
-        logger.info(f"  Total Timesteps: {total_timesteps}")
-        logger.info(f"  Total Episodes: {total_episodes}")
-        logger.info(f"  Episodes per Group: 4")
-        logger.info(f"  Input Dimension: {input_dim}")
-        logger.info(f"  Learning Rate: 0.0003")
-        logger.info(f"  Expected Time: 15-25 minutes")
-        
-        # 체크포인트 경로
-        checkpoint_path = os.path.join(output_dir, 'checkpoints', 'checkpoint_iter{}.pt')
-        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-        
-        # 훈련 시작
-        start_time = time.time()
-        
-        final_metrics = trainer.train(
-            total_episodes=total_episodes,
-            checkpoint_interval=checkpoint_interval,
-            checkpoint_path=checkpoint_path
-        )
-        
-        training_time = time.time() - start_time
-        
-        # 5. 결과 출력
-        logger.info("=" * 60)
-        logger.info("🎉 DIRECT FEATURES TRAINING COMPLETED!")
-        logger.info("=" * 60)
-        
-        logger.info(f"📊 Results:")
-        logger.info(f"  Training Time: {training_time:.1f}s ({training_time/60:.1f}m)")
-        logger.info(f"  Total Episodes: {total_episodes}")
-        logger.info(f"  Total Timesteps: {final_metrics['total_timesteps']}")
-        
-        # 최종 모델 저장
-        final_model_path = os.path.join(output_dir, 'direct_features_model.pt')
-        trainer.save_checkpoint(final_model_path, final_metrics['num_updates'])
-        logger.info(f"  Final Model: {final_model_path}")
-        
-        logger.info("=" * 60)
-        logger.info("🎊 DIRECT FEATURES completed!")
-        logger.info("📈 Expected improvements:")
-        logger.info("  - No embedding quality issues")
-        logger.info("  - Direct trading signal access")
-        logger.info("  - Faster convergence")
-        logger.info("  - Better trading relevance")
-        logger.info(f"📊 TensorBoard: tensorboard --logdir {tensorboard_dir}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"❌ Training failed: {e}", exc_info=True)
-        return False
-    
-    finally:
-        # 정리
-        if 'env' in locals():
-            env.close()
-        
-        if device == 'cuda':
-            torch.cuda.empty_cache()
-
-
-if __name__ == '__main__':
-    success = main()
-    if success:
-        print("\n🎉 직접 특징 훈련이 완료되었습니다!")
-        print("📈 임베딩 문제를 우회했습니다!")
-    else:
-        print("\n❌ 훈련이 실패했습니다.")
-    
-    sys.exit(0 if success else 1)

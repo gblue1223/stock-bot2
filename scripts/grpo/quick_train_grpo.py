@@ -23,9 +23,7 @@ load_dotenv()
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
-from ai_trader.grpo.env import GRPOScalpingEnv
-from ai_trader.grpo.policy import GRPOPolicy
+from ai_trader.grpo.train_grpo import create_environment, create_policy
 from ai_trader.grpo.grpo import GRPOTrainer
 
 # 로깅 설정
@@ -65,57 +63,36 @@ def main():
     logger.info(f"🖥️ Using device: {device}")
     
     try:
-        # 1. 임베딩 모델 로드
-        logger.info("📥 Loading embedding model...")
-        checkpoint = torch.load(embedding_model_path, map_location=device)
-        config = checkpoint.get('config', {})
+        # 1. train_grpo 모듈을 사용하여 환경 생성
+        logger.info("🏗️ Creating IMPROVED environment using train_grpo module...")
         
-        embedding_model = MaskedAutoEncoder(
-            input_dim=config.get('input_dim', 28),
-            embedding_dim=config.get('embedding_dim', 128),
-            hidden_dim=config.get('hidden_dim', 256),
-            seq_len=config.get('seq_len', 60),
-            num_layers=config.get('num_layers', 3),
-            dropout=config.get('dropout', 0.1),
-            mask_ratio=config.get('mask_ratio', 0.15)
-        )
+        # argparse.Namespace를 흉내내는 객체 생성
+        class Args:
+            env = 'scalping'
+            policy = 'grpo'
+            db_path = db_path
+            table_name = 'datasets'
+            seq_len = 60
+            features = 28
+            episode_steps = 1000
+            embedding_model = embedding_model_path
+            embedding_dim = 128
+            quick_exit_mode = 'penalty_only'
+            hidden_dim = 64
+            action_dim = 3
         
-        embedding_model.load_state_dict(checkpoint['model_state_dict'])
-        embedding_model.to(device)
-        embedding_model.eval()
+        args = Args()
         
-        logger.info("✅ Embedding model loaded")
+        # create_environment와 create_policy 함수 사용
+        env = create_environment(args, device)
+        logger.info("✅ Environment created using train_grpo module")
         
-        # 2. 개선된 학습용 환경 생성
-        logger.info("🏗️ Creating IMPROVED environment...")
-        env = GRPOScalpingEnv(
-            embedding_model=embedding_model,
-            db_path=db_path,
-            table_name='datasets',
-            seq_len=60,
-            embedding_dim=128,
-            expected_features=28,
-            # 🔧 개선된 설정 - 보상 구조 최적화
-            transaction_cost_rate=0.00215,     # 0.00215 → 0.001 (학습 용이)
-            quick_exit_threshold=2.0,        # 5.0 → 2.0 (진짜 스캘핑)
-            quick_exit_penalty=0.0001,        # 거의 없는 페널티
-            max_holding_time=20.0,           # 20초 (진짜 스캘핑)
-            holding_penalty_rate=0.00001,     # 거의 없는 페널티
-            device=device
-        )
-        
-        # 3. 작은 정책 네트워크 (빠른 학습)
-        logger.info("🧠 Creating compact policy...")
-        policy = GRPOPolicy(
-            embedding_dim=128,
-            hidden_dim=64,  # 128 → 64 (더 빠른 학습)
-            action_dim=3
-        )
-        
-        policy.to(device)
+        # 2. 정책 생성
+        logger.info("🧠 Creating compact policy using train_grpo module...")
+        policy = create_policy(args, env, device)
         logger.info("✅ Compact policy created")
         
-        # 4. 최적화된 훈련기 설정
+        # 3. 최적화된 훈련기 설정
         logger.info("⚡ Creating OPTIMIZED trainer...")
         
         os.makedirs(output_dir, exist_ok=True)
@@ -137,9 +114,9 @@ def main():
             tensorboard_log_dir=tensorboard_dir
         )
         
-        logger.info("✅ Aggressive trainer created")
+        logger.info("✅ Optimized trainer created")
         
-        # 5. 최적화된 실험 설정
+        # 4. 최적화된 실험 설정
         logger.info("🔥 Starting OPTIMIZED training...")
         logger.info("=" * 60)
         
@@ -175,7 +152,7 @@ def main():
         
         training_time = time.time() - start_time
         
-        # 6. 결과 출력
+        # 5. 결과 출력
         logger.info("=" * 60)
         logger.info("🎉 QUICK TRAINING COMPLETED!")
         logger.info("=" * 60)
