@@ -1,104 +1,160 @@
 # Project Structure
 
-## Core Architecture
+## Core Package: `ai_trader/`
 
-The project follows a modular architecture with clear separation between embedding models, reinforcement learning, and supporting utilities.
+Main Python package containing all AI trading components.
 
-```
-ai_trader/                  # Main package
-├── embedding/              # AutoEncoder embedding models
-│   ├── autoencoder_model.py    # Model definitions (AutoEncoder, MaskedAutoEncoder)
-│   ├── autoencoder_trainer.py  # Training pipeline
-│   ├── fine_tuning/            # Trading-specific fine-tuning
-│   ├── data.py                 # Data loaders and datasets
-│   └── evaluation.py           # Model evaluation utilities
-├── grpo/                   # GRPO reinforcement learning
-│   ├── env.py                  # Scalping environment (GRPOScalpingEnv)
-│   ├── grpo.py                 # GRPO algorithm implementation
-│   ├── policy.py               # Policy networks
-│   ├── backtest.py             # Backtesting framework
-│   └── train_grpo.py           # Training scripts
-├── inference/              # Real-time inference
-│   └── infer_grpo.py           # Fast inference engine (2.87ms)
-└── reporting/              # Analysis and reporting
-    └── html_report.py          # HTML report generation
-```
+### `ai_trader/embedding/`
+AutoEncoder-based embedding models for time-series feature extraction.
 
-## Supporting Directories
+- `autoencoder_model.py`: AutoEncoder and MaskedAutoEncoder implementations
+- `autoencoder_trainer.py`: Training pipeline for embeddings
+- `fine_tuning.py`: Task-specific fine-tuning system
+- `data.py`: Data loaders for embedding training
+- `evaluation.py`: Embedding quality evaluation metrics
+- `fast_data_loader.py`: Optimized data loading for large datasets
+- `fine_tuning/`: Fine-tuning modules and task heads
 
-```
-examples/                   # Usage examples and demos
-├── autoencoder_training_example.py
-├── grpo_training_example.py
-└── complete_workflow_example.py
+### `ai_trader/grpo/`
+GRPO (Group Relative Policy Optimization) reinforcement learning system.
 
-scripts/                    # Data processing and utilities
-├── normalize_datasets.py       # DuckDB data normalization
-├── merge_datasets.py          # Dataset merging
-├── benchmark_autoencoder.py   # Performance benchmarking
-└── analysis/                  # Analysis scripts
+- `grpo.py`: Core GRPO algorithm implementation
+- `train_scalping.py`: Scalping-specific training script
+- `train_direct_features.py`: Direct feature training (without embeddings)
+- `backtest.py`: Backtesting framework
+- `evaluation.py`: Performance evaluation metrics
+- `alerts.py`: Alert system for trading signals
+- `environments/`: Trading environment implementations
+- `policies/`: Policy network architectures
+- `inference/`: Real-time inference engines
 
-tests/                      # Comprehensive test suite
-├── test_autoencoder_*.py      # AutoEncoder tests
-├── test_grpo_*.py             # GRPO tests
-├── test_performance_benchmark.py
-└── autoencoder/               # Integration test results
+### `ai_trader/lstm/`
+Legacy LSTM-based models (deprecated in favor of AutoEncoder + GRPO).
 
-models/                     # Trained models and checkpoints
-├── autoencoder/               # AutoEncoder models
-├── grpo_*/                    # GRPO trained policies
-└── datasets/                  # Preprocessed datasets
+### `ai_trader/reporting/`
+Report generation and visualization.
 
-config/                     # Configuration files
-docs/                       # Documentation and guides
-logs/                       # Application logs
-runs/                       # TensorBoard logs
-```
+- `html_report.py`: HTML report generator
+- `report_generator.py`: Report generation utilities
 
-## Code Organization Patterns
+## Scripts: `scripts/`
 
-### Module Structure
-- Each major component (embedding, grpo) has its own package
-- Clear separation between model definitions, training, and inference
-- Shared utilities in `lib/` directory
+Utility scripts for data processing, training, and analysis.
 
-### Naming Conventions
-- **Files**: Snake_case (e.g., `autoencoder_model.py`)
-- **Classes**: PascalCase (e.g., `GRPOScalpingEnv`, `AutoEncoderEmbedding`)
-- **Functions**: Snake_case (e.g., `train_autoencoder_embedding`)
-- **Constants**: UPPER_CASE (e.g., `TRANSACTION_COST_RATE`)
+### `scripts/data/`
+Data pipeline scripts for preprocessing and normalization.
 
-### Import Patterns
-```python
-# Absolute imports from ai_trader package
-from ai_trader.embedding.autoencoder_model import AutoEncoderEmbedding
-from ai_trader.grpo.env import GRPOScalpingEnv
+- `generate_datasets.py`: Convert raw CSV to DuckDB
+- `normalize_datasets.py`: Normalize and clean datasets
+- `merge_datasets.py`: Merge monthly sharded databases
+- `export_datasets.py`: Export filtered datasets
 
-# Relative imports within modules
-from .data import AutoEncoderDataLoader
-from .fine_tuning import fine_tune_for_trading_task
-```
+### `scripts/grpo/`
+GRPO training and evaluation scripts.
 
-### Configuration Management
-- Environment variables in `.env` file
-- Model configs as JSON files in `config/` or passed as arguments
-- Database paths and device settings configurable via environment
+- `quick_train_grpo.py`: Quick training script with defaults
 
-### Data Flow
-1. **Raw CSV** → `scripts/normalize_datasets.py` → **DuckDB**
-2. **DuckDB** → `embedding/data.py` → **AutoEncoder Training**
-3. **Trained AutoEncoder** → `fine_tuning/` → **Task-specific Model**
-4. **Fine-tuned Model** → `grpo/train_grpo.py` → **GRPO Policy**
-5. **GRPO Policy** → `inference/infer_grpo.py` → **Real-time Trading**
+### `scripts/analysis/`
+Analysis and diagnostic scripts.
 
-### Testing Structure
-- Unit tests for individual components
-- Integration tests for end-to-end workflows
-- Performance benchmarks with specific targets
-- Test data in `test_models/` and temporary directories
+### `scripts/colab/`
+Google Colab notebooks for cloud training.
 
-### Documentation
-- Docstrings in Korean and English
-- README files in major directories
-- Implementation summaries in `docs/TASK_*.md`
-- Quick reference guides for key features
+- `grpo_training_complete.ipynb`: Complete GRPO training workflow
+
+### `scripts/pre/`
+Pre-training data preparation scripts.
+
+## Examples: `examples/`
+
+End-to-end usage examples demonstrating workflows.
+
+- `autoencoder_training_example.py`: AutoEncoder training
+- `complete_workflow_example.py`: Full pipeline from data to inference
+- `grpo_training_example.py`: GRPO training
+- `grpo_inference_example.py`: Real-time inference
+- `grpo_backtest_example.py`: Backtesting
+- `grpo_evaluation_example.py`: Model evaluation
+- `generate_html_report_example.py`: Report generation
+- `fine_tuning/`: Fine-tuning examples
+
+## Tests: `tests/`
+
+Comprehensive test suite (38+ unit tests).
+
+- `test_grpo*.py`: GRPO component tests
+- `test_embedding*.py`: Embedding model tests
+- `test_autoencoder*.py`: AutoEncoder tests
+- `test_performance_benchmark.py`: Performance benchmarks
+- `test_backtest.py`: Backtesting tests
+
+## Data & Models
+
+### `models/`
+Trained model checkpoints (gitignored).
+
+- `autoencoder/`: Pre-trained AutoEncoder models
+- `grpo_*/`: GRPO policy checkpoints
+- `datasets/`: Preprocessed datasets for training
+
+### `logs/`
+Application logs and alert logs.
+
+- `alerts.jsonl`: Trading alert logs
+- `*.log`: Application logs
+
+### `runs/`
+TensorBoard logs for training monitoring.
+
+## Configuration
+
+### `config/`
+Configuration files.
+
+- `alert_config.json`: Alert system configuration
+
+### `.env`
+Environment variables (gitignored).
+
+- Database paths
+- Model directories
+- Device configuration (cuda/cpu)
+
+## Documentation: `docs/`
+
+Detailed documentation for specific features.
+
+- `GRPO_*.md`: GRPO-related documentation
+- `TASK_*.md`: Implementation summaries for specific tasks
+- `*_QUICK_REFERENCE.md`: Quick reference guides
+
+## External Integrations
+
+### `koapys/`
+Korean stock market API client (REST-based).
+
+### `koapys_openAPI/`
+Korean stock market OpenAPI integration (legacy).
+
+### `lib/`
+Shared utility libraries.
+
+- `event_emitter.py`: Event handling
+- `io.py`, `pd.py`, `plot.py`: Data I/O and visualization
+- `utils.py`: General utilities
+
+## Naming Conventions
+
+- **Python files**: snake_case (e.g., `autoencoder_model.py`)
+- **Classes**: PascalCase (e.g., `GRPOTrainer`, `AutoEncoderEmbedding`)
+- **Functions/methods**: snake_case (e.g., `train_grpo`, `compute_advantage`)
+- **Constants**: UPPER_SNAKE_CASE (e.g., `MAX_GRAD_NORM`)
+- **Private members**: Leading underscore (e.g., `_compute_loss`)
+
+## File Organization Patterns
+
+- Each major component has its own subdirectory under `ai_trader/`
+- Related functionality grouped in modules (e.g., all GRPO components in `grpo/`)
+- Examples are standalone scripts demonstrating specific workflows
+- Tests mirror the structure of the main package
+- Documentation uses descriptive names with task/feature identifiers

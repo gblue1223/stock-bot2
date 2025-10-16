@@ -1,31 +1,22 @@
 # Product Overview
 
-**AI-Powered Korean Stock Market Scalping System (Stock Bot)**
+AI-powered Korean stock market scalping system combining AutoEncoder-based embeddings with GRPO (Group Relative Policy Optimization) reinforcement learning for ultra-fast trading decisions.
 
-This is an AI trading system designed for ultra-fast scalping in the Korean stock market. The system combines AutoEncoder-based embeddings with GRPO (Group Relative Policy Optimization) reinforcement learning to make real-time trading decisions within seconds.
-
-## Key Features
+## Core Capabilities
 
 - **Ultra-fast inference**: 2.87ms real-time trading decisions (3x faster than 10ms target)
-- **Revolutionary training speed**: 10-100x faster AutoEncoder-based self-supervised learning
-- **Scalping specialization**: Optimized for trades within 30 seconds
-- **GRPO reinforcement learning**: Stable learning through Group Relative Policy Optimization
-- **Large-scale data**: Can train on 1.5 billion data points within weeks
+- **Scalping-focused**: Optimized for sub-30-second trades in Korean stock market
+- **Self-supervised learning**: AutoEncoder-based embeddings with 10-100x faster training than contrastive methods
+- **GRPO reinforcement learning**: Group relative policy optimization for stable learning across market conditions
+- **Large-scale data**: Capable of training on 1.5 billion data points within weeks
 
-## Core Architecture
+## System Architecture
 
-The system follows a three-stage pipeline:
-1. **AutoEncoder pre-training**: Fast self-supervised learning on market data
-2. **Fine-tuning**: Trading-specific task adaptation
-3. **GRPO training**: Reinforcement learning for scalping strategies
-4. **Real-time inference**: Sub-3ms trading decisions
+1. **AutoEncoder Pre-training**: Self-supervised learning on time-series market data
+2. **Fine-tuning**: Task-specific adaptation for trading signals (buy/hold/sell)
+3. **GRPO Training**: Reinforcement learning with group-relative advantages
+4. **Real-time Inference**: Sub-3ms prediction pipeline for live trading
 
-## Target Performance
+## Target Market
 
-- Inference speed: < 10ms (achieved: 2.87ms)
-- Win rate: > 50%
-- Sharpe ratio: > 1.0
-- Maximum drawdown: < 10%
-- Average holding time: < 30 seconds
-
-The system is specifically designed for Korean market conditions with transaction costs of 0.215% and focuses on ultra-short-term scalping strategies.
+Korean stock market (KRX) with focus on high-frequency scalping strategies during market hours (09:00-11:00).

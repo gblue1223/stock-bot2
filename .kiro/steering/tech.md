@@ -2,38 +2,19 @@
 
 ## Core Technologies
 
-- **Python 3.8+**: Primary development language
-- **PyTorch 2.2+**: Deep learning framework for AutoEncoder and GRPO models
-- **DuckDB**: High-performance analytical database for time series data
-- **Gymnasium**: RL environment framework
-- **Stable Baselines3**: Reinforcement learning algorithms
-
-## Key Libraries
-
-### Deep Learning & ML
-- `torch>=2.2` - Neural networks and GPU acceleration
-- `torchvision>=0.17` - Vision utilities
-- `tensorboard>=2.14` - Training visualization and logging
-- `stable-baselines3>=2.3.0` - RL algorithms
-- `gymnasium>=0.29` - RL environments
-- `scikit-learn>=1.4` - Traditional ML utilities
-- `numpy>=1.26`, `scipy>=1.10` - Numerical computing
-
-### Data Processing
-- `duckdb>=1.4.0` - Analytical database for large datasets
-- `pandas>=2.0` - Data manipulation
-- `pyarrow>=14.0` - Columnar data format
-
-### Development & Testing
-- `pytest>=8.0` - Testing framework
-- `pydantic>=2.0` - Data validation
-- `python-dotenv>=1.0` - Environment configuration
+- **Language**: Python 3.8+
+- **Deep Learning**: PyTorch 2.2+, TorchVision 0.17+
+- **Reinforcement Learning**: Gymnasium 0.29+, Stable-Baselines3 2.3.0+
+- **Data Processing**: DuckDB 1.4.0+, Pandas 2.0+, NumPy 1.26+, PyArrow 14.0+
+- **Scientific Computing**: SciPy 1.10+, scikit-learn 1.4+
+- **Monitoring**: TensorBoard 2.14+
+- **Environment**: python-dotenv 1.0+
 
 ## Hardware Requirements
 
-- **GPU**: CUDA-compatible GPU recommended (tested with CUDA 11.8)
-- **RAM**: 16GB minimum, 32GB recommended for large datasets
-- **Storage**: SSD recommended for DuckDB performance
+- **GPU**: CUDA-capable GPU recommended (CUDA 11.8+)
+- **RAM**: 16GB minimum, 32GB recommended
+- **Storage**: SSD recommended for DuckDB operations
 
 ## Common Commands
 
@@ -42,26 +23,11 @@
 # Install dependencies
 pip install -r requirements.txt
 
-# GPU support (CUDA)
+# Install with CUDA support
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-```
 
-### Data Processing
-```bash
-# Generate normalized datasets
-python scripts/normalize_datasets.py <input_folder> -o <output.duckdb> --workers 8
-
-# Merge multiple datasets
-python scripts/merge_datasets.py <input_folder> --out <merged.duckdb> --threads 4
-```
-
-### Training
-```bash
-# AutoEncoder training
-python examples/autoencoder_training_example.py --db <path.duckdb> --output-dir models/autoencoder
-
-# GRPO training (after AutoEncoder)
-python examples/grpo_training_example.py --embedding-model models/autoencoder/best_model.pt
+# Development install
+pip install -e .
 ```
 
 ### Testing
@@ -69,26 +35,69 @@ python examples/grpo_training_example.py --embedding-model models/autoencoder/be
 # Run all tests
 python -m pytest tests/ -v
 
+# Run specific test modules
+python -m pytest tests/test_grpo.py -v
+
+# Run with coverage
+python -m pytest tests/ --cov=ai_trader --cov-report=html
+
 # Performance benchmarks
 python -m pytest tests/test_performance_benchmark.py -v -s
-
-# Specific test suites
-python -m pytest tests/test_autoencoder_*.py -v
-python -m pytest tests/test_grpo_*.py -v
 ```
 
-### Performance Monitoring
+### Data Pipeline
 ```bash
-# TensorBoard logging
-tensorboard --logdir runs/
+# Generate datasets from raw CSV files
+python scripts/data/generate_datasets.py <input_dir> -o <output.duckdb> --workers 12
 
-# Benchmark AutoEncoder
-python scripts/benchmark_autoencoder.py --model-path models/autoencoder/best_model.pt
+# Normalize datasets
+python scripts/data/normalize_datasets.py <input_dir> -o <output.duckdb> --workers 12
+
+# Merge monthly sharded databases
+python scripts/data/merge_datasets.py <input_dir> --out <merged.duckdb> --threads 4
 ```
 
-## Configuration
+### Training
+```bash
+# AutoEncoder pre-training (use Jupyter notebooks in examples/)
+jupyter notebook examples/autoencoder_training_example.py
 
-- Environment variables in `.env` file
-- Model configurations in JSON format
-- DuckDB paths and device settings configurable
-- Supports both CPU and CUDA execution
+# GRPO training
+python -m ai_trader.grpo.train_grpo \
+    --embedding-model models/autoencoder/best_model.pt \
+    --db datasets_norm_all.duckdb \
+    --out models/grpo_scalping \
+    --episodes-per-group 12 \
+    --device cuda
+
+# Quick training script
+python scripts/grpo/quick_train_grpo.py
+```
+
+### Inference & Evaluation
+```bash
+# Run inference example
+python examples/grpo_inference_example.py
+
+# Backtesting
+python examples/grpo_backtest_example.py
+
+# Generate HTML report
+python examples/generate_html_report_example.py
+```
+
+### Monitoring
+```bash
+# Launch TensorBoard
+tensorboard --logdir runs/sb3
+
+# Check TensorBoard logs
+python scripts/check_tensorboard.py
+```
+
+## Development Tools
+
+- **Testing**: pytest 8.0+
+- **Version Control**: Git
+- **IDE**: VSCode (configuration in .vscode/)
+- **Virtual Environment**: venv or conda recommended
