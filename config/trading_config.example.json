@@ -1,0 +1,50 @@
+{
+  "_comment": "실전 거래 설정 예시 파일",
+  "_usage": "cp config/trading_config.example.json config/trading_config.json",
+  
+  "model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
+  "embedding_model_path": null,
+  "device": "cuda",
+  
+  "target_stocks": [
+    "005930",
+    "000660"
+  ],
+  
+  "max_position_size": 1000000,
+  "max_positions": 3,
+  
+  "min_buy_confidence": 0.0,
+  "min_sell_confidence": 0.0,
+  "stop_loss_rate": -2.0,
+  "take_profit_rate": 5.0,
+  "max_holding_period": 100,
+  
+  "market_start": "09:00",
+  "market_end": "15:30",
+  "trading_start": "09:00",
+  "trading_end": "11:00",
+  
+  "seq_len": 30,
+  "num_features": 24,
+  "update_interval": 1.0,
+  
+  "koapys_base_url": "http://localhost:5000",
+  "simulation": true,
+  
+  "_notes": {
+    "target_stocks": "거래 대상 종목 코드 (005930: 삼성전자, 000660: SK하이닉스)",
+    "max_position_size": "종목당 최대 투자 금액 (원)",
+    "max_positions": "최대 동시 보유 종목 수",
+    "min_buy_confidence": "Buy 신뢰도 임계값 (0.0 권장, 검증 결과 기반)",
+    "stop_loss_rate": "손절 비율 (%), 음수",
+    "take_profit_rate": "익절 비율 (%), 양수",
+    "max_holding_period": "최대 보유 기간 (틱)",
+    "trading_start": "거래 시작 시간 (스캘핑은 오전만 권장)",
+    "trading_end": "거래 종료 시간",
+    "seq_len": "시퀀스 길이 (학습 시 사용한 값과 동일해야 함)",
+    "num_features": "특징 수 (학습 시 사용한 값과 동일해야 함)",
+    "update_interval": "데이터 업데이트 간격 (초)",
+    "simulation": "시뮬레이션 모드 (true: 시뮬레이션, false: 실전)"
+  }
+}

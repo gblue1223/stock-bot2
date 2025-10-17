@@ -1,0 +1,25 @@
+{
+  "model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
+  "embedding_model_path": null,
+  "device": "cuda",
+  "target_stocks": [
+    "005930",
+    "000660"
+  ],
+  "max_position_size": 1000000,
+  "max_positions": 3,
+  "min_buy_confidence": 0.0,
+  "min_sell_confidence": 0.0,
+  "stop_loss_rate": -2.0,
+  "take_profit_rate": 5.0,
+  "max_holding_period": 100,
+  "market_start": "09:00",
+  "market_end": "15:30",
+  "trading_start": "09:00",
+  "trading_end": "11:00",
+  "seq_len": 30,
+  "num_features": 24,
+  "update_interval": 1.0,
+  "koapys_base_url": "http://localhost:5000",
+  "simulation": true
+}

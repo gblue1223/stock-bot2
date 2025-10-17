@@ -3,6 +3,11 @@
 개선된 추론 엔진 검증 스크립트
 
 주의점을 반영한 EnhancedGRPOInference 검증
+
+중요:
+    - DirectFeatureEnv의 state[0]은 등락률(%)
+    - 누적 수익률을 계산하여 Position의 가격으로 사용
+    - cumulative_return *= (1 + return_rate)
 """
 
 import os
@@ -117,9 +122,15 @@ def validate_enhanced(
         episode_reward = 0.0
         current_position = None
         
+        # 누적 수익률 추적 (등락률 -> 가격 변환)
+        cumulative_return = 1.0  # 시작 = 100%
+        
         while True:
-            # 현재 가격 (등락률의 첫 번째 특징)
-            current_price = state[0] if len(state) > 0 else 0.0
+            # 현재 등락률 (state[0])
+            current_return_rate = state[0] if len(state) > 0 else 0.0
+            
+            # 누적 수익률 업데이트
+            cumulative_return *= (1 + current_return_rate)
             
             # 시퀀스 복원 (평탄화된 상태를 시퀀스로)
             sequence = state.reshape(30, 24)
@@ -128,7 +139,7 @@ def validate_enhanced(
             action, confidence, pred_info = enhanced_inference.predict(
                 sequence=sequence,
                 current_position=current_position,
-                current_price=current_price,
+                current_price=cumulative_return,  # 누적 수익률 사용
                 deterministic=True
             )
             
@@ -149,9 +160,9 @@ def validate_enhanced(
             # 포지션 관리
             if action == Action.BUY.value and current_position is None:
                 current_position = Position(
-                    entry_price=current_price,
+                    entry_price=cumulative_return,
                     entry_time=info.get('step', 0),
-                    current_price=current_price,
+                    current_price=cumulative_return,
                     holding_period=0
                 )
             elif action == Action.SELL.value and current_position is not None:

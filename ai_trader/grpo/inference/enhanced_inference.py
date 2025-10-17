@@ -33,18 +33,17 @@ class Position:
     entry_time: int
     current_price: float
     holding_period: int
+    cumulative_return: float = 0.0  # 누적 수익률 (비율, 0.01 = 1%)
     
     @property
     def profit_rate(self) -> float:
-        """수익률 계산"""
-        if self.entry_price == 0:
-            return 0.0
-        return (self.current_price - self.entry_price) / self.entry_price * 100
+        """수익률 계산 (백분율)"""
+        return self.cumulative_return * 100
     
     @property
     def is_profit(self) -> bool:
         """수익 포지션 여부"""
-        return self.profit_rate > 0
+        return self.cumulative_return > 0
 
 
 class EnhancedGRPOInference:
@@ -127,9 +126,9 @@ class EnhancedGRPOInference:
         개선된 행동 예측
         
         Args:
-            sequence: 입력 시퀀스
+            sequence: 입력 시퀀스 (seq_len, num_features)
             current_position: 현재 포지션 (있으면)
-            current_price: 현재 가격
+            current_price: 현재 가격 (등락률)
             deterministic: 결정적 예측 여부
             
         Returns:
@@ -157,7 +156,9 @@ class EnhancedGRPOInference:
         
         # 포지션이 있으면 자동 손절/익절 체크
         if current_position is not None and self.enable_auto_exit:
-            # 포지션 업데이트
+            # 현재 등락률로 누적 수익률 업데이트
+            current_return = sequence[-1, 0] / 100.0  # 등락률 → 비율
+            current_position.cumulative_return += current_return
             current_position.current_price = current_price
             current_position.holding_period += 1
             
