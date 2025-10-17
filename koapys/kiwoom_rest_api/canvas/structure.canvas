@@ -1,0 +1,31 @@
+{
+	"nodes":[
+		{"id":"httpx_request","type":"text","text":"httpx.Client().request()\n외부 라이브러리","x":-440,"y":-55,"width":250,"height":60,"color":"5"},
+		{"id":"make_request","type":"text","text":"make_request()\nsync_client.py","x":-175,"y":-560,"width":250,"height":60,"color":"4"},
+		{"id":"make_request_async","type":"text","text":"make_request_async()\nasync_client.py","x":420,"y":-560,"width":250,"height":120,"color":"4"},
+		{"id":"httpx_async_request","type":"text","text":"httpx.AsyncClient().request()\n외부 라이브러리","x":720,"y":-280,"width":250,"height":130,"color":"5"},
+		{"id":"prepare_request_params","type":"text","text":"prepare_request_params()\nbase.py","x":320,"y":-55,"width":250,"height":60,"color":"3"},
+		{"id":"get_base_url","type":"text","text":"get_base_url()\nconfig.py","x":470,"y":180,"width":200,"height":60,"color":"2"},
+		{"id":"TokenManager","type":"text","text":"TokenManager\nauth/token.py","x":-800,"y":60,"width":200,"height":60,"color":"1"},
+		{"id":"get_api_secret","type":"text","text":"get_api_secret()\nconfig.py","x":-1000,"y":-280,"width":200,"height":60,"color":"2"},
+		{"id":"get_api_key","type":"text","text":"get_api_key()\nconfig.py","x":-800,"y":-500,"width":200,"height":60,"color":"2"},
+		{"id":"get_access_token","type":"text","text":"get_access_token()\nauth/token.py","x":-800,"y":300,"width":200,"height":60,"color":"1"},
+		{"id":"APIError","type":"text","text":"APIError\nbase.py","x":0,"y":300,"width":200,"height":60,"color":"3"},
+		{"id":"process_response","type":"text","text":"process_response()\nbase.py","x":-50,"y":-67,"width":250,"height":85,"color":"3"}
+	],
+	"edges":[
+		{"id":"make_request-prepare","fromNode":"make_request","fromSide":"bottom","toNode":"prepare_request_params","toSide":"top"},
+		{"id":"make_request_async-prepare","fromNode":"make_request_async","fromSide":"bottom","toNode":"prepare_request_params","toSide":"top"},
+		{"id":"make_request-httpx","fromNode":"make_request","fromSide":"bottom","toNode":"httpx_request","toSide":"top"},
+		{"id":"make_request_async-httpx","fromNode":"make_request_async","fromSide":"bottom","toNode":"httpx_async_request","toSide":"top"},
+		{"id":"make_request-process","fromNode":"make_request","fromSide":"bottom","toNode":"process_response","toSide":"top"},
+		{"id":"make_request_async-process","fromNode":"make_request_async","fromSide":"bottom","toNode":"process_response","toSide":"top"},
+		{"id":"prepare-get_base_url","fromNode":"prepare_request_params","fromSide":"bottom","toNode":"get_base_url","toSide":"top"},
+		{"id":"token-api_key","fromNode":"TokenManager","fromSide":"top","toNode":"get_api_key","toSide":"bottom"},
+		{"id":"token-api_secret","fromNode":"TokenManager","fromSide":"top","toNode":"get_api_secret","toSide":"bottom"},
+		{"id":"get_token-token","fromNode":"get_access_token","fromSide":"right","toNode":"TokenManager","toSide":"left"},
+		{"id":"process-error","fromNode":"process_response","fromSide":"bottom","toNode":"APIError","toSide":"top"},
+		{"id":"token-make_request","fromNode":"TokenManager","fromSide":"top","toNode":"make_request","toSide":"left","fromEnd":"arrow","toEnd":"none","label":"토큰 갱신 시 사용"},
+		{"id":"prepare-validate","fromNode":"process_response","fromSide":"bottom","toNode":"get_access_token","toSide":"right","label":"토큰 검증"}
+	]
+}

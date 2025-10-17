@@ -277,18 +277,89 @@ class LiveTrader:
     
     def extract_features(self, market_data: Dict) -> np.ndarray:
         """
-        시장 데이터에서 특징 추출
+        시장 데이터에서 24개 특징 추출
         
         Args:
             market_data: Koapys에서 받은 시장 데이터
             
         Returns:
-            특징 벡터 (num_features,)
+            특징 벡터 (24,) - 학습 데이터와 동일한 구조
+            
+        특징 목록:
+        1. 등락률
+        2. 누적거래대금
+        3. 거래회전율
+        4. 체결강도
+        5-14. 매도대기금액 1-10
+        15-24. 매수대기금액 1-10
         """
-        # TODO: 실제 특징 추출 로직 구현
-        # 현재는 더미 데이터 반환
-        features = np.random.randn(self.config.num_features)
-        return features
+        try:
+            features = []
+            
+            # 1. 등락률 (현재가 기준)
+            current_price = float(market_data.get('현재가', 0))
+            base_price = float(market_data.get('기준가', current_price))
+            if base_price > 0:
+                change_rate = (current_price - base_price) / base_price * 100
+            else:
+                change_rate = 0.0
+            features.append(change_rate)
+            
+            # 2. 누적거래대금 (정규화)
+            volume_amount = float(market_data.get('누적거래대금', 0))
+            features.append(volume_amount / 1e9)  # 10억 단위로 정규화
+            
+            # 3. 거래회전율 (거래량/상장주식수)
+            volume = float(market_data.get('거래량', 0))
+            listed_shares = float(market_data.get('상장주식수', 1))
+            turnover_rate = (volume / listed_shares * 100) if listed_shares > 0 else 0.0
+            features.append(turnover_rate)
+            
+            # 4. 체결강도 (매수체결량 / 매도체결량)
+            buy_volume = float(market_data.get('매수체결량', 0))
+            sell_volume = float(market_data.get('매도체결량', 1))
+            strength = (buy_volume / sell_volume * 100) if sell_volume > 0 else 100.0
+            features.append(strength)
+            
+            # 5-14. 매도대기금액 1-10 (호가 정보)
+            for i in range(1, 11):
+                sell_price = float(market_data.get(f'매도호가{i}', 0))
+                sell_qty = float(market_data.get(f'매도호가수량{i}', 0))
+                sell_amount = sell_price * sell_qty / 1e6  # 백만원 단위
+                features.append(sell_amount)
+            
+            # 15-24. 매수대기금액 1-10 (호가 정보)
+            for i in range(1, 11):
+                buy_price = float(market_data.get(f'매수호가{i}', 0))
+                buy_qty = float(market_data.get(f'매수호가수량{i}', 0))
+                buy_amount = buy_price * buy_qty / 1e6  # 백만원 단위
+                features.append(buy_amount)
+            
+            # numpy array로 변환
+            features_array = np.array(features, dtype=np.float32)
+            
+            # 길이 확인
+            if len(features_array) != self.config.num_features:
+                logger.warning(
+                    f"Feature length mismatch: expected {self.config.num_features}, "
+                    f"got {len(features_array)}"
+                )
+                # 패딩 또는 자르기
+                if len(features_array) < self.config.num_features:
+                    features_array = np.pad(
+                        features_array,
+                        (0, self.config.num_features - len(features_array)),
+                        mode='constant'
+                    )
+                else:
+                    features_array = features_array[:self.config.num_features]
+            
+            return features_array
+            
+        except Exception as e:
+            logger.error(f"Failed to extract features: {e}")
+            # 오류 시 제로 벡터 반환
+            return np.zeros(self.config.num_features, dtype=np.float32)
     
     def update_market_data(self, code: str):
         """

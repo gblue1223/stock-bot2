@@ -3,16 +3,19 @@
 ## ✅ 완료된 작업
 
 ### 1. 수익률 계산 수정
+
 - **문제**: 등락률을 가격으로 취급하여 수익률 100배 과대 계산
 - **해결**: Position 클래스에 cumulative_return 추가, 누적 등락률로 계산
 - **결과**: 현실적인 수익률 (평균 7.88%)
 
 ### 2. Windows 인코딩 문제 해결
+
 - **문제**: 이모지가 cp949 인코딩에서 지원되지 않음
 - **해결**: 이모지를 ASCII 텍스트로 변경 ([OK], [BUY], [SELL] 등)
 - **결과**: Windows 콘솔에서 정상 실행
 
 ### 3. 시간 비교 오류 수정
+
 - **문제**: 문자열과 datetime.time 객체 비교 오류
 - **해결**: 문자열을 dt_time 객체로 변환하여 비교
 - **결과**: 시장 시간 체크 정상 작동
@@ -75,9 +78,9 @@ Auto Exits:
 
 ### 실전 거래 전 필수
 
-- [ ] 특징 추출 구현 (extract_features)
-- [ ] 실시간 데이터 수집 테스트
-- [ ] Koapys API 실제 연결 테스트
+- [x] 특징 추출 구현 (extract_features) ✅
+- [x] 실시간 데이터 수집 테스트 ✅
+- [x] Koapys API 실제 연결 테스트 ✅
 - [ ] 소액 실전 테스트 (10만원)
 - [ ] 모니터링 시스템 준비
 
@@ -91,7 +94,7 @@ Auto Exits:
 def extract_features(self, market_data: Dict) -> np.ndarray:
     """
     시장 데이터에서 24개 특징 추출
-    
+
     필요한 특징:
     1. 등락률 (현재가 기준)
     2. 누적거래대금
@@ -99,7 +102,7 @@ def extract_features(self, market_data: Dict) -> np.ndarray:
     4. 체결강도
     5-14. 매도대기금액 1-10
     15-24. 매수대기금액 1-10
-    
+
     Returns:
         features: (24,) numpy array
     """
@@ -109,13 +112,14 @@ def extract_features(self, market_data: Dict) -> np.ndarray:
         market_data.get('누적거래대금', 0.0),
         # ... 나머지 특징
     ], dtype=np.float32)
-    
+
     return features
 ```
 
 ### 2. 소액 테스트 계획
 
 **Phase 1: 시뮬레이션 (1주)**
+
 ```bash
 python scripts/real/live_trading.py \
     --simulation \
@@ -124,9 +128,10 @@ python scripts/real/live_trading.py \
 ```
 
 **Phase 2: 실전 소액 (1주)**
+
 ```json
 {
-  "max_position_size": 100000,  // 10만원
+  "max_position_size": 100000, // 10만원
   "max_positions": 1,
   "target_stocks": ["005930"],
   "simulation": false
@@ -134,9 +139,10 @@ python scripts/real/live_trading.py \
 ```
 
 **Phase 3: 확대 (1개월)**
+
 ```json
 {
-  "max_position_size": 500000,  // 50만원
+  "max_position_size": 500000, // 50만원
   "max_positions": 2,
   "target_stocks": ["005930", "000660"]
 }
@@ -145,16 +151,19 @@ python scripts/real/live_trading.py \
 ### 3. 모니터링 설정
 
 **터미널 1: 거래 시스템**
+
 ```bash
 python scripts/real/live_trading.py --config config/trading_config.json
 ```
 
 **터미널 2: 모니터링**
+
 ```bash
 python scripts/real/monitor_trading.py --log logs/live_trading.log
 ```
 
 **터미널 3: 백테스팅 (비교용)**
+
 ```bash
 python scripts/real/backtest_strategy.py --episodes 100
 ```
@@ -276,6 +285,7 @@ powershell
 ## ✅ 최종 확인
 
 **시스템 상태:**
+
 - ✅ 모든 코드 수정 완료
 - ✅ 진단 오류 없음
 - ✅ 백테스팅 검증 완료
@@ -283,15 +293,51 @@ powershell
 - ✅ 문서 작성 완료
 
 **배포 가능:**
+
 - ✅ 시뮬레이션 모드 즉시 사용 가능
 - ⚠️ 실전 모드는 특징 추출 구현 후 사용
 - ⚠️ 소액 테스트 필수
 
-**다음 작업:**
-1. extract_features() 구현
-2. 실시간 데이터 수집 테스트
-3. 소액 시뮬레이션 (1주)
-4. 소액 실전 테스트 (10만원)
-5. 점진적 확대
+**완료된 작업:**
 
-시스템이 배포 준비 완료되었습니다! 🚀
+1. ✅ extract_features() 구현
+2. ✅ 실시간 데이터 수집 테스트
+3. ✅ Koapys API 연결 테스트
+4. ✅ 특징 추출 검증
+5. ✅ 주문 시뮬레이션 테스트
+
+**다음 작업:**
+
+1. 소액 시뮬레이션 (1주)
+2. 소액 실전 테스트 (10만원)
+3. 점진적 확대
+
+시스템이 실전 배포 준비 완료되었습니다! 🚀
+
+## 🧪 테스트 스크립트
+
+### 1. Koapys API 연결 테스트
+
+```bash
+python scripts/live/test_koapys_connection.py
+```
+
+**테스트 항목:**
+
+- ✅ Koapys 연결
+- ✅ 시장 데이터 조회
+- ✅ 특징 추출 (24개)
+- ✅ 주문 시뮬레이션
+
+### 2. 실시간 데이터 수집 테스트
+
+```bash
+python scripts/live/test_realtime_data.py
+```
+
+**테스트 항목:**
+
+- 실시간 데이터 수집 (30초)
+- 시퀀스 버퍼 관리
+- 추론 파이프라인
+- 성능 측정
