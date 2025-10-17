@@ -46,4 +46,17 @@ print(res)
 - 인증 방식이 다를 경우(예: API Key 헤더, OAuth2 등) `KoapysSimple.__init__` 구현을 알맞게 수정하세요.
 
 ## 호환성(Compatibility) 안내
-- `koapys`의 이벤트 기반 실시간 데이터 및 조건검색 기능은 데스크톱 OpenAPI에 의존합니다. REST API는 일반적으로 폴링 또는 스트리밍 엔드포인트를 제공합니다. 문서를 통해 확인이 되는 즉시, 가능한 범위에서 호환 레이어(래퍼)를 추가할 수 있습니다.
+
+### 지원되는 기능
+- ✅ 계좌 조회: `get_deposit()`, `get_equity_balance()`, `get_equity_balance2()`
+- ✅ 시세 조회: `get_stock_basic_info()`, `get_current_price()`, `get_upper_limit_price()`
+- ✅ 주문: `send_order()`, `send_order_modify()`, `send_order_cancel()`
+- ✅ **조건검색**: `get_condition_load()`, `get_condition_name_list()`, `get_stocks_by_condition()` (ka10171, ka10173)
+- ✅ 한글 필드명: OpenAPI와 동일한 한글 키 이름 사용
+
+### 미지원 기능
+- ❌ **실시간 데이터**: 이벤트 기반 실시간 시세는 데스크톱 OpenAPI 전용
+  - REST API는 폴링 방식으로 구현해야 합니다
+- ⚠️ **계좌 목록**: `get_account_list()` 부분 지원 (시뮬레이션 모드만)
+
+자세한 내용은 `MIGRATION_NOTES.md`를 참고하세요.

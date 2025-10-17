@@ -605,3 +605,126 @@ class KoapyRestSimple:
         except Exception as e:
             self._logger.error(f"Failed to cancel order: {e}")
             raise
+
+    # --- Condition Search ---
+    def get_condition_load(self) -> bool:
+        """
+        조건검색 목록을 로드합니다.
+        
+        Note:
+            조건식 목록 조회는 WebSocket API (ka10171)를 사용해야 합니다.
+            WebSocketClient.condition_list_request_ka10171()를 사용하세요.
+            
+        Returns:
+            bool: 성공 시 True (항상 True 반환, 실제 조회는 WebSocket 사용)
+        """
+        if self._simulation:
+            return True
+        
+        self.ensure_connected()
+        
+        # 조건식 목록 조회는 WebSocket을 통해서만 가능
+        self._logger.warning(
+            "조건식 목록 조회는 WebSocket API를 사용하세요. "
+            "예제: kiwoom_rest_api/examples/condition_search_websocket_example.py"
+        )
+        return True
+
+    def get_condition_name_list(self):
+        """
+        조건검색 목록을 조회합니다.
+        
+        Note:
+            조건식 목록 조회는 WebSocket API (ka10171)를 사용해야 합니다.
+            WebSocketClient.condition_list_request_ka10171()를 사용하세요.
+        
+        Returns:
+            list: 빈 목록 (실제 조회는 WebSocket 사용)
+        """
+        if self._simulation:
+            return []
+        
+        self.ensure_connected()
+        
+        # 조건식 목록 조회는 WebSocket을 통해서만 가능
+        self._logger.warning(
+            "조건식 목록 조회는 WebSocket API를 사용하세요. "
+            "예제: kiwoom_rest_api/examples/condition_search_websocket_example.py"
+        )
+        return []
+
+    def get_stocks_by_condition(self, condition_name: str, listener: Optional[Callable[[Any], None]] = None):
+        """
+        조건검색으로 종목을 조회합니다.
+        
+        Args:
+            condition_name (str): 조건식 이름
+            listener (Optional[Callable]): 비동기 처리를 위한 리스너
+            
+        Note:
+            REST API ka10173을 사용하여 조건검색을 수행합니다.
+            조건식 목록은 get_condition_name_list()로 먼저 조회해야 합니다.
+            
+        Returns:
+            list or None: listener가 None이면 종목코드 리스트 반환,
+                         listener가 있으면 None 반환 (비동기)
+        """
+        if self._simulation:
+            data = []
+            if listener:
+                threading.Thread(target=listener, args=(data,), daemon=True).start()
+                return None
+            return data
+        
+        self.ensure_connected()
+        
+        try:
+            # 조건식 목록에서 해당 조건식의 인덱스를 찾습니다
+            condition_list = self.get_condition_name_list()
+            condition_index = None
+            
+            for index, name in condition_list:
+                if name == condition_name:
+                    condition_index = index
+                    break
+            
+            if condition_index is None:
+                self._logger.warning(f"조건식 '{condition_name}'을 찾을 수 없습니다.")
+                data = []
+                if listener:
+                    threading.Thread(target=listener, args=(data,), daemon=True).start()
+                    return None
+                return data
+            
+            # ka10173 API 호출
+            result = self._stock_info.condition_search_realtime_request_ka10173(
+                condition_index=condition_index,
+                condition_name=condition_name,
+                realtime_flag="1"  # 실시간 조회
+            )
+            
+            # 결과에서 종목코드 리스트 추출
+            # 실제 응답 구조에 맞게 수정 필요
+            if isinstance(result, dict):
+                # 예상되는 응답 형식에서 종목코드 추출
+                stock_codes = result.get("stock_codes", [])
+                # 또는 배열 형태로 온다면
+                if not stock_codes and "stocks" in result:
+                    stock_codes = [item.get("stk_cd", "") for item in result.get("stocks", [])]
+                
+                data = stock_codes
+            else:
+                data = []
+            
+            if listener:
+                threading.Thread(target=listener, args=(data,), daemon=True).start()
+                return None
+            return data
+            
+        except Exception as e:
+            self._logger.error(f"조건검색 중 오류 발생: {e}")
+            data = []
+            if listener:
+                threading.Thread(target=listener, args=(data,), daemon=True).start()
+                return None
+            return data

@@ -59,6 +59,11 @@ KoapyRestSimple(
 - `send_order_modify()` → `kt10002` (stock_modify_order_request)
 - `send_order_cancel()` → `kt10003` (stock_cancel_order_request)
 
+#### 조건검색
+- `get_condition_load()` → `ka10171` (condition_list_request) ✅ **지원**
+- `get_condition_name_list()` → `ka10171` (condition_list_request) ✅ **지원**
+- `get_stocks_by_condition()` → `ka10173` (condition_search_realtime_request) ✅ **지원**
+
 ### 5. 호가 타입 매핑
 `OrderBookType` enum이 Kiwoom REST API의 `trde_tp` 파라미터로 자동 매핑됩니다:
 - `LIMIT` → "0" (지정가)
@@ -72,12 +77,17 @@ KoapyRestSimple(
 - `get_account_list()`: 계좌 목록 조회가 아직 구현되지 않음
 - `get_stocks_of_upper_limit_reached()`: 상한가 도달 종목 조회가 아직 구현되지 않음
 
+**참고:**
+- 조건검색 기능은 `ka10172`, `ka10173` API를 통해 지원됩니다
+- HTS에서 미리 등록한 조건식을 사용할 수 있습니다
+
 ### 2. 주문 수정/취소 시 종목코드
 `send_order_modify()`와 `send_order_cancel()`에서 종목코드(`stk_cd`)를 빈 문자열로 전달합니다.
 실제 API가 종목코드를 필수로 요구한다면, 주문 정보를 따로 저장해서 사용해야 할 수 있습니다.
 
 ## 사용 예시
 
+### 기본 사용법
 기존 코드는 그대로 사용 가능합니다:
 
 ```python
@@ -92,6 +102,30 @@ client = KoapyRestSimple(
 client.ensure_connected()
 balance = client.get_equity_balance(account_no="1234567890")
 price = client.get_current_price(code="005930")
+```
+
+### 조건검색 사용 예시
+```python
+from koapys import KoapyRestSimple
+
+client = KoapyRestSimple(simulation=False)
+client.ensure_connected()
+
+# 1. 조건식 목록 로드
+if client.get_condition_load():
+    print("조건식 목록 로드 성공")
+
+# 2. 조건식 목록 조회
+conditions = client.get_condition_name_list()
+print("등록된 조건식:", conditions)
+# 예: [('000', '상승추세종목'), ('001', '거래량급증'), ...]
+
+# 3. 조건검색 실행
+if conditions:
+    condition_name = conditions[0][1]  # 첫 번째 조건식 이름
+    stocks = client.get_stocks_by_condition(condition_name)
+    print(f"'{condition_name}' 조건에 맞는 종목:", stocks)
+    # 예: ['005930', '000660', '035420', ...]
 ```
 
 ## 환경 변수 설정

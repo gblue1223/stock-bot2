@@ -170,6 +170,107 @@ class WebSocketClient:
         await self.send(unregister_data)
         logger.info("실시간 데이터 해지")
 
+    async def condition_list_request_ka10171(
+        self,
+    ) -> None:
+        """
+        조건식 목록 조회
+        
+        API ID: ka10171
+        
+        Note:
+            사용자가 HTS에서 등록한 조건검색 목록을 조회합니다.
+            응답은 on_data 콜백을 통해 수신됩니다.
+            
+        Returns:
+            None (응답은 on_data 콜백으로 수신)
+            
+        Response Format (via on_data callback):
+            {
+                "trnm": "CNSLIST",
+                "return_code": 0,
+                "return_msg": "성공",
+                "data": [
+                    {
+                        "cond_idx": "000",
+                        "cond_nm": "상승추세종목"
+                    },
+                    {
+                        "cond_idx": "001",
+                        "cond_nm": "거래량급증"
+                    }
+                ]
+            }
+            
+        Example:
+            >>> client = WebSocketClient(access_token=token)
+            >>> await client.start()
+            >>> await client.condition_list_request_ka10171()
+        """
+        list_request_data = {
+            'trnm': 'CNSRLST'
+        }
+        
+        await self.send(list_request_data)
+        logger.info("조건식 목록 조회 요청")
+
+    async def register_condition_search_ka10173(
+        self,
+        condition_index: str,
+        condition_name: str,
+        group_no: str = "1",
+        refresh: str = "1"
+    ) -> None:
+        """
+        조건검색 실시간 등록
+        
+        Args:
+            condition_index: 조건식 인덱스 (예: "000", "001")
+            condition_name: 조건식 이름
+            group_no: 그룹 번호
+            refresh: 기존등록유지여부 (0: 기존유지안함, 1: 기존유지)
+        """
+        register_data = {
+            'trnm': 'CNSRREQ',  # 조건검색 등록
+            'grp_no': group_no,
+            'refresh': refresh,
+            'data': [{
+                'cond_idx': condition_index,
+                'cond_nm': condition_name,
+                'rtime_flg': '1'  # 실시간 조회
+            }]
+        }
+        
+        await self.send(register_data)
+        logger.info(f"조건검색 실시간 등록: [{condition_index}] {condition_name}")
+
+    async def unregister_condition_search_ka10174(
+        self,
+        condition_index: str = None,
+        group_no: str = "1"
+    ) -> None:
+        """
+        조건검색 실시간 해지
+        
+        Args:
+            condition_index: 조건식 인덱스 (None이면 그룹 전체 해지)
+            group_no: 그룹 번호
+        """
+        if condition_index:
+            unregister_data = {
+                'trnm': 'COND_REMOVE',
+                'grp_no': group_no,
+                'cond_idx': condition_index
+            }
+        else:
+            unregister_data = {
+                'trnm': 'COND_REMOVE_ALL',
+                'grp_no': group_no
+            }
+        
+        await self.send(unregister_data)
+        logger.info(f"조건검색 실시간 해지: {condition_index or '전체'}")
+
     async def _handle_message(self, message: str) -> None:
         """메시지 처리"""
         try:
