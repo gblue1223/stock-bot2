@@ -30,6 +30,10 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+# 상세 디버깅이 필요한 경우 아래 주석 해제
+# logging.getLogger('kiwoom_rest_api.websocket').setLevel(logging.DEBUG)
+# logging.getLogger('websockets').setLevel(logging.DEBUG)
+
 async def example_condition_search_realtime():
     """조건검색 실시간 WebSocket 예제"""
     print("=== 조건검색 실시간 WebSocket 예제 ===")
@@ -54,15 +58,17 @@ async def example_condition_search_realtime():
         nonlocal selected_condition
         
         # 1. 조건식 목록 응답
-        if realtime_data.trnm == 'CNSLIST':
+        if realtime_data.trnm == 'CNSRLST':
             print(f"\n✓ 조건식 목록 수신")
             if realtime_data.return_code == 0:
                 condition_list.clear()
+                # 데이터 형식: [['0', 'koa-시가베팅'], ['1', 'koa-관종-3%이상'], ...]
                 for item in realtime_data.data:
-                    cond_idx = item.get('cond_idx', '')
-                    cond_nm = item.get('cond_nm', '')
-                    condition_list.append({'cond_idx': cond_idx, 'cond_nm': cond_nm})
-                    print(f"  [{cond_idx}] {cond_nm}")
+                    if isinstance(item, list) and len(item) >= 2:
+                        cond_idx = item[0]
+                        cond_nm = item[1]
+                        condition_list.append({'cond_idx': cond_idx, 'cond_nm': cond_nm})
+                        print(f"  [{cond_idx}] {cond_nm}")
                 
                 if condition_list:
                     # 첫 번째 조건식 선택
@@ -177,15 +183,17 @@ async def example_multiple_condition_search():
     async def on_data_received(realtime_data: RealTimeData):
         """실시간 데이터 수신"""
         # 조건식 목록 응답
-        if realtime_data.trnm == 'CNSLIST':
+        if realtime_data.trnm == 'CNSRLST':
             print(f"\n✓ 조건식 목록 수신")
             if realtime_data.return_code == 0:
                 condition_list.clear()
+                # 데이터 형식: [['0', 'koa-시가베팅'], ['1', 'koa-관종-3%이상'], ...]
                 for item in realtime_data.data:
-                    cond_idx = item.get('cond_idx', '')
-                    cond_nm = item.get('cond_nm', '')
-                    condition_list.append({'cond_idx': cond_idx, 'cond_nm': cond_nm})
-                    print(f"  [{cond_idx}] {cond_nm}")
+                    if isinstance(item, list) and len(item) >= 2:
+                        cond_idx = item[0]
+                        cond_nm = item[1]
+                        condition_list.append({'cond_idx': cond_idx, 'cond_nm': cond_nm})
+                        print(f"  [{cond_idx}] {cond_nm}")
                 
                 if len(condition_list) < 2:
                     print("\n⚠️ 2개 이상의 조건식이 필요합니다.")

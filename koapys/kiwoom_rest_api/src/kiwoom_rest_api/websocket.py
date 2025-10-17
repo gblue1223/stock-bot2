@@ -71,7 +71,11 @@ class WebSocketClient:
     async def connect(self) -> None:
         """웹소켓 서버에 연결"""
         try:
-            logger.info(f"웹소켓 서버에 연결 중: {self.ws_url}")
+            if self.access_token:
+                logger.info(f"웹소켓 서버에 연결 중 (토큰 길이: {len(self.access_token)}): {self.ws_url}")
+            else:
+                logger.info(f"웹소켓 서버에 연결 중: {self.ws_url}")
+            
             self.websocket = await websockets.connect(
                 self.ws_url,
                 ping_interval=self.ping_interval,
@@ -91,7 +95,11 @@ class WebSocketClient:
             raise WebSocketError(f"연결 실패: {e}")
 
     async def login(self) -> None:
-        """웹소켓 서버에 로그인"""
+        """웹소켓 서버에 로그인
+        
+        Note:
+            액세스 토큰은 LOGIN 메시지의 'token' 필드로 전송됩니다.
+        """
         if not self.connected:
             await self.connect()
             
@@ -101,9 +109,9 @@ class WebSocketClient:
         }
         
         await self.send(login_data)
-        logger.info("로그인 요청 전송")
+        logger.info(f"로그인 메시지 전송 (토큰 길이: {len(self.access_token) if self.access_token else 0})")
 
-    async def send(self, message: Union[Dict[str, Any], str]) -> None:
+    async def send(self, message: Union[str, dict]) -> None:
         """메시지 전송"""
         if not self.connected:
             if self.auto_reconnect:
@@ -118,7 +126,7 @@ class WebSocketClient:
                 message_str = message
                 
             await self.websocket.send(message_str)
-            logger.debug(f"메시지 전송: {message_str}")
+            logger.debug(f"송신: {message_str[:100]}...")
             
         except Exception as e:
             logger.error(f"메시지 전송 실패: {e}")
@@ -187,7 +195,7 @@ class WebSocketClient:
             
         Response Format (via on_data callback):
             {
-                "trnm": "CNSLIST",
+                "trnm": "CNSRLST",
                 "return_code": 0,
                 "return_msg": "성공",
                 "data": [
@@ -218,8 +226,6 @@ class WebSocketClient:
         self,
         condition_index: str,
         condition_name: str,
-        group_no: str = "1",
-        refresh: str = "1"
     ) -> None:
         """
         조건검색 실시간 등록
@@ -232,13 +238,11 @@ class WebSocketClient:
         """
         register_data = {
             'trnm': 'CNSRREQ',  # 조건검색 등록
-            'grp_no': group_no,
-            'refresh': refresh,
-            'data': [{
-                'cond_idx': condition_index,
-                'cond_nm': condition_name,
-                'rtime_flg': '1'  # 실시간 조회
-            }]
+            "seq" : condition_index,# 조건검색식 일련번호
+            "search_type" : "0",    # 0:조건검색 
+            "stex_tp" : "K",        # K:KRX
+            "cont_yn" : "N",        # 연속조회여부 (Y:연속조회, N:단순조회)
+            "next_key" : ""         # 연속조회키 (연속조회여부가 'Y'인 경우 필수 세팅)
         }
         
         await self.send(register_data)
@@ -278,6 +282,7 @@ class WebSocketClient:
             realtime_data = RealTimeData(data)
             
             trnm = realtime_data.trnm
+            logger.debug(f"수신: trnm={trnm}, return_code={realtime_data.return_code}")
             
             if trnm == 'LOGIN':
                 if realtime_data.return_code == 0:
@@ -298,22 +303,24 @@ class WebSocketClient:
                 
             elif trnm == 'REAL':
                 # 실시간 데이터 수신
-                logger.debug(f"실시간 데이터 수신: {data}")
+                logger.debug(f"실시간 데이터 수신, data 항목 수: {len(realtime_data.data)}")
                 if self.on_data:
                     await self.on_data(realtime_data)
                     
             else:
-                # 기타 응답
-                logger.debug(f"기타 응답 수신: {data}")
+                # 기타 응답 (조건식 목록, 조건검색 응답 등)
+                logger.debug(f"응답 수신 - trnm: {trnm}, data 항목 수: {len(realtime_data.data)}")
                 if self.on_data:
                     await self.on_data(realtime_data)
+                else:
+                    logger.warning(f"on_data 콜백이 설정되지 않았습니다!")
                     
         except json.JSONDecodeError as e:
-            logger.error(f"JSON 파싱 오류: {e}")
+            logger.error(f"JSON 파싱 오류: {e}, 메시지: {message[:200]}")
             if self.on_error:
                 await self.on_error(e)
         except Exception as e:
-            logger.error(f"메시지 처리 오류: {e}")
+            logger.error(f"메시지 처리 오류: {e}", exc_info=True)
             if self.on_error:
                 await self.on_error(e)
 
