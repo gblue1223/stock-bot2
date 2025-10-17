@@ -84,7 +84,7 @@ class KoapyRestSimple:
         self.ensure_connected()
         # Note: Account list API may need to be implemented in kiwoom_rest_api
         # For now, return a placeholder or raise NotImplementedError
-        self._logger.warning("get_account_list not yet implemented with kiwoom_rest_api")
+        self._logger.warning("kiwoom_rest_api not support")
         return []
 
     def get_deposit(self, account_no: str) -> Dict[str, Any]:
@@ -101,7 +101,87 @@ class KoapyRestSimple:
         try:
             # Use kt00001 - deposit_detail_status_request
             result = self._account.deposit_detail_status_request_kt00001(qry_tp="0")
-            return result
+            
+            # Element 이름을 한글명으로 변환
+            element_to_korean = {
+                "entr": "예수금",
+                "profa_ch": "주식증거금현금",
+                "bncr_profa_ch": "수익증권증거금현금",
+                "nxdy_bncr_sell_exct": "익일수익증권매도정산대금",
+                "fc_stk_krw_repl_set_amt": "해외주식원화대용설정금",
+                "crd_grnta_ch": "신용보증금현금",
+                "crd_grnt_ch": "신용담보금현금",
+                "add_grnt_ch": "추가담보금현금",
+                "etc_profa": "기타증거금",
+                "uncl_stk_amt": "미수확보금",
+                "shrts_prica": "공매도대금",
+                "crd_set_grnta": "신용설정평가금",
+                "chck_ina_amt": "수표입금액",
+                "etc_chck_ina_amt": "기타수표입금액",
+                "crd_grnt_ruse": "신용담보재사용",
+                "knx_asset_evltv": "코넥스기본예탁금",
+                "elwdpst_evlta": "ELW예탁평가금",
+                "crd_ls_rght_frcs_amt": "신용대주권리예정금액",
+                "lvlh_join_amt": "생계형가입금액",
+                "lvlh_trns_alowa": "생계형입금가능금액",
+                "repl_amt": "대용금평가금액(합계)",
+                "remn_repl_evlta": "잔고대용평가금액",
+                "trst_remn_repl_evlta": "위탁대용잔고평가금액",
+                "bncr_remn_repl_evlta": "수익증권대용평가금액",
+                "profa_repl": "위탁증거금대용",
+                "crd_grnta_repl": "신용보증금대용",
+                "crd_grnt_repl": "신용담보금대용",
+                "add_grnt_repl": "추가담보금대용",
+                "rght_repl_amt": "권리대용금",
+                "pymn_alow_amt": "출금가능금액",
+                "wrap_pymn_alow_amt": "랩출금가능금액",
+                "ord_alow_amt": "주문가능금액",
+                "bncr_buy_alowa": "수익증권매수가능금액",
+                "20stk_ord_alow_amt": "20%종목주문가능금액",
+                "30stk_ord_alow_amt": "30%종목주문가능금액",
+                "40stk_ord_alow_amt": "40%종목주문가능금액",
+                "100stk_ord_alow_amt": "100%종목주문가능금액",
+                "ch_uncla": "현금미수금",
+                "ch_uncla_dlfe": "현금미수연체료",
+                "ch_uncla_tot": "현금미수금합계",
+                "crd_int_npay": "신용이자미납",
+                "int_npay_amt_dlfe": "신용이자미납연체료",
+                "int_npay_amt_tot": "신용이자미납합계",
+                "etc_loana": "기타대여금",
+                "etc_loana_dlfe": "기타대여금연체료",
+                "etc_loan_tot": "기타대여금합계",
+                "nrpy_loan": "미상환융자금",
+                "loan_sum": "융자금합계",
+                "ls_sum": "대주금합계",
+                "crd_grnt_rt": "신용담보비율",
+                "mdstrm_usfe": "중도이용료",
+                "min_ord_alow_yn": "최소주문가능금액",
+                "loan_remn_evlt_amt": "대출총평가금액",
+                "dpst_grntl_remn": "예탁담보대출잔고",
+                "sell_grntl_remn": "매도담보대출잔고",
+                "d1_entra": "d+1추정예수금",
+                "d1_slby_exct_amt": "d+1매도매수정산금",
+                "d1_buy_exct_amt": "d+1매수정산금",
+                "d1_out_rep_mor": "d+1미수변제소요금",
+                "d1_sel_exct_amt": "d+1매도정산금",
+                "d1_pymn_alow_amt": "d+1출금가능금액",
+                "d2_entra": "d+2추정예수금",
+                "d2_slby_exct_amt": "d+2매도매수정산금",
+                "d2_buy_exct_amt": "d+2매수정산금",
+                "d2_out_rep_mor": "d+2미수변제소요금",
+                "d2_sel_exct_amt": "d+2매도정산금",
+                "d2_pymn_alow_amt": "d+2출금가능금액",
+                "50stk_ord_alow_amt": "50%종목주문가능금액",
+                "60stk_ord_alow_amt": "60%종목주문가능금액",
+            }
+            
+            # 변환된 결과 생성
+            converted_result = {}
+            for key, value in result.items():
+                korean_key = element_to_korean.get(key, key)
+                converted_result[korean_key] = value
+            
+            return converted_result
         except Exception as e:
             self._logger.error(f"Failed to get deposit: {e}")
             raise
@@ -122,11 +202,69 @@ class KoapyRestSimple:
                 qry_tp="0",  # Query type
                 dmst_stex_tp="KRX"  # Domestic stock exchange type
             )
-            # Normalize shape to { total: dict, stocks: list }
+            
+            # Element 이름을 한글명으로 변환
+            total_element_to_korean = {
+                "acnt_nm": "계좌명",
+                "brch_nm": "지점명",
+                "entr": "예수금",
+                "d2_entra": "D+2추정예수금",
+                "tot_est_amt": "유가잔고평가액",
+                "aset_evlt_amt": "예탁자산평가액",
+                "tot_pur_amt": "총매입금액",
+                "prsm_dpst_aset_amt": "추정예탁자산",
+                "tot_grnt_sella": "매도담보대출금",
+                "tdy_lspft_amt": "당일투자원금",
+                "invt_bsamt": "당월투자원금",
+                "lspft_amt": "누적투자원금",
+                "tdy_lspft": "당일투자손익",
+                "lspft2": "당월투자손익",
+                "lspft": "누적투자손익",
+                "tdy_lspft_rt": "당일손익율",
+                "lspft_ratio": "당월손익율",
+                "lspft_rt": "누적손익율",
+            }
+            
+            stock_element_to_korean = {
+                "stk_cd": "종목코드",
+                "stk_nm": "종목명",
+                "rmnd_qty": "보유수량",
+                "avg_prc": "평균단가",
+                "cur_prc": "현재가",
+                "evlt_amt": "평가금액",
+                "pl_amt": "손익금액",
+                "pl_rt": "손익율",
+                "loan_dt": "대출일",
+                "pur_amt": "매입금액",
+                "setl_remn": "결제잔고",
+                "pred_buyq": "전일매수수량",
+                "pred_sellq": "전일매도수량",
+                "tdy_buyq": "금일매수수량",
+                "tdy_sellq": "금일매도수량",
+            }
+            
+            # 변환된 결과 생성
             if isinstance(result, dict):
+                # total 정보 변환
+                total = {}
+                for key, value in result.items():
+                    if key not in ["stk_acnt_evlt_prst", "return_code", "return_msg"]:
+                        korean_key = total_element_to_korean.get(key, key)
+                        total[korean_key] = value
+                
+                # stocks 정보 변환
+                stocks = []
+                stock_list = result.get("stk_acnt_evlt_prst", [])
+                for stock in stock_list:
+                    converted_stock = {}
+                    for key, value in stock.items():
+                        korean_key = stock_element_to_korean.get(key, key)
+                        converted_stock[korean_key] = value
+                    stocks.append(converted_stock)
+                
                 return {
-                    "total": result.get("summary", result.get("total", {})),
-                    "stocks": result.get("items", result.get("stocks", []))
+                    "total": total,
+                    "stocks": stocks
                 }
             return {"total": {}, "stocks": []}
         except Exception as e:
@@ -140,7 +278,75 @@ class KoapyRestSimple:
         try:
             # Use kt00005 - filled_position_request for detailed balance
             result = self._account.filled_position_request_kt00005(dmst_stex_tp="KRX")
-            return result
+            
+            # Element 이름을 한글명으로 변환
+            total_element_to_korean = {
+                "entr": "예수금",
+                "entr_d1": "예수금D+1",
+                "entr_d2": "예수금D+2",
+                "pymn_alow_amt": "출금가능금액",
+                "uncl_stk_amt": "미수확보금",
+                "repl_amt": "대용금",
+                "rght_repl_amt": "권리대용금",
+                "ord_alowa": "주문가능현금",
+                "ch_uncla": "현금미수금",
+                "crd_int_npay_gold": "신용이자미납금",
+                "etc_loana": "기타대여금",
+                "nrpy_loan": "미상환융자금",
+                "profa_ch": "증거금현금",
+                "repl_profa": "증거금대용",
+                "stk_buy_tot_amt": "주식매수총액",
+                "evlt_amt_tot": "평가금액합계",
+                "tot_pl_tot": "총손익합계",
+                "tot_pl_rt": "총손익률",
+                "tot_re_buy_alowa": "총재매수가능금액",
+                "20ord_alow_amt": "20%주문가능금액",
+                "30ord_alow_amt": "30%주문가능금액",
+                "40ord_alow_amt": "40%주문가능금액",
+                "50ord_alow_amt": "50%주문가능금액",
+                "60ord_alow_amt": "60%주문가능금액",
+                "100ord_alow_amt": "100%주문가능금액",
+                "crd_loan_tot": "신용융자합계",
+                "crd_loan_ls_tot": "신용융자대주합계",
+                "crd_grnt_rt": "신용담보비율",
+                "dpst_grnt_use_amt_amt": "예탁담보대출금액",
+                "grnt_loan_amt": "매도담보대출금액",
+            }
+            
+            stock_element_to_korean = {
+                "crd_tp": "신용구분",
+                "loan_dt": "대출일",
+                "expr_dt": "만기일",
+                "stk_cd": "종목번호",
+                "stk_nm": "종목명",
+                "setl_remn": "결제잔고",
+                "cur_qty": "현재잔고",
+                "cur_prc": "현재가",
+                "buy_uv": "매입단가",
+                "pur_amt": "매입금액",
+                "evlt_amt": "평가금액",
+                "evltv_prft": "평가손익",
+                "pl_rt": "손익률",
+            }
+            
+            # 변환된 결과 생성
+            converted_result = {}
+            for key, value in result.items():
+                if key == "stk_cntr_remn":
+                    # 종목별 체결잔고 배열 변환
+                    converted_stocks = []
+                    for stock in value:
+                        converted_stock = {}
+                        for stock_key, stock_value in stock.items():
+                            korean_key = stock_element_to_korean.get(stock_key, stock_key)
+                            converted_stock[korean_key] = stock_value
+                        converted_stocks.append(converted_stock)
+                    converted_result["종목별체결잔고"] = converted_stocks
+                else:
+                    korean_key = total_element_to_korean.get(key, key)
+                    converted_result[korean_key] = value
+            
+            return converted_result
         except Exception as e:
             self._logger.error(f"Failed to get equity balance2: {e}")
             raise
@@ -166,7 +372,80 @@ class KoapyRestSimple:
         try:
             # Use ka10001 - basic_stock_information_request
             result = self._stock_info.basic_stock_information_request_ka10001(stock_code=code)
-            data = result if isinstance(result, dict) else {}
+            
+            # Element 이름을 한글명으로 변환
+            # OpenAPI의 "주식기본정보요청" (opt10001)과 동일한 필드명 사용
+            element_to_korean = {
+                # 기본 정보
+                "stk_cd": "종목코드",
+                "stk_nm": "종목명",
+                "base_pric": "기준가",
+                "cur_prc": "현재가",
+                "open_pric": "시가",
+                "high_pric": "고가",
+                "low_pric": "저가",
+                "upl_pric": "상한가",
+                "lst_pric": "하한가",
+                "trde_qty": "거래량",
+                "trde_pre": "거래대금",
+                
+                # 등락 정보
+                "pre_sig": "전일대비기호",
+                "pred_pre": "전일대비",
+                "flu_rt": "등락율",
+                
+                # 52주/250일 고저가
+                "oyr_hgst": "52주최고가",
+                "oyr_lwst": "52주최저가",
+                "250hgst": "250일최고가",
+                "250lwst": "250일최저가",
+                "250hgst_pric_dt": "250일최고가일자",
+                "250hgst_pric_pre_rt": "250일최고가대비율",
+                "250lwst_pric_dt": "250일최저가일자",
+                "250lwst_pric_pre_rt": "250일최저가대비율",
+                
+                # 시장 정보
+                "mac": "시가총액",
+                "mac_wght": "시가총액비중",
+                "for_exh_rt": "외국인소진율",
+                "flo_stk": "유통주식",
+                "dstr_stk": "배당주식수",
+                "dstr_rt": "배당율",
+                
+                # 재무 정보
+                "fav": "액면가",
+                "fav_unit": "액면가단위",
+                "cap": "자본금",
+                "sale_amt": "매출액",
+                "bus_pro": "영업이익",
+                "cup_nga": "당기순이익",
+                "crd_rt": "신용비율",
+                
+                # 투자지표
+                "per": "PER",
+                "pbr": "PBR",
+                "eps": "EPS",
+                "bps": "BPS",
+                "roe": "ROE",
+                "ev": "EV",
+                
+                # 예상 체결
+                "exp_cntr_pric": "예상체결가",
+                "exp_cntr_qty": "예상체결량",
+                
+                # 기타
+                "setl_mm": "결제월",
+                "repl_pric": "대용가",
+            }
+            
+            # 변환된 결과 생성
+            converted_data = {}
+            if isinstance(result, dict):
+                for key, value in result.items():
+                    korean_key = element_to_korean.get(key, key)
+                    converted_data[korean_key] = value
+            
+            data = converted_data if converted_data else {}
             if listener:
                 threading.Thread(target=listener, args=(data,), daemon=True).start()
                 return None
@@ -182,7 +461,8 @@ class KoapyRestSimple:
         data = self.get_stock_basic_info(code, listener=None)
         if not data:
             return -1
-        price = data.get("상한가") or data.get("upperLimit") or data.get("upper_limit") or data.get("uplmt_prc")
+        # get_stock_basic_info가 이미 한글명으로 변환하므로 한글 키로 조회
+        price = data.get("상한가")
         try:
             return int(str(price).replace(",", ""))
         except Exception:
@@ -194,13 +474,18 @@ class KoapyRestSimple:
         self.ensure_connected()
         try:
             data = self.get_stock_basic_info(code)
-            price = data.get("현재가") or data.get("price") or data.get("current_price") or data.get("cur_prc")
+            # get_stock_basic_info가 이미 한글명으로 변환하므로 한글 키로 조회
+            price = data.get("현재가")
             return int(str(price).replace(",", "")) if price is not None else -1
         except Exception as e:
             self._logger.error(f"Failed to get current price: {e}")
             return -1
 
     def get_stocks_of_upper_limit_reached(self, listener: Optional[Callable[[Dict[str, Any]], None]] = None):
+        """
+        전일 상한가 종목들
+        :param listener: 데이터를 처리할 리스너 None 이라면 동기식(블러킹)으로 처리
+        """
         if self._simulation:
             data = []
             if listener:

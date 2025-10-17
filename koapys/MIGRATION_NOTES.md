@@ -14,7 +14,22 @@
   - `Account`: 계좌 정보 조회
   - `Order`: 주문 처리
 
-### 2. 생성자 파라미터 추가
+### 2. 응답 데이터 한글화
+- 모든 API 응답의 Element 이름을 한글명으로 자동 변환
+- 기존 OpenAPI와 동일한 키 이름 사용으로 호환성 유지
+- 변환 대상 메서드:
+  - `get_deposit()`: 70+ 필드 변환
+  - `get_equity_balance()`: total 및 stocks 배열 변환
+  - `get_equity_balance2()`: 종목별체결잔고 포함 변환
+  - `get_stock_basic_info()`: 주식 기본 정보 변환
+- 예시:
+  - `entr` → `예수금`
+  - `cur_prc` → `현재가`
+  - `stk_nm` → `종목명`
+  - `pymn_alow_amt` → `출금가능금액`
+  - `tot_pur_amt` → `총매입금액`
+
+### 3. 생성자 파라미터
 ```python
 KoapyRestSimple(
     timeout: int = 10,
@@ -23,7 +38,7 @@ KoapyRestSimple(
 )
 ```
 
-### 3. API 매핑
+### 4. API 매핑
 
 #### 계좌 관련
 - `get_deposit()` → `kt00001` (deposit_detail_status_request)
@@ -44,7 +59,7 @@ KoapyRestSimple(
 - `send_order_modify()` → `kt10002` (stock_modify_order_request)
 - `send_order_cancel()` → `kt10003` (stock_cancel_order_request)
 
-### 4. 호가 타입 매핑
+### 5. 호가 타입 매핑
 `OrderBookType` enum이 Kiwoom REST API의 `trde_tp` 파라미터로 자동 매핑됩니다:
 - `LIMIT` → "0" (지정가)
 - `MARKET` → "3" (시장가)
