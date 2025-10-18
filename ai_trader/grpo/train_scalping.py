@@ -22,8 +22,8 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from ai_trader.grpo.grpo import GRPOTrainer
-from ai_trader.grpo.environments import GRPOScalpingEnv, NormalizedFeatureEnv, DirectFeatureEnv
-from ai_trader.grpo.policies import GRPOPolicy, NormalizedFeaturePolicy, DirectFeaturePolicy
+from ai_trader.grpo.environments import GRPOScalpingEnv, DirectFeatureEnv
+from ai_trader.grpo.policies import GRPOPolicy, DirectFeaturePolicy
 
 # 로깅 설정
 logging.basicConfig(
@@ -62,7 +62,7 @@ def create_environment(args, device):
             raise ValueError("--embedding_model is required for scalping environment")
         
         logger.info(f"Loading embedding model from {args.embedding_model}...")
-        from ai_trader.embedding.masked_autoencoder import MaskedAutoEncoder
+        from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
         
         embedding_model = MaskedAutoEncoder(
             input_dim=args.features,
@@ -94,14 +94,7 @@ def create_environment(args, device):
 
 def create_policy(args, env, device):
     """정책 생성"""
-    if args.policy == 'normalized':
-        logger.info("Creating NormalizedFeaturePolicy...")
-        policy = NormalizedFeaturePolicy(
-            feature_dim=env.feature_dim,
-            hidden_dim=args.hidden_dim,
-            action_dim=args.action_dim
-        )
-    elif args.policy == 'direct':
+    if args.policy == 'direct':
         logger.info("Creating DirectFeaturePolicy...")
         input_dim = env.observation_space.shape[0]
         policy = DirectFeaturePolicy(

@@ -14,7 +14,7 @@ import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 
-from .env import GRPOScalpingEnv
+from .environments import GRPOScalpingEnv
 
 logger = logging.getLogger(__name__)
 

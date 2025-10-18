@@ -23,7 +23,7 @@ load_dotenv()
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from ai_trader.grpo.train_grpo import create_environment, create_policy
+from ai_trader.grpo.train_scalping import create_environment, create_policy
 from ai_trader.grpo.grpo import GRPOTrainer
 
 # 로깅 설정
@@ -43,7 +43,7 @@ def main():
     
     # 경로 설정
     embedding_model_path = r"C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt"
-    db_path = r"C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
+    db_file_path = r"C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
     output_dir = "models/grpo_scalping"
     
     # 경로 확인
@@ -52,8 +52,8 @@ def main():
         logger.error(f"❌ Embedding model not found: {embedding_model_path}")
         return False
     
-    if not os.path.exists(db_path):
-        logger.error(f"❌ Database not found: {db_path}")
+    if not os.path.exists(db_file_path):
+        logger.error(f"❌ Database not found: {db_file_path}")
         return False
     
     logger.info("✅ All files found")
@@ -70,7 +70,7 @@ def main():
         class Args:
             env = 'scalping'
             policy = 'grpo'
-            db_path = db_path
+            db_path = db_file_path
             table_name = 'datasets'
             seq_len = 60
             features = 28
