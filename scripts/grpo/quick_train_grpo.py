@@ -74,11 +74,11 @@ def main():
             table_name = 'datasets'
             seq_len = 60
             features = 28
-            episode_steps = 1000
+            episode_steps = 200              # 🔧 1000 → 200 (짧은 에피소드)
             embedding_model = embedding_model_path
             embedding_dim = 128
             quick_exit_mode = 'penalty_only'
-            hidden_dim = 64
+            hidden_dim = 128                 # 🔧 64 → 128 (더 큰 정책)
             action_dim = 3
         
         args = Args()
@@ -101,15 +101,15 @@ def main():
         trainer = GRPOTrainer(
             policy=policy,
             env=env,
-            episodes_per_group=4,        # 3 → 4 (더 안정적)
-            num_groups=3,                # 2 → 3 (더 세밀한 그룹화)
-            learning_rate=0.0005,        # 0.001 → 0.0005 (안정적 학습)
-            gamma=0.95,                  # 0.9 → 0.95 (중기 보상 고려)
-            clip_epsilon=0.2,            # 0.4 → 0.2 (보수적 업데이트)
-            kl_target=0.01,              # 0.03 → 0.01 (안정적 KL)
-            entropy_coef=0.02,           # 0.05 → 0.02 (적절한 탐험)
-            value_coef=0.5,              # 0.2 → 0.5 (가치 함수 중시)
-            max_grad_norm=0.5,           # 1.5 → 0.5 (안정적 그래디언트)
+            episodes_per_group=8,        # 🔧 4 → 8 (더 많은 샘플)
+            num_groups=3,                # 더 세밀한 그룹화
+            learning_rate=0.001,         # 🔧 0.0005 → 0.001 (빠른 학습)
+            gamma=0.98,                  # 🔧 0.95 → 0.98 (장기 보상 중시)
+            clip_epsilon=0.2,            # PPO 표준값
+            kl_target=0.01,              # 안정적 KL
+            entropy_coef=0.1,            # 🔧 0.02 → 0.1 (더 많은 탐험!)
+            value_coef=0.5,              # 가치 함수 중시
+            max_grad_norm=0.5,           # 안정적 그래디언트
             device=device,
             tensorboard_log_dir=tensorboard_dir
         )
@@ -120,22 +120,23 @@ def main():
         logger.info("🔥 Starting OPTIMIZED training...")
         logger.info("=" * 60)
         
-        # 더 많은 에피소드로 안정적 학습
-        total_timesteps = 5000           # 3000 → 5000 (더 충분한 학습)
-        episodes_per_iteration = 4 * 3   # 12 episodes per iteration
-        total_episodes = (total_timesteps // 50) * episodes_per_iteration  # 더 많은 에피소드
-        checkpoint_interval = 5          # 10 → 5 (더 자주 저장)
+        # 🔧 더 많은 에피소드로 충분한 학습
+        total_timesteps = 20000          # 🔧 5000 → 20000 (충분한 학습)
+        episodes_per_iteration = 8 * 3   # 🔧 24 episodes per iteration
+        total_episodes = (total_timesteps // 50) * episodes_per_iteration
+        checkpoint_interval = 10         # 10 iterations마다 저장
         
-        logger.info(f"📊 OPTIMIZED Configuration:")
+        logger.info(f"📊 FIXED Configuration:")
         logger.info(f"  Total Timesteps: {total_timesteps}")
         logger.info(f"  Total Episodes: {total_episodes}")
-        logger.info(f"  Episodes per Group: 4")
-        logger.info(f"  Learning Rate: 0.0005 (balanced)")
-        logger.info(f"  Gamma: 0.95 (medium-term)")
-        logger.info(f"  Entropy: 0.02 (balanced exploration)")
-        logger.info(f"  Max Episode Steps: 1000 (shorter)")
-        logger.info(f"  Max Holding Time: 10s (true scalping)")
-        logger.info(f"  Expected Time: 20-40 minutes")
+        logger.info(f"  Episodes per Group: 8 (more samples)")
+        logger.info(f"  Learning Rate: 0.001 (faster learning)")
+        logger.info(f"  Gamma: 0.98 (long-term rewards)")
+        logger.info(f"  Entropy: 0.1 (HIGH exploration!)")
+        logger.info(f"  Hidden Dim: 128 (larger policy)")
+        logger.info(f"  Max Episode Steps: 200 (SHORT episodes)")
+        logger.info(f"  Expected Win Rate: 30-50%")
+        logger.info(f"  Expected Time: 60-90 minutes")
         
         # 체크포인트 경로
         checkpoint_path = os.path.join(output_dir, 'checkpoints', 'checkpoint_iter{}.pt')
@@ -169,11 +170,20 @@ def main():
         logger.info(f"  Final Model: {final_model_path}")
         
         logger.info("=" * 60)
-        logger.info("🎊 QUICK completed!")
-        logger.info("📈 Expected quick improvements:")
-        logger.info("  - Win rate should reach 25-35% quickly")
-        logger.info("  - Much shorter episodes")
-        logger.info("  - Faster convergence")
+        logger.info("🎊 FIXED training completed!")
+        logger.info("📈 Key improvements applied:")
+        logger.info("  ✅ Episode length: 1000 → 200 (5x faster feedback)")
+        logger.info("  ✅ Entropy: 0.02 → 0.1 (5x more exploration)")
+        logger.info("  ✅ Learning rate: 0.0005 → 0.001 (2x faster)")
+        logger.info("  ✅ Episodes per group: 4 → 8 (2x more samples)")
+        logger.info("  ✅ Hidden dim: 64 → 128 (2x larger policy)")
+        logger.info("  ✅ Total timesteps: 5000 → 20000 (4x more training)")
+        logger.info("")
+        logger.info("📊 Expected results:")
+        logger.info("  - Win rate: 30-50% (was 9.3%)")
+        logger.info("  - Mean reward: positive (was -77.47)")
+        logger.info("  - More trades per episode")
+        logger.info("  - Shorter holding times")
         logger.info(f"📊 TensorBoard: tensorboard --logdir {tensorboard_dir}")
         
         return True

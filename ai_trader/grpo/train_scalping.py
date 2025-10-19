@@ -35,18 +35,7 @@ logger = logging.getLogger(__name__)
 
 def create_environment(args, device):
     """환경 생성"""
-    if args.env == 'normalized':
-        logger.info("Creating NormalizedFeatureEnv...")
-        env = NormalizedFeatureEnv(
-            db_path=args.db_path,
-            table_name=args.table_name,
-            seq_len=args.seq_len,
-            expected_features=args.features,
-            transaction_cost_rate=0.00215,
-            max_episode_steps=args.episode_steps,
-            device=device
-        )
-    elif args.env == 'direct':
+    if args.env == 'direct':
         logger.info("Creating DirectFeatureEnv...")
         env = DirectFeatureEnv(
             db_path=args.db_path,
@@ -82,6 +71,8 @@ def create_environment(args, device):
             embedding_dim=args.embedding_dim,
             expected_features=args.features,
             transaction_cost_rate=0.00215,
+            max_holding_time=10.0,  # 🔧 10초로 설정 (스캘핑)
+            holding_penalty_rate=0.001,  # 🔧 시간 기반 페널티 비율
             max_episode_steps=args.episode_steps,
             quick_exit_mode=args.quick_exit_mode,
             device=device

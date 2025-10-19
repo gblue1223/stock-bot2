@@ -177,6 +177,17 @@ class GRPOTrainer:
             
             # 에피소드 메타데이터
             episode_metadata = step_info.get('episode', {})
+            # 환경이 제공하는 total_return을 우선 사용해 일관성 유지
+            if 'total_return' in episode_metadata:
+                env_total = float(episode_metadata['total_return'])
+                sum_collected = float(np.sum(rewards))
+                # 내부 누적과 차이가 있으면 경고 로그
+                if abs(env_total - sum_collected) > 1e-6:
+                    logger.warning(
+                        f"Episode reward mismatch: env_total={env_total:.6f} vs collected_sum={sum_collected:.6f}"
+                    )
+                episode_reward = env_total
+            # 메타데이터에 episode_reward로 기록
             episode_metadata['episode_reward'] = episode_reward
             episode_metadata['episode_steps'] = episode_steps
             

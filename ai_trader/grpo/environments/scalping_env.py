@@ -41,7 +41,7 @@ class GRPOScalpingEnv(gym.Env):
         transaction_cost_rate: 거래 비용 비율 (기본값: 0.00215 = 0.215%)
         quick_exit_threshold: 빠른 손절 시간 임계값 (초, 기본값: 1.5)
         quick_exit_penalty: 빠른 손절 룰 위반 페널티 (기본값: 0.01)
-        max_holding_time: 최대 보유 시간 (초, 기본값: 60)
+        max_holding_time: 최대 보유 시간 (초, 기본값: 10)
         holding_penalty_rate: 장기 보유 페널티 비율 (기본값: 0.001)
         max_episode_steps: 에피소드당 최대 스텝 수 (기본값: None, 제한 없음)
         quick_exit_mode: 빠른 손절 룰 동작 모드 (기본값: 'penalty_only')
@@ -63,7 +63,7 @@ class GRPOScalpingEnv(gym.Env):
         transaction_cost_rate: float = 0.00215,
         quick_exit_threshold: float = 1.5,
         quick_exit_penalty: float = 0.01,
-        max_holding_time: float = 60.0,
+        max_holding_time: float = 10.0,
         holding_penalty_rate: float = 0.001,
         max_episode_steps: Optional[int] = None,
         quick_exit_mode: str = 'penalty_only',
@@ -383,6 +383,9 @@ class GRPOScalpingEnv(gym.Env):
         self.episode_data, self.episode_metadata = self._sample_episode_start()
         self.episode_length = len(self.episode_data)
         
+        # 🔧 등락률로부터 가격 계산
+        self._compute_prices()
+        
         # 에피소드 상태 초기화
         self.current_step = self.seq_len - 1  # 최소 seq_len만큼의 히스토리 필요
         self.position = 0
@@ -409,16 +412,45 @@ class GRPOScalpingEnv(gym.Env):
         
         return observation, info
     
+    def _compute_prices(self):
+        """
+        등락률로부터 가격 계산
+        
+        등락률(첫 번째 특징)을 누적하여 실제 가격을 생성합니다.
+        기준 가격 100,000원에서 시작하여 등락률을 적용합니다.
+        """
+        self.base_price = 100000.0  # 기준 가격 (10만원)
+        self.prices = np.zeros(len(self.episode_data))
+        self.prices[0] = self.base_price
+        
+        # 등락률을 누적하여 가격 계산
+        for i in range(1, len(self.episode_data)):
+            # price[i] = price[i-1] * (1 + return[i])
+            # 등락률은 첫 번째 특징 (인덱스 0)
+            return_rate = self.episode_data[i, 0]
+            
+            # 🔧 등락률 클리핑: -0.3 ~ +0.3 (±30%)
+            # 극단적인 등락률로 인한 가격 0 방지
+            return_rate = np.clip(return_rate, -0.3, 0.3)
+            
+            self.prices[i] = self.prices[i-1] * (1 + return_rate)
+            
+            # 🔧 최소 가격 보장: 1,000원 이상
+            self.prices[i] = max(self.prices[i], 1000.0)
+        
+        logger.debug(
+            f"Computed prices: min={self.prices.min():.2f}, "
+            f"max={self.prices.max():.2f}, "
+            f"mean={self.prices.mean():.2f}"
+        )
+    
     def _get_current_price(self) -> float:
         """
         현재 가격 반환
         
-        실제로는 '등락률' 특징을 사용하여 가격 변화를 시뮬레이션합니다.
-        간단히 하기 위해 등락률을 누적하여 가격을 계산합니다.
+        등락률로부터 계산된 실제 가격을 반환합니다.
         """
-        # 등락률은 첫 번째 특징이라고 가정 (실제로는 feature_columns에서 확인 필요)
-        # 여기서는 간단히 인덱스 0을 사용
-        return float(self.episode_data[self.current_step, 0])
+        return float(self.prices[self.current_step])
     
     def _calculate_reward(self, entry_price: float, exit_price: float, holding_time: float) -> Tuple[float, Dict[str, float]]:
         """
@@ -441,24 +473,38 @@ class GRPOScalpingEnv(gym.Env):
             - total_reward: 총 보상
             - reward_components: 보상 구성 요소 딕셔너리
         """
+        # 🔧 Division by zero 방지
+        if entry_price <= 0:
+            logger.warning(
+                f"Invalid entry_price: {entry_price}, setting to 1000.0"
+            )
+            entry_price = 1000.0
+        
         # 수익률 계산: (청산가 - 진입가) / 진입가
         profit_rate = (exit_price - entry_price) / entry_price
+        
+        # 🔧 수익률 클리핑: ±100% (비현실적인 수익률 방지)
+        profit_rate = np.clip(profit_rate, -1.0, 1.0)
         
         # 거래 비용 차감 (왕복 0.43%)
         # 양의 보상을 받으려면 수익률이 0.43%를 초과해야 함
         reward = profit_rate - self.round_trip_cost
         
-        # 장기 보유 페널티: -0.001 * (보유시간 - 60초)
-        holding_penalty = 0.0
-        if holding_time > self.max_holding_time:
-            holding_penalty = self.holding_penalty_rate * (holding_time - self.max_holding_time)
-            reward -= holding_penalty
+        # 🔧 보상 스케일링: ×100 (학습 안정성)
+        # 수익률 1% = 보상 1.0
+        reward = reward * 100
+        
+        # 🔧 장기 보유 페널티 제거 (매 스텝 페널티로 대체됨)
+        # 매 스텝마다 보유 페널티가 적용되므로 여기서는 중복 제거
+        # holding_penalty = 0.0
+        # if holding_time > self.max_holding_time:
+        #     holding_penalty = self.holding_penalty_rate * (holding_time - self.max_holding_time)
+        #     reward -= holding_penalty
         
         # 보상 구성 요소
         reward_components = {
             'profit_rate': profit_rate,
             'transaction_cost': -self.round_trip_cost,
-            'holding_penalty': -holding_penalty,
             'net_reward': reward
         }
         
@@ -571,10 +617,18 @@ class GRPOScalpingEnv(gym.Env):
                 self.position = 1
                 self.entry_price = self.current_price
                 self.entry_time = self.current_time
+                # 🔧 매수 행동에 작은 양의 보상 (거래 유도)
+                reward = 0.1  # 매수 자체에 작은 보상
                 logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
+            else:
+                # 이미 포지션 보유 중: 페널티
+                reward = -0.1
         
         elif action == 2:  # 매도
-            if self.position == 1:
+            if self.position == 0:
+                # 포지션 없는데 매도: 페널티
+                reward = -0.1
+            elif self.position == 1:
                 # 보유 시간 계산
                 holding_time = self.current_time - self.entry_time
                 
@@ -606,18 +660,38 @@ class GRPOScalpingEnv(gym.Env):
                 self.entry_time = 0.0
         
         elif action == 0:  # 보유
-            # 빠른 손절 룰 체크 (모드에 따라 다르게 동작)
+            # 🔧 보유 시 페널티 (과도한 보유 방지)
+            # 스캘핑은 빠른 거래가 목표
+            
             if self.position == 1:
+                # 포지션 보유 중: 시간에 비례하는 페널티
                 holding_time = self.current_time - self.entry_time
+                
+                # 기본 보유 페널티: -0.01 (스케일링 후 -1.0)
+                base_penalty = -0.01
+                
+                # 🔧 시간 기반 추가 페널티: max_holding_time 이상 보유 시 증가
+                # holding_penalty_rate를 사용하여 페널티 강도 조절
+                if holding_time > self.max_holding_time:
+                    # max_holding_time 초과 시 holding_penalty_rate 적용
+                    # 🔧 스케일링 제거: 매 스텝 누적되므로 작은 값 사용
+                    time_penalty = -self.holding_penalty_rate * (holding_time - self.max_holding_time)
+                    reward = base_penalty + time_penalty  # 스케일링 제거
+                else:
+                    reward = base_penalty  # 스케일링 제거
                 
                 # 빠른 손절 룰 체크 (모드 선택)
                 if self.quick_exit_mode == 'penalty_only':
                     # 페널티만 부여 (권장, 학습 효과적)
-                    reward, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
+                    penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
+                    reward += penalty  # 스케일링 제거
                 elif self.quick_exit_mode == 'force_close':
                     # 강제 청산 (이전 동작, 과도한 거래 유발)
-                    reward, quick_exit_triggered = self._check_quick_exit_force_close(holding_time)
-                # else: reward = 0.0 유지 (정상 보유)
+                    penalty, quick_exit_triggered = self._check_quick_exit_force_close(holding_time)
+                    reward += penalty  # 스케일링 제거
+            else:
+                # 포지션 없음: 더 큰 페널티 (거래 유도)
+                reward = -0.05  # 스케일링 제거
         
         # 보상 기록
         self.episode_rewards.append(reward)
@@ -641,7 +715,14 @@ class GRPOScalpingEnv(gym.Env):
                 self.current_price,
                 holding_time
             )
-            self.episode_rewards.append(final_reward)
+            # 최종 보상을 현재 스텝 보상에 합산하여 외부 수집 보상과 일치시킵니다
+            reward += final_reward
+            # 내부 누적 보상 또한 마지막 스텝에 합산되도록 병합합니다
+            if len(self.episode_rewards) > 0:
+                self.episode_rewards[-1] += final_reward
+            else:
+                # 방어적 처리: 이론상 발생하지 않지만 빈 경우엔 추가
+                self.episode_rewards.append(final_reward)
             
             # 강제 청산 거래 기록
             self.episode_trades.append({
