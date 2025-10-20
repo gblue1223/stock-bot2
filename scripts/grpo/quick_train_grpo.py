@@ -165,7 +165,7 @@ def main():
         logger.info(f"  Episodes/Second: {total_episodes/training_time:.1f}")
         
         # 최종 모델 저장
-        final_model_path = os.path.join(output_dir, 'quick_fix_model.pt')
+        final_model_path = os.path.join(output_dir, 'model.pt')
         trainer.save_checkpoint(final_model_path, final_metrics['num_updates'])
         logger.info(f"  Final Model: {final_model_path}")
         
