@@ -56,7 +56,6 @@ class RealtimeDataCollector:
         
         # Koapys 클라이언트
         self.koapys = KoapyRestSimple(
-            base_url=os.getenv('KOAPYS_BASE_URL', 'http://localhost:5000'),
             simulation=True
         )
         

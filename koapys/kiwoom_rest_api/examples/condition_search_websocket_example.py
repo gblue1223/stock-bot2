@@ -9,6 +9,7 @@ import asyncio
 import os
 import sys
 import logging
+import json
 from typing import Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
@@ -23,6 +24,9 @@ sys.path.insert(0, str(project_root))
 # kiwoom_rest_api 모듈 경로 추가
 kiwoom_api_src = Path(__file__).parent.parent / 'src'
 sys.path.insert(0, str(kiwoom_api_src))
+
+# 경로 설정 후에 가져와야 임포트 오류가 발생하지 않습니다
+from kiwoom_rest_api.core.field_codes import FIELD_TITLE_MAP
 
 # 로깅 설정
 logging.basicConfig(
@@ -53,6 +57,16 @@ async def example_condition_search_realtime():
     received_stocks = []
     
     # 콜백 함수들 설정
+    def _translate_values(values: Dict[str, Any]) -> Dict[str, Any]:
+        """숫자 코드 값을 사람이 읽기 쉬운 타이틀 맵으로 변환합니다."""
+        if not isinstance(values, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        for k, v in values.items():
+            title = FIELD_TITLE_MAP.get(str(k), str(k))
+            out[title] = v
+        return out
+
     async def on_data_received(realtime_data: RealTimeData):
         """실시간 데이터 수신 시 호출"""
         nonlocal selected_condition
@@ -90,13 +104,64 @@ async def example_condition_search_realtime():
         elif realtime_data.trnm == 'CNSRREQ':
             if realtime_data.return_code == 0:
                 print("✓ 조건검색 등록 성공 - 실시간 종목 데이터 수신 대기 중...")
+                # 조회데이터 로그 (요청된 포맷)
+                try:
+                    # values 또는 숫자키 딕셔너리에 대한 타이틀 변환 추가
+                    processed_query_data = []
+                    for it in realtime_data.data:
+                        if isinstance(it, dict):
+                            if 'values' in it and isinstance(it['values'], dict):
+                                it_out = dict(it)
+                                it_out['values_titles'] = _translate_values(it['values'])
+                                processed_query_data.append(it_out)
+                            else:
+                                # 아이템 자체가 숫자코드 키들로 이뤄진 경우
+                                has_numeric_keys = any(str(k).isdigit() for k in it.keys())
+                                if has_numeric_keys:
+                                    it_out = dict(it)
+                                    it_out['titles'] = _translate_values(it)
+                                    processed_query_data.append(it_out)
+                                else:
+                                    processed_query_data.append(it)
+                        else:
+                            processed_query_data.append(it)
+
+                    query_log = {
+                        'trnm': realtime_data.trnm,
+                        'seq': realtime_data.raw_data.get('seq'),
+                        'return_code': realtime_data.return_code,
+                        'data': processed_query_data,
+                    }
+                    logging.info("# 조회데이터\n" + json.dumps(query_log, ensure_ascii=False, indent=4))
+                except Exception as e:
+                    logging.warning(f"조회데이터 로그 생성 실패: {e}")
             else:
                 print(f"✗ 조건검색 등록 실패: {realtime_data.return_msg}")
         
         # 3. 실시간 조건검색 데이터
-        elif realtime_data.trnm == 'COND_REAL':
+        elif realtime_data.trnm == 'REAL':
             # 조건검색 실시간 데이터
             print(f"\n실시간 조건검색 데이터 수신: {len(realtime_data.data)}개 항목")
+            # 실시간데이터 로그 (요청된 포맷)
+            try:
+                # values에 대한 타이틀 변환 추가
+                processed_data = []
+                for it in realtime_data.data:
+                    if isinstance(it, dict) and 'values' in it and isinstance(it['values'], dict):
+                        values_titles = _translate_values(it['values'])
+                        it_out = dict(it)
+                        it_out['values_titles'] = values_titles
+                        processed_data.append(it_out)
+                    else:
+                        processed_data.append(it)
+
+                realtime_log = {
+                    'data': processed_data,
+                    'trnm': 'REAL',
+                }
+                logging.info("#실시간데이터\n" + json.dumps(realtime_log, ensure_ascii=False, indent=4))
+            except Exception as e:
+                logging.warning(f"실시간데이터 로그 생성 실패: {e}")
             for item in realtime_data.data:
                 stock_code = item.get('stk_cd', '')
                 stock_name = item.get('stk_nm', '')
