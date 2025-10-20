@@ -791,20 +791,22 @@ class GRPOScalpingEnv(gym.Env):
         else:
             avg_holding_time = 0.0
         
-        # 샤프 비율 계산
-        # 샤프 비율 = (평균 수익률 - 무위험 수익률) / 수익률 표준편차
-        # 스캘핑의 경우 무위험 수익률은 0으로 가정
-        if len(self.episode_rewards) > 1:
-            mean_reward = np.mean(self.episode_rewards)
-            std_reward = np.std(self.episode_rewards)
-            
-            # 표준편차가 0이면 샤프 비율은 0
-            if std_reward > 0:
+        # 샤프 비율 계산 (안정화)
+        # 우선 개별 거래 보상을 사용하고, 거래가 없으면 스텝 보상 사용
+        sharpe_ratio = 0.0
+        epsilon = 1e-6  # near-zero 분모 방지 임계값
+        if self.episode_trades and len(self.episode_trades) > 1:
+            trade_rewards = np.asarray([t['reward'] for t in self.episode_trades], dtype=np.float64)
+            mean_reward = float(np.mean(trade_rewards))
+            std_reward = float(np.std(trade_rewards))
+            if np.isfinite(std_reward) and std_reward >= epsilon:
                 sharpe_ratio = mean_reward / std_reward
-            else:
-                sharpe_ratio = 0.0
-        else:
-            sharpe_ratio = 0.0
+        elif len(self.episode_rewards) > 1:
+            step_rewards = np.asarray(self.episode_rewards, dtype=np.float64)
+            mean_reward = float(np.mean(step_rewards))
+            std_reward = float(np.std(step_rewards))
+            if np.isfinite(std_reward) and std_reward >= epsilon:
+                sharpe_ratio = mean_reward / std_reward
         
         # 승률 계산 (추가 메트릭)
         if self.episode_trades:

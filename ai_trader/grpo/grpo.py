@@ -56,13 +56,15 @@ class GRPOTrainer:
         num_groups: int = 4,
         learning_rate: float = 3e-4,
         gamma: float = 0.99,
+        lambda_gae: float = 0.95,
         clip_epsilon: float = 0.2,
         kl_target: float = 0.01,
         entropy_coef: float = 0.01,
         value_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         device: str = 'cpu',
-        tensorboard_log_dir: Optional[str] = None
+        tensorboard_log_dir: Optional[str] = None,
+        use_gae: bool = True
     ):
         self.policy = policy
         self.env = env
@@ -76,11 +78,13 @@ class GRPOTrainer:
         self.num_groups = num_groups
         self.learning_rate = learning_rate
         self.gamma = gamma
+        self.lambda_gae = lambda_gae
         self.clip_epsilon = clip_epsilon
         self.kl_target = kl_target
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
+        self.use_gae = use_gae
         
         # Optimizer 초기화
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
@@ -155,7 +159,7 @@ class GRPOTrainer:
                 next_state, reward, terminated, truncated, step_info = self.env.step(action)
                 done = terminated or truncated
                 if done:
-                    logger.info(f"Episode finished: episode={episode_idx}, step={self.env.current_step}")
+                    logger.debug(f"Episode finished: episode={episode_idx}, step={self.env.current_step}")
                 
                 # 데이터 저장
                 states.append(state)
@@ -502,21 +506,49 @@ class GRPOTrainer:
         all_advantages = []
         all_returns = []
         
-        for episode, advantage in zip(episodes, advantages):
-            states = episode['states']
-            actions = episode['actions']
-            old_log_probs = episode['log_probs']
-            rewards = episode['rewards']
-            
-            # 리턴 계산 (할인된 누적 보상)
-            returns = self._compute_returns(rewards)
-            
-            # 데이터 추가
-            all_states.append(states)
-            all_actions.append(actions)
-            all_old_log_probs.append(old_log_probs)
-            all_advantages.append(advantage)
-            all_returns.append(returns)
+        if self.use_gae:
+            # 에피소드별로 값 함수 추정 후 GAE 계산
+            for episode in episodes:
+                states = episode['states']
+                actions = episode['actions']
+                old_log_probs = episode['log_probs']
+                rewards = episode['rewards']
+                dones = episode['dones']
+                
+                # 텐서화
+                states_tensor_ep = torch.from_numpy(states).float().to(self.device)
+                actions_tensor_ep = torch.from_numpy(actions).long().to(self.device)
+                
+                with torch.no_grad():
+                    # 현재 정책에서 값 함수 추정 (evaluate_actions가 values 반환)
+                    _, _, values_ep = self.policy.evaluate_actions(states_tensor_ep, actions_tensor_ep)
+                    values_ep = values_ep.squeeze(-1).cpu().numpy() if values_ep.dim() > 1 else values_ep.cpu().numpy()
+                
+                # GAE 계산
+                adv_ep, ret_ep = self._compute_gae(rewards, dones, values_ep)
+                
+                # 축적
+                all_states.append(states)
+                all_actions.append(actions)
+                all_old_log_probs.append(old_log_probs)
+                all_advantages.append(adv_ep)
+                all_returns.append(ret_ep)
+        else:
+            for episode, advantage in zip(episodes, advantages):
+                states = episode['states']
+                actions = episode['actions']
+                old_log_probs = episode['log_probs']
+                rewards = episode['rewards']
+                
+                # 리턴 계산 (할인된 누적 보상)
+                returns = self._compute_returns(rewards)
+                
+                # 데이터 추가
+                all_states.append(states)
+                all_actions.append(actions)
+                all_old_log_probs.append(old_log_probs)
+                all_advantages.append(advantage)
+                all_returns.append(returns)
         
         # 배열로 변환
         all_states = np.concatenate(all_states, axis=0)
@@ -724,6 +756,44 @@ class GRPOTrainer:
             returns[t] = running_return
         
         return returns
+    
+    def _compute_gae(
+        self,
+        rewards: np.ndarray,
+        dones: np.ndarray,
+        values: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        GAE(Generalized Advantage Estimation) 계산
+        Args:
+            rewards: 보상 배열 (T,)
+            dones: 종료 플래그 배열 (T,) - 각 스텝이 에피소드 종료인지 여부
+            values: 값 함수 추정 배열 (T,) - 각 상태의 V(s_t)
+        Returns:
+            (advantages, returns) 튜플. advantages와 returns는 길이 T.
+        """
+        T = len(rewards)
+        advantages = np.zeros(T, dtype=np.float32)
+        returns = np.zeros(T, dtype=np.float32)
+        gae = 0.0
+        next_value = 0.0
+        gamma = self.gamma
+        lam = self.lambda_gae
+        
+        for t in reversed(range(T)):
+            # done이면 다음 상태의 값은 0으로 부트스트랩
+            next_non_terminal = 0.0 if dones[t] else 1.0
+            if t < T - 1:
+                next_value = values[t + 1] * next_non_terminal
+            else:
+                next_value = 0.0  # 마지막 스텝의 다음 값은 0 (에피소드 종료 가정)
+            
+            delta = rewards[t] + gamma * next_value - values[t]
+            gae = delta + gamma * lam * next_non_terminal * gae
+            advantages[t] = gae
+            returns[t] = advantages[t] + values[t]
+        
+        return advantages.astype(np.float32), returns.astype(np.float32)
     
     def train(
         self,
