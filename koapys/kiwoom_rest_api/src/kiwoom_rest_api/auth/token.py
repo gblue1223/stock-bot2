@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Any
-import time
+import logging
 
 from kiwoom_rest_api.config import get_api_key, get_api_secret, TOKEN_URL
 from kiwoom_rest_api.core.sync_client import make_request
+
+logger = logging.getLogger(__name__)
 
 class TokenManager:
     """Manages OAuth tokens for Kiwoom API"""
@@ -50,17 +52,21 @@ class TokenManager:
     
     def _request_new_token(self) -> None:
         """Request a new access token"""
-        response = make_request(
-            endpoint=TOKEN_URL,
-            method="POST",
-            data={
-                "grant_type": "client_credentials",
-                "appkey": get_api_key(),
-                "secretkey": get_api_secret(),
-            },
-        )
-        
-        self._update_token_info(response)
+        try:
+            response = make_request(
+                endpoint=TOKEN_URL,
+                method="POST",
+                data={
+                    "grant_type": "client_credentials",
+                    "appkey": get_api_key(),
+                    "secretkey": get_api_secret(),
+                },
+            )
+            logger.debug(f"Token request response type: {type(response)}, content: {response}")
+            self._update_token_info(response)
+        except Exception as e:
+            logger.error(f"Failed to request new token: {e}", exc_info=True)
+            raise
     
     def _refresh_access_token(self) -> None:
         """Refresh the access token using the refresh token"""
@@ -79,7 +85,19 @@ class TokenManager:
     
     def _update_token_info(self, token_response: Dict[str, Any]) -> None:
         """Update token information from the API response"""
-        self._access_token = token_response.get("token")
+        logger.debug(f"Token response keys: {list(token_response.keys())}")
+        
+        # Try multiple possible keys for access token
+        self._access_token = (
+            token_response.get("token") or 
+            token_response.get("access_token") or
+            token_response.get("accessToken")
+        )
+        
+        if self._access_token:
+            logger.info(f"Access token updated successfully (length: {len(self._access_token)})")
+        else:
+            logger.warning(f"Failed to extract access token from response. Available keys: {list(token_response.keys())}")
         
         # Calculate expiry time
         if "expires_in" in token_response:

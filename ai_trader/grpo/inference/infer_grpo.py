@@ -132,17 +132,7 @@ class GRPOInference:
         # 설정 추출 (없으면 빈 dict)
         config = checkpoint.get('config', {}) if isinstance(checkpoint, dict) else {}
         
-        # 모델 생성 (체크포인트에 값이 없을 때 안전한 기본값 사용)
-        model = AutoEncoderEmbedding(
-            input_dim=config.get('input_dim', 60),
-            embedding_dim=config.get('embedding_dim', 128),
-            hidden_dim=config.get('hidden_dim', 256),
-            seq_len=config.get('seq_len', 60),
-            num_layers=config.get('num_layers', 3),
-            dropout=config.get('dropout', 0.1)
-        )
-        
-        # 가중치 탐지: 다양한 체크포인트 포맷 지원
+        # 가중치 탐지: 다양한 체크포맷 지원 및 차원 추론 준비
         state_dict = None
         if isinstance(checkpoint, dict):
             if 'state_dict' in checkpoint:
@@ -166,6 +156,58 @@ class GRPOInference:
         if state_dict is None:
             raise KeyError("Embedding checkpoint does not contain a recognizable state dict ('state_dict', 'model_state_dict', etc.)")
         
+        # 구성값 부족 시 state_dict로부터 차원 자동 추론
+        inferred = {}
+        try:
+            if 'encoder.input_projection.weight' in state_dict:
+                w = state_dict['encoder.input_projection.weight']
+                inferred['hidden_dim'] = int(w.shape[0])
+                inferred['input_dim'] = int(w.shape[1])
+            if 'encoder.bottleneck.0.weight' in state_dict:
+                # Linear( hidden_dim -> embedding_dim ) so weight is (embedding_dim, hidden_dim)
+                bw = state_dict['encoder.bottleneck.0.weight']
+                inferred['embedding_dim'] = int(bw.shape[0])
+                inferred.setdefault('hidden_dim', int(bw.shape[1]))
+            if 'decoder.embedding_expansion.weight' in state_dict:
+                # Linear( embedding_dim -> hidden_dim * seq_len ) so weight is (hidden_dim*seq_len, embedding_dim)
+                ew = state_dict['decoder.embedding_expansion.weight']
+                if 'embedding_dim' not in inferred:
+                    inferred['embedding_dim'] = int(ew.shape[1])
+                if 'hidden_dim' in inferred:
+                    inferred['seq_len'] = int(ew.shape[0] // inferred['hidden_dim'])
+            if 'decoder.output_projection.weight' in state_dict and 'input_dim' not in inferred:
+                # Linear( hidden_dim -> input_dim ) so weight is (input_dim, hidden_dim)
+                ow = state_dict['decoder.output_projection.weight']
+                inferred.setdefault('input_dim', int(ow.shape[0]))
+                inferred.setdefault('hidden_dim', int(ow.shape[1]))
+        except Exception as _:
+            pass
+
+        # 최종 하이퍼파라미터 결정: state_dict에서 추론된 값을 우선 사용하여 가중치와 일치 보장
+        def pick(name: str, default_val):
+            if name in inferred:
+                return int(inferred[name])
+            val = config.get(name, None)
+            return int(val) if val is not None else default_val
+
+        input_dim = pick('input_dim', 60)
+        embedding_dim = pick('embedding_dim', 128)
+        hidden_dim = pick('hidden_dim', 256)
+        seq_len = pick('seq_len', 60)
+        num_layers = int(config.get('num_layers', 3))
+        dropout = float(config.get('dropout', 0.1))
+
+        # 모델 생성 (추론값 반영)
+        model = AutoEncoderEmbedding(
+            input_dim=input_dim,
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            seq_len=seq_len,
+            num_layers=num_layers,
+            dropout=dropout
+        )
+        logger.info(f"Embedding dims -> input_dim={input_dim}, embedding_dim={embedding_dim}, hidden_dim={hidden_dim}, seq_len={seq_len}")
+        
         # 가중치 로드 (호환성을 위해 strict=False)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
@@ -176,8 +218,8 @@ class GRPOInference:
         model.eval()
         
         # 모델 속성 저장 (TorchScript 컴파일에 필요)
-        model.seq_len = config.get('seq_len', 60)
-        model.input_dim = config.get('input_dim', 60)
+        model.seq_len = seq_len
+        model.input_dim = input_dim
         
         # 정규화 통계 추출 (제공되지 않은 경우)
         if self.normalization_stats is None and isinstance(checkpoint, dict):

@@ -279,9 +279,17 @@ class LiveTrader:
         self.condition_monitor: Optional[ConditionMonitor] = None
         if self.config.use_condition_monitor and WebSocketClient and TokenManager:
             try:
-                self.condition_monitor = ConditionMonitor()
-                self.condition_monitor.start()
-                logger.info("[OK] Condition monitor started (first condition)")
+                # 메인 스레드에서 미리 토큰 획득
+                token_manager = TokenManager()
+                access_token = token_manager.get_token()
+                
+                if access_token:
+                    logger.info(f"Access token acquired for condition monitor (length: {len(access_token)})")
+                    self.condition_monitor = ConditionMonitor(access_token=access_token)
+                    self.condition_monitor.start()
+                    logger.info("[OK] Condition monitor started (first condition)")
+                else:
+                    logger.warning("Failed to acquire access token; condition monitor disabled")
             except Exception as e:
                 logger.warning(f"Failed to start condition monitor: {e}")
     
@@ -733,11 +741,12 @@ class LiveTrader:
 class ConditionMonitor:
     """첫 번째 조건식을 실시간으로 모니터링하여 종목 코드를 유지하는 백그라운드 모니터"""
 
-    def __init__(self):
+    def __init__(self, access_token: Optional[str] = None):
         self._codes: Set[str] = set()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._access_token = access_token  # 메인 스레드에서 전달받은 토큰
 
     def get_codes(self) -> List[str]:
         with self._lock:
@@ -762,12 +771,19 @@ class ConditionMonitor:
             logging.getLogger(__name__).error(f"ConditionMonitor fatal: {e}", exc_info=True)
 
     async def _run_async(self):
-        if not (WebSocketClient and TokenManager):
-            logging.getLogger(__name__).warning("kiwoom_rest_api not available; ConditionMonitor disabled")
+        if not WebSocketClient:
+            logging.getLogger(__name__).warning("WebSocketClient not available; ConditionMonitor disabled")
             return
 
-        token_manager = TokenManager()
-        client = WebSocketClient(access_token=token_manager.get_token())
+        # 전달받은 토큰 사용 (메인 스레드에서 이미 획득함)
+        access_token = self._access_token
+        if not access_token:
+            logging.getLogger(__name__).error("No access token provided; ConditionMonitor disabled")
+            return
+        
+        logging.getLogger(__name__).info(f"Using provided access token (length: {len(access_token)})")
+
+        client = WebSocketClient(access_token=access_token)
 
         selected_condition = {'cond_idx': None, 'cond_nm': None}
 
