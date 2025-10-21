@@ -1,11 +1,9 @@
 {
-  "model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
-  "embedding_model_path": null,
+  "#model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
+  "model_path": "models/grpo_scalping@2025120/model.pt",
+  "embedding_model_path": "models/autoencoder@20251013/model.pt",
   "device": "cuda",
-  "target_stocks": [
-    "005930",
-    "000660"
-  ],
+  "target_stocks": [],
   "max_position_size": 1000000,
   "max_positions": 3,
   "min_buy_confidence": 0.0,

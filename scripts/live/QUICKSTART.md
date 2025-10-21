@@ -59,9 +59,8 @@ python scripts/real/backtest_strategy.py \
 
 ```bash
 # 시뮬레이션 모드 실행
-python scripts/real/live_trading.py \
+python scripts/live/live_trading.py \
     --simulation \
-    --stocks 005930 000660 \
     --config config/trading_config.json
 ```
 

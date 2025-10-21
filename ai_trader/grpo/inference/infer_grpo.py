@@ -129,10 +129,10 @@ class GRPOInference:
         """
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         
-        # 설정 추출
-        config = checkpoint.get('config', {})
+        # 설정 추출 (없으면 빈 dict)
+        config = checkpoint.get('config', {}) if isinstance(checkpoint, dict) else {}
         
-        # 모델 생성
+        # 모델 생성 (체크포인트에 값이 없을 때 안전한 기본값 사용)
         model = AutoEncoderEmbedding(
             input_dim=config.get('input_dim', 60),
             embedding_dim=config.get('embedding_dim', 128),
@@ -142,8 +142,36 @@ class GRPOInference:
             dropout=config.get('dropout', 0.1)
         )
         
-        # 가중치 로드
-        model.load_state_dict(checkpoint['state_dict'])
+        # 가중치 탐지: 다양한 체크포인트 포맷 지원
+        state_dict = None
+        if isinstance(checkpoint, dict):
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            elif 'autoencoder_state_dict' in checkpoint:
+                state_dict = checkpoint['autoencoder_state_dict']
+            elif 'ae_state_dict' in checkpoint:
+                state_dict = checkpoint['ae_state_dict']
+            elif 'model' in checkpoint and hasattr(checkpoint['model'], 'state_dict'):
+                state_dict = checkpoint['model'].state_dict()
+            else:
+                # raw state dict 형태인지 확인 (값이 텐서인 경우가 많음)
+                try:
+                    if all(hasattr(v, 'shape') for v in checkpoint.values()):
+                        state_dict = checkpoint  # type: ignore[arg-type]
+                except Exception:
+                    state_dict = None
+        
+        if state_dict is None:
+            raise KeyError("Embedding checkpoint does not contain a recognizable state dict ('state_dict', 'model_state_dict', etc.)")
+        
+        # 가중치 로드 (호환성을 위해 strict=False)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            logger.warning(f"Embedding state_dict missing keys: {list(missing)[:5]}{' …' if len(missing) > 5 else ''}")
+        if unexpected:
+            logger.warning(f"Embedding state_dict unexpected keys: {list(unexpected)[:5]}{' …' if len(unexpected) > 5 else ''}")
         model.to(self.device)
         model.eval()
         
@@ -152,8 +180,12 @@ class GRPOInference:
         model.input_dim = config.get('input_dim', 60)
         
         # 정규화 통계 추출 (제공되지 않은 경우)
-        if self.normalization_stats is None and 'normalization_stats' in checkpoint:
-            self.normalization_stats = checkpoint['normalization_stats']
+        if self.normalization_stats is None and isinstance(checkpoint, dict):
+            if 'normalization_stats' in checkpoint:
+                self.normalization_stats = checkpoint['normalization_stats']
+            elif 'norm' in checkpoint and isinstance(checkpoint['norm'], dict) and \
+                 'mean' in checkpoint['norm'] and 'std' in checkpoint['norm']:
+                self.normalization_stats = checkpoint['norm']
         
         return model
     

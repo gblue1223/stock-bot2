@@ -21,8 +21,10 @@ import json
 import logging
 import argparse
 import time
+import threading
+import asyncio
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
 from datetime import datetime, time as dt_time
 from collections import deque
 
@@ -33,6 +35,19 @@ from dotenv import load_dotenv
 # 프로젝트 루트 추가
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+# kiwoom_rest_api 모듈 경로 추가 (예제 파일과 동일한 방식)
+kiwoom_api_src = Path(__file__).parent.parent.parent / 'koapys' / 'kiwoom_rest_api' / 'src'
+sys.path.insert(0, str(kiwoom_api_src))
+
+try:
+    from kiwoom_rest_api import WebSocketClient, RealTimeData
+    from kiwoom_rest_api.auth.token import TokenManager
+except Exception as _e:
+    WebSocketClient = None  # type: ignore
+    RealTimeData = None  # type: ignore
+    TokenManager = None  # type: ignore
+    logging.getLogger(__name__).warning(f"kiwoom_rest_api import failed: {_e}")
 
 from koapys.client import KoapyRestSimple
 from koapys.types import OrderType, OrderBookType
@@ -72,7 +87,7 @@ class TradingConfig:
             config_path: 설정 파일 경로 (JSON)
         """
         # 기본 설정
-        self.model_path = "models/grpo_direct_features@20251016/direct_features_model.pt"
+        self.model_path = None
         self.embedding_model_path = None
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
@@ -100,9 +115,10 @@ class TradingConfig:
         self.update_interval = 1.0  # 데이터 업데이트 간격 (초)
         
         # Koapys 설정
-        self.koapys_base_url = os.getenv('KOAPYS_BASE_URL', 'http://localhost:5000')
-        self.koapys_api_key = os.getenv('KOAPYS_API_KEY')
         self.simulation = os.getenv('SIMULATION', 'true').lower() == 'true'
+        # 조건검색 사용 설정
+        self.use_condition_monitor = True
+        self.condition_collect_delay = 2.0  # 최초 등록 직후 딜레이(초)
         
         # 설정 파일에서 로드
         if config_path and os.path.exists(config_path):
@@ -198,8 +214,6 @@ class LiveTrader:
         # Koapys 클라이언트 초기화
         logger.info("Initializing Koapys client...")
         self.koapys = KoapyRestSimple(
-            base_url=config.koapys_base_url,
-            api_key=config.koapys_api_key,
             simulation=config.simulation
         )
         
@@ -260,6 +274,16 @@ class LiveTrader:
         # 실행 상태
         self.is_running = False
         self.last_update_time = {}  # code -> timestamp
+        
+        # 조건검색 실시간 모니터 (첫 번째 조건식)
+        self.condition_monitor: Optional[ConditionMonitor] = None
+        if self.config.use_condition_monitor and WebSocketClient and TokenManager:
+            try:
+                self.condition_monitor = ConditionMonitor()
+                self.condition_monitor.start()
+                logger.info("[OK] Condition monitor started (first condition)")
+            except Exception as e:
+                logger.warning(f"Failed to start condition monitor: {e}")
     
     def is_market_open(self) -> bool:
         """장이 열려있는지 확인"""
@@ -596,7 +620,7 @@ class LiveTrader:
         logger.info("=" * 80)
         logger.info("[START] Live Trading System")
         logger.info("=" * 80)
-        logger.info(f"Target stocks: {self.config.target_stocks}")
+        logger.info(f"Target stocks (initial): {self.config.target_stocks}")
         logger.info(f"Simulation mode: {self.config.simulation}")
         logger.info(f"Device: {self.config.device}")
         logger.info("=" * 80)
@@ -611,8 +635,22 @@ class LiveTrader:
                     time.sleep(60)
                     continue
                 
+                # 조건검색 실시간으로부터 종목 동기화
+                dynamic_codes: List[str] = self.config.target_stocks
+                if self.condition_monitor is not None:
+                    dynamic_codes = self.condition_monitor.get_codes()
+
+                    # 신규 코드에 대해 버퍼 준비
+                    for code in dynamic_codes:
+                        if code not in self.data_buffers:
+                            self.data_buffers[code] = MarketDataBuffer(
+                                seq_len=self.config.seq_len,
+                                num_features=self.config.num_features,
+                            )
+                    # 제거된 코드 버퍼는 남겨두어도 무방(메모리 사용 적음). 필요 시 정리 가능.
+
                 # 각 종목 처리
-                for code in self.config.target_stocks:
+                for code in dynamic_codes:
                     try:
                         self.process_stock(code)
                     except Exception as e:
@@ -684,6 +722,118 @@ class LiveTrader:
         
         logger.info("[OK] Shutdown complete")
 
+        # 조건 모니터 중지
+        if self.condition_monitor is not None:
+            try:
+                self.condition_monitor.stop()
+            except Exception:
+                pass
+
+
+class ConditionMonitor:
+    """첫 번째 조건식을 실시간으로 모니터링하여 종목 코드를 유지하는 백그라운드 모니터"""
+
+    def __init__(self):
+        self._codes: Set[str] = set()
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    def get_codes(self) -> List[str]:
+        with self._lock:
+            return sorted(self._codes)
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run_thread, name="ConditionMonitor", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=3)
+
+    def _run_thread(self):
+        try:
+            asyncio.run(self._run_async())
+        except Exception as e:
+            logging.getLogger(__name__).error(f"ConditionMonitor fatal: {e}", exc_info=True)
+
+    async def _run_async(self):
+        if not (WebSocketClient and TokenManager):
+            logging.getLogger(__name__).warning("kiwoom_rest_api not available; ConditionMonitor disabled")
+            return
+
+        token_manager = TokenManager()
+        client = WebSocketClient(access_token=token_manager.get_token())
+
+        selected_condition = {'cond_idx': None, 'cond_nm': None}
+
+        async def on_data(realtime_data: 'RealTimeData'):
+            trnm = getattr(realtime_data, 'trnm', None)
+            if trnm == 'CNSRLST':
+                # pick first condition
+                try:
+                    items = realtime_data.data or []
+                    cond_list = []
+                    for item in items:
+                        # accept list format [idx, name] or dict format
+                        if isinstance(item, list) and len(item) >= 2:
+                            cond_list.append({'cond_idx': item[0], 'cond_nm': item[1]})
+                        elif isinstance(item, dict) and 'cond_idx' in item and 'cond_nm' in item:
+                            cond_list.append({'cond_idx': item['cond_idx'], 'cond_nm': item['cond_nm']})
+                    if cond_list:
+                        selected_condition.update(cond_list[0])
+                        await client.register_condition_search_ka10173(
+                            condition_index=selected_condition['cond_idx'],
+                            condition_name=selected_condition['cond_nm']
+                        )
+                except Exception:
+                    logging.getLogger(__name__).warning("Failed to parse CNSRLST")
+            elif trnm == 'REAL':
+                # parse real-time condition events
+                try:
+                    for it in realtime_data.data or []:
+                        code = None
+                        action = None
+                        if isinstance(it, dict):
+                            # example: {'values': {'9001': '005930', '843': 'I', ...}, 'item': '005930'}
+                            values = it.get('values') if isinstance(it.get('values'), dict) else None
+                            if values:
+                                code = values.get('9001') or it.get('item')
+                                action = values.get('843') or values.get('action')  # 'I' in, maybe 'O' out
+                            else:
+                                code = it.get('stk_cd') or it.get('item')
+                                action = it.get('action')
+                        if code:
+                            with self._lock:
+                                if action in ('I', 'in', '입장', '편입', '1') or action is None:
+                                    self._codes.add(code if code.startswith('A') == False else code[1:])
+                                elif action in ('O', 'out', '이탈', '0'):
+                                    self._codes.discard(code if code.startswith('A') == False else code[1:])
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Failed to parse REAL: {e}")
+
+        async def on_login():
+            await client.condition_list_request_ka10171()
+
+        client.on_login = on_login
+        client.on_data = on_data
+
+        await client.start()
+        try:
+            # keep running until stop requested
+            while not self._stop_event.is_set():
+                await asyncio.sleep(0.5)
+        finally:
+            try:
+                # best-effort stop
+                await client.stop()
+            except Exception:
+                pass
+
 
 def main():
     """메인 함수"""
@@ -717,10 +867,13 @@ def main():
     if args.simulation:
         config.simulation = True
     
-    # 종목 코드 확인
+    # 종목 코드 확인: target_stocks 미설정 시에도 조건검색 모니터가 활성화되어 있으면 진행
     if not config.target_stocks:
-        logger.error("No target stocks specified. Use --stocks or config file.")
-        return False
+        if getattr(config, 'use_condition_monitor', False):
+            logger.info("No static target stocks provided; proceeding with dynamic codes from condition monitor.")
+        else:
+            logger.error("No target stocks specified. Use --stocks or config file, or enable condition monitor.")
+            return False
     
     # 로그 디렉토리 생성
     os.makedirs('logs', exist_ok=True)
