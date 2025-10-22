@@ -3,14 +3,12 @@
 조건검색 WebSocket 클라이언트 사용 예제
 
 이 예제는 키움증권의 조건검색 실시간 WebSocket API를 사용하는 방법을 보여줍니다.
+ConditionSearchClient 클래스를 사용하여 간편하게 조건검색을 수행합니다.
 """
 
 import asyncio
-import os
 import sys
 import logging
-import json
-from typing import Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -18,15 +16,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # 프로젝트 루트 추가
-project_root = Path(__file__).parent.parent.parent
+project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-# kiwoom_rest_api 모듈 경로 추가
-kiwoom_api_src = Path(__file__).parent.parent / 'src'
-sys.path.insert(0, str(kiwoom_api_src))
-
-# 경로 설정 후에 가져와야 임포트 오류가 발생하지 않습니다
-from kiwoom_rest_api.core.field_codes import FIELD_TITLE_MAP
+from koapys import KoapyRestSimple, ConditionSearchClient, ConditionInfo
 
 # 로깅 설정
 logging.basicConfig(
@@ -39,290 +32,198 @@ logging.basicConfig(
 # logging.getLogger('websockets').setLevel(logging.DEBUG)
 
 async def example_condition_search_realtime():
-    """조건검색 실시간 WebSocket 예제"""
+    """조건검색 실시간 WebSocket 예제 (단일 조건식)"""
     print("=== 조건검색 실시간 WebSocket 예제 ===")
     
-    from kiwoom_rest_api import WebSocketClient, RealTimeData
-    from kiwoom_rest_api.auth.token import TokenManager
+    # KoapyRestSimple 클라이언트 생성
+    koapy_client = KoapyRestSimple()
+    koapy_client.ensure_connected()
     
-    # 토큰 매니저 생성
-    token_manager = TokenManager()
-    client = WebSocketClient(access_token=token_manager.get_token())
+    # ConditionSearchClient 생성
+    client = ConditionSearchClient(access_token=koapy_client.access_token)
     
-    # 조건식 목록 및 선택된 조건식 저장
-    condition_list = []
     selected_condition = None
     
-    # 수신된 종목 저장
-    received_stocks = []
-    
-    # 콜백 함수들 설정
-    def _translate_values(values: Dict[str, Any]) -> Dict[str, Any]:
-        """숫자 코드 값을 사람이 읽기 쉬운 타이틀 맵으로 변환합니다."""
-        if not isinstance(values, dict):
-            return {}
-        out: Dict[str, Any] = {}
-        for k, v in values.items():
-            title = FIELD_TITLE_MAP.get(str(k), str(k))
-            out[title] = v
-        return out
-
-    async def on_data_received(realtime_data: RealTimeData):
-        """실시간 데이터 수신 시 호출"""
+    # 콜백 함수 설정
+    def on_condition_list(conditions):
+        """조건식 목록 수신 시 호출"""
         nonlocal selected_condition
+        print(f"\n✓ 조건식 목록 수신: {len(conditions)}개")
+        for cond in conditions:
+            print(f"  [{cond.index}] {cond.name}")
         
-        # 1. 조건식 목록 응답
-        if realtime_data.trnm == 'CNSRLST':
-            print(f"\n✓ 조건식 목록 수신")
-            if realtime_data.return_code == 0:
-                condition_list.clear()
-                # 데이터 형식: [['0', 'koa-시가베팅'], ['1', 'koa-관종-3%이상'], ...]
-                for item in realtime_data.data:
-                    if isinstance(item, list) and len(item) >= 2:
-                        cond_idx = item[0]
-                        cond_nm = item[1]
-                        condition_list.append({'cond_idx': cond_idx, 'cond_nm': cond_nm})
-                        print(f"  [{cond_idx}] {cond_nm}")
-                
-                if condition_list:
-                    # 첫 번째 조건식 선택
-                    selected_condition = condition_list[0]
-                    print(f"\n선택된 조건식: [{selected_condition['cond_idx']}] {selected_condition['cond_nm']}")
-                    
-                    # 선택한 조건식으로 실시간 등록
-                    print(f"\n2. 조건검색 실시간 등록 중...")
-                    await client.register_condition_search_ka10173(
-                        condition_index=selected_condition['cond_idx'],
-                        condition_name=selected_condition['cond_nm']
-                    )
-                else:
-                    print("\n⚠️ 등록된 조건식이 없습니다. HTS에서 조건식을 먼저 등록해주세요.")
-            else:
-                print(f"✗ 조건식 목록 조회 실패: {realtime_data.return_msg}")
-        
-        # 2. 조건검색 등록 응답
-        elif realtime_data.trnm == 'CNSRREQ':
-            if realtime_data.return_code == 0:
-                print("✓ 조건검색 등록 성공 - 실시간 종목 데이터 수신 대기 중...")
-                # 조회데이터 로그 (요청된 포맷)
-                try:
-                    # values 또는 숫자키 딕셔너리에 대한 타이틀 변환 추가
-                    processed_query_data = []
-                    for it in realtime_data.data:
-                        if isinstance(it, dict):
-                            if 'values' in it and isinstance(it['values'], dict):
-                                it_out = dict(it)
-                                it_out['values_titles'] = _translate_values(it['values'])
-                                processed_query_data.append(it_out)
-                            else:
-                                # 아이템 자체가 숫자코드 키들로 이뤄진 경우
-                                has_numeric_keys = any(str(k).isdigit() for k in it.keys())
-                                if has_numeric_keys:
-                                    it_out = dict(it)
-                                    it_out['titles'] = _translate_values(it)
-                                    processed_query_data.append(it_out)
-                                else:
-                                    processed_query_data.append(it)
-                        else:
-                            processed_query_data.append(it)
-
-                    query_log = {
-                        'trnm': realtime_data.trnm,
-                        'seq': realtime_data.raw_data.get('seq'),
-                        'return_code': realtime_data.return_code,
-                        'data': processed_query_data,
-                    }
-                    logging.info("# 조회데이터\n" + json.dumps(query_log, ensure_ascii=False, indent=4))
-                except Exception as e:
-                    logging.warning(f"조회데이터 로그 생성 실패: {e}")
-            else:
-                print(f"✗ 조건검색 등록 실패: {realtime_data.return_msg}")
-        
-        # 3. 실시간 조건검색 데이터
-        elif realtime_data.trnm == 'REAL':
-            # 조건검색 실시간 데이터
-            print(f"\n실시간 조건검색 데이터 수신: {len(realtime_data.data)}개 항목")
-            # 실시간데이터 로그 (요청된 포맷)
-            try:
-                # values에 대한 타이틀 변환 추가
-                processed_data = []
-                for it in realtime_data.data:
-                    if isinstance(it, dict) and 'values' in it and isinstance(it['values'], dict):
-                        values_titles = _translate_values(it['values'])
-                        it_out = dict(it)
-                        it_out['values_titles'] = values_titles
-                        processed_data.append(it_out)
-                    else:
-                        processed_data.append(it)
-
-                realtime_log = {
-                    'data': processed_data,
-                    'trnm': 'REAL',
-                }
-                logging.info("#실시간데이터\n" + json.dumps(realtime_log, ensure_ascii=False, indent=4))
-            except Exception as e:
-                logging.warning(f"실시간데이터 로그 생성 실패: {e}")
-            for item in realtime_data.data:
-                stock_code = item.get('stk_cd', '')
-                stock_name = item.get('stk_nm', '')
-                action = item.get('action', '')  # 'in' or 'out'
-                
-                if action == 'in':
-                    print(f"  [편입] {stock_code} - {stock_name}")
-                    if stock_code not in received_stocks:
-                        received_stocks.append(stock_code)
-                elif action == 'out':
-                    print(f"  [이탈] {stock_code} - {stock_name}")
-                    if stock_code in received_stocks:
-                        received_stocks.remove(stock_code)
-                else:
-                    print(f"  [종목] {stock_code} - {stock_name}")
-                    if stock_code not in received_stocks:
-                        received_stocks.append(stock_code)
+        if conditions:
+            selected_condition = conditions[0]
+            print(f"\n선택된 조건식: [{selected_condition.index}] {selected_condition.name}")
+        else:
+            print("\n⚠️ 등록된 조건식이 없습니다. HTS에서 조건식을 먼저 등록해주세요.")
     
-    async def on_connected():
-        """연결 성공 시 호출"""
-        print("✓ WebSocket 서버에 연결되었습니다")
+    def on_condition_registered(cond_idx, cond_name):
+        """조건검색 등록 완료 시 호출"""
+        print(f"✓ 조건검색 등록 성공: [{cond_idx}] {cond_name}")
+        print("   실시간 종목 데이터 수신 대기 중...")
     
-    async def on_logged_in():
-        """로그인 성공 시 호출"""
-        print("✓ WebSocket 서버 로그인 성공")
-        
-        # 로그인 후 조건식 목록 조회
-        print("\n1. 조건식 목록 조회 중...")
-        await client.condition_list_request_ka10171()
+    def on_stock_in(code, name, cond_idx):
+        """종목 편입 시 호출"""
+        print(f"  [편입] {code} - {name}")
     
-    async def on_error(error: Exception):
+    def on_stock_out(code, name, cond_idx):
+        """종목 이탈 시 호출"""
+        print(f"  [이탈] {code} - {name}")
+    
+    def on_error(error):
         """오류 발생 시 호출"""
         print(f"✗ 오류 발생: {error}")
     
-    # 콜백 함수들 등록
-    client.on_data = on_data_received
-    client.on_connect = on_connected
-    client.on_login = on_logged_in
+    # 콜백 등록
+    client.on_condition_list = on_condition_list
+    client.on_condition_registered = on_condition_registered
+    client.on_stock_in = on_stock_in
+    client.on_stock_out = on_stock_out
     client.on_error = on_error
     
-    # 클라이언트 시작
-    await client.start()
-    
-    # 60초간 실행 (조건 충족 종목 실시간 수신)
-    print("\n3. 실시간 데이터 수신 중 (60초)...")
-    print("   조건에 맞는 종목이 발생하면 실시간으로 표시됩니다.")
     try:
-        await asyncio.sleep(60)
-    finally:
-        # 조건검색 해지
+        # 1. 클라이언트 시작
+        print("\n1. WebSocket 연결 중...")
+        await client.start()
+        
+        # 2. 조건식 목록 로드
+        print("\n2. 조건식 목록 조회 중...")
+        conditions = await client.load_conditions()
+        
+        if not conditions:
+            print("조건식이 없습니다. 종료합니다.")
+            return
+        
+        # 3. 첫 번째 조건식 등록
         if selected_condition:
-            print("\n4. 조건검색 해지 중...")
-            await client.unregister_condition_search_ka10174(
-                condition_index=selected_condition['cond_idx']
+            print(f"\n3. 조건검색 실시간 등록 중...")
+            await client.register_condition(
+                condition_index=selected_condition.index,
+                condition_name=selected_condition.name
             )
-            await asyncio.sleep(1)  # 해지 메시지 전송 대기
+        
+        # 4. 60초간 실시간 데이터 수신
+        print("\n4. 실시간 데이터 수신 중 (60초)...")
+        print("   조건에 맞는 종목이 발생하면 실시간으로 표시됩니다.\n")
+        await asyncio.sleep(60)
+        
+    finally:
+        # 5. 조건검색 해지 및 종료
+        if selected_condition:
+            print("\n5. 조건검색 해지 중...")
+            await client.unregister_condition(
+                condition_index=selected_condition.index
+            )
+            await asyncio.sleep(1)
         
         await client.stop()
+        koapy_client.close()
         
-        print(f"\n최종 수신 종목 수: {len(received_stocks)}개")
-        if received_stocks:
-            print("수신된 종목:")
-            for stock in received_stocks[:20]:  # 최대 20개 표시
-                print(f"  - {stock}")
+        # 최종 결과 출력
+        stocks = client.get_received_stocks()
+        total_stocks = sum(len(s) for s in stocks.values())
+        print(f"\n=== 최종 수신 종목 수: {total_stocks}개 ===")
+        for cond_idx, stock_list in stocks.items():
+            if stock_list:
+                print(f"\n조건식 [{cond_idx}]: {len(stock_list)}개 종목")
+                for stock in stock_list[:20]:  # 최대 20개 표시
+                    print(f"  - {stock}")
 
 async def example_multiple_condition_search():
     """여러 조건식 동시 실행 예제"""
     print("=== 여러 조건검색 동시 실행 예제 ===")
     
-    from kiwoom_rest_api import WebSocketClient, RealTimeData
-    from kiwoom_rest_api.auth.token import TokenManager
+    # KoapyRestSimple 클라이언트 생성
+    koapy_client = KoapyRestSimple()
+    koapy_client.ensure_connected()
     
-    # 토큰 매니저 생성
-    token_manager = TokenManager()
-    client = WebSocketClient(access_token=token_manager.get_token())
+    # ConditionSearchClient 생성
+    client = ConditionSearchClient(access_token=koapy_client.access_token)
     
-    # 조건식 목록 및 선택된 조건식들 저장
-    condition_list = []
     selected_conditions = []
     
-    # 조건식별 종목 저장
-    condition_stocks = {}
-    
-    async def on_data_received(realtime_data: RealTimeData):
-        """실시간 데이터 수신"""
-        # 조건식 목록 응답
-        if realtime_data.trnm == 'CNSRLST':
-            print(f"\n✓ 조건식 목록 수신")
-            if realtime_data.return_code == 0:
-                condition_list.clear()
-                # 데이터 형식: [['0', 'koa-시가베팅'], ['1', 'koa-관종-3%이상'], ...]
-                for item in realtime_data.data:
-                    if isinstance(item, list) and len(item) >= 2:
-                        cond_idx = item[0]
-                        cond_nm = item[1]
-                        condition_list.append({'cond_idx': cond_idx, 'cond_nm': cond_nm})
-                        print(f"  [{cond_idx}] {cond_nm}")
-                
-                if len(condition_list) < 2:
-                    print("\n⚠️ 2개 이상의 조건식이 필요합니다.")
-                    return
-                
-                # 최대 2개 조건식 사용
-                selected_conditions.clear()
-                selected_conditions.extend(condition_list[:2])
-                
-                # 조건식별 종목 저장 초기화
-                for cond in selected_conditions:
-                    condition_stocks[cond['cond_idx']] = []
-                
-                # 모든 조건식 등록
-                print("\n✓ 조건식 등록 중...")
-                for cond in selected_conditions:
-                    print(f"  등록: [{cond['cond_idx']}] {cond['cond_nm']}")
-                    await client.register_condition_search_ka10173(
-                        condition_index=cond['cond_idx'],
-                        condition_name=cond['cond_nm'],
-                        group_no=cond['cond_idx']  # 각 조건식을 별도 그룹으로
-                    )
-                    await asyncio.sleep(0.5)  # 등록 간격
+    # 콜백 함수 설정
+    def on_condition_list(conditions):
+        """조건식 목록 수신 시 호출"""
+        print(f"\n✓ 조건식 목록 수신: {len(conditions)}개")
+        for cond in conditions:
+            print(f"  [{cond.index}] {cond.name}")
         
-        # 실시간 조건검색 데이터
-        elif realtime_data.trnm == 'COND_REAL':
-            for item in realtime_data.data:
-                cond_idx = item.get('cond_idx', '')
-                stock_code = item.get('stk_cd', '')
-                stock_name = item.get('stk_nm', '')
-                
-                if cond_idx in condition_stocks:
-                    print(f"[{cond_idx}] {stock_code} - {stock_name}")
-                    if stock_code not in condition_stocks[cond_idx]:
-                        condition_stocks[cond_idx].append(stock_code)
+        if len(conditions) < 2:
+            print("\n⚠️ 2개 이상의 조건식이 필요합니다.")
+        else:
+            # 최대 2개 조건식 선택
+            selected_conditions.clear()
+            selected_conditions.extend(conditions[:2])
+            print(f"\n선택된 조건식: {len(selected_conditions)}개")
+            for cond in selected_conditions:
+                print(f"  [{cond.index}] {cond.name}")
     
-    async def on_logged_in():
-        """로그인 후 조건식 목록 조회"""
-        print("✓ 로그인 성공, 조건식 목록 조회 중...")
-        await client.condition_list_request_ka10171()
+    def on_condition_registered(cond_idx, cond_name):
+        """조건검색 등록 완료 시 호출"""
+        print(f"✓ 조건검색 등록 성공: [{cond_idx}] {cond_name}")
     
-    client.on_data = on_data_received
-    client.on_login = on_logged_in
+    def on_stock_in(code, name, cond_idx):
+        """종목 편입 시 호출"""
+        print(f"  [{cond_idx}] 편입: {code} - {name}")
     
-    await client.start()
+    def on_stock_out(code, name, cond_idx):
+        """종목 이탈 시 호출"""
+        print(f"  [{cond_idx}] 이탈: {code} - {name}")
+    
+    def on_error(error):
+        """오류 발생 시 호출"""
+        print(f"✗ 오류 발생: {error}")
+    
+    # 콜백 등록
+    client.on_condition_list = on_condition_list
+    client.on_condition_registered = on_condition_registered
+    client.on_stock_in = on_stock_in
+    client.on_stock_out = on_stock_out
+    client.on_error = on_error
     
     try:
+        # 1. 클라이언트 시작
+        print("\n1. WebSocket 연결 중...")
+        await client.start()
+        
+        # 2. 조건식 목록 로드
+        print("\n2. 조건식 목록 조회 중...")
+        conditions = await client.load_conditions()
+        
+        if len(conditions) < 2:
+            print("조건식이 2개 미만입니다. 종료합니다.")
+            return
+        
+        # 3. 여러 조건식 등록
+        print(f"\n3. 조건검색 실시간 등록 중... ({len(selected_conditions)}개)")
+        await client.register_multiple_conditions(selected_conditions, delay=0.5)
+        
+        # 4. 60초간 실시간 데이터 수신
+        print("\n4. 실시간 데이터 수신 중 (60초)...")
+        print("   조건에 맞는 종목이 발생하면 실시간으로 표시됩니다.\n")
         await asyncio.sleep(60)
+        
     finally:
-        # 모든 조건식 해지
-        print("\n조건식 해지 중...")
-        for cond in selected_conditions:
-            await client.unregister_condition_search_ka10174(
-                condition_index=cond['cond_idx'],
-                group_no=cond['cond_idx']
-            )
+        # 5. 모든 조건검색 해지 및 종료
+        if selected_conditions:
+            print("\n5. 조건검색 해지 중...")
+            await client.unregister_multiple_conditions(selected_conditions)
+            await asyncio.sleep(1)
         
         await client.stop()
+        koapy_client.close()
         
-        # 결과 출력
+        # 최종 결과 출력
+        stocks = client.get_received_stocks()
         print("\n=== 최종 결과 ===")
-        for cond_idx, stocks in condition_stocks.items():
-            cond_name = next((c['cond_nm'] for c in selected_conditions if c['cond_idx'] == cond_idx), cond_idx)
-            print(f"[{cond_idx}] {cond_name}: {len(stocks)}개 종목")
+        for cond_idx, stock_list in stocks.items():
+            cond_name = next((c.name for c in selected_conditions if c.index == cond_idx), cond_idx)
+            print(f"[{cond_idx}] {cond_name}: {len(stock_list)}개 종목")
+            if stock_list:
+                for stock in stock_list[:10]:  # 최대 10개 표시
+                    print(f"  - {stock}")
 
 async def main():
     """메인 함수"""

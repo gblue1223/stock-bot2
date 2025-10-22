@@ -26,7 +26,7 @@ class KoapyRestSimple:
     def __init__(
         self,
         timeout: int = 10,
-        simulation: bool = False,
+        simulation: bool = False, # 미완성
         logger: Optional[logging.Logger] = None,
     ):
         self._base_url = get_base_url()
@@ -34,18 +34,21 @@ class KoapyRestSimple:
         self._simulation = simulation
         self._logger = logger or logging.getLogger("koapyRest")
         self._is_connected = False
+        self._token_manager = TokenManager()
         
         # Initialize kiwoom_rest_api components
         if not simulation:
-            self._token_manager = TokenManager()
             self._stock_info = StockInfo(base_url=self._base_url, token_manager=self._token_manager)
             self._account = Account(base_url=self._base_url, token_manager=self._token_manager)
             self._order = Order(base_url=self._base_url, token_manager=self._token_manager)
         else:
-            self._token_manager = None
             self._stock_info = None
             self._account = None
             self._order = None
+
+    @property
+    def access_token(self) -> str:
+        return self._token_manager.get_token()
 
     # --- Compatibility helpers ---
     @property
