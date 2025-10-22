@@ -40,21 +40,8 @@ sys.path.insert(0, str(project_root))
 # 환경 변수 로드 (모든 import 전에!)
 load_dotenv()
 
-# kiwoom_rest_api 모듈 경로 추가 (예제 파일과 동일한 방식)
-kiwoom_api_src = Path(__file__).parent.parent.parent / 'koapys' / 'kiwoom_rest_api' / 'src'
-sys.path.insert(0, str(kiwoom_api_src))
-
-try:
-    from kiwoom_rest_api import WebSocketClient, RealTimeData
-    from kiwoom_rest_api.auth.token import TokenManager
-except Exception as _e:
-    WebSocketClient = None  # type: ignore
-    RealTimeData = None  # type: ignore
-    TokenManager = None  # type: ignore
-    logging.getLogger(__name__).warning(f"kiwoom_rest_api import failed: {_e}")
-
-from koapys.client import KoapyRestSimple
 from koapys.types import OrderType, OrderBookType
+from koapys import KoapyRestSimple, ConditionSearchClient
 from ai_trader.grpo.inference.infer_grpo import GRPOInference
 from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
 
@@ -278,20 +265,9 @@ class LiveTrader:
         
         # 조건검색 실시간 모니터 (첫 번째 조건식)
         self.condition_monitor: Optional[ConditionMonitor] = None
-        if self.config.use_condition_monitor and WebSocketClient and TokenManager:
+        if self.config.use_condition_monitor:
             try:
-                # 메인 스레드에서 미리 토큰 획득
-                # Enable debug logging temporarily
-                token_logger = logging.getLogger('kiwoom_rest_api.auth.token')
-                original_level = token_logger.level
-                token_logger.setLevel(logging.DEBUG)
-                
-                token_manager = TokenManager()
-                access_token = token_manager.get_token()
-                
-                # Restore original level
-                token_logger.setLevel(original_level)
-                
+                access_token = self.koapys.access_token
                 if access_token:
                     logger.info(f"Access token acquired for condition monitor (length: {len(access_token)})")
                     self.condition_monitor = ConditionMonitor(access_token=access_token)
@@ -767,6 +743,7 @@ class ConditionMonitor:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._access_token = access_token  # 메인 스레드에서 전달받은 토큰
+        self._selected_condition_idx: Optional[str] = None
 
     def get_codes(self) -> List[str]:
         with self._lock:
@@ -791,8 +768,8 @@ class ConditionMonitor:
             logging.getLogger(__name__).error(f"ConditionMonitor fatal: {e}", exc_info=True)
 
     async def _run_async(self):
-        if not WebSocketClient:
-            logging.getLogger(__name__).warning("WebSocketClient not available; ConditionMonitor disabled")
+        if not ConditionSearchClient:
+            logging.getLogger(__name__).warning("ConditionSearchClient not available; ConditionMonitor disabled")
             return
 
         # 전달받은 토큰 사용 (메인 스레드에서 이미 획득함)
@@ -803,69 +780,81 @@ class ConditionMonitor:
         
         logging.getLogger(__name__).info(f"Using provided access token (length: {len(access_token)})")
 
-        client = WebSocketClient(access_token=access_token)
+        # ConditionSearchClient 생성
+        client = ConditionSearchClient(access_token=access_token)
 
-        selected_condition = {'cond_idx': None, 'cond_nm': None}
+        # 콜백 함수 설정
+        def on_condition_list(conditions):
+            """조건식 목록 수신 시 첫 번째 조건식 선택"""
+            if conditions:
+                self._selected_condition_idx = conditions[0].index
+                logging.getLogger(__name__).info(
+                    f"Selected condition: [{conditions[0].index}] {conditions[0].name}"
+                )
 
-        async def on_data(realtime_data: 'RealTimeData'):
-            trnm = getattr(realtime_data, 'trnm', None)
-            if trnm == 'CNSRLST':
-                # pick first condition
-                try:
-                    items = realtime_data.data or []
-                    cond_list = []
-                    for item in items:
-                        # accept list format [idx, name] or dict format
-                        if isinstance(item, list) and len(item) >= 2:
-                            cond_list.append({'cond_idx': item[0], 'cond_nm': item[1]})
-                        elif isinstance(item, dict) and 'cond_idx' in item and 'cond_nm' in item:
-                            cond_list.append({'cond_idx': item['cond_idx'], 'cond_nm': item['cond_nm']})
-                    if cond_list:
-                        selected_condition.update(cond_list[0])
-                        logging.getLogger(__name__).info(f"Selected condition: [{selected_condition['cond_idx']}] {selected_condition['cond_nm']}")
-                        await client.register_condition_search_ka10173(
-                            condition_index=selected_condition['cond_idx'],
-                            condition_name=selected_condition['cond_nm']
-                        )
-                except Exception as e:
-                    logging.getLogger(__name__).warning(f"Failed to parse CNSRLST: {e}")
-            elif trnm == 'CNSRREQ':
-                # 조건검색 초기 조회 결과 (등록 직후 현재 조건에 맞는 종목들)
-                try:
-                    items = realtime_data.data or []
-                    added_count = 0
-                    for it in items:
-                        if isinstance(it, dict):
-                            # 종목 코드는 '9001' 키에 있음 (예: "A042660")
-                            code = it.get('9001')
-                            if code:
-                                # 'A' 접두사 제거
-                                code_clean = code[1:] if code.startswith('A') else code
-                                with self._lock:
-                                    self._codes.add(code_clean)
-                                    added_count += 1
-                    if added_count > 0:
-                        logging.getLogger(__name__).info(f"Added {added_count} stocks from initial condition search")
-                except Exception as e:
-                    logging.getLogger(__name__).warning(f"Failed to parse CNSRREQ: {e}")
-            
-        async def on_login():
-            await client.condition_list_request_ka10171()
+        def on_condition_registered(cond_idx, cond_name):
+            """조건검색 등록 완료"""
+            logging.getLogger(__name__).info(f"Condition registered: [{cond_idx}] {cond_name}")
 
-        client.on_login = on_login
-        client.on_data = on_data
+        def on_stock_in(code, name, cond_idx):
+            """종목 편입 시 호출"""
+            # 'A' 접두사 제거
+            code_clean = code[1:] if code.startswith('A') else code
+            with self._lock:
+                if code_clean not in self._codes:
+                    self._codes.add(code_clean)
+                    logging.getLogger(__name__).info(f"Stock added: {code_clean} ({name})")
 
-        await client.start()
+        def on_stock_out(code, name, cond_idx):
+            """종목 이탈 시 호출"""
+            code_clean = code[1:] if code.startswith('A') else code
+            with self._lock:
+                if code_clean in self._codes:
+                    self._codes.remove(code_clean)
+                    logging.getLogger(__name__).info(f"Stock removed: {code_clean} ({name})")
+
+        def on_error(error):
+            """오류 발생 시 호출"""
+            logging.getLogger(__name__).error(f"ConditionSearchClient error: {error}")
+
+        # 콜백 등록
+        client.on_condition_list = on_condition_list
+        client.on_condition_registered = on_condition_registered
+        client.on_stock_in = on_stock_in
+        client.on_stock_out = on_stock_out
+        client.on_error = on_error
+
         try:
-            # keep running until stop requested
+            # WebSocket 연결 시작
+            await client.start()
+            
+            # 조건식 목록 로드 및 등록
+            conditions = await client.load_conditions()
+            
+            if not conditions:
+                logging.getLogger(__name__).warning("No conditions found")
+                return
+            
+            # 첫 번째 조건식 등록
+            if self._selected_condition_idx:
+                selected = conditions[0]
+                await client.register_condition(
+                    condition_index=selected.index,
+                    condition_name=selected.name
+                )
+            
+            # 종료 신호까지 대기
             while not self._stop_event.is_set():
                 await asyncio.sleep(0.5)
+                
         finally:
             try:
-                # best-effort stop
+                # 조건검색 해지 및 연결 종료
+                if self._selected_condition_idx:
+                    await client.unregister_condition(self._selected_condition_idx)
                 await client.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Error during cleanup: {e}")
 
 
 def main():
