@@ -848,33 +848,7 @@ class ConditionMonitor:
                         logging.getLogger(__name__).info(f"Added {added_count} stocks from initial condition search")
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"Failed to parse CNSRREQ: {e}")
-            elif trnm == 'REAL':
-                # parse real-time condition events (실시간 편입/이탈)
-                try:
-                    for it in realtime_data.data or []:
-                        code = None
-                        action = None
-                        if isinstance(it, dict):
-                            # example: {'values': {'9001': '005930', '843': 'I', ...}, 'item': '005930'}
-                            values = it.get('values') if isinstance(it.get('values'), dict) else None
-                            if values:
-                                code = values.get('9001') or it.get('item')
-                                action = values.get('843') or values.get('action')  # 'I' in, maybe 'O' out
-                            else:
-                                code = it.get('stk_cd') or it.get('item')
-                                action = it.get('action')
-                        if code:
-                            code_clean = code[1:] if code.startswith('A') else code
-                            with self._lock:
-                                if action in ('I', 'in', '입장', '편입', '1') or action is None:
-                                    self._codes.add(code_clean)
-                                    logging.getLogger(__name__).debug(f"[+] Stock added to condition: {code_clean}")
-                                elif action in ('O', 'out', '이탈', '0'):
-                                    self._codes.discard(code_clean)
-                                    logging.getLogger(__name__).debug(f"[-] Stock removed from condition: {code_clean}")
-                except Exception as e:
-                    logging.getLogger(__name__).warning(f"Failed to parse REAL: {e}")
-
+            
         async def on_login():
             await client.condition_list_request_ka10171()
 
