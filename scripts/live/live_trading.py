@@ -32,9 +32,13 @@ import numpy as np
 import torch
 from dotenv import load_dotenv
 
+# ⚠️ 중요: 다른 모듈을 import하기 전에 환경 변수를 먼저 로드해야 합니다
 # 프로젝트 루트 추가
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+
+# 환경 변수 로드 (모든 import 전에!)
+load_dotenv()
 
 # kiwoom_rest_api 모듈 경로 추가 (예제 파일과 동일한 방식)
 kiwoom_api_src = Path(__file__).parent.parent.parent / 'koapys' / 'kiwoom_rest_api' / 'src'
@@ -53,9 +57,6 @@ from koapys.client import KoapyRestSimple
 from koapys.types import OrderType, OrderBookType
 from ai_trader.grpo.inference.infer_grpo import GRPOInference
 from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
-
-# 환경 변수 로드
-load_dotenv()
 
 # 로깅 설정
 logging.basicConfig(
@@ -280,8 +281,16 @@ class LiveTrader:
         if self.config.use_condition_monitor and WebSocketClient and TokenManager:
             try:
                 # 메인 스레드에서 미리 토큰 획득
+                # Enable debug logging temporarily
+                token_logger = logging.getLogger('kiwoom_rest_api.auth.token')
+                original_level = token_logger.level
+                token_logger.setLevel(logging.DEBUG)
+                
                 token_manager = TokenManager()
                 access_token = token_manager.get_token()
+                
+                # Restore original level
+                token_logger.setLevel(original_level)
                 
                 if access_token:
                     logger.info(f"Access token acquired for condition monitor (length: {len(access_token)})")
@@ -291,7 +300,7 @@ class LiveTrader:
                 else:
                     logger.warning("Failed to acquire access token; condition monitor disabled")
             except Exception as e:
-                logger.warning(f"Failed to start condition monitor: {e}")
+                logger.warning(f"Failed to start condition monitor: {e}", exc_info=True)
     
     def is_market_open(self) -> bool:
         """장이 열려있는지 확인"""

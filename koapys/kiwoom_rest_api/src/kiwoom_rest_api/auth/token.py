@@ -53,13 +53,24 @@ class TokenManager:
     def _request_new_token(self) -> None:
         """Request a new access token"""
         try:
+            api_key = get_api_key()
+            api_secret = get_api_secret()
+            
+            # API 키 검증 (보안을 위해 일부만 표시)
+            if not api_key or not api_secret:
+                logger.error(f"Missing API credentials: key={'SET' if api_key else 'MISSING'}, secret={'SET' if api_secret else 'MISSING'}")
+                self._access_token = None
+                return
+            
+            logger.debug(f"Requesting token with API key: {api_key[:10]}... (length: {len(api_key)})")
+            
             response = make_request(
                 endpoint=TOKEN_URL,
                 method="POST",
                 data={
                     "grant_type": "client_credentials",
-                    "appkey": get_api_key(),
-                    "secretkey": get_api_secret(),
+                    "appkey": api_key,
+                    "secretkey": api_secret,
                 },
             )
             logger.debug(f"Token request response type: {type(response)}, content: {response}")
@@ -87,6 +98,16 @@ class TokenManager:
         """Update token information from the API response"""
         logger.debug(f"Token response keys: {list(token_response.keys())}")
         
+        # Check for error response
+        return_code = token_response.get("return_code")
+        return_msg = token_response.get("return_msg", "")
+        
+        if return_code != 0:
+            logger.error(f"Token request failed: code={return_code}, msg={return_msg}")
+            logger.error(f"Full response: {token_response}")
+            self._access_token = None
+            return
+        
         # Try multiple possible keys for access token
         self._access_token = (
             token_response.get("token") or 
@@ -98,6 +119,7 @@ class TokenManager:
             logger.info(f"Access token updated successfully (length: {len(self._access_token)})")
         else:
             logger.warning(f"Failed to extract access token from response. Available keys: {list(token_response.keys())}")
+            logger.warning(f"return_code={return_code}, return_msg={return_msg}")
         
         # Calculate expiry time
         if "expires_in" in token_response:
