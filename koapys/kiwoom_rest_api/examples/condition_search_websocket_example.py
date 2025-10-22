@@ -19,7 +19,7 @@ load_dotenv()
 project_root = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(project_root))
 
-from koapys import KoapyRestSimple, ConditionSearchClient, ConditionInfo
+from koapys import KoapyRestSimple, ConditionSearchClient
 
 # 로깅 설정
 logging.basicConfig(

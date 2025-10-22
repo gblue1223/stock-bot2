@@ -32,11 +32,6 @@ FINAL_COLUMNS: List[str] = [
     # 매도/매수 대기금액 1~10
     *[f"매도대기금액{i}" for i in range(1, 11)],
     *[f"매수대기금액{i}" for i in range(1, 11)],
-    # TODO: 나중에 추가
-    # *[f"매도거래원{i}" for i in range(1, 6)],
-    # *[f"매도거래원수량{i}" for i in range(1, 6)],
-    # *[f"매수거래원{i}" for i in range(1, 6)],
-    # *[f"매수거래원수량{i}" for i in range(1, 6)],
 ]
 
 def _to_time_ms(val: object) -> int:
