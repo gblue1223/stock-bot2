@@ -703,6 +703,17 @@ class LiveTrader:
         logger.info(f"Total Profit: {self.stats['total_profit']:.2f}%")
         logger.info(f"Active Positions: {len(self.positions)}")
         
+        # 현재 모니터링 중인 종목
+        if self.condition_monitor:
+            monitored_codes = self.condition_monitor.get_codes()
+            logger.info(f"\n[MONITOR] Tracked Stocks: {len(monitored_codes)}")
+            if monitored_codes:
+                # 최대 10개까지만 표시
+                display_codes = monitored_codes[:10]
+                logger.info(f"  Codes: {', '.join(display_codes)}")
+                if len(monitored_codes) > 10:
+                    logger.info(f"  ... and {len(monitored_codes) - 10} more")
+        
         # 추론 엔진 통계
         inference_stats = self.inference.get_stats()
         logger.info(f"\n[AI] Inference Stats:")
@@ -811,14 +822,34 @@ class ConditionMonitor:
                             cond_list.append({'cond_idx': item['cond_idx'], 'cond_nm': item['cond_nm']})
                     if cond_list:
                         selected_condition.update(cond_list[0])
+                        logging.getLogger(__name__).info(f"Selected condition: [{selected_condition['cond_idx']}] {selected_condition['cond_nm']}")
                         await client.register_condition_search_ka10173(
                             condition_index=selected_condition['cond_idx'],
                             condition_name=selected_condition['cond_nm']
                         )
-                except Exception:
-                    logging.getLogger(__name__).warning("Failed to parse CNSRLST")
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Failed to parse CNSRLST: {e}")
+            elif trnm == 'CNSRREQ':
+                # 조건검색 초기 조회 결과 (등록 직후 현재 조건에 맞는 종목들)
+                try:
+                    items = realtime_data.data or []
+                    added_count = 0
+                    for it in items:
+                        if isinstance(it, dict):
+                            # 종목 코드는 '9001' 키에 있음 (예: "A042660")
+                            code = it.get('9001')
+                            if code:
+                                # 'A' 접두사 제거
+                                code_clean = code[1:] if code.startswith('A') else code
+                                with self._lock:
+                                    self._codes.add(code_clean)
+                                    added_count += 1
+                    if added_count > 0:
+                        logging.getLogger(__name__).info(f"Added {added_count} stocks from initial condition search")
+                except Exception as e:
+                    logging.getLogger(__name__).warning(f"Failed to parse CNSRREQ: {e}")
             elif trnm == 'REAL':
-                # parse real-time condition events
+                # parse real-time condition events (실시간 편입/이탈)
                 try:
                     for it in realtime_data.data or []:
                         code = None
@@ -833,11 +864,14 @@ class ConditionMonitor:
                                 code = it.get('stk_cd') or it.get('item')
                                 action = it.get('action')
                         if code:
+                            code_clean = code[1:] if code.startswith('A') else code
                             with self._lock:
                                 if action in ('I', 'in', '입장', '편입', '1') or action is None:
-                                    self._codes.add(code if code.startswith('A') == False else code[1:])
+                                    self._codes.add(code_clean)
+                                    logging.getLogger(__name__).debug(f"[+] Stock added to condition: {code_clean}")
                                 elif action in ('O', 'out', '이탈', '0'):
-                                    self._codes.discard(code if code.startswith('A') == False else code[1:])
+                                    self._codes.discard(code_clean)
+                                    logging.getLogger(__name__).debug(f"[-] Stock removed from condition: {code_clean}")
                 except Exception as e:
                     logging.getLogger(__name__).warning(f"Failed to parse REAL: {e}")
 
