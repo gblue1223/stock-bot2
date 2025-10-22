@@ -309,7 +309,8 @@ class WebSocketClient:
                     
             else:
                 # 기타 응답 (조건식 목록, 조건검색 응답 등)
-                logger.debug(f"응답 수신 - trnm: {trnm}, data 항목 수: {len(realtime_data.data)}")
+                data_len = len(realtime_data.data) if realtime_data.data is not None else 0
+                logger.debug(f"응답 수신 - trnm: {trnm}, data 항목 수: {data_len}")
                 if self.on_data:
                     await self.on_data(realtime_data)
                 else:

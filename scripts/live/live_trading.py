@@ -111,7 +111,7 @@ class TradingConfig:
         self.trading_end = "11:00"  # 거래 종료 (스캘핑은 오전만)
         
         # 데이터 수집 설정
-        self.seq_len = 30  # 시퀀스 길이
+        self.seq_len = 60  # 시퀀스 길이
         self.num_features = 24  # 특징 수
         self.update_interval = 1.0  # 데이터 업데이트 간격 (초)
         
@@ -649,7 +649,7 @@ class LiveTrader:
                 # 장 시간 확인
                 if not self.is_market_open():
                     logger.info("Market is closed. Waiting...")
-                    time.sleep(60)
+                    time.sleep(30)
                     continue
                 
                 # 조건검색 실시간으로부터 종목 동기화
