@@ -100,7 +100,7 @@ class TradingConfig:
         
         # 데이터 수집 설정
         self.seq_len = 60  # 시퀀스 길이
-        self.num_features = 24  # 특징 수
+        self.num_features = 28  # 특징 수 (파생 피처 4개 + 기본 지표 4개 + 대기금액 20개)
         self.update_interval = 1.0  # 데이터 업데이트 간격 (초)
         
         # Koapys 설정
@@ -301,10 +301,11 @@ class LiveTrader:
             market_data: Koapys에서 받은 시장 데이터 (dict 형태)
             
         Returns:
-            특징 벡터 (24,) - FINAL_COLUMNS에서 메타데이터 및 호가/수량 제외
+            특징 벡터 (28,) - FINAL_COLUMNS에서 메타데이터 및 호가/수량 제외
             
-        추출되는 특징 (24개):
-        - 등락률, 누적거래대금, 거래회전율, 체결강도 (4개)
+        추출되는 특징 (28개):
+        - 파생 피처: 종목명_scalar, 시간_sin, 시간_cos, 시간_scalar (4개)
+        - 기본 지표: 등락률, 누적거래대금, 거래회전율, 체결강도 (4개)
         - 매도대기금액1~10 (10개)
         - 매수대기금액1~10 (10개)
         

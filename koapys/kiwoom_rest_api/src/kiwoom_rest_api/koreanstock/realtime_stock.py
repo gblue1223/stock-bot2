@@ -17,8 +17,11 @@ logger = logging.getLogger(__name__)
 
 # 최종 컬럼 정의 (normalize_datasets.py의 FINAL_COLUMNS 참고)
 FINAL_COLUMNS: List[str] = [
-    "종목코드", "종목명", "시간", "등락률",
-    "누적거래대금", "거래회전율", "체결강도",
+    "종목코드", "종목명", "시간",
+    # 파생 피처 (종목명과 시간에서 생성)
+    "종목명_scalar", "시간_sin", "시간_cos", "시간_scalar",
+    # 기본 지표
+    "등락률", "누적거래대금", "거래회전율", "체결강도",
     # 매도/매수 호가 및 수량 1~10
     *[f"매도호가{i}" for i in range(1, 11)],
     *[f"매도호가수량{i}" for i in range(1, 11)],
@@ -36,6 +39,12 @@ class StockRealtimeData:
     종목코드: str = ""
     종목명: str = ""
     시간: str = ""
+    
+    # 파생 피처 (종목명과 시간에서 계산)
+    종목명_scalar: float = 0.0
+    시간_sin: float = 0.0
+    시간_cos: float = 0.0
+    시간_scalar: float = 0.0
     
     # 체결 정보 (0B)
     현재가: float = 0.0
@@ -120,6 +129,46 @@ class StockRealtimeData:
     매수대기금액8: float = 0.0
     매수대기금액9: float = 0.0
     매수대기금액10: float = 0.0
+    
+    def compute_derived_features(self):
+        """파생 피처 계산 (종목명_scalar, 시간_sin, 시간_cos, 시간_scalar)"""
+        import numpy as np
+        
+        # 종목명_scalar: 문자 레벨 스칼라 인코딩
+        if self.종목명:
+            char_sum = sum(ord(c) for c in self.종목명)
+            self.종목명_scalar = float(char_sum % 10000) / 10000.0
+        else:
+            self.종목명_scalar = 0.0
+        
+        # 시간 파생 피처
+        if self.시간:
+            try:
+                # HHMMSSmmm -> seconds
+                time_str = str(self.시간).zfill(9)
+                hh = int(time_str[0:2])
+                mm = int(time_str[2:4])
+                ss = int(time_str[4:6])
+                secs = hh * 3600 + mm * 60 + ss
+                
+                # sin/cos 주기 변환
+                SECONDS_IN_DAY = 24 * 60 * 60
+                self.시간_sin = float(np.sin(2 * np.pi * secs / SECONDS_IN_DAY))
+                self.시간_cos = float(np.cos(2 * np.pi * secs / SECONDS_IN_DAY))
+                
+                # 장 시작 후 경과 시간 (표준화)
+                MARKET_OPEN_SECONDS = 9 * 3600  # 09:00:00
+                sec_from_open = max(0, secs - MARKET_OPEN_SECONDS)
+                # 간단한 표준화: 0~6시간(21600초) 범위를 -1~1로 매핑
+                self.시간_scalar = float((sec_from_open - 10800) / 10800.0)  # 3시간 중심, ±3시간
+            except Exception:
+                self.시간_sin = 0.0
+                self.시간_cos = 0.0
+                self.시간_scalar = 0.0
+        else:
+            self.시간_sin = 0.0
+            self.시간_cos = 0.0
+            self.시간_scalar = 0.0
     
     def compute_waiting_amounts(self):
         """호가와 수량을 곱해 대기금액 계산 (백만원 단위)"""
@@ -298,6 +347,9 @@ class RealtimeStockClient:
                     self._process_quote_data(stock, values)
                     if self.on_quote_data:
                         self.on_quote_data(item_code, stock)
+                
+                # 파생 피처 계산 (종목명_scalar, 시간_sin, 시간_cos, 시간_scalar)
+                stock.compute_derived_features()
                 
                 # 대기금액 계산
                 stock.compute_waiting_amounts()

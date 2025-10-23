@@ -27,8 +27,11 @@ DEFAULT_MIN_QUALIFYING_MINUTES: int = 1
 
 # Final column order required
 FINAL_COLUMNS: List[str] = [
-    "종목코드", "종목명", "시간", "등락률",
-    "누적거래대금", "거래회전율", "체결강도",
+    "종목코드", "종목명", "시간",
+    # 파생 피처 (종목명과 시간에서 생성)
+    "종목명_scalar", "시간_sin", "시간_cos", "시간_scalar",
+    # 기본 지표
+    "등락률", "누적거래대금", "거래회전율", "체결강도",
     # 매도/매수 대기금액 1~10
     *[f"매도대기금액{i}" for i in range(1, 11)],
     *[f"매수대기금액{i}" for i in range(1, 11)],

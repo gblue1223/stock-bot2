@@ -16,7 +16,7 @@
   "trading_start": "09:00",
   "trading_end": "11:00",
   "seq_len": 30,
-  "num_features": 24,
+  "num_features": 28,
   "update_interval": 1.0,
   "koapys_base_url": "http://localhost:5000",
   "simulation": true
