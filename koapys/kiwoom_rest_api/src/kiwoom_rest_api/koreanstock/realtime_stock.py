@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 FINAL_COLUMNS: List[str] = [
     "종목코드", "종목명", "시간", "등락률",
     "누적거래대금", "거래회전율", "체결강도",
+    # 매도/매수 호가 및 수량 1~10
+    *[f"매도호가{i}" for i in range(1, 11)],
+    *[f"매도호가수량{i}" for i in range(1, 11)],
+    *[f"매수호가{i}" for i in range(1, 11)],
+    *[f"매수호가수량{i}" for i in range(1, 11)],
     # 매도/매수 대기금액 1~10
     *[f"매도대기금액{i}" for i in range(1, 11)],
     *[f"매수대기금액{i}" for i in range(1, 11)],
@@ -130,9 +135,16 @@ class StockRealtimeData:
             setattr(self, f"매수대기금액{i}", (bid_price * bid_qty) / 1_000_000)
     
     def to_dict(self) -> Dict[str, Any]:
-        """딕셔너리로 변환 (FINAL_COLUMNS 기준)"""
-        return {col: getattr(self, col, 0.0 if col not in ["종목코드", "종목명", "시간"] else "") 
-                for col in FINAL_COLUMNS}
+        """딕셔너리로 변환 (FINAL_COLUMNS 기준, 호가/수량 제외)"""
+        result = {}
+        for col in FINAL_COLUMNS:
+            # 호가 및 호가수량 필드 제외 (매도호가1~10, 매도호가수량1~10, 매수호가1~10, 매수호가수량1~10)
+            if col.startswith('매도호가') or col.startswith('매수호가'):
+                continue
+            
+            default_val = "" if col in ["종목코드", "종목명", "시간"] else 0.0
+            result[col] = getattr(self, col, default_val)
+        return result
     
     def to_full_dict(self) -> Dict[str, Any]:
         """모든 필드를 포함한 딕셔너리로 변환"""

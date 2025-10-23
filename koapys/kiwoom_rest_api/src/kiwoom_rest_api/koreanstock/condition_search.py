@@ -191,8 +191,9 @@ class ConditionSearchClient:
                         self.received_stocks[cond_idx] = []
                     
                     stock_count = 0
+                    data = realtime_data.data if isinstance(realtime_data.data, list) else []
                     # 등록 성공 시 초기 종목 데이터 처리
-                    for item in realtime_data.data:
+                    for item in data:
                         if isinstance(item, dict):
                             # values 딕셔너리에서 데이터 추출
                             if 'values' in item and isinstance(item['values'], dict):

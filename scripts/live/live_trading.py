@@ -42,6 +42,7 @@ load_dotenv()
 
 from koapys.types import OrderType, OrderBookType
 from koapys import KoapyRestSimple, ConditionSearchClient
+from koapys import FINAL_COLUMNS
 from ai_trader.grpo.inference.infer_grpo import GRPOInference
 from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
 
@@ -294,63 +295,39 @@ class LiveTrader:
     
     def extract_features(self, market_data: Dict) -> np.ndarray:
         """
-        시장 데이터에서 24개 특징 추출
+        시장 데이터에서 특징 추출 (to_dict와 동일한 로직)
         
         Args:
-            market_data: Koapys에서 받은 시장 데이터
+            market_data: Koapys에서 받은 시장 데이터 (dict 형태)
             
         Returns:
-            특징 벡터 (24,) - 학습 데이터와 동일한 구조
+            특징 벡터 (24,) - FINAL_COLUMNS에서 메타데이터 및 호가/수량 제외
             
-        특징 목록:
-        1. 등락률
-        2. 누적거래대금
-        3. 거래회전율
-        4. 체결강도
-        5-14. 매도대기금액 1-10
-        15-24. 매수대기금액 1-10
+        추출되는 특징 (24개):
+        - 등락률, 누적거래대금, 거래회전율, 체결강도 (4개)
+        - 매도대기금액1~10 (10개)
+        - 매수대기금액1~10 (10개)
+        
+        제외되는 필드:
+        - 메타데이터: 종목코드, 종목명, 시간
+        - 호가/수량: 매도호가1~10, 매도호가수량1~10, 매수호가1~10, 매수호가수량1~10
         """
         try:
             features = []
             
-            # 1. 등락률 (현재가 기준)
-            current_price = float(market_data.get('현재가', 0))
-            base_price = float(market_data.get('기준가', current_price))
-            if base_price > 0:
-                change_rate = (current_price - base_price) / base_price * 100
-            else:
-                change_rate = 0.0
-            features.append(change_rate)
-            
-            # 2. 누적거래대금 (정규화)
-            volume_amount = float(market_data.get('누적거래대금', 0))
-            features.append(volume_amount / 1e9)  # 10억 단위로 정규화
-            
-            # 3. 거래회전율 (거래량/상장주식수)
-            volume = float(market_data.get('거래량', 0))
-            listed_shares = float(market_data.get('상장주식수', 1))
-            turnover_rate = (volume / listed_shares * 100) if listed_shares > 0 else 0.0
-            features.append(turnover_rate)
-            
-            # 4. 체결강도 (매수체결량 / 매도체결량)
-            buy_volume = float(market_data.get('매수체결량', 0))
-            sell_volume = float(market_data.get('매도체결량', 1))
-            strength = (buy_volume / sell_volume * 100) if sell_volume > 0 else 100.0
-            features.append(strength)
-            
-            # 5-14. 매도대기금액 1-10 (호가 정보)
-            for i in range(1, 11):
-                sell_price = float(market_data.get(f'매도호가{i}', 0))
-                sell_qty = float(market_data.get(f'매도호가수량{i}', 0))
-                sell_amount = sell_price * sell_qty / 1e6  # 백만원 단위
-                features.append(sell_amount)
-            
-            # 15-24. 매수대기금액 1-10 (호가 정보)
-            for i in range(1, 11):
-                buy_price = float(market_data.get(f'매수호가{i}', 0))
-                buy_qty = float(market_data.get(f'매수호가수량{i}', 0))
-                buy_amount = buy_price * buy_qty / 1e6  # 백만원 단위
-                features.append(buy_amount)
+            # FINAL_COLUMNS를 순회하면서 to_dict()와 동일한 로직 적용
+            for col in FINAL_COLUMNS:
+                # 메타데이터 제외
+                if col in ["종목코드", "종목명", "시간"]:
+                    continue
+                
+                # 호가 및 호가수량 제외 (to_dict와 동일)
+                if col.startswith('매도호가') or col.startswith('매수호가'):
+                    continue
+                
+                # 특징 추출
+                value = market_data.get(col, 0.0)
+                features.append(float(value))
             
             # numpy array로 변환
             features_array = np.array(features, dtype=np.float32)
