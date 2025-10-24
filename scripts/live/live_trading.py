@@ -774,10 +774,19 @@ class LiveTrader:
         
         # 버퍼 확인
         if code not in self.data_buffers:
+            # 첫 체크 시에만 로그 (중복 방지)
+            if not hasattr(self, f'_buffer_not_found_{code}'):
+                setattr(self, f'_buffer_not_found_{code}', True)
+                logger.info(f"[SKIP] {code}: Buffer not found")
             return
         
         # 시퀀스가 준비되지 않았으면 대기
-        if not self.data_buffers[code].is_ready():
+        buffer = self.data_buffers[code]
+        if not buffer.is_ready():
+            buffer_len = len(buffer.buffer)
+            # 첫 번째 체크 시 또는 10의 배수일 때만 로그
+            if buffer_len == 0 or buffer_len % 10 == 0:
+                logger.info(f"[BUFFER] {code}: Collecting data ({buffer_len}/{self.config.seq_len})")
             return
         
         # 시퀀스 가져오기
@@ -819,13 +828,18 @@ class LiveTrader:
         logger.info("=" * 80)
         
         self.is_running = True
+        market_check_count = 0
         
         try:
             while self.is_running:
                 # 장 시간 확인
-                if not self.is_market_open():
-                    logger.info("Market is closed. Waiting...")
-                    time.sleep(30)
+                if self.is_market_open():
+                    market_check_count = 0
+                else:
+                    market_check_count += 1
+                    if market_check_count == 1:
+                        logger.info("Market is closed. Waiting...")
+                    time.sleep(1)
                     continue
                 
                 # 조건검색 실시간으로부터 종목 동기화
@@ -861,15 +875,23 @@ class LiveTrader:
                     # 제거된 코드 버퍼는 남겨두어도 무방(메모리 사용 적음). 필요 시 정리 가능.
 
                 # 각 종목 처리
-                for code in dynamic_codes:
-                    try:
-                        self.process_stock(code)
-                    except Exception as e:
-                        logger.error(f"Error processing {code}: {e}", exc_info=True)
+                if not dynamic_codes:
+                    if int(time.time()) % 10 == 0:  # 10초마다 한 번만 로그
+                        logger.warning("[SKIP] No dynamic codes to process")
+                else:
+                    for code in dynamic_codes:
+                        try:
+                            self.process_stock(code)
+                        except Exception as e:
+                            logger.error(f"Error processing {code}: {e}", exc_info=True)
                 
                 # 통계 출력 (1분마다)
-                if int(time.time()) % 60 == 0:
-                    self.print_stats()
+                current_time = int(time.time())
+                if current_time % 60 == 0:
+                    # 동일한 시간에 중복 출력 방지
+                    if not hasattr(self, '_last_stats_time') or current_time != self._last_stats_time:
+                        self._last_stats_time = current_time
+                        self.print_stats()
                 
                 # 대기
                 time.sleep(self.config.update_interval)
