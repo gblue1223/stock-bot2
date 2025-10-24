@@ -39,8 +39,11 @@ async def example_condition_search_realtime():
     koapy_client = KoapyRestSimple()
     koapy_client.ensure_connected()
     
+    # WebSocketClient 시작 (KoapyRestSimple에서 관리)
+    await koapy_client.start_websocket()
+    
     # ConditionSearchClient 생성
-    client = ConditionSearchClient(access_token=koapy_client.access_token)
+    client = ConditionSearchClient(client=koapy_client.websocket)
     
     selected_condition = None
     
@@ -83,41 +86,38 @@ async def example_condition_search_realtime():
     client.on_error = on_error
     
     try:
-        # 1. 클라이언트 시작
-        print("\n1. WebSocket 연결 중...")
-        await client.start()
-        
-        # 2. 조건식 목록 로드
-        print("\n2. 조건식 목록 조회 중...")
+        # 1. 조건식 목록 로드
+        print("\n1. 조건식 목록 조회 중...")
         conditions = await client.load_conditions()
         
         if not conditions:
             print("조건식이 없습니다. 종료합니다.")
             return
         
-        # 3. 첫 번째 조건식 등록
+        # 2. 첫 번째 조건식 등록
         if selected_condition:
-            print(f"\n3. 조건검색 실시간 등록 중...")
+            print(f"\n2. 조건검색 실시간 등록 중...")
             await client.register_condition(
                 condition_index=selected_condition.index,
                 condition_name=selected_condition.name
             )
         
-        # 4. 60초간 실시간 데이터 수신
-        print("\n4. 실시간 데이터 수신 중 (60초)...")
+        # 3. 60초간 실시간 데이터 수신
+        print("\n3. 실시간 데이터 수신 중 (60초)...")
         print("   조건에 맞는 종목이 발생하면 실시간으로 표시됩니다.\n")
         await asyncio.sleep(60)
         
     finally:
-        # 5. 조건검색 해지 및 종료
+        # 4. 조건검색 해지 및 종료
         if selected_condition:
-            print("\n5. 조건검색 해지 중...")
+            print("\n4. 조건검색 해지 중...")
             await client.unregister_condition(
                 condition_index=selected_condition.index
             )
             await asyncio.sleep(1)
         
-        await client.stop()
+        client.cleanup()  # 콜백 정리
+        await koapy_client.stop_websocket()
         koapy_client.close()
         
         # 최종 결과 출력
@@ -138,8 +138,11 @@ async def example_multiple_condition_search():
     koapy_client = KoapyRestSimple()
     koapy_client.ensure_connected()
     
+    # WebSocketClient 시작 (KoapyRestSimple에서 관리)
+    await koapy_client.start_websocket()
+    
     # ConditionSearchClient 생성
-    client = ConditionSearchClient(access_token=koapy_client.access_token)
+    client = ConditionSearchClient(client=koapy_client.websocket)
     
     selected_conditions = []
     
@@ -184,35 +187,32 @@ async def example_multiple_condition_search():
     client.on_error = on_error
     
     try:
-        # 1. 클라이언트 시작
-        print("\n1. WebSocket 연결 중...")
-        await client.start()
-        
-        # 2. 조건식 목록 로드
-        print("\n2. 조건식 목록 조회 중...")
+        # 1. 조건식 목록 로드
+        print("\n1. 조건식 목록 조회 중...")
         conditions = await client.load_conditions()
         
         if len(conditions) < 2:
             print("조건식이 2개 미만입니다. 종료합니다.")
             return
         
-        # 3. 여러 조건식 등록
-        print(f"\n3. 조건검색 실시간 등록 중... ({len(selected_conditions)}개)")
+        # 2. 여러 조건식 등록
+        print(f"\n2. 조건검색 실시간 등록 중... ({len(selected_conditions)}개)")
         await client.register_multiple_conditions(selected_conditions, delay=0.5)
         
-        # 4. 60초간 실시간 데이터 수신
-        print("\n4. 실시간 데이터 수신 중 (60초)...")
+        # 3. 60초간 실시간 데이터 수신
+        print("\n3. 실시간 데이터 수신 중 (60초)...")
         print("   조건에 맞는 종목이 발생하면 실시간으로 표시됩니다.\n")
         await asyncio.sleep(60)
         
     finally:
-        # 5. 모든 조건검색 해지 및 종료
+        # 4. 모든 조건검색 해지 및 종료
         if selected_conditions:
-            print("\n5. 조건검색 해지 중...")
+            print("\n4. 조건검색 해지 중...")
             await client.unregister_multiple_conditions(selected_conditions)
             await asyncio.sleep(1)
         
-        await client.stop()
+        client.cleanup()  # 콜백 정리
+        await koapy_client.stop_websocket()
         koapy_client.close()
         
         # 최종 결과 출력

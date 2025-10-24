@@ -1,7 +1,7 @@
 import logging
-import os
 import sys
 import threading
+import asyncio
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -93,7 +93,8 @@ class KoapyRestSimple:
         ws_url: Optional[str] = None,
         auto_reconnect: bool = True,
         reconnect_interval: int = 5,
-        ping_interval: int = 30
+        ping_interval: int = 30,
+        force_new: bool = False
     ) -> WebSocketClient:
         """WebSocket 클라이언트를 생성하고 시작합니다.
         
@@ -102,6 +103,7 @@ class KoapyRestSimple:
             auto_reconnect: 자동 재연결 여부
             reconnect_interval: 재연결 간격 (초)
             ping_interval: PING 간격 (초)
+            force_new: 기존 WebSocket이 있어도 새로 생성할지 여부
             
         Returns:
             WebSocketClient 인스턴스
@@ -119,9 +121,20 @@ class KoapyRestSimple:
         
         self.ensure_connected()
         
-        if self._websocket_client is not None:
-            self._logger.warning("WebSocket 클라이언트가 이미 생성되어 있습니다. 기존 클라이언트를 반환합니다.")
-            return self._websocket_client
+        # 현재 이벤트 루프 확인
+        current_loop = asyncio.get_running_loop()
+        
+        if self._websocket_client is not None and not force_new:
+            # 기존 WebSocket이 동일한 이벤트 루프에서 실행 중인지 확인
+            try:
+                if self._websocket_client.connected:
+                    self._logger.info("WebSocket 클라이언트가 이미 실행 중입니다. 기존 클라이언트를 반환합니다.")
+                    return self._websocket_client
+                else:
+                    self._logger.warning("기존 WebSocket 클라이언트가 연결되지 않았습니다. 새로 생성합니다.")
+            except Exception:
+                self._logger.warning("기존 WebSocket 클라이언트 상태 확인 실패. 새로 생성합니다.")
+                self._websocket_client = None
         
         # WebSocketClient 생성
         self._websocket_client = WebSocketClient(

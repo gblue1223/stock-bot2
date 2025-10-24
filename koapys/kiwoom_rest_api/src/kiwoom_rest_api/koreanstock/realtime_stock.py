@@ -206,16 +206,22 @@ class RealtimeStockClient:
     주식체결(0B) 및 주식호가(0C) 실시간 데이터를 수신하는 헬퍼 클래스
     """
     
-    def __init__(self, access_token: str, auto_translate: bool = True):
+    def __init__(self, client: WebSocketClient, auto_translate: bool = True):
         """
         Args:
-            access_token: 키움 API 액세스 토큰
+            client: WebSocketClient 인스턴스 (외부에서 생성 및 관리)
             auto_translate: 필드명 자동 변환 여부
         """
-        self.client = WebSocketClient(access_token=access_token)
+        self.client = client
         self.auto_translate = auto_translate
         self.stock_data: Dict[str, StockRealtimeData] = {}  # stock_code -> StockRealtimeData
         self._login_event = asyncio.Event()
+        self._original_on_data = self.client.on_data  # 기존 콜백 백업
+        self._original_on_login = self.client.on_login
+        
+        # 이미 로그인된 경우 이벤트 설정
+        if self.client.is_logged_in:
+            self._login_event.set()
         
         # 사용자 정의 콜백
         self.on_trade_data: Optional[Callable[[str, StockRealtimeData], None]] = None  # 체결 데이터
@@ -223,17 +229,16 @@ class RealtimeStockClient:
         self.on_data_update: Optional[Callable[[str, StockRealtimeData], None]] = None  # 전체 데이터 업데이트
         self.on_error: Optional[Callable[[Exception], None]] = None
         
-        # 내부 콜백 등록
+        # 내부 콜백 등록 (기존 콜백과 체인)
         self.client.on_data = self._handle_data
         self.client.on_login = self._on_login
     
-    async def start(self):
-        """WebSocket 연결 시작"""
-        await self.client.start()
-    
-    async def stop(self):
-        """WebSocket 연결 종료"""
-        await self.client.stop()
+    def cleanup(self):
+        """콜백 정리 (원래 콜백 복원)"""
+        if hasattr(self, '_original_on_data'):
+            self.client.on_data = self._original_on_data
+        if hasattr(self, '_original_on_login'):
+            self.client.on_login = self._original_on_login
     
     async def register_stocks(
         self,
@@ -250,8 +255,17 @@ class RealtimeStockClient:
             include_quote: 주식호가(0C) 포함 여부
             group_no: 그룹 번호
         """
-        # 로그인 완료 대기
-        await self._login_event.wait()
+        # 로그인 완료 대기 (타임아웃 포함)
+        try:
+            await asyncio.wait_for(self._login_event.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            # 이미 로그인된 상태일 수 있으므로 확인
+            if not self.client.is_logged_in:
+                logger.error("로그인 대기 중 타임아웃 발생")
+                raise
+            else:
+                logger.warning("로그인 이벤트 대기 타임아웃, 하지만 이미 로그인된 상태이므로 계속 진행")
+                self._login_event.set()  # 이벤트 설정
         
         # 실시간 타입 리스트 생성
         type_list = []
@@ -446,21 +460,24 @@ class RealtimeStockManager:
     여러 종목을 관리하고 데이터 저장 등의 고급 기능 제공
     """
     
-    def __init__(self, access_token: str):
-        self.client = RealtimeStockClient(access_token=access_token)
+    def __init__(self, realtime_client: RealtimeStockClient):
+        """
+        Args:
+            realtime_client: RealtimeStockClient 인스턴스 (외부에서 생성 및 관리)
+        """
+        self.client = realtime_client
         self.registered_stocks: List[str] = []
         self.data_history: Dict[str, List[Dict[str, Any]]] = {}  # stock_code -> [data_dict]
         self.max_history_size: int = 1000
-    
-    async def start(self):
-        """시작"""
+        self._original_on_data_update = self.client.on_data_update  # 기존 콜백 백업
+        
         # 데이터 업데이트 콜백 등록
         self.client.on_data_update = self._on_data_update
-        await self.client.start()
     
-    async def stop(self):
-        """종료"""
-        await self.client.stop()
+    def cleanup(self):
+        """콜백 정리 (원래 콜백 복원)"""
+        if hasattr(self, '_original_on_data_update'):
+            self.client.on_data_update = self._original_on_data_update
     
     async def add_stocks(
         self,

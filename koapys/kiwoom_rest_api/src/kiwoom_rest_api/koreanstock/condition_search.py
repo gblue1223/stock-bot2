@@ -27,17 +27,23 @@ class ConditionSearchClient:
     조건검색 관련 작업을 간편하게 수행할 수 있는 헬퍼 클래스
     """
     
-    def __init__(self, access_token: str, auto_translate: bool = True):
+    def __init__(self, client: WebSocketClient, auto_translate: bool = True):
         """
         Args:
-            access_token: 키움 API 액세스 토큰
+            client: WebSocketClient 인스턴스 (외부에서 생성 및 관리)
             auto_translate: 필드명 자동 변환 여부
         """
-        self.client = WebSocketClient(access_token=access_token)
+        self.client = client
         self.auto_translate = auto_translate
         self.conditions: List[ConditionInfo] = []
         self.received_stocks: Dict[str, List[str]] = {}  # condition_index -> [stock_codes]
         self._login_event = asyncio.Event()  # 로그인 완료 이벤트
+        self._original_on_data = self.client.on_data  # 기존 콜백 백업
+        self._original_on_login = self.client.on_login
+        
+        # 이미 로그인된 경우 이벤트 설정
+        if self.client.is_logged_in:
+            self._login_event.set()
         
         # 사용자 정의 콜백
         self.on_condition_list: Optional[Callable[[List[ConditionInfo]], None]] = None
@@ -46,17 +52,16 @@ class ConditionSearchClient:
         self.on_stock_out: Optional[Callable[[str, str, str], None]] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
         
-        # 내부 콜백 등록
+        # 내부 콜백 등록 (기존 콜백과 체인)
         self.client.on_data = self._handle_data
         self.client.on_login = self._on_login
         
-    async def start(self):
-        """WebSocket 연결 시작"""
-        await self.client.start()
-        
-    async def stop(self):
-        """WebSocket 연결 종료"""
-        await self.client.stop()
+    def cleanup(self):
+        """콜백 정리 (원래 콜백 복원)"""
+        if hasattr(self, '_original_on_data'):
+            self.client.on_data = self._original_on_data
+        if hasattr(self, '_original_on_login'):
+            self.client.on_login = self._original_on_login
         
     async def load_conditions(self) -> List[ConditionInfo]:
         """조건식 목록 로드
@@ -276,85 +281,3 @@ class ConditionSearchClient:
             logger.exception(f"데이터 처리 중 오류: {e}")
             if self.on_error:
                 self.on_error(e)
-
-
-class ConditionSearchManager:
-    """조건검색 관리자 (고급 기능)
-    
-    여러 조건식을 관리하고 종목 중복 제거 등의 고급 기능 제공
-    """
-    
-    def __init__(self, access_token: str):
-        self.client = ConditionSearchClient(access_token=access_token)
-        self.active_conditions: Dict[str, ConditionInfo] = {}
-        
-    async def start(self):
-        """시작"""
-        await self.client.start()
-        
-    async def stop(self):
-        """종료"""
-        # 모든 활성 조건 해지
-        await self.client.unregister_multiple_conditions(
-            list(self.active_conditions.values())
-        )
-        await self.client.stop()
-        
-    async def load_and_register_conditions(
-        self,
-        condition_names: Optional[List[str]] = None,
-        max_conditions: Optional[int] = None
-    ):
-        """조건식 로드 및 등록
-        
-        Args:
-            condition_names: 등록할 조건식 이름 리스트 (None이면 전체)
-            max_conditions: 최대 등록 개수
-        """
-        # 조건식 목록 로드
-        conditions = await self.client.load_conditions()
-        
-        if not conditions:
-            logger.warning("등록된 조건식이 없습니다")
-            return
-        
-        # 필터링
-        if condition_names:
-            conditions = [c for c in conditions if c.name in condition_names]
-        
-        if max_conditions:
-            conditions = conditions[:max_conditions]
-        
-        # 등록
-        await self.client.register_multiple_conditions(conditions)
-        
-        for cond in conditions:
-            self.active_conditions[cond.index] = cond
-            
-    def get_all_stocks(self, deduplicate: bool = True) -> List[str]:
-        """모든 조건식의 종목 조회
-        
-        Args:
-            deduplicate: 중복 제거 여부
-            
-        Returns:
-            종목 코드 리스트
-        """
-        all_stocks = []
-        for stocks in self.client.received_stocks.values():
-            all_stocks.extend(stocks)
-        
-        if deduplicate:
-            return list(set(all_stocks))
-        return all_stocks
-        
-    def get_stocks_by_condition(self, condition_index: str) -> List[str]:
-        """특정 조건식의 종목 조회
-        
-        Args:
-            condition_index: 조건식 인덱스
-            
-        Returns:
-            종목 코드 리스트
-        """
-        return self.client.received_stocks.get(condition_index, []).copy()
