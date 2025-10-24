@@ -13,7 +13,6 @@ from .kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.account import Account
 from .kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.chart import Chart
 from .kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.condition_search import (
     ConditionSearchClient,
-    ConditionSearchManager,
     ConditionInfo,
 )
 from .kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.realtime_stock import (
@@ -49,9 +48,8 @@ __all__ = [
     # kiwoom_rest_api.koreanstock
     "Account",
     "Chart",
-    "ConditionSearchClient",
-    "ConditionSearchManager",
     "ConditionInfo",
+    "ConditionSearchClient",
     "RealtimeStockClient",
     "RealtimeStockManager",
     "StockRealtimeData",

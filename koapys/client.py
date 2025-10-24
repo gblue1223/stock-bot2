@@ -15,6 +15,7 @@ from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
 from kiwoom_rest_api.koreanstock.account import Account
 from kiwoom_rest_api.koreanstock.order import Order
 from kiwoom_rest_api.config import get_base_url
+from kiwoom_rest_api.websocket import WebSocketClient
 
 from .types import OrderType, OrderBookType
 
@@ -35,6 +36,7 @@ class KoapyRestSimple:
         self._logger = logger or logging.getLogger("koapyRest")
         self._is_connected = False
         self._token_manager = TokenManager()
+        self._websocket_client: Optional[WebSocketClient] = None
         
         # Initialize kiwoom_rest_api components
         if not simulation:
@@ -49,6 +51,15 @@ class KoapyRestSimple:
     @property
     def access_token(self) -> str:
         return self._token_manager.get_token()
+    
+    @property
+    def websocket(self) -> Optional[WebSocketClient]:
+        """WebSocketClient 인스턴스
+        
+        Returns:
+            WebSocketClient 또는 None (start_websocket() 호출 전)
+        """
+        return self._websocket_client
 
     # --- Compatibility helpers ---
     @property
@@ -77,7 +88,76 @@ class KoapyRestSimple:
             self._is_connected = False
             raise ConnectionError(f"Unable to connect to Kiwoom REST API: {e}")
 
+    async def start_websocket(
+        self,
+        ws_url: Optional[str] = None,
+        auto_reconnect: bool = True,
+        reconnect_interval: int = 5,
+        ping_interval: int = 30
+    ) -> WebSocketClient:
+        """WebSocket 클라이언트를 생성하고 시작합니다.
+        
+        Args:
+            ws_url: 웹소켓 URL (None이면 설정에서 자동 선택)
+            auto_reconnect: 자동 재연결 여부
+            reconnect_interval: 재연결 간격 (초)
+            ping_interval: PING 간격 (초)
+            
+        Returns:
+            WebSocketClient 인스턴스
+            
+        Example:
+            >>> client = KoapyRestSimple()
+            >>> client.ensure_connected()
+            >>> ws_client = await client.start_websocket()
+            >>> # 웹소켓 사용
+            >>> await client.stop_websocket()
+        """
+        if self._simulation:
+            self._logger.warning("시뮬레이션 모드에서는 WebSocket을 사용할 수 없습니다")
+            return None
+        
+        self.ensure_connected()
+        
+        if self._websocket_client is not None:
+            self._logger.warning("WebSocket 클라이언트가 이미 생성되어 있습니다. 기존 클라이언트를 반환합니다.")
+            return self._websocket_client
+        
+        # WebSocketClient 생성
+        self._websocket_client = WebSocketClient(
+            access_token=self.access_token,
+            ws_url=ws_url,
+            auto_reconnect=auto_reconnect,
+            reconnect_interval=reconnect_interval,
+            ping_interval=ping_interval
+        )
+        
+        # WebSocket 연결 및 로그인
+        await self._websocket_client.start()
+        
+        self._logger.info("WebSocket 클라이언트 시작 완료")
+        return self._websocket_client
+    
+    async def stop_websocket(self):
+        """WebSocket 클라이언트를 중지합니다.
+        
+        Example:
+            >>> await client.stop_websocket()
+        """
+        if self._websocket_client is None:
+            self._logger.warning("WebSocket 클라이언트가 시작되지 않았습니다")
+            return
+        
+        await self._websocket_client.stop()
+        self._websocket_client = None
+        self._logger.info("WebSocket 클라이언트 중지 완료")
+    
     def close(self):
+        """REST API 클라이언트를 닫습니다.
+        
+        Note:
+            WebSocket은 별도로 stop_websocket()을 호출해야 합니다.
+        """
         self._is_connected = False
 
     # --- Accounts ---
