@@ -303,9 +303,12 @@ class WebSocketClient:
                 
             elif trnm == 'REAL':
                 # 실시간 데이터 수신
-                logger.debug(f"실시간 데이터 수신, data 항목 수: {len(realtime_data.data)}")
+                data_count = len(realtime_data.data) if realtime_data.data else 0
+                logger.info(f"[WEBSOCKET] 실시간 데이터 수신, data 항목 수: {data_count}")
                 if self.on_data:
                     await self.on_data(realtime_data)
+                else:
+                    logger.warning("[WEBSOCKET] on_data 콜백이 없어서 실시간 데이터가 무시됨!")
                     
             else:
                 # 기타 응답 (조건식 목록, 조건검색 응답 등)

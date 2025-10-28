@@ -168,6 +168,9 @@ class ConditionSearchClient:
     async def _handle_data(self, realtime_data: RealTimeData):
         """실시간 데이터 처리"""
         try:
+            # 디버깅: 모든 메시지 타입 로그
+            logger.debug(f"[ConditionSearchClient] Received trnm={realtime_data.trnm}, return_code={realtime_data.return_code}")
+            
             # 1. 조건식 목록 응답
             if realtime_data.trnm == 'CNSRLST':
                 if realtime_data.return_code == 0:
@@ -230,8 +233,17 @@ class ConditionSearchClient:
                     
             # 3. 실시간 조건검색 데이터
             elif realtime_data.trnm == 'REAL':
+                logger.debug(f"[ConditionSearchClient] REAL data received, items={len(realtime_data.data) if realtime_data.data else 0}")
                 for item in realtime_data.data:
                     if not isinstance(item, dict):
+                        continue
+                    
+                    # 타입 확인 - 조건검색 실시간 데이터인지 확인
+                    item_type = item.get('type', '')
+                    logger.debug(f"[ConditionSearchClient] REAL item type={item_type}, item={item}")
+                    
+                    # 조건검색 실시간 데이터가 아니면 스킵 (주식체결/호가 데이터는 RealtimeStockClient에서 처리)
+                    if item_type in ['0B', '0C']:
                         continue
                     
                     # values 딕셔너리에서 데이터 추출
@@ -245,6 +257,8 @@ class ConditionSearchClient:
                     
                     action = item.get('action', '')  # 'in' or 'out'
                     cond_idx = item.get('cond_idx', '')
+                    
+                    logger.debug(f"[ConditionSearchClient] Processing: code={stock_code}, name={stock_name}, action={action}, cond_idx={cond_idx}")
                     
                     if not stock_code:
                         continue

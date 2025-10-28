@@ -58,6 +58,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# 오후장 디버깅을 위해 관련 모듈의 로그 레벨을 DEBUG로 설정
+logging.getLogger('koapys.kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.realtime_stock').setLevel(logging.DEBUG)
+logging.getLogger('koapys.kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.condition_search').setLevel(logging.DEBUG)
+logging.getLogger('kiwoom_rest_api.websocket').setLevel(logging.DEBUG)
+
 # Windows 콘솔 인코딩 설정
 import sys
 if sys.platform == 'win32':
@@ -107,6 +112,7 @@ class TradingConfig:
         # 조건검색 사용 설정
         self.use_condition_monitor = True
         self.condition_collect_delay = 2.0  # 최초 등록 직후 딜레이(초)
+        self.condition_poll_interval = 5  # 조건검색 폴링 간격(초)
         
         # 설정 파일에서 로드
         if config_path and os.path.exists(config_path):
@@ -274,13 +280,23 @@ class LiveTrader:
         self._condition_codes: Set[str] = set()
         self._condition_codes_lock = threading.Lock()
         
+        # 조건검색 폴링 설정 (실시간 신호가 안 오는 경우 대비)
+        self._condition_poll_interval = config.condition_poll_interval
+        self._last_condition_poll = 0
+        self._last_condition_signal_time = time.time()  # 마지막 실시간 신호 수신 시각
+        self._condition_realtime_working = None  # None: 미확인, True: 정상, False: 비정상
+        
         # 실시간 데이터 클라이언트 시작 (WebSocket 및 조건검색 포함)
         self._start_realtime_client()
     
     def get_condition_codes(self) -> List[str]:
         """조건검색으로 받은 종목 코드 반환"""
         with self._condition_codes_lock:
-            return sorted(self._condition_codes)
+            codes = sorted(self._condition_codes)
+            if not hasattr(self, '_last_logged_codes') or self._last_logged_codes != codes:
+                logger.info(f"[CONDITION] Current tracked stocks: {len(codes)} - {codes[:5]}{'...' if len(codes) > 5 else ''}")
+                self._last_logged_codes = codes
+            return codes
     
     def is_market_open(self) -> bool:
         """장이 열려있는지 확인"""
@@ -346,9 +362,20 @@ class LiveTrader:
             if self.koapys.websocket.is_logged_in:
                 self.realtime_client._login_event.set()
             
+            # 실시간 데이터 수신 카운터 (디버깅용)
+            data_receive_count = {'count': 0, 'last_log_time': time.time()}
+            
             # 콜백 설정: 데이터 업데이트 시 자동으로 버퍼에 추가
             def on_data_update(code: str, stock_data: StockRealtimeData):
                 try:
+                    # 실시간 데이터 수신 모니터링 (5초마다 로그)
+                    data_receive_count['count'] += 1
+                    current_time = time.time()
+                    if current_time - data_receive_count['last_log_time'] >= 5.0:
+                        logger.info(f"[REALTIME] Received {data_receive_count['count']} data updates in last 5 seconds")
+                        data_receive_count['count'] = 0
+                        data_receive_count['last_log_time'] = current_time
+                    
                     if code not in self.data_buffers:
                         return
                     
@@ -379,6 +406,7 @@ class LiveTrader:
             
             self.realtime_client.on_data_update = on_data_update
             logger.info("[OK] RealtimeStockClient initialized")
+            logger.info(f"[DEBUG] Current data buffers: {list(self.data_buffers.keys())}")
             
             # 조건검색 클라이언트 생성 (use_condition_monitor가 True인 경우)
             if self.config.use_condition_monitor:
@@ -388,33 +416,56 @@ class LiveTrader:
                 def on_stock_in(code, name, cond_idx):
                     """종목 편입 시 호출"""
                     code_clean = code[1:] if code.startswith('A') else code
+                    logger.info(f"[CONDITION] Stock IN signal received: {code} -> {code_clean} ({name}), cond_idx={cond_idx}")
+                    
+                    # 실시간 신호 수신 기록
+                    self._last_condition_signal_time = time.time()
+                    if self._condition_realtime_working is None:
+                        self._condition_realtime_working = True
+                        logger.info("[CONDITION] Real-time signals are working! Polling disabled.")
+                    
                     with self._condition_codes_lock:
                         if code_clean not in self._condition_codes:
                             self._condition_codes.add(code_clean)
-                            logger.info(f"[CONDITION] Stock added: {code_clean} ({name})")
+                            logger.info(f"[CONDITION] Stock added to tracking: {code_clean} ({name}), Total: {len(self._condition_codes)}")
+                        else:
+                            logger.debug(f"[CONDITION] Stock {code_clean} already tracked")
                 
                 def on_stock_out(code, name, cond_idx):
                     """종목 이탈 시 호출"""
                     code_clean = code[1:] if code.startswith('A') else code
+                    logger.info(f"[CONDITION] Stock OUT signal received: {code} -> {code_clean} ({name}), cond_idx={cond_idx}")
+                    
+                    # 실시간 신호 수신 기록
+                    self._last_condition_signal_time = time.time()
+                    if self._condition_realtime_working is None:
+                        self._condition_realtime_working = True
+                        logger.info("[CONDITION] Real-time signals are working! Polling disabled.")
+                    
                     with self._condition_codes_lock:
                         if code_clean in self._condition_codes:
                             self._condition_codes.remove(code_clean)
-                            logger.info(f"[CONDITION] Stock removed: {code_clean} ({name})")
+                            logger.info(f"[CONDITION] Stock removed from tracking: {code_clean} ({name}), Remaining: {len(self._condition_codes)}")
+                        else:
+                            logger.debug(f"[CONDITION] Stock {code_clean} was not tracked")
                 
                 self.condition_client.on_stock_in = on_stock_in
                 self.condition_client.on_stock_out = on_stock_out
                 
                 # 조건식 로드 및 등록
+                logger.info("[CONDITION] Loading condition list...")
                 conditions = await self.condition_client.load_conditions()
                 if conditions:
+                    logger.info(f"[CONDITION] Found {len(conditions)} conditions")
                     selected = conditions[0]
+                    logger.info(f"[CONDITION] Registering condition: [{selected.index}] {selected.name}")
                     await self.condition_client.register_condition(
                         condition_index=selected.index,
                         condition_name=selected.name
                     )
                     logger.info(f"[OK] Condition monitor registered: [{selected.index}] {selected.name}")
                 else:
-                    logger.warning("No conditions found for monitoring")
+                    logger.warning("[CONDITION] No conditions found for monitoring")
             
             # 초기 종목 등록
             if self.config.target_stocks:
@@ -445,16 +496,66 @@ class LiveTrader:
             return
         
         try:
-            logger.info(f"Starting registration of {len(stock_codes)} stocks: {stock_codes}")
+            logger.info(f"[REGISTER] Starting registration of {len(stock_codes)} stocks: {stock_codes}")
             await self.realtime_client.register_stocks(
                 stock_codes=stock_codes,
                 include_trade=True,
                 include_quote=True
             )
-            logger.info(f"✓ Successfully registered {len(stock_codes)} stocks for realtime data")
+            logger.info(f"[REGISTER] ✓ Successfully registered {len(stock_codes)} stocks for realtime data")
         except Exception as e:
-            logger.error(f"✗ Failed to register stocks: {e}", exc_info=True)
+            logger.error(f"[REGISTER] ✗ Failed to register stocks: {e}", exc_info=True)
             raise  # Re-raise to propagate to caller
+    
+    async def _poll_condition_search(self):
+        """조건검색 폴링 (주기적으로 조건 충족 종목 재조회)"""
+        if not self.condition_client:
+            return
+        
+        try:
+            # 등록된 조건식 정보 가져오기
+            stocks_by_condition = self.condition_client.get_received_stocks()
+            
+            if not stocks_by_condition:
+                logger.debug("[CONDITION] No registered conditions for polling")
+                return
+            
+            # 첫 번째 조건식의 종목 리스트 가져오기
+            cond_idx = list(stocks_by_condition.keys())[0]
+            current_stocks = set(stocks_by_condition[cond_idx])
+            
+            # 조건식 재등록 (새로운 종목 수신)
+            conditions = self.condition_client.conditions
+            if conditions:
+                selected = conditions[0]
+                logger.debug(f"[CONDITION] Re-registering condition [{selected.index}] {selected.name}")
+                await self.condition_client.register_condition(
+                    condition_index=selected.index,
+                    condition_name=selected.name
+                )
+                
+                # 잠시 대기하여 응답 수신
+                await asyncio.sleep(0.5)
+                
+                # 업데이트된 종목 리스트 확인
+                updated_stocks_by_condition = self.condition_client.get_received_stocks()
+                if cond_idx in updated_stocks_by_condition:
+                    updated_stocks = set(updated_stocks_by_condition[cond_idx])
+                    
+                    # 신규 편입 종목
+                    new_stocks = updated_stocks - current_stocks
+                    # 이탈 종목
+                    removed_stocks = current_stocks - updated_stocks
+                    
+                    if new_stocks or removed_stocks:
+                        logger.info(f"[CONDITION] Poll result: +{len(new_stocks)} new, -{len(removed_stocks)} removed")
+                    
+                    # _condition_codes 업데이트
+                    with self._condition_codes_lock:
+                        self._condition_codes = updated_stocks.copy()
+                        
+        except Exception as e:
+            logger.error(f"[CONDITION] Polling error: {e}", exc_info=True)
     
     def extract_features(self, market_data: Dict) -> np.ndarray:
         """
@@ -845,7 +946,46 @@ class LiveTrader:
                 # 조건검색 실시간으로부터 종목 동기화
                 dynamic_codes: List[str] = self.config.target_stocks
                 if self.config.use_condition_monitor:
+                    # 실시간 신호 상태 확인 (60초 동안 신호 없으면 폴링 모드)
+                    current_time = time.time()
+                    time_since_last_signal = current_time - self._last_condition_signal_time
+                    
+                    # 실시간 신호가 60초 이상 없으면 폴링 모드로 전환
+                    if time_since_last_signal > 60 and self._condition_realtime_working != False:
+                        self._condition_realtime_working = False
+                        logger.warning("[CONDITION] No real-time signals for 60s. Switching to polling mode.")
+                    
+                    # 폴링 모드일 때만 주기적 폴링 실행
+                    if self._condition_realtime_working == False:
+                        if current_time - self._last_condition_poll >= self._condition_poll_interval:
+                            self._last_condition_poll = current_time
+                            if self.condition_client and self.realtime_loop:
+                                logger.info("[CONDITION] Polling condition search for updates...")
+                                try:
+                                    # 비동기로 조건검색 재실행
+                                    future = asyncio.run_coroutine_threadsafe(
+                                        self._poll_condition_search(),
+                                        self.realtime_loop
+                                    )
+                                    future.result(timeout=3.0)
+                                except Exception as e:
+                                    logger.warning(f"[CONDITION] Polling failed: {e}")
+                    elif self._condition_realtime_working is None:
+                        # 초기 상태: 첫 60초는 실시간 신호를 기다림
+                        if time_since_last_signal > 60:
+                            logger.info("[CONDITION] No real-time signals detected in first 60s. Enabling polling mode.")
+                            self._condition_realtime_working = False
+                    
+                    prev_count = len(dynamic_codes)
                     dynamic_codes = self.get_condition_codes()
+                    
+                    # 종목 변화 감지
+                    if prev_count == 0 and len(dynamic_codes) == 0:
+                        if not hasattr(self, '_no_codes_warned'):
+                            logger.warning("[CONDITION] No stocks from condition search yet. Waiting...")
+                            self._no_codes_warned = True
+                    elif len(dynamic_codes) > 0:
+                        self._no_codes_warned = False
 
                     # 신규 코드 발견 시 버퍼 및 실시간 등록
                     new_codes = []
@@ -856,22 +996,28 @@ class LiveTrader:
                                 num_features=self.config.num_features,
                             )
                             new_codes.append(code)
+                            logger.info(f"[CONDITION] New stock detected: {code}")
                     
                     # 신규 종목을 실시간 데이터에 등록
-                    if new_codes and self.realtime_client and self.realtime_loop:
-                        logger.info(f"[NEW STOCKS] Registering {len(new_codes)} new stocks: {', '.join(new_codes)}")
-                        try:
-                            future = asyncio.run_coroutine_threadsafe(
-                                self._register_realtime_stocks(new_codes),
-                                self.realtime_loop
-                            )
-                            # 타임아웃과 함께 결과 대기 (충분한 시간 제공)
-                            future.result(timeout=5.0)
-                            logger.info(f"[OK] Successfully registered {len(new_codes)} stocks for realtime data")
-                        except TimeoutError:
-                            logger.warning(f"Timeout while registering new stocks in realtime (waited 5 seconds)")
-                        except Exception as e:
-                            logger.warning(f"Failed to register new stocks in realtime: {e}", exc_info=True)
+                    if new_codes:
+                        if not self.realtime_client:
+                            logger.warning(f"[NEW STOCKS] Cannot register {len(new_codes)} stocks: realtime_client is None")
+                        elif not self.realtime_loop:
+                            logger.warning(f"[NEW STOCKS] Cannot register {len(new_codes)} stocks: realtime_loop is None")
+                        else:
+                            logger.info(f"[NEW STOCKS] Registering {len(new_codes)} new stocks: {', '.join(new_codes)}")
+                            try:
+                                future = asyncio.run_coroutine_threadsafe(
+                                    self._register_realtime_stocks(new_codes),
+                                    self.realtime_loop
+                                )
+                                # 타임아웃과 함께 결과 대기 (충분한 시간 제공)
+                                future.result(timeout=5.0)
+                                logger.info(f"[OK] Successfully registered {len(new_codes)} stocks for realtime data")
+                            except TimeoutError:
+                                logger.warning(f"Timeout while registering new stocks in realtime (waited 5 seconds)")
+                            except Exception as e:
+                                logger.warning(f"Failed to register new stocks in realtime: {e}", exc_info=True)
                     # 제거된 코드 버퍼는 남겨두어도 무방(메모리 사용 적음). 필요 시 정리 가능.
 
                 # 각 종목 처리
@@ -943,7 +1089,16 @@ class LiveTrader:
         # 현재 모니터링 중인 종목
         if self.config.use_condition_monitor:
             monitored_codes = self.get_condition_codes()
-            logger.info(f"\n[MONITOR] Tracked Stocks: {len(monitored_codes)}")
+            
+            # 조건검색 모드 표시
+            if self._condition_realtime_working is None:
+                mode_str = "Waiting for signals"
+            elif self._condition_realtime_working:
+                mode_str = "Real-time mode"
+            else:
+                mode_str = "Polling mode (no real-time signals)"
+            
+            logger.info(f"\n[MONITOR] Tracked Stocks: {len(monitored_codes)} ({mode_str})")
             if monitored_codes:
                 # 최대 10개까지만 표시
                 display_codes = monitored_codes[:10]

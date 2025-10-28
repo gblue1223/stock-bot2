@@ -329,6 +329,9 @@ class RealtimeStockClient:
     async def _handle_data(self, realtime_data: RealTimeData):
         """실시간 데이터 처리"""
         try:
+            # 디버깅: 수신된 메시지 타입 로그
+            logger.debug(f"[RealtimeStockClient] trnm={realtime_data.trnm}, data_count={len(realtime_data.data) if realtime_data.data else 0}")
+            
             if realtime_data.trnm != 'REAL':
                 return
             
