@@ -113,10 +113,10 @@ class SimpleWebSocketClient:
         
     def _setup_default_handlers(self):
         """기본 핸들러 설정"""
-        self.client.on_data = self._on_data_received
-        self.client.on_connect = self._on_connected
-        self.client.on_login = self._on_logged_in
-        self.client.on_error = self._on_error
+        self.client.on('data', self._on_data_received)
+        self.client.on('connect', self._on_connected)
+        self.client.on('login', self._on_logged_in)
+        self.client.on('error', self._on_error)
         
     async def _on_data_received(self, realtime_data: RealTimeData):
         """데이터 수신 시 호출"""

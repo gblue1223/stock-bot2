@@ -8,6 +8,7 @@ pytest>=8.0
 requests>=2.31
 httpx>=0.28.0
 websockets>=12.0
+pyee>=11.0
 # Deep Learning / RL
 torch>=2.2
 torchvision>=0.17

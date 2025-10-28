@@ -216,8 +216,6 @@ class RealtimeStockClient:
         self.auto_translate = auto_translate
         self.stock_data: Dict[str, StockRealtimeData] = {}  # stock_code -> StockRealtimeData
         self._login_event = asyncio.Event()
-        self._original_on_data = self.client.on_data  # 기존 콜백 백업
-        self._original_on_login = self.client.on_login
         
         # 이미 로그인된 경우 이벤트 설정
         if self.client.is_logged_in:
@@ -229,16 +227,14 @@ class RealtimeStockClient:
         self.on_data_update: Optional[Callable[[str, StockRealtimeData], None]] = None  # 전체 데이터 업데이트
         self.on_error: Optional[Callable[[Exception], None]] = None
         
-        # 내부 콜백 등록 (기존 콜백과 체인)
-        self.client.on_data = self._handle_data
-        self.client.on_login = self._on_login
+        # 이벤트 리스너 등록
+        self.client.on('data', self._handle_data)
+        self.client.on('login', self._on_login)
     
     def cleanup(self):
-        """콜백 정리 (원래 콜백 복원)"""
-        if hasattr(self, '_original_on_data'):
-            self.client.on_data = self._original_on_data
-        if hasattr(self, '_original_on_login'):
-            self.client.on_login = self._original_on_login
+        """이벤트 리스너 제거"""
+        self.client.remove_listener('data', self._handle_data)
+        self.client.remove_listener('login', self._on_login)
     
     async def register_stocks(
         self,
@@ -472,13 +468,13 @@ class RealtimeStockManager:
         self.registered_stocks: List[str] = []
         self.data_history: Dict[str, List[Dict[str, Any]]] = {}  # stock_code -> [data_dict]
         self.max_history_size: int = 1000
-        self._original_on_data_update = self.client.on_data_update  # 기존 콜백 백업
         
-        # 데이터 업데이트 콜백 등록
+        # 데이터 업데이트 콜백 등록 (기존 콜백을 래핑)
+        self._original_on_data_update = self.client.on_data_update
         self.client.on_data_update = self._on_data_update
     
     def cleanup(self):
-        """콜백 정리 (원래 콜백 복원)"""
+        """콜백 복원"""
         if hasattr(self, '_original_on_data_update'):
             self.client.on_data_update = self._original_on_data_update
     

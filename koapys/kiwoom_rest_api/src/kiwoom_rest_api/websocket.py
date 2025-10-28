@@ -4,6 +4,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Union
 import websockets
 from websockets.exceptions import ConnectionClosed, WebSocketException
+from pyee.asyncio import AsyncIOEventEmitter
 
 from .config import get_ws_url, WS_TIMEOUT
 
@@ -25,7 +26,7 @@ class RealTimeData:
         self.return_msg = data.get('return_msg')
         self.data = data.get('data', [])
 
-class WebSocketClient:
+class WebSocketClient(AsyncIOEventEmitter):
     """키움증권 실시간 웹소켓 클라이언트"""
     
     def __init__(
@@ -45,7 +46,16 @@ class WebSocketClient:
             auto_reconnect: 자동 재연결 여부
             reconnect_interval: 재연결 간격 (초)
             ping_interval: PING 간격 (초)
+            
+        Events:
+            connect: 웹소켓 연결 성공 시 발생
+            disconnect: 웹소켓 연결 종료 시 발생
+            login: 로그인 성공 시 발생
+            data: 실시간 데이터 수신 시 발생 (RealTimeData 전달)
+            error: 오류 발생 시 발생 (Exception 전달)
         """
+        super().__init__()
+        
         self.access_token = access_token
         self.ws_url = ws_url or get_ws_url()
         self.auto_reconnect = auto_reconnect
@@ -56,13 +66,6 @@ class WebSocketClient:
         self.connected = False
         self.keep_running = True
         self.is_logged_in = False
-        
-        # 콜백 함수들
-        self.on_connect: Optional[Callable] = None
-        self.on_disconnect: Optional[Callable] = None
-        self.on_login: Optional[Callable] = None
-        self.on_data: Optional[Callable[[RealTimeData], None]] = None
-        self.on_error: Optional[Callable[[Exception], None]] = None
         
         # 태스크들
         self._receive_task: Optional[asyncio.Task] = None
@@ -84,14 +87,12 @@ class WebSocketClient:
             self.connected = True
             logger.info("웹소켓 서버 연결 성공")
             
-            if self.on_connect:
-                await self.on_connect()
+            self.emit('connect')
                 
         except Exception as e:
             logger.error(f"웹소켓 연결 실패: {e}")
             self.connected = False
-            if self.on_error:
-                await self.on_error(e)
+            self.emit('error', e)
             raise WebSocketError(f"연결 실패: {e}")
 
     async def login(self) -> None:
@@ -130,8 +131,7 @@ class WebSocketClient:
             
         except Exception as e:
             logger.error(f"메시지 전송 실패: {e}")
-            if self.on_error:
-                await self.on_error(e)
+            self.emit('error', e)
             raise WebSocketError(f"메시지 전송 실패: {e}")
 
     async def register_realtime(
@@ -288,13 +288,11 @@ class WebSocketClient:
                 if realtime_data.return_code == 0:
                     self.is_logged_in = True
                     logger.info("로그인 성공")
-                    if self.on_login:
-                        await self.on_login()
+                    self.emit('login')
                 else:
                     error_msg = realtime_data.return_msg or "로그인 실패"
                     logger.error(f"로그인 실패: {error_msg}")
-                    if self.on_error:
-                        await self.on_error(WebSocketError(error_msg))
+                    self.emit('error', WebSocketError(error_msg))
                         
             elif trnm == 'PING':
                 # PING에 PONG으로 응답
@@ -305,28 +303,20 @@ class WebSocketClient:
                 # 실시간 데이터 수신
                 data_count = len(realtime_data.data) if realtime_data.data else 0
                 logger.debug(f"[WEBSOCKET] 실시간 데이터 수신, data 항목 수: {data_count}")
-                if self.on_data:
-                    await self.on_data(realtime_data)
-                else:
-                    logger.warning("[WEBSOCKET] on_data 콜백이 없어서 실시간 데이터가 무시됨!")
+                self.emit('data', realtime_data)
                     
             else:
                 # 기타 응답 (조건식 목록, 조건검색 응답 등)
                 data_len = len(realtime_data.data) if realtime_data.data is not None else 0
                 logger.debug(f"응답 수신 - trnm: {trnm}, data 항목 수: {data_len}")
-                if self.on_data:
-                    await self.on_data(realtime_data)
-                else:
-                    logger.warning(f"on_data 콜백이 설정되지 않았습니다!")
+                self.emit('data', realtime_data)
                     
         except json.JSONDecodeError as e:
             logger.error(f"JSON 파싱 오류: {e}, 메시지: {message[:200]}")
-            if self.on_error:
-                await self.on_error(e)
+            self.emit('error', e)
         except Exception as e:
             logger.error(f"메시지 처리 오류: {e}", exc_info=True)
-            if self.on_error:
-                await self.on_error(e)
+            self.emit('error', e)
 
     async def _receive_messages(self) -> None:
         """메시지 수신 루프"""
@@ -343,8 +333,7 @@ class WebSocketClient:
                 self.connected = False
                 self.is_logged_in = False
                 
-                if self.on_disconnect:
-                    await self.on_disconnect()
+                self.emit('disconnect')
                     
                 if self.auto_reconnect and self.keep_running:
                     logger.info(f"{self.reconnect_interval}초 후 재연결을 시도합니다")
@@ -359,8 +348,7 @@ class WebSocketClient:
                     
             except Exception as e:
                 logger.error(f"메시지 수신 오류: {e}")
-                if self.on_error:
-                    await self.on_error(e)
+                self.emit('error', e)
 
     async def _ping_loop(self) -> None:
         """PING 루프 (연결 유지)"""

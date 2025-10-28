@@ -38,8 +38,6 @@ class ConditionSearchClient:
         self.conditions: List[ConditionInfo] = []
         self.received_stocks: Dict[str, List[str]] = {}  # condition_index -> [stock_codes]
         self._login_event = asyncio.Event()  # 로그인 완료 이벤트
-        self._original_on_data = self.client.on_data  # 기존 콜백 백업
-        self._original_on_login = self.client.on_login
         
         # 이미 로그인된 경우 이벤트 설정
         if self.client.is_logged_in:
@@ -52,16 +50,14 @@ class ConditionSearchClient:
         self.on_stock_out: Optional[Callable[[str, str, str], None]] = None
         self.on_error: Optional[Callable[[Exception], None]] = None
         
-        # 내부 콜백 등록 (기존 콜백과 체인)
-        self.client.on_data = self._handle_data
-        self.client.on_login = self._on_login
+        # 이벤트 리스너 등록
+        self.client.on('data', self._handle_data)
+        self.client.on('login', self._on_login)
         
     def cleanup(self):
-        """콜백 정리 (원래 콜백 복원)"""
-        if hasattr(self, '_original_on_data'):
-            self.client.on_data = self._original_on_data
-        if hasattr(self, '_original_on_login'):
-            self.client.on_login = self._original_on_login
+        """이벤트 리스너 제거"""
+        self.client.remove_listener('data', self._handle_data)
+        self.client.remove_listener('login', self._on_login)
         
     async def load_conditions(self) -> List[ConditionInfo]:
         """조건식 목록 로드
@@ -171,18 +167,7 @@ class ConditionSearchClient:
             # 디버깅: 모든 메시지 타입 로그
             logger.debug(f"[ConditionSearchClient] Received trnm={realtime_data.trnm}, return_code={realtime_data.return_code}")
             
-            # REAL 데이터 중 0B/0C 타입은 RealtimeStockClient로 전달 (체인)
-            if realtime_data.trnm == 'REAL' and realtime_data.data:
-                has_stock_data = False
-                for item in realtime_data.data:
-                    if isinstance(item, dict) and item.get('type') in ['0B', '0C']:
-                        has_stock_data = True
-                        break
-                
-                # 주식 체결/호가 데이터가 있으면 이전 핸들러로 전달 (체인)
-                if has_stock_data and self._original_on_data:
-                    await self._original_on_data(realtime_data)
-                    # return 제거: 조건검색 처리도 계속 진행
+            # REAL 데이터는 다른 리스너들에게도 전달됨 (PyEventEmitter가 자동 처리)
             
             # 1. 조건식 목록 응답
             if realtime_data.trnm == 'CNSRLST':
