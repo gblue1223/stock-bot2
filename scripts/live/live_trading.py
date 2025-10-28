@@ -848,8 +848,11 @@ class LiveTrader:
         buffer = self.data_buffers[code]
         if not buffer.is_ready():
             buffer_len = len(buffer.buffer)
-            # 첫 번째 체크 시 또는 10의 배수일 때만 로그
-            if buffer_len == 0 or buffer_len % 10 == 0:
+            # 10초마다 한 번씩만 로그 (중복 방지)
+            current_time = int(time.time())
+            last_log_attr = f'_buffer_log_{code}'
+            if not hasattr(self, last_log_attr) or current_time - getattr(self, last_log_attr) >= 10:
+                setattr(self, last_log_attr, current_time)
                 logger.info(f"[BUFFER] {code}: Collecting data ({buffer_len}/{self.config.seq_len})")
             return
         
