@@ -304,7 +304,7 @@ class WebSocketClient:
             elif trnm == 'REAL':
                 # 실시간 데이터 수신
                 data_count = len(realtime_data.data) if realtime_data.data else 0
-                logger.info(f"[WEBSOCKET] 실시간 데이터 수신, data 항목 수: {data_count}")
+                logger.debug(f"[WEBSOCKET] 실시간 데이터 수신, data 항목 수: {data_count}")
                 if self.on_data:
                     await self.on_data(realtime_data)
                 else:

@@ -171,6 +171,19 @@ class ConditionSearchClient:
             # 디버깅: 모든 메시지 타입 로그
             logger.debug(f"[ConditionSearchClient] Received trnm={realtime_data.trnm}, return_code={realtime_data.return_code}")
             
+            # REAL 데이터 중 0B/0C 타입은 RealtimeStockClient로 전달 (체인)
+            if realtime_data.trnm == 'REAL' and realtime_data.data:
+                has_stock_data = False
+                for item in realtime_data.data:
+                    if isinstance(item, dict) and item.get('type') in ['0B', '0C']:
+                        has_stock_data = True
+                        break
+                
+                # 주식 체결/호가 데이터가 있으면 이전 핸들러로 전달 (체인)
+                if has_stock_data and self._original_on_data:
+                    await self._original_on_data(realtime_data)
+                    # return 제거: 조건검색 처리도 계속 진행
+            
             # 1. 조건식 목록 응답
             if realtime_data.trnm == 'CNSRLST':
                 if realtime_data.return_code == 0:
@@ -231,34 +244,20 @@ class ConditionSearchClient:
                 else:
                     logger.error(f"조건검색 등록 실패: {realtime_data.return_msg}")
                     
-            # 3. 실시간 조건검색 데이터
-            elif realtime_data.trnm == 'REAL':
-                logger.debug(f"[ConditionSearchClient] REAL data received, items={len(realtime_data.data) if realtime_data.data else 0}")
+            # 3. 실시간 조건검색 데이터 (COND_REAL)
+            elif realtime_data.trnm == 'COND_REAL':
+                logger.debug(f"[ConditionSearchClient] COND_REAL data received, items={len(realtime_data.data) if realtime_data.data else 0}")
                 for item in realtime_data.data:
                     if not isinstance(item, dict):
                         continue
                     
-                    # 타입 확인 - 조건검색 실시간 데이터인지 확인
-                    item_type = item.get('type', '')
-                    logger.debug(f"[ConditionSearchClient] REAL item type={item_type}, item={item}")
-                    
-                    # 조건검색 실시간 데이터가 아니면 스킵 (주식체결/호가 데이터는 RealtimeStockClient에서 처리)
-                    if item_type in ['0B', '0C']:
-                        continue
-                    
-                    # values 딕셔너리에서 데이터 추출
-                    if 'values' in item and isinstance(item['values'], dict):
-                        values = item['values']
-                        stock_code = values.get('9001', '')
-                        stock_name = values.get('302', '')
-                    else:
-                        stock_code = item.get('stk_cd') or item.get('9001', '')
-                        stock_name = item.get('stk_nm') or item.get('302', '')
-                    
+                    # 문서 형식에 따라 데이터 추출
+                    stock_code = item.get('stk_cd', '')
+                    stock_name = item.get('stk_nm', '')
                     action = item.get('action', '')  # 'in' or 'out'
                     cond_idx = item.get('cond_idx', '')
                     
-                    logger.debug(f"[ConditionSearchClient] Processing: code={stock_code}, name={stock_name}, action={action}, cond_idx={cond_idx}")
+                    logger.debug(f"[ConditionSearchClient] COND_REAL: code={stock_code}, name={stock_name}, action={action}, cond_idx={cond_idx}")
                     
                     if not stock_code:
                         continue
@@ -275,6 +274,7 @@ class ConditionSearchClient:
                         # 편입
                         if stock_code not in self.received_stocks[cond_idx]:
                             self.received_stocks[cond_idx].append(stock_code)
+                        logger.info(f"[CONDITION] 종목 편입: {stock_code} ({stock_name})")
                         if self.on_stock_in:
                             self.on_stock_in(stock_code, stock_name, cond_idx)
                             
@@ -282,14 +282,11 @@ class ConditionSearchClient:
                         # 이탈
                         if stock_code in self.received_stocks[cond_idx]:
                             self.received_stocks[cond_idx].remove(stock_code)
+                        logger.info(f"[CONDITION] 종목 이탈: {stock_code} ({stock_name})")
                         if self.on_stock_out:
                             self.on_stock_out(stock_code, stock_name, cond_idx)
                     else:
-                        # 기본 종목 (action 없음)
-                        if stock_code not in self.received_stocks[cond_idx]:
-                            self.received_stocks[cond_idx].append(stock_code)
-                        if self.on_stock_in:
-                            self.on_stock_in(stock_code, stock_name, cond_idx)
+                        logger.warning(f"[CONDITION] Unknown action '{action}' for {stock_code}")
                             
         except Exception as e:
             logger.exception(f"데이터 처리 중 오류: {e}")

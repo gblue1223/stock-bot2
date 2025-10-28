@@ -5,8 +5,6 @@
   "device": "cuda",
   "target_stocks": [],
   "use_condition_monitor": true,
-  "#condition_poll_interval": "조건검색 폴링 간격(초). 실시간 신호가 60초 이상 없을 때만 폴링 활성화",
-  "condition_poll_interval": 5,
   "max_position_size": 1000000,
   "max_positions": 3,
   "min_buy_confidence": 0.0,
