@@ -83,7 +83,7 @@ logger.info(f"Log file: {log_filename}")
 
 # 오후장 디버깅을 위해 관련 모듈의 로그 레벨을 DEBUG로 설정
 # logging.getLogger('koapys.kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.realtime_stock').setLevel(logging.DEBUG)
-# logging.getLogger('koapys.kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.condition_search').setLevel(logging.DEBUG)
+logging.getLogger('koapys.kiwoom_rest_api.src.kiwoom_rest_api.koreanstock.condition_search').setLevel(logging.DEBUG)
 # logging.getLogger('kiwoom_rest_api.websocket').setLevel(logging.DEBUG)
 
 # 메인 모듈 DEBUG 로그 활성화 (버퍼 디버깅용)
@@ -1099,133 +1099,6 @@ class LiveTrader:
         self.koapys.close()
         
         logger.info("[OK] Shutdown complete")
-
-
-class ConditionMonitor:
-    """첫 번째 조건식을 실시간으로 모니터링하여 종목 코드를 유지하는 백그라운드 모니터"""
-
-    def __init__(self, access_token: Optional[str] = None):
-        self._codes: Set[str] = set()
-        self._lock = threading.Lock()
-        self._thread: Optional[threading.Thread] = None
-        self._stop_event = threading.Event()
-        self._access_token = access_token  # 메인 스레드에서 전달받은 토큰
-        self._selected_condition_idx: Optional[str] = None
-
-    def get_codes(self) -> List[str]:
-        with self._lock:
-            return sorted(self._codes)
-
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_thread, name="ConditionMonitor", daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=3)
-
-    def _run_thread(self):
-        try:
-            asyncio.run(self._run_async())
-        except Exception as e:
-            logging.getLogger(__name__).error(f"ConditionMonitor fatal: {e}", exc_info=True)
-
-    async def _run_async(self):
-        if not ConditionSearchClient:
-            logging.getLogger(__name__).warning("ConditionSearchClient not available; ConditionMonitor disabled")
-            return
-
-        # 전달받은 토큰 사용 (메인 스레드에서 이미 획득함)
-        access_token = self._access_token
-        if not access_token:
-            logging.getLogger(__name__).error("No access token provided; ConditionMonitor disabled")
-            return
-        
-        logging.getLogger(__name__).info(f"Using provided access token (length: {len(access_token)})")
-
-        # WebSocketClient 임포트 및 생성
-        from koapys.kiwoom_rest_api.src.kiwoom_rest_api.websocket import WebSocketClient
-        
-        ws_client = WebSocketClient(access_token=access_token)
-        await ws_client.start()
-        
-        # ConditionSearchClient 생성
-        client = ConditionSearchClient(client=ws_client)
-
-        # 콜백 함수 설정
-        def on_condition_list(conditions):
-            """조건식 목록 수신 시 첫 번째 조건식 선택"""
-            if conditions:
-                self._selected_condition_idx = conditions[0].index
-                logging.getLogger(__name__).info(
-                    f"Selected condition: [{conditions[0].index}] {conditions[0].name}"
-                )
-
-        def on_condition_registered(cond_idx, cond_name):
-            """조건검색 등록 완료"""
-            logging.getLogger(__name__).info(f"Condition registered: [{cond_idx}] {cond_name}")
-
-        def on_stock_in(code, name, cond_idx):
-            """종목 편입 시 호출"""
-            # 'A' 접두사 제거
-            code_clean = code[1:] if code.startswith('A') else code
-            with self._lock:
-                if code_clean not in self._codes:
-                    self._codes.add(code_clean)
-                    logging.getLogger(__name__).info(f"Stock added: {code_clean} ({name})")
-
-        def on_stock_out(code, name, cond_idx):
-            """종목 이탈 시 호출"""
-            code_clean = code[1:] if code.startswith('A') else code
-            with self._lock:
-                if code_clean in self._codes:
-                    self._codes.remove(code_clean)
-                    logging.getLogger(__name__).info(f"Stock removed: {code_clean} ({name})")
-
-        def on_error(error):
-            """오류 발생 시 호출"""
-            logging.getLogger(__name__).error(f"ConditionSearchClient error: {error}")
-
-        # 콜백 등록
-        client.on_condition_list = on_condition_list
-        client.on_condition_registered = on_condition_registered
-        client.on_stock_in = on_stock_in
-        client.on_stock_out = on_stock_out
-        client.on_error = on_error
-
-        try:
-            # 조건식 목록 로드 및 등록
-            conditions = await client.load_conditions()
-            
-            if not conditions:
-                logging.getLogger(__name__).warning("No conditions found")
-                return
-            
-            # 첫 번째 조건식 등록
-            if self._selected_condition_idx:
-                selected = conditions[0]
-                await client.register_condition(
-                    condition_index=selected.index,
-                    condition_name=selected.name
-                )
-            
-            # 종료 신호까지 대기
-            while not self._stop_event.is_set():
-                await asyncio.sleep(0.5)
-                
-        finally:
-            try:
-                # 조건검색 해지 및 연결 종료
-                if self._selected_condition_idx:
-                    await client.unregister_condition(self._selected_condition_idx)
-                client.cleanup()
-                await ws_client.stop()
-            except Exception as e:
-                logging.getLogger(__name__).warning(f"Error during cleanup: {e}")
 
 
 def main():
