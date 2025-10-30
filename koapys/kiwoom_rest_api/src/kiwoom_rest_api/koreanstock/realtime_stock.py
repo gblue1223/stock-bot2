@@ -365,11 +365,14 @@ class RealtimeStockClient:
                     continue
                 
                 type_code = item_data.get('type')
-                item_code = item_data.get('item')  # 종목코드
-                values = item_data.get('values', {})
+                if type_code != '0B' and type_code != '0C':
+                    continue
                 
+                item_code = item_data.get('item')  # 종목코드
                 if not item_code:
                     continue
+                
+                values = item_data.get('values', {})
                 
                 # 종목 데이터 가져오기 또는 생성
                 if item_code not in self.stock_data:
