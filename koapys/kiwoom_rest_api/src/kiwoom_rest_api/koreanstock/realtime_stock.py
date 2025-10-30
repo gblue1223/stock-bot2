@@ -161,7 +161,15 @@ class StockRealtimeData:
                 sec_from_open = max(0, secs - MARKET_OPEN_SECONDS)
                 # 간단한 표준화: 0~6시간(21600초) 범위를 -1~1로 매핑
                 self.시간_scalar = float((sec_from_open - 10800) / 10800.0)  # 3시간 중심, ±3시간
-            except Exception:
+                
+                # 로그 (주기적으로만 - 30초마다)
+                if secs % 30 < 1:  # 30초 근처에서만
+                    logger.debug(
+                        f"[DERIVED] {self.종목코드} 파생피처: 종목명_scalar={self.종목명_scalar:.4f}, "
+                        f"시간_sin={self.시간_sin:.4f}, 시간_cos={self.시간_cos:.4f}, 시간_scalar={self.시간_scalar:.4f}"
+                    )
+            except Exception as e:
+                logger.warning(f"[DERIVED] {self.종목코드} 파생피처 계산 실패: {e}")
                 self.시간_sin = 0.0
                 self.시간_cos = 0.0
                 self.시간_scalar = 0.0
@@ -172,16 +180,35 @@ class StockRealtimeData:
     
     def compute_waiting_amounts(self):
         """호가와 수량을 곱해 대기금액 계산 (백만원 단위)"""
+        total_ask_amount = 0.0
+        total_bid_amount = 0.0
+        
         for i in range(1, 11):
             # 매도대기금액
             ask_price = getattr(self, f"매도호가{i}", 0.0)
             ask_qty = getattr(self, f"매도호가수량{i}", 0.0)
-            setattr(self, f"매도대기금액{i}", (ask_price * ask_qty) / 1_000_000)
+            ask_amount = (ask_price * ask_qty) / 1_000_000
+            setattr(self, f"매도대기금액{i}", ask_amount)
+            total_ask_amount += ask_amount
             
             # 매수대기금액
             bid_price = getattr(self, f"매수호가{i}", 0.0)
             bid_qty = getattr(self, f"매수호가수량{i}", 0.0)
-            setattr(self, f"매수대기금액{i}", (bid_price * bid_qty) / 1_000_000)
+            bid_amount = (bid_price * bid_qty) / 1_000_000
+            setattr(self, f"매수대기금액{i}", bid_amount)
+            total_bid_amount += bid_amount
+        
+        # 로그 (1분마다 한 번만 - 시간이 정각일 때)
+        if self.시간 and len(str(self.시간)) >= 4:
+            time_str = str(self.시간).zfill(9)
+            mm = int(time_str[2:4])
+            ss = int(time_str[4:6])
+            if ss < 1:  # 정각 근처
+                logger.debug(
+                    f"[WAITING] {self.종목코드} 대기금액: 총매도={total_ask_amount:.2f}백만, "
+                    f"총매수={total_bid_amount:.2f}백만, 매도1={getattr(self, '매도대기금액1', 0):.2f}, "
+                    f"매수1={getattr(self, '매수대기금액1', 0):.2f}"
+                )
     
     def to_dict(self) -> Dict[str, Any]:
         """딕셔너리로 변환 (FINAL_COLUMNS 기준, 호가/수량 제외)"""

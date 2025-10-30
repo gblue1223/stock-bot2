@@ -405,6 +405,19 @@ class LiveTrader:
                     # StockRealtimeData를 dict로 변환
                     market_data = stock_data.to_dict()
                     
+                    # 주기적으로 raw 데이터 로깅 (30초마다)
+                    raw_log_attr = f'_raw_data_log_{code}'
+                    if not hasattr(self, raw_log_attr) or current_time - getattr(self, raw_log_attr) >= 30:
+                        setattr(self, raw_log_attr, current_time)
+                        logger.debug(
+                            f"[RAW DATA] {code}: 등락률={market_data.get('등락률', 0):.4f}, "
+                            f"누적거래대금={market_data.get('누적거래대금', 0):.2e}, "
+                            f"거래회전율={market_data.get('거래회전율', 0):.4f}, "
+                            f"체결강도={market_data.get('체결강도', 0):.4f}, "
+                            f"매도대기금액1={market_data.get('매도대기금액1', 0):.2f}, "
+                            f"매수대기금액1={market_data.get('매수대기금액1', 0):.2f}"
+                        )
+                    
                     # 특징 추출
                     features = self.extract_features(market_data)
                     logger.debug(f"[REALTIME] {code}: Extracted {len(features)} features")
@@ -542,6 +555,7 @@ class LiveTrader:
         """
         try:
             features = []
+            feature_names = []
             
             # FINAL_COLUMNS를 순회하면서 to_dict()와 동일한 로직 적용
             for col in FINAL_COLUMNS:
@@ -556,6 +570,7 @@ class LiveTrader:
                 # 특징 추출
                 value = market_data.get(col, 0.0)
                 features.append(float(value))
+                feature_names.append(col)
             
             # numpy array로 변환
             features_array = np.array(features, dtype=np.float32)
@@ -576,10 +591,37 @@ class LiveTrader:
                 else:
                     features_array = features_array[:self.config.num_features]
             
+            # 주기적으로 특징 값 샘플 로그 (5분마다)
+            code = market_data.get('종목코드', 'UNKNOWN')
+            current_time = int(time.time())
+            log_attr = f'_feature_log_{code}'
+            if not hasattr(self, log_attr) or current_time - getattr(self, log_attr) >= 300:  # 5분
+                setattr(self, log_attr, current_time)
+                
+                # 통계 계산
+                non_zero_count = np.count_nonzero(features_array)
+                mean_val = np.mean(features_array)
+                std_val = np.std(features_array)
+                min_val = np.min(features_array)
+                max_val = np.max(features_array)
+                
+                logger.info(
+                    f"[FEATURES] {code} 특징 추출 샘플: "
+                    f"길이={len(features_array)}, 비영={non_zero_count}, "
+                    f"평균={mean_val:.4f}, 표준편차={std_val:.4f}, 범위=[{min_val:.4f}, {max_val:.4f}]"
+                )
+                
+                # 주요 특징 값 출력
+                logger.debug(
+                    f"[FEATURES] {code} 주요값: "
+                    f"등락률={features_array[4]:.4f}, 누적거래대금={features_array[5]:.2e}, "
+                    f"거래회전율={features_array[6]:.4f}, 체결강도={features_array[7]:.4f}"
+                )
+            
             return features_array
             
         except Exception as e:
-            logger.error(f"Failed to extract features: {e}")
+            logger.error(f"Failed to extract features: {e}", exc_info=True)
             # 오류 시 제로 벡터 반환
             return np.zeros(self.config.num_features, dtype=np.float32)
     
@@ -859,6 +901,20 @@ class LiveTrader:
         # 시퀀스 가져오기
         sequence = self.data_buffers[code].get_sequence()
         
+        # 주기적으로 시퀀스 통계 로깅 (1분마다)
+        current_time = int(time.time())
+        seq_log_attr = f'_seq_log_{code}'
+        if not hasattr(self, seq_log_attr) or current_time - getattr(self, seq_log_attr) >= 60:
+            setattr(self, seq_log_attr, current_time)
+            seq_mean = np.mean(sequence)
+            seq_std = np.std(sequence)
+            seq_min = np.min(sequence)
+            seq_max = np.max(sequence)
+            logger.info(
+                f"[SEQUENCE] {code}: shape={sequence.shape}, mean={seq_mean:.4f}, "
+                f"std={seq_std:.4f}, range=[{seq_min:.4f}, {seq_max:.4f}]"
+            )
+        
         # 현재 포지션
         current_position = self.positions.get(code)
         
@@ -877,6 +933,21 @@ class LiveTrader:
             current_price=current_price,
             deterministic=True
         )
+        
+        # 예측 결과 로깅 (HOLD가 아닌 경우만)
+        if action != Action.HOLD.value:
+            action_name = 'BUY' if action == Action.BUY.value else 'SELL'
+            stock_name = ''
+            if self.realtime_client:
+                stock_data = self.realtime_client.get_stock_data(code)
+                if stock_data:
+                    stock_name = f" ({stock_data.종목명})"
+            
+            logger.info(
+                f"[PREDICT] {code}{stock_name}: {action_name} signal, "
+                f"confidence={confidence:.4f}, raw_action={pred_info.get('raw_action')}, "
+                f"filtered={pred_info.get('filtered')}, reason={pred_info.get('filter_reason') or pred_info.get('exit_reason')}"
+            )
         
         # 행동 실행
         if action == Action.BUY.value and self.is_trading_time():

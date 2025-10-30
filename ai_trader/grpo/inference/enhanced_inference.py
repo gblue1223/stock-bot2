@@ -139,11 +139,32 @@ class EnhancedGRPOInference:
         """
         self.stats['total_predictions'] += 1
         
+        # 주기적으로 입력 시퀀스 통계 로깅 (100번마다)
+        if self.stats['total_predictions'] % 100 == 1:
+            seq_mean = np.mean(sequence)
+            seq_std = np.std(sequence)
+            seq_min = np.min(sequence)
+            seq_max = np.max(sequence)
+            non_zero = np.count_nonzero(sequence)
+            logger.info(
+                f"[INFERENCE] Input sequence stats (prediction #{self.stats['total_predictions']}): "
+                f"shape={sequence.shape}, mean={seq_mean:.4f}, std={seq_std:.4f}, "
+                f"range=[{seq_min:.4f}, {seq_max:.4f}], non-zero={non_zero}/{sequence.size}"
+            )
+        
         # 기본 추론
         raw_action, raw_confidence = self.base_inference.predict(
             sequence, 
             deterministic=deterministic
         )
+        
+        # 원시 예측 결과 로깅 (10번마다)
+        if self.stats['total_predictions'] % 10 == 1:
+            action_name = ['HOLD', 'BUY', 'SELL'][raw_action] if raw_action in [0, 1, 2] else 'UNKNOWN'
+            logger.debug(
+                f"[INFERENCE] Raw prediction #{self.stats['total_predictions']}: "
+                f"action={action_name}({raw_action}), confidence={raw_confidence:.4f}"
+            )
         
         info = {
             'raw_action': raw_action,
@@ -228,7 +249,14 @@ class EnhancedGRPOInference:
                 
                 return Action.HOLD.value, raw_confidence, info
         
-        # 필터링 통과
+        # 필터링 통과 - 최종 결과 로깅 (Buy/Sell만)
+        if raw_action in [Action.BUY.value, Action.SELL.value]:
+            action_name = 'BUY' if raw_action == Action.BUY.value else 'SELL'
+            logger.info(
+                f"[INFERENCE] Final action: {action_name}, confidence={raw_confidence:.4f}, "
+                f"position={'YES' if current_position else 'NO'}"
+            )
+        
         return raw_action, raw_confidence, info
     
     def _check_auto_exit(self, position: Position) -> Tuple[int, str]:
