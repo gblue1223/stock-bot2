@@ -229,49 +229,78 @@ class ConditionSearchClient:
                 else:
                     logger.error(f"조건검색 등록 실패: {realtime_data.return_msg}")
                     
-            # 3. 실시간 조건검색 데이터 (COND_REAL)
-            elif realtime_data.trnm == 'COND_REAL':
-                logger.debug(f"[ConditionSearchClient] COND_REAL data received, items={len(realtime_data.data) if realtime_data.data else 0}")
+            # 3. 실시간 조건검색 데이터 (REAL, type='02')
+            elif realtime_data.trnm == 'REAL':
+                # REAL 타입 중 조건검색(type='02')만 처리
                 for item in realtime_data.data:
                     if not isinstance(item, dict):
                         continue
                     
-                    # 문서 형식에 따라 데이터 추출
-                    stock_code = item.get('stk_cd', '')
-                    stock_name = item.get('stk_nm', '')
-                    action = item.get('action', '')  # 'in' or 'out'
-                    cond_idx = item.get('cond_idx', '')
+                    # type='02'인 경우만 조건검색 데이터
+                    if item.get('type') != '02':
+                        continue
                     
-                    logger.debug(f"[ConditionSearchClient] COND_REAL: code={stock_code}, name={stock_name}, action={action}, cond_idx={cond_idx}")
+                    logger.debug(f"[ConditionSearchClient] REAL type='02' data received: {item}")
+                    
+                    # values 딕셔너리에서 데이터 추출
+                    values = item.get('values', {})
+                    if not values or not isinstance(values, dict):
+                        logger.warning(f"[ConditionSearchClient] No values in condition search data: {item}")
+                        continue
+                    
+                    # 실제 데이터 형식:
+                    # '841': 일련번호
+                    # '9001': 종목코드
+                    # '843': 'I' (삽입/편입) 또는 'D' (삭제/이탈)
+                    # '20': 체결시간
+                    # '907': 매도/수 구분
+                    stock_code = values.get('9001', '')
+                    action_flag = values.get('843', '')  # 'I' or 'D'
+                    
+                    # item의 'item' 필드도 종목코드를 담고 있음 (백업)
+                    if not stock_code:
+                        stock_code = item.get('item', '')
+                    
+                    logger.debug(
+                        f"[ConditionSearchClient] Parsed: code={stock_code}, "
+                        f"action={action_flag}, time={values.get('20')}"
+                    )
                     
                     if not stock_code:
+                        logger.warning(f"[ConditionSearchClient] No stock code in condition data: {item}")
                         continue
-                        
-                    # 조건 인덱스가 없는 경우 첫 번째 조건으로 간주
-                    if not cond_idx and self.received_stocks:
-                        cond_idx = list(self.received_stocks.keys())[0]
+                    
+                    # 조건 인덱스 (등록된 첫 번째 조건으로 간주)
+                    if not self.received_stocks:
+                        logger.warning(f"[ConditionSearchClient] No registered conditions yet")
+                        continue
+                    
+                    cond_idx = list(self.received_stocks.keys())[0]
                     
                     # 종목 리스트 초기화
                     if cond_idx not in self.received_stocks:
                         self.received_stocks[cond_idx] = []
                     
-                    if action == 'in':
-                        # 편입
+                    # 종목명은 별도로 제공되지 않음 (빈 문자열 사용)
+                    stock_name = ''
+                    
+                    if action_flag == 'I':
+                        # 편입 (Insert)
                         if stock_code not in self.received_stocks[cond_idx]:
                             self.received_stocks[cond_idx].append(stock_code)
-                        logger.info(f"[CONDITION] 종목 편입: {stock_code} ({stock_name})")
+                        logger.info(f"[CONDITION] 종목 편입: {stock_code}")
                         if self.on_stock_in:
                             self.on_stock_in(stock_code, stock_name, cond_idx)
                             
-                    elif action == 'out':
-                        # 이탈
+                    elif action_flag == 'D':
+                        # 이탈 (Delete)
                         if stock_code in self.received_stocks[cond_idx]:
                             self.received_stocks[cond_idx].remove(stock_code)
-                        logger.info(f"[CONDITION] 종목 이탈: {stock_code} ({stock_name})")
+                        logger.info(f"[CONDITION] 종목 이탈: {stock_code}")
                         if self.on_stock_out:
                             self.on_stock_out(stock_code, stock_name, cond_idx)
                     else:
-                        logger.warning(f"[CONDITION] Unknown action '{action}' for {stock_code}")
+                        logger.warning(f"[CONDITION] Unknown action flag '{action_flag}' for {stock_code}")
                             
         except Exception as e:
             logger.exception(f"데이터 처리 중 오류: {e}")
