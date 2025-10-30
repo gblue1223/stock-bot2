@@ -525,13 +525,13 @@ class LiveTrader:
             await self.realtime_client.register_stocks(
                 stock_codes=stock_codes,
                 include_trade=True,
-                include_quote=True
+                include_quote=True,
+                refresh="0"
             )
             logger.info(f"[REGISTER] ✓ Successfully registered {len(stock_codes)} stocks for realtime data")
         except Exception as e:
             logger.error(f"[REGISTER] ✗ Failed to register stocks: {e}", exc_info=True)
             raise  # Re-raise to propagate to caller
-    
     
     def extract_features(self, market_data: Dict) -> np.ndarray:
         """

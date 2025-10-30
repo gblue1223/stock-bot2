@@ -268,7 +268,8 @@ class RealtimeStockClient:
         stock_codes: List[str],
         include_trade: bool = True,
         include_quote: bool = True,
-        group_no: str = "1"
+        group_no: str = "1",
+        refresh: str = "1"
     ):
         """주식 실시간 데이터 등록
         
@@ -277,6 +278,7 @@ class RealtimeStockClient:
             include_trade: 주식체결(0B) 포함 여부
             include_quote: 주식호가(0C) 포함 여부
             group_no: 그룹 번호
+            refresh: 기존등록유지여부 (0: 기존유지안함, 1: 기존유지)
         """
         # 로그인 완료 대기 (타임아웃 포함)
         try:
@@ -311,7 +313,7 @@ class RealtimeStockClient:
             group_no=group_no,
             type_list=type_list,
             item_list=stock_codes,
-            refresh="1"
+            refresh=refresh
         )
         
         logger.info(f"주식 실시간 데이터 등록: {len(stock_codes)}개 종목, 타입={type_list}")
