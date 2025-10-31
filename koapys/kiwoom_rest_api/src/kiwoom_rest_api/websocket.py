@@ -237,9 +237,9 @@ class WebSocketClient(AsyncIOEventEmitter):
             refresh: 기존등록유지여부 (0: 기존유지안함, 1: 기존유지)
         """
         register_data = {
-            'trnm': 'CNSRREQ',  # 조건검색 등록
+            'trnm': 'CNSRREQ',      # 조건검색 등록
             "seq" : condition_index,# 조건검색식 일련번호
-            "search_type" : "0",    # 0:조건검색 
+            "search_type" : "1",    # 1: 조건검색+실시간조건검색
             "stex_tp" : "K",        # K:KRX
             "cont_yn" : "N",        # 연속조회여부 (Y:연속조회, N:단순조회)
             "next_key" : ""         # 연속조회키 (연속조회여부가 'Y'인 경우 필수 세팅)
