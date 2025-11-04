@@ -183,6 +183,11 @@ class StockRealtimeData:
         total_ask_amount = 0.0
         total_bid_amount = 0.0
         
+        # 디버그: 처음 몇 번만 상세 로깅
+        if not hasattr(self, '_waiting_debug_count'):
+            self._waiting_debug_count = 0
+        do_debug = self._waiting_debug_count < 3
+        
         for i in range(1, 11):
             # 매도대기금액
             ask_price = getattr(self, f"매도호가{i}", 0.0)
@@ -197,6 +202,16 @@ class StockRealtimeData:
             bid_amount = (bid_price * bid_qty) / 1_000_000
             setattr(self, f"매수대기금액{i}", bid_amount)
             total_bid_amount += bid_amount
+            
+            # 상세 디버그 로그
+            if do_debug and i == 1:
+                logger.debug(
+                    f"[WAITING_CALC] {self.종목코드} 매도1: 호가={ask_price}, 수량={ask_qty}, 금액={ask_amount:.2f}백만 | "
+                    f"매수1: 호가={bid_price}, 수량={bid_qty}, 금액={bid_amount:.2f}백만"
+                )
+        
+        if do_debug:
+            self._waiting_debug_count += 1
         
         # 로그 (1분마다 한 번만 - 시간이 정각일 때)
         if self.시간 and len(str(self.시간)) >= 4:
@@ -276,7 +291,7 @@ class RealtimeStockClient:
         Args:
             stock_codes: 종목코드 리스트 (예: ['005930', '000660'])
             include_trade: 주식체결(0B) 포함 여부
-            include_quote: 주식호가(0C) 포함 여부
+            include_quote: 주식호가잔량(0D) 포함 여부 (호가+수량)
             group_no: 그룹 번호
             refresh: 기존등록유지여부 (0: 기존유지안함, 1: 기존유지)
         """
@@ -297,7 +312,7 @@ class RealtimeStockClient:
         if include_trade:
             type_list.append('0B')
         if include_quote:
-            type_list.append('0C')
+            type_list.append('0D')  # 주식호가잔량 (호가 가격 41-60 + 수량 61-80)
         
         if not type_list:
             logger.warning("등록할 실시간 타입이 없습니다")
@@ -365,7 +380,7 @@ class RealtimeStockClient:
                     continue
                 
                 type_code = item_data.get('type')
-                if type_code != '0B' and type_code != '0C':
+                if type_code not in ['0B', '0C', '0D']:
                     continue
                 
                 item_code = item_data.get('item')  # 종목코드
@@ -387,8 +402,8 @@ class RealtimeStockClient:
                     if self.on_trade_data:
                         self.on_trade_data(item_code, stock)
                 
-                elif type_code == '0C':
-                    # 주식호가 데이터
+                elif type_code in ['0C', '0D']:
+                    # 주식호가 데이터 (0C: 우선호가, 0D: 호가잔량)
                     self._process_quote_data(stock, values)
                     if self.on_quote_data:
                         self.on_quote_data(item_code, stock)
@@ -410,6 +425,15 @@ class RealtimeStockClient:
     
     def _process_trade_data(self, stock: StockRealtimeData, values: Dict[str, Any]):
         """주식체결(0B) 데이터 처리"""
+        # 디버그: 받은 필드 출력 (처음 몇 번만)
+        if not hasattr(self, '_trade_debug_count'):
+            self._trade_debug_count = 0
+        if self._trade_debug_count < 5:
+            logger.debug(f"[0B TRADE] {stock.종목코드} received fields: {list(values.keys())}")
+            if '567' in values:
+                logger.debug(f"[0B TRADE] {stock.종목코드} 체결강도 raw value: {values.get('567')}")
+            self._trade_debug_count += 1
+        
         # 필드 매핑 (websocket_constants.py 참고)
         stock.종목코드 = self._safe_str(values.get('9001', stock.종목코드))
         stock.종목명 = self._safe_str(values.get('900', stock.종목명))
@@ -432,34 +456,76 @@ class RealtimeStockClient:
             stock.시간 = self._safe_str(values.get('569', stock.시간))
     
     def _process_quote_data(self, stock: StockRealtimeData, values: Dict[str, Any]):
-        """주식호가(0C) 데이터 처리"""
+        """주식호가(0C/0D) 데이터 처리"""
+        # 디버그: 받은 필드 출력 (처음 몇 번만)
+        if not hasattr(self, '_quote_debug_count'):
+            self._quote_debug_count = 0
+        if self._quote_debug_count < 5:
+            logger.debug(f"[QUOTE] {stock.종목코드} received fields: {list(values.keys())[:20]}...")  # 처음 20개만
+            # 0D 타입인지 0C 타입인지 확인
+            is_0d = '61' in values or '71' in values  # 0D는 61(매도호가수량1), 71(매수호가수량1)
+            is_0c = '47' in values or '48' in values  # 0C는 47(매도호가수량1), 48(매수호가수량1)
+            if is_0d:
+                logger.debug(f"[QUOTE] {stock.종목코드} 0D 타입 - 매도호가1={values.get('41')}, 매도수량1={values.get('61')}, 매수호가1={values.get('51')}, 매수수량1={values.get('71')}")
+            elif is_0c:
+                logger.debug(f"[QUOTE] {stock.종목코드} 0C 타입 - 매도호가1={values.get('27')}, 매도수량1={values.get('47')}, 매수호가1={values.get('28')}, 매수수량1={values.get('48')}")
+            self._quote_debug_count += 1
+        
         # 종목 정보
         stock.종목코드 = self._safe_str(values.get('9001', stock.종목코드))
         stock.종목명 = self._safe_str(values.get('900', stock.종목명))
         
-        # 매도호가 1~10 (필드: 27, 29, 31, 33, 35, 37, 39, 41, 43, 45)
-        ask_price_fields = ['27', '29', '31', '33', '35', '37', '39', '41', '43', '45']
-        for i, field in enumerate(ask_price_fields, 1):
-            if field in values:
-                setattr(stock, f"매도호가{i}", self._safe_float(values.get(field)))
+        # 0D 타입 (주식호가잔량) 처리
+        if '61' in values or '71' in values:
+            # 매도호가 1~10 (필드: 41-50)
+            for i in range(1, 11):
+                field = str(40 + i)
+                if field in values:
+                    setattr(stock, f"매도호가{i}", self._safe_float(values.get(field)))
+            
+            # 매수호가 1~10 (필드: 51-60)
+            for i in range(1, 11):
+                field = str(50 + i)
+                if field in values:
+                    setattr(stock, f"매수호가{i}", self._safe_float(values.get(field)))
+            
+            # 매도호가수량 1~10 (필드: 61-70)
+            for i in range(1, 11):
+                field = str(60 + i)
+                if field in values:
+                    setattr(stock, f"매도호가수량{i}", self._safe_float(values.get(field)))
+            
+            # 매수호가수량 1~10 (필드: 71-80)
+            for i in range(1, 11):
+                field = str(70 + i)
+                if field in values:
+                    setattr(stock, f"매수호가수량{i}", self._safe_float(values.get(field)))
         
-        # 매수호가 1~10 (필드: 28, 30, 32, 34, 36, 38, 40, 42, 44, 46)
-        bid_price_fields = ['28', '30', '32', '34', '36', '38', '40', '42', '44', '46']
-        for i, field in enumerate(bid_price_fields, 1):
-            if field in values:
-                setattr(stock, f"매수호가{i}", self._safe_float(values.get(field)))
-        
-        # 매도호가수량 1~10 (필드: 47, 49, 51, 53, 55, 57, 59, 61, 63, 65)
-        ask_qty_fields = ['47', '49', '51', '53', '55', '57', '59', '61', '63', '65']
-        for i, field in enumerate(ask_qty_fields, 1):
-            if field in values:
-                setattr(stock, f"매도호가수량{i}", self._safe_float(values.get(field)))
-        
-        # 매수호가수량 1~10 (필드: 48, 50, 52, 54, 56, 58, 60, 62, 64, 66)
-        bid_qty_fields = ['48', '50', '52', '54', '56', '58', '60', '62', '64', '66']
-        for i, field in enumerate(bid_qty_fields, 1):
-            if field in values:
-                setattr(stock, f"매수호가수량{i}", self._safe_float(values.get(field)))
+        # 0C 타입 (주식우선호가) 처리 - 하위 호환성
+        else:
+            # 매도호가 1~10 (필드: 27, 29, 31, 33, 35, 37, 39, 41, 43, 45)
+            ask_price_fields = ['27', '29', '31', '33', '35', '37', '39', '41', '43', '45']
+            for i, field in enumerate(ask_price_fields, 1):
+                if field in values:
+                    setattr(stock, f"매도호가{i}", self._safe_float(values.get(field)))
+            
+            # 매수호가 1~10 (필드: 28, 30, 32, 34, 36, 38, 40, 42, 44, 46)
+            bid_price_fields = ['28', '30', '32', '34', '36', '38', '40', '42', '44', '46']
+            for i, field in enumerate(bid_price_fields, 1):
+                if field in values:
+                    setattr(stock, f"매수호가{i}", self._safe_float(values.get(field)))
+            
+            # 매도호가수량 1~10 (필드: 47, 49, 51, 53, 55, 57, 59, 61, 63, 65)
+            ask_qty_fields = ['47', '49', '51', '53', '55', '57', '59', '61', '63', '65']
+            for i, field in enumerate(ask_qty_fields, 1):
+                if field in values:
+                    setattr(stock, f"매도호가수량{i}", self._safe_float(values.get(field)))
+            
+            # 매수호가수량 1~10 (필드: 48, 50, 52, 54, 56, 58, 60, 62, 64, 66)
+            bid_qty_fields = ['48', '50', '52', '54', '56', '58', '60', '62', '64', '66']
+            for i, field in enumerate(bid_qty_fields, 1):
+                if field in values:
+                    setattr(stock, f"매수호가수량{i}", self._safe_float(values.get(field)))
     
     @staticmethod
     def _safe_float(value: Any, default: float = 0.0) -> float:

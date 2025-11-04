@@ -23,6 +23,8 @@
   "seq_len": 30,
   "num_features": 28,
   "update_interval": 1.0,
+  "online_window_size": 200,
+  "online_warmup_samples": 50,
   "koapys_base_url": "http://localhost:5000",
   "simulation": true
 }

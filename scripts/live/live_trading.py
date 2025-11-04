@@ -135,6 +135,10 @@ class TradingConfig:
         self.num_features = 28  # 특징 수 (파생 피처 4개 + 기본 지표 4개 + 대기금액 20개)
         self.update_interval = 1.0  # 데이터 업데이트 간격 (초)
         
+        # 정규화 설정 (PerStockNormalizer 고정)
+        self.online_window_size = 200  # Rolling window 크기
+        self.online_warmup_samples = 50  # 워밍업 샘플 수
+        
         # 조건검색 사용 설정
         self.use_condition_monitor = True
         self.condition_collect_delay = 2.0  # 최초 등록 직후 딜레이(초)
@@ -251,11 +255,24 @@ class LiveTrader:
         
         # GRPO 추론 엔진 초기화
         logger.info("Initializing GRPO inference engine...")
+        
+        # PerStockNormalizer 초기화 (항상 사용)
+        from scripts.live.online_normalizer import PerStockNormalizer
+        
+        self.normalizer = PerStockNormalizer(
+            num_features=config.num_features,
+            window_size=config.online_window_size,
+            warmup_samples=config.online_warmup_samples
+        )
+        logger.info(f"✅ PerStockNormalizer initialized (window={config.online_window_size}, warmup={config.online_warmup_samples})")
+        
+        # GRPOInference는 정규화 통계 없이 초기화 (PerStockNormalizer가 처리)
         base_inference = GRPOInference(
             policy_path=config.model_path,
             embedding_model_path=config.embedding_model_path,
             device=config.device,
-            use_torchscript=False
+            use_torchscript=False,
+            normalization_stats=None
         )
         
         self.inference = EnhancedGRPOInference(
@@ -267,6 +284,9 @@ class LiveTrader:
             max_holding_period=config.max_holding_period,
             enable_auto_exit=True
         )
+        
+        # PerStockNormalizer를 사용하므로 사전 통계 불필요
+        
         logger.info("[OK] Inference engine initialized")
         
         # 데이터 버퍼 (종목별)
@@ -574,6 +594,23 @@ class LiveTrader:
             
             # numpy array로 변환
             features_array = np.array(features, dtype=np.float32)
+            
+            # 정규화 적용 (PerStockNormalizer)
+            features_array = self.normalizer.normalize(code, features_array, update=True)
+            
+            # 워밍업 상태 로그 (종목별 1회만)
+            warmup_log_attr = f'_warmup_logged_{code}'
+            if not self.normalizer.is_ready(code):
+                if not hasattr(self, warmup_log_attr):
+                    stats = self.normalizer.get_stats(code)
+                    logger.info(f"[NORMALIZER] {code} warming up... ({stats['sample_count']}/{self.config.online_warmup_samples})")
+                    setattr(self, warmup_log_attr, True)
+            else:
+                # 준비 완료 시 한 번 로그
+                ready_log_attr = f'_ready_logged_{code}'
+                if not hasattr(self, ready_log_attr):
+                    logger.info(f"[NORMALIZER] {code} ready for inference")
+                    setattr(self, ready_log_attr, True)
             
             # 길이 확인
             if len(features_array) != self.config.num_features:
@@ -1133,6 +1170,17 @@ class LiveTrader:
         logger.info(f"Buy Signal Rate: {inference_stats.get('buy_signal_rate', 0):.2%}")
         logger.info(f"Buy Filter Rate: {inference_stats.get('buy_filter_rate', 0):.2%}")
         logger.info(f"Auto Exit Rate: {inference_stats.get('auto_exit_rate', 0):.2%}")
+        
+        # 정규화 통계
+        logger.info(f"\n[NORMALIZER] Per-Stock Statistics:")
+        tracked_codes = self.get_condition_codes() if self.config.use_condition_monitor else self.config.target_stocks
+        for code in tracked_codes[:5]:  # 최대 5개만 출력
+            stats = self.normalizer.get_stats(code)
+            if stats:
+                logger.info(
+                    f"  {code}: samples={stats['sample_count']}, ready={stats['is_ready']}"
+                )
+        
         logger.info("=" * 80)
     
     def shutdown(self):
