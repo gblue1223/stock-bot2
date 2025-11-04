@@ -574,6 +574,9 @@ class LiveTrader:
         - 호가/수량: 매도호가1~10, 매도호가수량1~10, 매수호가1~10, 매수호가수량1~10
         """
         try:
+            # 종목코드 추출
+            code = market_data.get('종목코드', 'UNKNOWN')
+            
             features = []
             feature_names = []
             
@@ -629,7 +632,6 @@ class LiveTrader:
                     features_array = features_array[:self.config.num_features]
             
             # 주기적으로 특징 값 샘플 로그 (5분마다)
-            code = market_data.get('종목코드', 'UNKNOWN')
             current_time = int(time.time())
             log_attr = f'_feature_log_{code}'
             if not hasattr(self, log_attr) or current_time - getattr(self, log_attr) >= 300:  # 5분
