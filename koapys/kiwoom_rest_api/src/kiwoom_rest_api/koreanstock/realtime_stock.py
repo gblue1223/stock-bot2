@@ -132,48 +132,34 @@ class StockRealtimeData:
     
     def compute_derived_features(self):
         """파생 피처 계산 (종목명_scalar, 시간_sin, 시간_cos, 시간_scalar)"""
-        import numpy as np
+        # lib.normalization의 중앙화된 함수 사용
+        try:
+            # 모든 파생 피처를 한 번에 계산
+            from lib.normalization import compute_all_derived_features
+            
+            self.종목명_scalar, self.시간_sin, self.시간_cos, self.시간_scalar = \
+                compute_all_derived_features(self.종목명, self.시간)
+            
+            # 로그 (주기적으로만 - 30초마다)
+            if self.시간:
+                try:
+                    time_str = str(self.시간).zfill(9)
+                    hh = int(time_str[0:2])
+                    mm = int(time_str[2:4])
+                    ss = int(time_str[4:6])
+                    secs = hh * 3600 + mm * 60 + ss
+                    
+                    if secs % 30 < 1:  # 30초 근처에서만
+                        logger.debug(
+                            f"[DERIVED] {self.종목코드} 파생피처: 종목명_scalar={self.종목명_scalar:.4f}, "
+                            f"시간_sin={self.시간_sin:.4f}, 시간_cos={self.시간_cos:.4f}, 시간_scalar={self.시간_scalar:.4f}"
+                        )
+                except Exception:
+                    pass
         
-        # 종목명_scalar: 문자 레벨 스칼라 인코딩
-        if self.종목명:
-            char_sum = sum(ord(c) for c in self.종목명)
-            self.종목명_scalar = float(char_sum % 10000) / 10000.0
-        else:
+        except Exception as e:
+            logger.warning(f"[DERIVED] {self.종목코드} 파생피처 계산 실패: {e}")
             self.종목명_scalar = 0.0
-        
-        # 시간 파생 피처
-        if self.시간:
-            try:
-                # HHMMSSmmm -> seconds
-                time_str = str(self.시간).zfill(9)
-                hh = int(time_str[0:2])
-                mm = int(time_str[2:4])
-                ss = int(time_str[4:6])
-                secs = hh * 3600 + mm * 60 + ss
-                
-                # sin/cos 주기 변환
-                SECONDS_IN_DAY = 24 * 60 * 60
-                self.시간_sin = float(np.sin(2 * np.pi * secs / SECONDS_IN_DAY))
-                self.시간_cos = float(np.cos(2 * np.pi * secs / SECONDS_IN_DAY))
-                
-                # 장 시작 후 경과 시간 (표준화)
-                MARKET_OPEN_SECONDS = 9 * 3600  # 09:00:00
-                sec_from_open = max(0, secs - MARKET_OPEN_SECONDS)
-                # 간단한 표준화: 0~6시간(21600초) 범위를 -1~1로 매핑
-                self.시간_scalar = float((sec_from_open - 10800) / 10800.0)  # 3시간 중심, ±3시간
-                
-                # 로그 (주기적으로만 - 30초마다)
-                if secs % 30 < 1:  # 30초 근처에서만
-                    logger.debug(
-                        f"[DERIVED] {self.종목코드} 파생피처: 종목명_scalar={self.종목명_scalar:.4f}, "
-                        f"시간_sin={self.시간_sin:.4f}, 시간_cos={self.시간_cos:.4f}, 시간_scalar={self.시간_scalar:.4f}"
-                    )
-            except Exception as e:
-                logger.warning(f"[DERIVED] {self.종목코드} 파생피처 계산 실패: {e}")
-                self.시간_sin = 0.0
-                self.시간_cos = 0.0
-                self.시간_scalar = 0.0
-        else:
             self.시간_sin = 0.0
             self.시간_cos = 0.0
             self.시간_scalar = 0.0

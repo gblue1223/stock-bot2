@@ -18,7 +18,9 @@ from lib.normalization import (
     signed_log1p as _signed_log1p_np,
     LOGSTD_FEATURES,
     STDONLY_FEATURES,
-    DERIVED_FEATURES
+    DERIVED_FEATURES,
+    compute_stock_name_scalar_batch,
+    compute_time_features_batch
 )
 
 
@@ -564,22 +566,12 @@ def _scale_with_bounds(series: pd.Series, min_value: float, max_value: float) ->
 
 
 def _encode_char_scalar(series: pd.Series) -> pd.Series:
-    cats = series.astype(str).replace({"nan": ""})
-    unique_chars = sorted(set("".join(cats.tolist())))
-    if not unique_chars:
-        return pd.Series(0.0, index=series.index, dtype=float)
-    char_to_id = {ch: idx + 1 for idx, ch in enumerate(unique_chars)}
-    max_id = float(len(unique_chars))
-
-    def _encode(s: str) -> float:
-        if not s:
-            return 0.0
-        ids = [char_to_id.get(ch, 0) for ch in s]
-        if not ids:
-            return 0.0
-        return float(np.mean(ids)) / max_id
-
-    return cats.apply(_encode).astype(float)
+    """
+    문자 레벨 스칼라 인코딩 (래퍼 함수)
+    
+    lib.normalization.compute_stock_name_scalar_batch를 사용합니다.
+    """
+    return compute_stock_name_scalar_batch(series)
 
 
 def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
@@ -633,17 +625,16 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
         _extra_new["종목명_scalar"] = _encode_char_scalar(out['종목명'])
         broker_scalar_cols.append("종목명_scalar")
 
-    # '시간' 파생 피처: 기존 시간 스칼라 + sin/cos 주기 변환 + 장 시작 후 경과 초
+    # '시간' 파생 피처: sin/cos 주기 변환 + 장 시작 후 경과 시간 (z-score)
     if '시간' in out.columns:
-        # HHMMSSmmm -> seconds
-        secs = out['시간'].apply(_time_ms_to_seconds).astype(int)
-        SECONDS_IN_DAY = 24 * 60 * 60
-        MARKET_OPEN_SECONDS = 9 * 3600  # 09:00:00
-        _extra_new['시간_sin'] = np.sin(2 * np.pi * secs / SECONDS_IN_DAY)
-        _extra_new['시간_cos'] = np.cos(2 * np.pi * secs / SECONDS_IN_DAY)
-        # 장 시작 후 경과 시간(초), 0 미만은 0으로 클립
-        sec_from_open = (secs - MARKET_OPEN_SECONDS).clip(lower=0).astype(float)
-        _extra_new['시간_scalar'] = _standard_scale(sec_from_open)
+        # lib.normalization의 중앙화된 함수 사용
+        time_sin, time_cos, time_scalar = compute_time_features_batch(
+            out['시간'], 
+            use_zscore_for_scalar=True  # 학습 데이터는 z-score 사용
+        )
+        _extra_new['시간_sin'] = time_sin
+        _extra_new['시간_cos'] = time_cos
+        _extra_new['시간_scalar'] = time_scalar
         # 파생 컬럼들은 이미 정상화 되었거나 [-1,1] 구간이므로 추가 스케일 제외 목록에 포함
         broker_scalar_cols.extend(['시간_sin', '시간_cos', '시간_scalar'])
 
