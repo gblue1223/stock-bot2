@@ -1,36 +1,43 @@
 """
-온라인 정규화 모듈
+학습 호환 온라인 정규화 (Training-Compatible Online Normalization)
 
-사전 계산된 통계 없이 실시간으로 정규화를 수행합니다.
-Rolling window 방식으로 최근 데이터의 통계를 사용합니다.
+실시간 데이터 스트림에서 Rolling window 기반으로 정규화 통계를 계산합니다.
+학습 데이터와 동일한 정규화 전략을 사용합니다:
+- Log + Z-Score: 누적거래대금, 거래회전율, 체결강도, 매도/매수대기금액
+- Z-Score Only: 등락률
+- No Normalization: 파생 피처 (이미 정규화됨)
 """
 
 import numpy as np
 from collections import deque
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 import logging
+
+from lib.normalization import (
+    FEATURE_NAMES,
+    signed_log1p,
+    standard_scale,
+    get_normalization_strategy,
+    DERIVED_FEATURES
+)
 
 logger = logging.getLogger(__name__)
 
 
 class OnlineNormalizer:
     """
-    실시간 데이터 정규화 클래스
+    학습 호환 실시간 데이터 정규화 클래스
     
-    최근 N개 샘플의 통계(평균, 표준편차)를 계산하여 정규화합니다.
+    학습 데이터와 동일한 정규화 전략을 사용:
+    1. Log + Z-Score: 누적거래대금, 거래회전율, 체결강도, 매도/매수대기금액
+    2. Z-Score Only: 등락률
+    3. No Normalization: 파생 피처 (이미 정규화됨)
+    
+    최근 N개 샘플의 통계를 Rolling window로 유지합니다.
     초기 워밍업 기간 동안은 Min-Max 스케일링을 사용합니다.
     
-    장점:
-    - 사전 통계 불필요
-    - 시장 변동성에 적응
-    - 종목 특성 자동 반영
-    
-    단점:
-    - 초기 워밍업 필요 (약 100-200 샘플)
-    - 통계가 시간에 따라 변함 (일관성 낮음)
-    
     Args:
-        num_features: 특징 수
+        num_features: 특징 수 (기본값: 28)
         window_size: Rolling window 크기 (기본값: 200)
         warmup_samples: 워밍업 샘플 수 (기본값: 50)
         clip_range: 정규화 후 클리핑 범위 (기본값: (-5, 5))
@@ -38,7 +45,7 @@ class OnlineNormalizer:
     
     def __init__(
         self, 
-        num_features: int,
+        num_features: int = 28,
         window_size: int = 200,
         warmup_samples: int = 50,
         clip_range: tuple = (-5.0, 5.0)
@@ -48,7 +55,16 @@ class OnlineNormalizer:
         self.warmup_samples = warmup_samples
         self.clip_range = clip_range
         
-        # 각 특징별 rolling buffer
+        # 특징 이름
+        self.feature_names = FEATURE_NAMES
+        
+        # 특징별 정규화 전략
+        self.strategies = [get_normalization_strategy(name) for name in self.feature_names]
+        
+        # 특징별 rolling buffer (변환 후 값 저장)
+        # log_std 전략: 로그 변환 후 값 저장
+        # std_only: 원본 값 저장
+        # derived: 원본 값 저장 (정규화 안함)
         self.buffers: Dict[int, deque] = {
             i: deque(maxlen=window_size) for i in range(num_features)
         }
@@ -61,30 +77,50 @@ class OnlineNormalizer:
         # 샘플 카운트
         self.sample_count = 0
         
-        # 특징별 관측 범위 (Min-Max 용)
+        # Min-Max 범위 (워밍업용)
         self.feature_mins = np.full(num_features, np.inf, dtype=np.float32)
         self.feature_maxs = np.full(num_features, -np.inf, dtype=np.float32)
         
         logger.info(
-            f"OnlineNormalizer initialized: features={num_features}, "
+            f"TrainingCompatibleNormalizer initialized: features={num_features}, "
             f"window={window_size}, warmup={warmup_samples}"
         )
+    
+    def _transform_for_storage(self, features: np.ndarray) -> np.ndarray:
+        """
+        버퍼 저장용 변환
+        
+        log_std 전략: 로그 변환 적용
+        나머지: 원본 유지
+        """
+        transformed = np.zeros_like(features, dtype=np.float32)
+        
+        for i, strategy in enumerate(self.strategies):
+            if strategy == "log_std":
+                transformed[i] = signed_log1p(features[i])
+            else:
+                transformed[i] = features[i]
+        
+        return transformed
     
     def update(self, features: np.ndarray):
         """
         새로운 샘플로 통계 업데이트
         
         Args:
-            features: 특징 벡터 (num_features,)
+            features: 원본 특징 벡터 (num_features,)
         """
         if len(features) != self.num_features:
             raise ValueError(f"Expected {self.num_features} features, got {len(features)}")
         
+        # 변환 (log_std는 로그 변환)
+        transformed = self._transform_for_storage(features)
+        
         # 각 특징을 버퍼에 추가
-        for i, value in enumerate(features):
+        for i, value in enumerate(transformed):
             self.buffers[i].append(float(value))
             
-            # Min/Max 업데이트
+            # Min/Max 업데이트 (워밍업용)
             self.feature_mins[i] = min(self.feature_mins[i], value)
             self.feature_maxs[i] = max(self.feature_maxs[i], value)
         
@@ -92,7 +128,7 @@ class OnlineNormalizer:
         self.cache_valid = False
         self.sample_count += 1
     
-    def _compute_statistics(self) -> tuple:
+    def _compute_statistics(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         현재 버퍼에서 평균과 표준편차 계산
         
@@ -107,17 +143,17 @@ class OnlineNormalizer:
             if len(buffer) > 0:
                 buffer_array = np.array(buffer)
                 means[i] = np.mean(buffer_array)
-                std = np.std(buffer_array)
-                stds[i] = std if std > 1e-6 else 1.0  # 표준편차 0 방지
+                std = np.std(buffer_array, ddof=0)  # 모집단 표준편차
+                stds[i] = std if std > 1e-6 else 1.0
         
         return means, stds
     
     def normalize(self, features: np.ndarray, update: bool = True) -> np.ndarray:
         """
-        특징 정규화
+        특징 정규화 (학습 방식과 동일)
         
         Args:
-            features: 특징 벡터 (num_features,)
+            features: 원본 특징 벡터 (num_features,)
             update: True면 이 샘플로 통계 업데이트
             
         Returns:
@@ -132,15 +168,19 @@ class OnlineNormalizer:
                 self.update(features)
             
             # Min-Max 스케일링: [min, max] -> [-1, 1]
-            normalized = np.zeros_like(features)
+            normalized = np.zeros_like(features, dtype=np.float32)
             for i in range(self.num_features):
-                min_val = self.feature_mins[i]
-                max_val = self.feature_maxs[i]
-                
-                if max_val > min_val:
-                    normalized[i] = 2.0 * (features[i] - min_val) / (max_val - min_val) - 1.0
+                if self.strategies[i] == "derived":
+                    # 파생 피처는 그대로
+                    normalized[i] = features[i]
                 else:
-                    normalized[i] = 0.0
+                    min_val = self.feature_mins[i]
+                    max_val = self.feature_maxs[i]
+                    
+                    if max_val > min_val:
+                        normalized[i] = 2.0 * (features[i] - min_val) / (max_val - min_val) - 1.0
+                    else:
+                        normalized[i] = 0.0
             
             return normalized
         
@@ -149,8 +189,35 @@ class OnlineNormalizer:
             self.mean_cache, self.std_cache = self._compute_statistics()
             self.cache_valid = True
         
-        # Z-score 정규화
-        normalized = (features - self.mean_cache) / (self.std_cache + 1e-8)
+        # 특징별 정규화
+        normalized = np.zeros_like(features, dtype=np.float32)
+        
+        for i, strategy in enumerate(self.strategies):
+            if strategy == "derived":
+                # 파생 피처는 이미 정규화되어 있음
+                normalized[i] = features[i]
+            elif strategy == "log_std":
+                # Log + Z-Score
+                log_value = signed_log1p(features[i])
+                normalized[i] = standard_scale(
+                    log_value,
+                    self.mean_cache[i],
+                    self.std_cache[i]
+                )
+            elif strategy == "std_only":
+                # Z-Score only
+                normalized[i] = standard_scale(
+                    features[i],
+                    self.mean_cache[i],
+                    self.std_cache[i]
+                )
+            else:
+                # 기본값: Z-Score
+                normalized[i] = standard_scale(
+                    features[i],
+                    self.mean_cache[i],
+                    self.std_cache[i]
+                )
         
         # 클리핑
         normalized = np.clip(normalized, self.clip_range[0], self.clip_range[1])

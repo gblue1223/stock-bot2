@@ -13,6 +13,14 @@ import pickle as _pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# 공통 정규화 모듈 import
+from lib.normalization import (
+    signed_log1p as _signed_log1p_np,
+    LOGSTD_FEATURES,
+    STDONLY_FEATURES,
+    DERIVED_FEATURES
+)
+
 
 INPUT_TABLE = "datasets"  # 입력 DuckDB 테이블명
 TEXT_COLUMNS = {"종목코드", "종목명", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
@@ -444,25 +452,13 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
 def _signed_log1p(arr: pd.Series) -> pd.Series:
     """
     부호를 보존하는 log1p 변환을 적용합니다.
-
-    정의: y = sign(x) * log1p(|x|)
-    - 음수/양수 모두에 대해 로그 스케일링의 효과를 주면서 부호는 유지합니다.
-    - `arr`는 수치형으로 강제 변환되며, 변환 실패/결측은 0으로 채웁니다.
-
-    매개변수:
-    - arr: pd.Series
-
-    반환값:
-    - pd.Series: 입력과 동일한 인덱스를 가지는 변환 결과
-
-    예시:
-    >>> import pandas as pd
-    >>> s = pd.Series([-100, -1, 0, 1, 9])
-    >>> _signed_log1p(s).round(6).tolist()
-    [-4.615121, -0.693147, 0.0, 0.693147, 2.302585]
+    
+    lib.normalization.signed_log1p의 래퍼 함수입니다.
     """
     x = pd.to_numeric(arr, errors="coerce").fillna(0)
-    return np.sign(x) * np.log1p(np.abs(x))
+    # numpy array로 변환하여 lib.normalization 함수 사용
+    result = _signed_log1p_np(x.values)
+    return pd.Series(result, index=arr.index)
 
 
 def _time_ms_to_seconds(t: int) -> int:
@@ -596,17 +592,9 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     """
     out = df.copy()
 
-    # Define column groups
-    logstd_cols: set[str] = {
-        "누적거래대금",
-        "거래회전율",
-        "체결강도",
-    }
-    for i in range(1, 11):
-        logstd_cols.add(f"매도대기금액{i}")
-        logstd_cols.add(f"매수대기금액{i}")
-
-    stdonly_cols: set[str] = {"등락률"}
+    # Define column groups (lib.normalization에서 가져옴)
+    logstd_cols: set[str] = LOGSTD_FEATURES
+    stdonly_cols: set[str] = STDONLY_FEATURES
 
     broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
 
