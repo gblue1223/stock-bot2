@@ -138,6 +138,7 @@ class TradingConfig:
         # 정규화 설정 (PerStockNormalizer 고정)
         self.online_window_size = 200  # Rolling window 크기
         self.online_warmup_samples = 50  # 워밍업 샘플 수
+        self.normalization_stats_path = None  # ✅ 학습 데이터 정규화 통계 파일 경로
         
         # 조건검색 사용 설정
         self.use_condition_monitor = True
@@ -258,13 +259,54 @@ class LiveTrader:
         
         # PerStockNormalizer 초기화 (항상 사용)
         from scripts.live.online_normalizer import PerStockNormalizer
+        import json
+        import pickle
+        
+        # ✅ 학습 데이터 정규화 통계 로드
+        training_mean = None
+        training_std = None
+        use_training_stats = False
+        
+        if config.normalization_stats_path:
+            norm_stats_path = Path(config.normalization_stats_path)
+            if norm_stats_path.exists():
+                try:
+                    # JSON 또는 PKL 파일 로드
+                    if norm_stats_path.suffix == '.json':
+                        with open(norm_stats_path, 'r') as f:
+                            stats = json.load(f)
+                        training_mean = np.array(stats['mean'], dtype=np.float32)
+                        training_std = np.array(stats['std'], dtype=np.float32)
+                    elif norm_stats_path.suffix == '.pkl':
+                        with open(norm_stats_path, 'rb') as f:
+                            stats = pickle.load(f)
+                        training_mean = stats['mean']
+                        training_std = stats['std']
+                    
+                    use_training_stats = True
+                    logger.info(f"✅ Loaded training normalization stats from {norm_stats_path}")
+                    logger.info(f"   Mean range: [{training_mean.min():.4f}, {training_mean.max():.4f}]")
+                    logger.info(f"   Std range: [{training_std.min():.4f}, {training_std.max():.4f}]")
+                except Exception as e:
+                    logger.warning(f"Failed to load normalization stats: {e}")
+                    logger.warning("Falling back to online normalization")
+            else:
+                logger.warning(f"Normalization stats file not found: {norm_stats_path}")
+                logger.warning("Using online normalization only")
         
         self.normalizer = PerStockNormalizer(
             num_features=config.num_features,
             window_size=config.online_window_size,
-            warmup_samples=config.online_warmup_samples
+            warmup_samples=config.online_warmup_samples,
+            use_training_stats=use_training_stats,
+            training_mean=training_mean,
+            training_std=training_std
         )
-        logger.info(f"✅ PerStockNormalizer initialized (window={config.online_window_size}, warmup={config.online_warmup_samples})")
+        
+        if use_training_stats:
+            logger.info(f"✅ PerStockNormalizer initialized with TRAINING STATISTICS")
+        else:
+            logger.info(f"✅ PerStockNormalizer initialized (window={config.online_window_size}, warmup={config.online_warmup_samples})")
         
         # GRPOInference는 정규화 통계 없이 초기화 (PerStockNormalizer가 처리)
         base_inference = GRPOInference(
@@ -598,8 +640,31 @@ class LiveTrader:
             # numpy array로 변환
             features_array = np.array(features, dtype=np.float32)
             
+            # ✅ 정규화 전 원본 데이터 로깅 (디버그용, 10번마다)
+            if self.stats['predictions'] % 10 == 0:
+                logger.debug(
+                    f"[BEFORE NORM] {code}: mean={features_array.mean():.2f}, "
+                    f"std={features_array.std():.2f}, "
+                    f"range=[{features_array.min():.2f}, {features_array.max():.2f}]"
+                )
+                logger.debug(
+                    f"[BEFORE NORM] {code} 주요값: "
+                    f"등락률={features_array[4]:.4f}, "
+                    f"누적거래대금={features_array[5]:.2e}, "
+                    f"거래회전율={features_array[6]:.4f}, "
+                    f"체결강도={features_array[7]:.4f}"
+                )
+            
             # 정규화 적용 (PerStockNormalizer)
             features_array = self.normalizer.normalize(code, features_array, update=True)
+            
+            # ✅ 정규화 후 데이터 로깅 (디버그용, 10번마다)
+            if self.stats['predictions'] % 10 == 0:
+                logger.debug(
+                    f"[AFTER NORM] {code}: mean={features_array.mean():.4f}, "
+                    f"std={features_array.std():.4f}, "
+                    f"range=[{features_array.min():.4f}, {features_array.max():.4f}]"
+                )
             
             # 워밍업 상태 로그 (종목별 1회만)
             warmup_log_attr = f'_warmup_logged_{code}'
@@ -936,6 +1001,26 @@ class LiveTrader:
                 setattr(self, last_log_attr, current_time)
                 logger.info(f"[BUFFER] {code}: Collecting data ({buffer_len}/{self.config.seq_len})")
             return
+        
+        # ✅ 호가 데이터 검증 (최신 데이터 확인)
+        if self.realtime_client:
+            stock_data = self.realtime_client.get_stock_data(code)
+            if stock_data:
+                # 체결강도와 대기금액이 모두 0이면 호가 데이터 누락으로 판단
+                if (stock_data.체결강도 == 0 and 
+                    stock_data.매도대기금액1 == 0 and 
+                    stock_data.매수대기금액1 == 0):
+                    
+                    # 1분마다 한 번씩만 경고 로그
+                    current_time = int(time.time())
+                    warn_log_attr = f'_quote_warn_{code}'
+                    if not hasattr(self, warn_log_attr) or current_time - getattr(self, warn_log_attr) >= 60:
+                        setattr(self, warn_log_attr, current_time)
+                        logger.warning(
+                            f"[DATA QUALITY] {code}: 호가 데이터 누락 "
+                            f"(체결강도=0, 매도대기금액1=0, 매수대기금액1=0), 예측 스킵"
+                        )
+                    return
         
         # 시퀀스 가져오기
         sequence = self.data_buffers[code].get_sequence()

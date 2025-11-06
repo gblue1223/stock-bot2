@@ -1,6 +1,7 @@
 {
   "# model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
   "model_path": "models/grpo_scalping@2025120/model.pt",
+  "normalization_stats_path": "models/grpo_scalping@2025120/normalization_stats.json",
   "embedding_model_path": "models/autoencoder@20251013/model.pt",
   "device": "cuda",
   "target_stocks": [],

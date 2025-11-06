@@ -48,7 +48,10 @@ class OnlineNormalizer:
         num_features: int = 28,
         window_size: int = 200,
         warmup_samples: int = 50,
-        clip_range: tuple = (-5.0, 5.0)
+        clip_range: tuple = (-5.0, 5.0),
+        use_training_stats: bool = False,
+        training_mean: Optional[np.ndarray] = None,
+        training_std: Optional[np.ndarray] = None
     ):
         self.num_features = num_features
         self.window_size = window_size
@@ -60,6 +63,18 @@ class OnlineNormalizer:
         
         # 특징별 정규화 전략
         self.strategies = [get_normalization_strategy(name) for name in self.feature_names]
+        
+        # ✅ 학습 데이터 통계 사용 여부
+        self.use_training_stats = use_training_stats
+        self.training_mean = training_mean
+        self.training_std = training_std
+        
+        if use_training_stats:
+            if training_mean is None or training_std is None:
+                raise ValueError("use_training_stats=True requires training_mean and training_std")
+            if len(training_mean) != num_features or len(training_std) != num_features:
+                raise ValueError(f"Training stats must have {num_features} features")
+            logger.info(f"OnlineNormalizer: Using training statistics (mean range: [{training_mean.min():.4f}, {training_mean.max():.4f}])")
         
         # 특징별 rolling buffer (변환 후 값 저장)
         # log_std 전략: 로그 변환 후 값 저장
@@ -162,8 +177,18 @@ class OnlineNormalizer:
         if len(features) != self.num_features:
             raise ValueError(f"Expected {self.num_features} features, got {len(features)}")
         
-        # 워밍업 중이면 Min-Max 스케일링 사용
-        if self.sample_count < self.warmup_samples:
+        # ✅ 학습 통계 사용 모드
+        if self.use_training_stats:
+            # 학습 데이터 통계를 직접 사용 (워밍업 불필요)
+            self.mean_cache = self.training_mean
+            self.std_cache = self.training_std
+            
+            # 통계 업데이트는 하되, 정규화에는 학습 통계 사용
+            if update:
+                self.update(features)
+        
+        # 워밍업 중이면 Min-Max 스케일링 사용 (학습 통계 미사용 시)
+        elif self.sample_count < self.warmup_samples:
             if update:
                 self.update(features)
             
@@ -184,10 +209,11 @@ class OnlineNormalizer:
             
             return normalized
         
-        # 통계 계산 (캐시 사용)
-        if not self.cache_valid:
-            self.mean_cache, self.std_cache = self._compute_statistics()
-            self.cache_valid = True
+        # 통계 계산 (캐시 사용) - 학습 통계 미사용 시
+        else:
+            if not self.cache_valid:
+                self.mean_cache, self.std_cache = self._compute_statistics()
+                self.cache_valid = True
         
         # 특징별 정규화
         normalized = np.zeros_like(features, dtype=np.float32)
@@ -222,6 +248,17 @@ class OnlineNormalizer:
         # 클리핑
         normalized = np.clip(normalized, self.clip_range[0], self.clip_range[1])
         
+        # ✅ 정규화 결과 검증 (워밍업 완료 후)
+        if self.sample_count >= self.warmup_samples:
+            max_abs_value = np.abs(normalized).max()
+            if max_abs_value > 100:
+                logger.warning(
+                    f"[NORMALIZER] 정규화 후에도 값이 너무 큼! "
+                    f"max_abs={max_abs_value:.2f}, "
+                    f"mean_cache(first 5)={self.mean_cache[:5]}, "
+                    f"std_cache(first 5)={self.std_cache[:5]}"
+                )
+        
         # 통계 업데이트
         if update:
             self.update(features)
@@ -230,6 +267,9 @@ class OnlineNormalizer:
     
     def is_ready(self) -> bool:
         """정규화가 준비되었는지 확인"""
+        # 학습 통계 사용 시 즉시 준비됨
+        if self.use_training_stats:
+            return True
         return self.sample_count >= self.warmup_samples
     
     def get_stats(self) -> dict:
@@ -279,16 +319,27 @@ class PerStockNormalizer:
         self,
         num_features: int,
         window_size: int = 200,
-        warmup_samples: int = 50
+        warmup_samples: int = 50,
+        use_training_stats: bool = False,
+        training_mean: Optional[np.ndarray] = None,
+        training_std: Optional[np.ndarray] = None
     ):
         self.num_features = num_features
         self.window_size = window_size
         self.warmup_samples = warmup_samples
         
+        # ✅ 학습 통계 저장
+        self.use_training_stats = use_training_stats
+        self.training_mean = training_mean
+        self.training_std = training_std
+        
         # 종목별 normalizer
         self.normalizers: Dict[str, OnlineNormalizer] = {}
         
-        logger.info(f"PerStockNormalizer initialized: features={num_features}")
+        if use_training_stats:
+            logger.info(f"PerStockNormalizer initialized: features={num_features}, using training statistics")
+        else:
+            logger.info(f"PerStockNormalizer initialized: features={num_features}")
     
     def normalize(self, stock_code: str, features: np.ndarray, update: bool = True) -> np.ndarray:
         """
@@ -307,9 +358,15 @@ class PerStockNormalizer:
             self.normalizers[stock_code] = OnlineNormalizer(
                 num_features=self.num_features,
                 window_size=self.window_size,
-                warmup_samples=self.warmup_samples
+                warmup_samples=self.warmup_samples,
+                use_training_stats=self.use_training_stats,
+                training_mean=self.training_mean,
+                training_std=self.training_std
             )
-            logger.info(f"Created normalizer for stock: {stock_code}")
+            if self.use_training_stats:
+                logger.info(f"Created normalizer for stock: {stock_code} (using training stats)")
+            else:
+                logger.info(f"Created normalizer for stock: {stock_code}")
         
         return self.normalizers[stock_code].normalize(features, update=update)
     

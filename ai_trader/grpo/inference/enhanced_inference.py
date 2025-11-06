@@ -139,6 +139,20 @@ class EnhancedGRPOInference:
         """
         self.stats['total_predictions'] += 1
         
+        # ✅ 입력 데이터 검증 (정규화 확인)
+        max_abs_value = np.abs(sequence).max()
+        if max_abs_value > 100:
+            logger.warning(
+                f"[INFERENCE] 입력 데이터가 정규화되지 않은 것으로 보임! "
+                f"max_abs={max_abs_value:.2f}, "
+                f"mean={sequence.mean():.2f}, "
+                f"std={sequence.std():.2f}"
+            )
+            logger.warning(
+                "[INFERENCE] 예측 결과가 부정확할 수 있습니다. "
+                "정규화 통계를 확인하세요."
+            )
+        
         # 주기적으로 입력 시퀀스 통계 로깅 (100번마다)
         if self.stats['total_predictions'] % 100 == 1:
             seq_mean = np.mean(sequence)
