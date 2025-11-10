@@ -273,7 +273,7 @@ class LiveTrader:
                 try:
                     # JSON 또는 PKL 파일 로드
                     if norm_stats_path.suffix == '.json':
-                        with open(norm_stats_path, 'r') as f:
+                        with open(norm_stats_path, 'r', encoding='utf-8') as f:  # ✅ UTF-8 인코딩 명시
                             stats = json.load(f)
                         training_mean = np.array(stats['mean'], dtype=np.float32)
                         training_std = np.array(stats['std'], dtype=np.float32)
@@ -349,7 +349,8 @@ class LiveTrader:
             'winning_trades': 0,
             'losing_trades': 0,
             'total_profit': 0.0,
-            'max_drawdown': 0.0
+            'max_drawdown': 0.0,
+            'predictions': 0  # ✅ 예측 횟수 추가
         }
         
         # 실행 상태
