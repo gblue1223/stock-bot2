@@ -256,6 +256,18 @@ def main():
         trainer.save_checkpoint(final_model_path, final_metrics['num_updates'])
         logger.info(f"  Final Model: {final_model_path}")
         
+        # 정규화 통계 저장 (실시간 거래용)
+        if hasattr(env, 'mean') and hasattr(env, 'std'):
+            import json
+            normalization_stats = {
+                'mean': env.mean.cpu().numpy().tolist() if torch.is_tensor(env.mean) else env.mean.tolist(),
+                'std': env.std.cpu().numpy().tolist() if torch.is_tensor(env.std) else env.std.tolist()
+            }
+            stats_path = os.path.join(args.output_dir, 'normalization_stats.json')
+            with open(stats_path, 'w') as f:
+                json.dump(normalization_stats, f, indent=2)
+            logger.info(f"  Normalization Stats: {stats_path}")
+        
         logger.info("=" * 60)
         logger.info(f"TensorBoard: tensorboard --logdir {tensorboard_dir}")
         

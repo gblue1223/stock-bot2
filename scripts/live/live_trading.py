@@ -308,13 +308,21 @@ class LiveTrader:
         else:
             logger.info(f"✅ PerStockNormalizer initialized (window={config.online_window_size}, warmup={config.online_warmup_samples})")
         
-        # GRPOInference는 정규화 통계 없이 초기화 (PerStockNormalizer가 처리)
+        # 학습 통계를 GRPOInference에 직접 전달 (실시간 데이터 = 학습 데이터 가정)
+        normalization_stats_for_inference = None
+        if use_training_stats:
+            normalization_stats_for_inference = {
+                'mean': training_mean,
+                'std': training_std
+            }
+            logger.info("✅ Using training statistics directly in GRPOInference (no online normalization)")
+        
         base_inference = GRPOInference(
             policy_path=config.model_path,
             embedding_model_path=config.embedding_model_path,
             device=config.device,
             use_torchscript=False,
-            normalization_stats=None
+            normalization_stats=normalization_stats_for_inference
         )
         
         self.inference = EnhancedGRPOInference(
@@ -656,8 +664,28 @@ class LiveTrader:
                     f"체결강도={features_array[7]:.4f}"
                 )
             
-            # 정규화 적용 (PerStockNormalizer)
-            features_array = self.normalizer.normalize(code, features_array, update=True)
+            # 정규화 적용
+            if normalization_stats_for_inference is None:
+                # 온라인 정규화 사용 (PerStockNormalizer)
+                features_array = self.normalizer.normalize(code, features_array, update=True)
+                
+                # 워밍업 상태 로그 (종목별 1회만)
+                warmup_log_attr = f'_warmup_logged_{code}'
+                if not self.normalizer.is_ready(code):
+                    if not hasattr(self, warmup_log_attr):
+                        stats = self.normalizer.get_stats(code)
+                        logger.info(f"[NORMALIZER] {code} warming up... ({stats['sample_count']}/{self.config.online_warmup_samples})")
+                        setattr(self, warmup_log_attr, True)
+                else:
+                    # 준비 완료 시 한 번 로그
+                    ready_log_attr = f'_ready_logged_{code}'
+                    if not hasattr(self, ready_log_attr):
+                        logger.info(f"[NORMALIZER] {code} ready for inference")
+                        setattr(self, ready_log_attr, True)
+            else:
+                # 학습 통계 사용 (GRPOInference가 내부에서 처리)
+                # 정규화는 GRPOInference.predict()에서 자동으로 수행됨
+                pass
             
             # ✅ 정규화 후 데이터 로깅 (디버그용, 10번마다)
             if self.stats['predictions'] % 10 == 0:
@@ -666,20 +694,6 @@ class LiveTrader:
                     f"std={features_array.std():.4f}, "
                     f"range=[{features_array.min():.4f}, {features_array.max():.4f}]"
                 )
-            
-            # 워밍업 상태 로그 (종목별 1회만)
-            warmup_log_attr = f'_warmup_logged_{code}'
-            if not self.normalizer.is_ready(code):
-                if not hasattr(self, warmup_log_attr):
-                    stats = self.normalizer.get_stats(code)
-                    logger.info(f"[NORMALIZER] {code} warming up... ({stats['sample_count']}/{self.config.online_warmup_samples})")
-                    setattr(self, warmup_log_attr, True)
-            else:
-                # 준비 완료 시 한 번 로그
-                ready_log_attr = f'_ready_logged_{code}'
-                if not hasattr(self, ready_log_attr):
-                    logger.info(f"[NORMALIZER] {code} ready for inference")
-                    setattr(self, ready_log_attr, True)
             
             # 길이 확인
             if len(features_array) != self.config.num_features:
