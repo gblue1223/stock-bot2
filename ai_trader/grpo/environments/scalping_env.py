@@ -324,14 +324,20 @@ class GRPOScalpingEnv(gym.Env):
             # (seq_len, n_features) -> (1, seq_len, n_features)
             seq_tensor = torch.from_numpy(sequence).float().unsqueeze(0).to(self.device)
             
-            # 임베딩 생성 - MaskedAutoEncoder는 (reconstruction, embedding, mask) 튜플을 반환
+            # 임베딩 생성
             result = self.embedding_model(seq_tensor)
             
             if isinstance(result, tuple):
-                # MaskedAutoEncoder의 경우: (reconstruction, embedding, mask)
-                _, embedding, _ = result
+                if len(result) == 3:
+                    # MaskedAutoEncoder의 경우: (reconstruction, embedding, mask)
+                    _, embedding, _ = result
+                elif len(result) == 2:
+                    # AutoEncoderEmbedding의 경우: (reconstruction, embedding)
+                    _, embedding = result
+                else:
+                    raise ValueError(f"Unexpected result length: {len(result)}")
             else:
-                # 일반 AutoEncoder의 경우: embedding만 반환
+                # embedding만 반환하는 경우
                 embedding = result
             
             # (1, embedding_dim) -> (embedding_dim,)

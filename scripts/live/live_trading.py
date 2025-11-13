@@ -267,26 +267,22 @@ class LiveTrader:
         training_std = None
         use_training_stats = False
         
+        # ✅ 원본 데이터의 정규화 통계 로드
         if config.normalization_stats_path:
             norm_stats_path = Path(config.normalization_stats_path)
             if norm_stats_path.exists():
                 try:
-                    # JSON 또는 PKL 파일 로드
-                    if norm_stats_path.suffix == '.json':
-                        with open(norm_stats_path, 'r', encoding='utf-8') as f:  # ✅ UTF-8 인코딩 명시
-                            stats = json.load(f)
-                        training_mean = np.array(stats['mean'], dtype=np.float32)
-                        training_std = np.array(stats['std'], dtype=np.float32)
-                    elif norm_stats_path.suffix == '.pkl':
-                        with open(norm_stats_path, 'rb') as f:
-                            stats = pickle.load(f)
-                        training_mean = stats['mean']
-                        training_std = stats['std']
+                    # JSON 파일 로드
+                    with open(norm_stats_path, 'r', encoding='utf-8') as f:
+                        stats = json.load(f)
+                    training_mean = np.array(stats['mean'], dtype=np.float32)
+                    training_std = np.array(stats['std'], dtype=np.float32)
                     
                     use_training_stats = True
-                    logger.info(f"✅ Loaded training normalization stats from {norm_stats_path}")
+                    logger.info(f"✅ Loaded RAW normalization stats from {norm_stats_path}")
                     logger.info(f"   Mean range: [{training_mean.min():.4f}, {training_mean.max():.4f}]")
                     logger.info(f"   Std range: [{training_std.min():.4f}, {training_std.max():.4f}]")
+                    logger.info(f"   Note: {stats.get('note', 'N/A')}")
                 except Exception as e:
                     logger.warning(f"Failed to load normalization stats: {e}")
                     logger.warning("Falling back to online normalization")
