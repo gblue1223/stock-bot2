@@ -416,8 +416,7 @@ class RealtimeStockClient:
             self._trade_debug_count = 0
         if self._trade_debug_count < 5:
             logger.debug(f"[0B TRADE] {stock.종목코드} received fields: {list(values.keys())}")
-            if '567' in values:
-                logger.debug(f"[0B TRADE] {stock.종목코드} 체결강도 raw value: {values.get('228')}")
+            logger.debug(f"[0B TRADE] {stock.종목코드} 체결강도 raw value: {values.get('228')}")
             self._trade_debug_count += 1
         
         # 필드 매핑 (websocket_constants.py 참고)
