@@ -455,6 +455,19 @@ class LiveTrader:
                         data_receive_count['count'] = 0
                         data_receive_count['last_log_time'] = current_time
                     
+                    # ✅ 거래 활발도 검증 (체결강도 > 0)
+                    if stock_data.체결강도 == 0:
+                        # 체결강도=0인 종목은 거래가 활발하지 않음
+                        # 1분마다 한 번씩만 로그
+                        warn_log_attr = f'_inactive_stock_{code}'
+                        if not hasattr(self, warn_log_attr) or current_time - getattr(self, warn_log_attr) >= 60:
+                            setattr(self, warn_log_attr, current_time)
+                            logger.debug(
+                                f"[INACTIVE] {code}: 체결강도=0 (거래 비활발), "
+                                f"등락률={stock_data.등락률:.2f}%, 거래회전율={stock_data.거래회전율:.2f}%"
+                            )
+                        return
+                    
                     if code not in self.data_buffers:
                         logger.debug(f"[REALTIME] Skipping {code}: buffer not found")
                         return
@@ -482,7 +495,7 @@ class LiveTrader:
                     features = self.extract_features(market_data)
                     logger.debug(f"[REALTIME] {code}: Extracted {len(features)} features")
                     
-                    # 버퍼에 추가
+                    # 버퍼에 추가 (체결강도 > 0 검증은 이미 완료)
                     before_len = len(self.data_buffers[code].buffer)
                     self.data_buffers[code].add(features)
                     after_len = len(self.data_buffers[code].buffer)
@@ -511,9 +524,13 @@ class LiveTrader:
                 
                 # 조건검색 콜백 설정
                 def on_stock_in(code, name, cond_idx):
-                    """종목 편입 시 호출"""
+                    """종목 편입 시 호출 - 거래 활발도 검증 추가"""
                     code_clean = code[1:] if code.startswith('A') else code
                     logger.info(f"[CONDITION] Stock IN signal received: {code} -> {code_clean} ({name}), cond_idx={cond_idx}")
+                    
+                    # ✅ 거래 활발도 사전 검증
+                    # 실시간 데이터에서 체결강도를 확인하여 활발한 종목만 추가
+                    # (실제 검증은 on_data_update에서 수행)
                     
                     with self._condition_codes_lock:
                         if code_clean not in self._condition_codes:
@@ -637,6 +654,19 @@ class LiveTrader:
             
             # numpy array로 변환
             features_array = np.array(features, dtype=np.float32)
+            
+            # ✅ 체결강도 검증 (정규화 전) - 경고만 출력
+            # 인덱스 7 = 체결강도 (FINAL_COLUMNS 순서 기준)
+            # on_data_update에서 이미 필터링되므로 여기서는 경고만
+            if len(features_array) > 7 and features_array[7] == 0.0:
+                current_time = int(time.time())
+                warn_log_attr = f'_zero_intensity_{code}'
+                if not hasattr(self, warn_log_attr) or current_time - getattr(self, warn_log_attr) >= 60:
+                    setattr(self, warn_log_attr, current_time)
+                    logger.debug(
+                        f"[FEATURE INFO] {code}: 체결강도=0 in features "
+                        f"(이미 on_data_update에서 필터링됨)"
+                    )
             
             # ✅ 정규화 전 원본 데이터 로깅 (디버그용, 10번마다)
             if self.stats['predictions'] % 10 == 0:
@@ -1001,23 +1031,23 @@ class LiveTrader:
                 logger.info(f"[BUFFER] {code}: Collecting data ({buffer_len}/{self.config.seq_len})")
             return
         
-        # ✅ 호가 데이터 검증 (최신 데이터 확인)
+        # ✅ 거래 활발도 검증 (체결강도 > 0)
+        # on_data_update에서 이미 필터링되므로 여기서는 추가 검증만 수행
         if self.realtime_client:
             stock_data = self.realtime_client.get_stock_data(code)
             if stock_data:
-                # 체결강도와 대기금액이 모두 0이면 호가 데이터 누락으로 판단
-                if (stock_data.체결강도 == 0 and 
-                    stock_data.매도대기금액1 == 0 and 
-                    stock_data.매수대기금액1 == 0):
-                    
-                    # 1분마다 한 번씩만 경고 로그
+                # 체결강도가 0이면 거래 비활발 (이미 on_data_update에서 필터링됨)
+                if stock_data.체결강도 == 0:
+                    return
+                
+                # 추가 검증: 매도/매수 대기금액이 모두 0인 경우
+                if (stock_data.매도대기금액1 == 0 and stock_data.매수대기금액1 == 0):
                     current_time = int(time.time())
                     warn_log_attr = f'_quote_warn_{code}'
-                    if not hasattr(self, warn_log_attr) or current_time - getattr(self, warn_log_attr) >= 60:
+                    if not hasattr(self, warn_log_attr) or current_time - getattr(self, warn_log_attr) >= 30:
                         setattr(self, warn_log_attr, current_time)
-                        logger.warning(
-                            f"[DATA QUALITY] {code}: 호가 데이터 누락 "
-                            f"(체결강도=0, 매도대기금액1=0, 매수대기금액1=0), 예측 스킵"
+                        logger.debug(
+                            f"[DATA QUALITY] {code}: 매도/매수대기금액=0, 예측 스킵"
                         )
                     return
         
