@@ -47,6 +47,9 @@ from koapys import FINAL_COLUMNS
 from ai_trader.grpo.inference.infer_grpo import GRPOInference
 from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
 
+from lib.rolling_normalization import RollingNormalizer
+from lib.normalization import FEATURE_NAMES
+        
 # 로깅 설정
 import os
 from datetime import datetime
@@ -257,52 +260,18 @@ class LiveTrader:
         # GRPO 추론 엔진 초기화
         logger.info("Initializing GRPO inference engine...")
         
-        # PerStockNormalizer 초기화 (항상 사용)
-        from scripts.live.online_normalizer import PerStockNormalizer
-        import json
-        import pickle
+        # ✅ Rolling Window Normalizer 초기화 (분포 이동 문제 해결)
+        # 종목별 normalizer 딕셔너리
+        self.normalizers = {}
         
-        # ✅ 학습 데이터 정규화 통계 로드
-        training_mean = None
-        training_std = None
-        use_training_stats = False
+        # Rolling window 설정
+        self.rolling_window_size = 1000  # 최근 1000개 데이터
+        self.rolling_min_samples = 100   # 최소 100개 수집 후 정규화
         
-        # ✅ 원본 데이터의 정규화 통계 로드
-        if config.normalization_stats_path:
-            norm_stats_path = Path(config.normalization_stats_path)
-            if norm_stats_path.exists():
-                try:
-                    # JSON 파일 로드
-                    with open(norm_stats_path, 'r', encoding='utf-8') as f:
-                        stats = json.load(f)
-                    training_mean = np.array(stats['mean'], dtype=np.float32)
-                    training_std = np.array(stats['std'], dtype=np.float32)
-                    
-                    use_training_stats = True
-                    logger.info(f"✅ Loaded RAW normalization stats from {norm_stats_path}")
-                    logger.info(f"   Mean range: [{training_mean.min():.4f}, {training_mean.max():.4f}]")
-                    logger.info(f"   Std range: [{training_std.min():.4f}, {training_std.max():.4f}]")
-                    logger.info(f"   Note: {stats.get('note', 'N/A')}")
-                except Exception as e:
-                    logger.warning(f"Failed to load normalization stats: {e}")
-                    logger.warning("Falling back to online normalization")
-            else:
-                logger.warning(f"Normalization stats file not found: {norm_stats_path}")
-                logger.warning("Using online normalization only")
-        
-        self.normalizer = PerStockNormalizer(
-            num_features=config.num_features,
-            window_size=config.online_window_size,
-            warmup_samples=config.online_warmup_samples,
-            use_training_stats=use_training_stats,
-            training_mean=training_mean,
-            training_std=training_std
-        )
-        
-        if use_training_stats:
-            logger.info(f"✅ PerStockNormalizer initialized with TRAINING STATISTICS")
-        else:
-            logger.info(f"✅ PerStockNormalizer initialized (window={config.online_window_size}, warmup={config.online_warmup_samples})")
+        logger.info(f"✅ Rolling Window Normalizer initialized")
+        logger.info(f"   Window size: {self.rolling_window_size}")
+        logger.info(f"   Min samples: {self.rolling_min_samples}")
+        logger.info(f"   Strategy: Adaptive to market changes")
         
         # GRPOInference는 정규화 통계 없이 초기화
         # 정규화는 PerStockNormalizer가 처리 (학습 통계 또는 온라인 통계)
@@ -683,23 +652,33 @@ class LiveTrader:
                     f"체결강도={features_array[7]:.4f}"
                 )
             
-            # 정규화 적용 (PerStockNormalizer - 학습 통계 또는 온라인 통계)
-            features_array = self.normalizer.normalize(code, features_array, update=True)
+            # ✅ Rolling Window 정규화 적용 (분포 이동 문제 해결)
+            # 종목별 normalizer 가져오기 (없으면 생성)
+            if code not in self.normalizers:
+                self.normalizers[code] = RollingNormalizer(
+                    window_size=self.rolling_window_size,
+                    min_samples=self.rolling_min_samples,
+                    feature_names=FEATURE_NAMES
+                )
+                logger.info(f"[NORMALIZER] Created rolling normalizer for {code}")
             
-            # 워밍업 상태 로그 (종목별 1회만, 온라인 통계 사용 시만)
-            if not self.normalizer.use_training_stats:
-                warmup_log_attr = f'_warmup_logged_{code}'
-                if not self.normalizer.is_ready(code):
-                    if not hasattr(self, warmup_log_attr):
-                        stats = self.normalizer.get_stats(code)
-                        logger.info(f"[NORMALIZER] {code} warming up... ({stats['sample_count']}/{self.config.online_warmup_samples})")
-                        setattr(self, warmup_log_attr, True)
-                else:
-                    # 준비 완료 시 한 번 로그
-                    ready_log_attr = f'_ready_logged_{code}'
-                    if not hasattr(self, ready_log_attr):
-                        logger.info(f"[NORMALIZER] {code} ready for inference")
-                        setattr(self, ready_log_attr, True)
+            normalizer = self.normalizers[code]
+            features_array = normalizer.normalize(features_array, update=True)
+            
+            # 워밍업 상태 로그 (종목별 1회만)
+            warmup_log_attr = f'_warmup_logged_{code}'
+            stats = normalizer.get_stats()
+            
+            if stats['n_samples'] < self.rolling_min_samples:
+                if not hasattr(self, warmup_log_attr):
+                    logger.info(f"[NORMALIZER] {code} warming up... ({stats['n_samples']}/{self.rolling_min_samples})")
+                    setattr(self, warmup_log_attr, True)
+            else:
+                # 준비 완료 시 한 번 로그
+                ready_log_attr = f'_ready_logged_{code}'
+                if not hasattr(self, ready_log_attr):
+                    logger.info(f"[NORMALIZER] {code} ready for inference (samples={stats['n_samples']})")
+                    setattr(self, ready_log_attr, True)
             
             # ✅ 정규화 후 데이터 로깅 (디버그용, 10번마다)
             if self.stats['predictions'] % 10 == 0:
@@ -876,14 +855,15 @@ class LiveTrader:
                 f"cost={total_cost:,.0f}원, available={available_cash:,.0f}원, confidence={confidence:.3f}"
             )
             
+            # 시장가 주문 (가격 0으로 설정)
             order_result = self.koapys.send_order(
                 rqname=f"BUY_{code}_{datetime.now().strftime('%H%M%S')}",
                 account_no=self.account_no,
                 order_type=OrderType.BUY,
                 code=code,
                 quantity=quantity,
-                price=int(current_price),
-                hoga=OrderBookType.MARKET_IOC
+                price=0,  # 시장가는 0
+                hoga=OrderBookType.MARKET
             )
             
             # 포지션 생성
@@ -962,14 +942,15 @@ class LiveTrader:
                 f"confidence={confidence:.3f}, reason={reason}"
             )
             
+            # 시장가 주문 (가격 0으로 설정)
             order_result = self.koapys.send_order(
                 rqname=f"SELL_{code}_{datetime.now().strftime('%H%M%S')}",
                 account_no=self.account_no,
                 order_type=OrderType.SELL,
                 code=code,
                 quantity=quantity,
-                price=int(current_price),
-                hoga=OrderBookType.MARKET_IOC
+                price=0,  # 시장가는 0
+                hoga=OrderBookType.MARKET
             )
             
             # 포지션 제거
@@ -1287,14 +1268,14 @@ class LiveTrader:
         logger.info(f"Buy Filter Rate: {inference_stats.get('buy_filter_rate', 0):.2%}")
         logger.info(f"Auto Exit Rate: {inference_stats.get('auto_exit_rate', 0):.2%}")
         
-        # 정규화 통계
+        # 정규화 통계 (Rolling Window)
         logger.info(f"\n[NORMALIZER] Per-Stock Statistics:")
         tracked_codes = self.get_condition_codes() if self.config.use_condition_monitor else self.config.target_stocks
         for code in tracked_codes[:5]:  # 최대 5개만 출력
-            stats = self.normalizer.get_stats(code)
-            if stats:
+            if code in self.normalizers:
+                stats = self.normalizers[code].get_stats()
                 logger.info(
-                    f"  {code}: samples={stats['sample_count']}, ready={stats['is_ready']}"
+                    f"  {code}: samples={stats['n_samples']}, window={stats['window_size']}"
                 )
         
         logger.info("=" * 80)

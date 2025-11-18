@@ -28,8 +28,9 @@
   "num_features": 28,
   "update_interval": 1.0,
 
-  "online_window_size": 200,
-  "online_warmup_samples": 50,
+  "# DEPRECATED: online_window_size and online_warmup_samples": "Now using rolling window normalization",
+  "online_window_size": 1000,
+  "online_warmup_samples": 100,
 
   "use_condition_monitor": true,
   "condition_collect_delay": 2.0
