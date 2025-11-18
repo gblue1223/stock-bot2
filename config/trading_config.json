@@ -33,5 +33,7 @@
   "online_warmup_samples": 100,
 
   "use_condition_monitor": true,
-  "condition_collect_delay": 2.0
+  "condition_collect_delay": 2.0,
+  "keep_monitoring_after_out": true,
+  "# keep_monitoring_after_out": "한번 포착된 종목은 조건검색 이탈 후에도 계속 모니터링"
 }

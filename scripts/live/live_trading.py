@@ -509,16 +509,23 @@ class LiveTrader:
                             logger.debug(f"[CONDITION] Stock {code_clean} already tracked")
                 
                 def on_stock_out(code, name, cond_idx):
-                    """종목 이탈 시 호출"""
+                    """
+                    종목 이탈 시 호출
+                    
+                    ✅ 변경: 한번 포착된 종목은 계속 모니터링
+                    조건검색에서 이탈해도 실시간 데이터는 계속 수신
+                    """
                     code_clean = code[1:] if code.startswith('A') else code
                     logger.info(f"[CONDITION] Stock OUT signal received: {code} -> {code_clean} ({name}), cond_idx={cond_idx}")
+                    logger.info(f"[CONDITION] ✅ Keeping {code_clean} in tracking (continue monitoring)")
                     
-                    with self._condition_codes_lock:
-                        if code_clean in self._condition_codes:
-                            self._condition_codes.remove(code_clean)
-                            logger.info(f"[CONDITION] Stock removed from tracking: {code_clean} ({name}), Remaining: {len(self._condition_codes)}")
-                        else:
-                            logger.debug(f"[CONDITION] Stock {code_clean} was not tracked")
+                    # ✅ 변경: 종목을 제거하지 않음 (계속 모니터링)
+                    # with self._condition_codes_lock:
+                    #     if code_clean in self._condition_codes:
+                    #         self._condition_codes.remove(code_clean)
+                    #         logger.info(f"[CONDITION] Stock removed from tracking: {code_clean} ({name}), Remaining: {len(self._condition_codes)}")
+                    #     else:
+                    #         logger.debug(f"[CONDITION] Stock {code_clean} was not tracked")
                 
                 self.condition_client.on_stock_in = on_stock_in
                 self.condition_client.on_stock_out = on_stock_out
