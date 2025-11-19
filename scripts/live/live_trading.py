@@ -152,6 +152,7 @@ class TradingConfig:
         self.max_hold_time_seconds = 300  # 최대 보유 시간 (초, 5분)
         self.verify_position_before_sell = True  # 매도 전 포지션 확인
         self.max_sell_attempts = 3  # 매도 재시도 횟수
+        self.min_profit_rate = 0.0  # 최소 이익률 (%, 수수료 고려)
         
         # 설정 파일에서 로드
         if config_path and os.path.exists(config_path):
@@ -954,12 +955,23 @@ class LiveTrader:
                 return
             
             # ✅ 최대 보유 시간 확인 (강제 청산)
+            force_sell = False
             if time_since_buy > self.config.max_hold_time_seconds:
                 logger.warning(
                     f"[FORCE SELL] {code}: Maximum hold time exceeded "
                     f"(elapsed: {time_since_buy:.1f}s > {self.config.max_hold_time_seconds}s)"
                 )
                 reason = "MaxHoldTime"
+                force_sell = True
+            
+            # ✅ 수수료 고려한 최소 이익률 확인 (강제 청산이 아닐 때만)
+            if not force_sell and hasattr(self.config, 'min_profit_rate'):
+                if profit_rate < self.config.min_profit_rate and self.config.min_profit_rate > 0:
+                    logger.debug(
+                        f"[SELL SKIP] {code}: Profit rate too low "
+                        f"(profit={profit_rate:.2f}% < min={self.config.min_profit_rate:.2f}%)"
+                    )
+                    return
             
             # ✅ 체결 확인 (PENDING 상태면 실제 체결 여부 확인)
             if self.config.verify_position_before_sell:

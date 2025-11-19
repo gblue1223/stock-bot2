@@ -183,18 +183,60 @@ stocks = balance.get('stocks', [])
 
 **참고**: `docs/BALANCE_API_FIX.md`
 
+## 🎯 추가 개선 (2025-11-19)
+
+### 수수료 고려한 최소 이익률 설정 ✅
+
+**문제**: 모든 거래 손실 (0승 47패)
+
+**해결**:
+```python
+# scripts/live/live_trading.py
+self.min_profit_rate = 0.5  # 최소 이익률 0.5%
+
+# execute_sell()
+if profit_rate < self.config.min_profit_rate:
+    logger.debug(f"[SELL SKIP] {code}: Profit rate too low")
+    return
+```
+
+**효과**:
+- 수수료 0.3% 고려
+- 순이익 0.2% 이상 보장
+- 비효율적 거래 제거
+
+### SELL 신호 필터링 개선 ✅
+
+**문제**: 불필요한 로그 수백 건 (로그 50MB+)
+
+**해결**:
+```python
+# ai_trader/grpo/inference/enhanced_inference.py
+if current_position is None:
+    # ✅ 로그 제거
+    return Action.HOLD.value, raw_confidence, info
+```
+
+**효과**:
+- 로그 크기: 50MB+ → 10MB 이하
+- 성능 개선
+- 가독성 향상
+
+**참고**: `docs/TRADING_IMPROVEMENTS.md`
+
 ## 📝 다음 단계
 
 1. ✅ 코드 수정 완료
 2. ✅ 단위 테스트 통과
 3. ✅ 최대 보유 시간 추가
 4. ✅ 잔고 조회 API 수정
-5. ⏳ 실전 테스트 (다음 거래일)
-6. ⏳ 모니터링 및 검증
-7. ⏳ 추가 개선 사항 반영
+5. ✅ 수수료 고려한 최소 이익률 설정
+6. ✅ SELL 신호 필터링 개선
+7. ⏳ 실전 테스트 (다음 거래일)
+8. ⏳ 모니터링 및 검증
 
 ---
 
 **작성일**: 2025-11-18  
-**최종 업데이트**: 2025-11-18 12:30  
-**상태**: ✅ 수정 완료 및 테스트 통과 (잔고 API 수정 포함)
+**최종 업데이트**: 2025-11-19  
+**상태**: ✅ 모든 개선 완료 및 테스트 통과

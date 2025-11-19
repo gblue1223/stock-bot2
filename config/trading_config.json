@@ -44,5 +44,7 @@
   "verify_position_before_sell": true,
   "# verify_position_before_sell": "매도 전 실제 보유 수량 확인",
   "max_sell_attempts": 3,
-  "# max_sell_attempts": "매도 재시도 최대 횟수"
+  "# max_sell_attempts": "매도 재시도 최대 횟수",
+  "min_profit_rate": 0.5,
+  "# min_profit_rate": "최소 이익률 (%, 수수료 0.3% 고려하여 0.5% 이상만 매도)"
 }

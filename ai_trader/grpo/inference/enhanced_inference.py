@@ -242,13 +242,11 @@ class EnhancedGRPOInference:
         elif raw_action == Action.SELL.value:
             self.stats['sell_signals'] += 1
             
-            # 포지션이 없으면 Sell 무시
+            # 포지션이 없으면 Sell 무시 (로그 제거)
             if current_position is None:
                 info['filtered'] = True
                 info['filter_reason'] = "No position to sell"
-                
-                logger.debug("Sell signal filtered: no position")
-                
+                # ✅ 불필요한 로그 제거 (너무 많이 발생)
                 return Action.HOLD.value, raw_confidence, info
             
             # 신뢰도가 너무 낮으면 Hold로 변경
