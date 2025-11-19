@@ -138,7 +138,7 @@ class TradingConfig:
         self.num_features = 28  # 특징 수 (파생 피처 4개 + 기본 지표 4개 + 대기금액 20개)
         self.update_interval = 1.0  # 데이터 업데이트 간격 (초)
         
-        # 정규화 설정 (PerStockNormalizer 고정)
+        # 정규화 설정 (RollingNormalizer 사용: 종목별 롤링 통계 적용)
         self.online_window_size = 200  # Rolling window 크기
         self.online_warmup_samples = 50  # 워밍업 샘플 수
         self.normalization_stats_path = None  # ✅ 학습 데이터 정규화 통계 파일 경로
@@ -280,14 +280,34 @@ class LiveTrader:
         logger.info(f"   Min samples: {self.rolling_min_samples}")
         logger.info(f"   Strategy: Adaptive to market changes")
         
+        # 학습 정규화 통계 시드 로드
+        self.seed_mean = None
+        self.seed_std = None
+        try:
+            stats_path = getattr(self.config, 'normalization_stats_path', None)
+            if stats_path and os.path.exists(stats_path):
+                with open(stats_path, 'r', encoding='utf-8') as f:
+                    _stats = json.load(f)
+                _mean = np.array(_stats.get('mean', []), dtype=np.float32)
+                _std = np.array(_stats.get('std', []), dtype=np.float32)
+                if len(_mean) == self.config.num_features and len(_std) == self.config.num_features:
+                    self.seed_mean = _mean
+                    self.seed_std = np.where(_std < 1e-6, 1.0, _std).astype(np.float32)
+                else:
+                    logger.warning("Normalization stats size mismatch; seeding skipped")
+            else:
+                logger.debug("No normalization stats provided for seeding")
+        except Exception as e:
+            logger.warning(f"Failed to load normalization stats seed: {e}")
+        
         # GRPOInference는 정규화 통계 없이 초기화
-        # 정규화는 PerStockNormalizer가 처리 (학습 통계 또는 온라인 통계)
+        # 정규화는 실시간 RollingNormalizer가 처리 (학습 시 고정 통계 대신 롤링 통계 사용)
         base_inference = GRPOInference(
             policy_path=config.model_path,
             embedding_model_path=config.embedding_model_path,
             device=config.device,
             use_torchscript=False,
-            normalization_stats=None  # PerStockNormalizer가 처리
+            normalization_stats=None  # 정규화는 RollingNormalizer가 처리
         )
         
         self.inference = EnhancedGRPOInference(
@@ -300,7 +320,7 @@ class LiveTrader:
             enable_auto_exit=True
         )
         
-        # PerStockNormalizer를 사용하므로 사전 통계 불필요
+        # RollingNormalizer 사용으로 사전 통계 주입 생략 (실시간 롤링 정규화)
         
         logger.info("[OK] Inference engine initialized")
         
@@ -672,7 +692,9 @@ class LiveTrader:
                 self.normalizers[code] = RollingNormalizer(
                     window_size=self.rolling_window_size,
                     min_samples=self.rolling_min_samples,
-                    feature_names=FEATURE_NAMES
+                    feature_names=FEATURE_NAMES,
+                    seed_mean=self.seed_mean,
+                    seed_std=self.seed_std
                 )
                 logger.info(f"[NORMALIZER] Created rolling normalizer for {code}")
             

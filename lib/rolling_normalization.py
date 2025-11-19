@@ -20,7 +20,9 @@ class RollingNormalizer:
         self,
         window_size: int = 1000,
         min_samples: int = 100,
-        feature_names: Optional[list] = None
+        feature_names: Optional[list] = None,
+        seed_mean: Optional[np.ndarray] = None,
+        seed_std: Optional[np.ndarray] = None,
     ):
         """
         Args:
@@ -31,6 +33,10 @@ class RollingNormalizer:
         self.window_size = window_size
         self.min_samples = min_samples
         self.feature_names = feature_names
+        
+        # 초기 시드 통계 (학습 통계 warm start)
+        self.seed_mean = seed_mean
+        self.seed_std = seed_std
         
         # Rolling window 저장소
         self.windows = None  # shape: (window_size, n_features)
@@ -75,10 +81,21 @@ class RollingNormalizer:
             return self.mean_cache, self.std_cache
         
         if self.n_samples < self.min_samples:
-            # 샘플이 부족하면 기본값 사용
-            n_features = self.windows.shape[1]
-            self.mean_cache = np.zeros(n_features, dtype=np.float32)
-            self.std_cache = np.ones(n_features, dtype=np.float32)
+            # 샘플이 부족하면 시드 통계(있으면) 사용, 없으면 기본값
+            if self.seed_mean is not None and self.seed_std is not None:
+                self.mean_cache = self.seed_mean.astype(np.float32)
+                std = self.seed_std.astype(np.float32)
+                self.std_cache = np.where(std < 1e-6, 1.0, std)
+            else:
+                # windows가 아직 초기화되지 않았을 수 있으므로 안전 처리
+                n_features = self.windows.shape[1] if self.windows is not None else (
+                    len(self.seed_mean) if self.seed_mean is not None else 0
+                )
+                if n_features <= 0:
+                    # 마지막 안전망: 0/1 반환 (호출 측에서 shape 보장 필요)
+                    raise ValueError("RollingNormalizer: insufficient samples and no seed statistics; cannot infer feature dimension.")
+                self.mean_cache = np.zeros(n_features, dtype=np.float32)
+                self.std_cache = np.ones(n_features, dtype=np.float32)
         else:
             # 유효한 데이터만 사용
             valid_data = self.windows[:self.n_samples]
