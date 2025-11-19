@@ -147,6 +147,12 @@ class TradingConfig:
         self.use_condition_monitor = True
         self.condition_collect_delay = 2.0  # 최초 등록 직후 딜레이(초)
         
+        # 포지션 관리 설정
+        self.min_hold_time_seconds = 3  # 최소 보유 시간 (초)
+        self.max_hold_time_seconds = 300  # 최대 보유 시간 (초, 5분)
+        self.verify_position_before_sell = True  # 매도 전 포지션 확인
+        self.max_sell_attempts = 3  # 매도 재시도 횟수
+        
         # 설정 파일에서 로드
         if config_path and os.path.exists(config_path):
             self.load_from_file(config_path)
@@ -873,7 +879,7 @@ class LiveTrader:
                 hoga=OrderBookType.MARKET
             )
             
-            # 포지션 생성
+            # 포지션 생성 (수량 정보 포함)
             self.positions[code] = Position(
                 entry_price=current_price,
                 entry_time=int(time.time()),
@@ -881,6 +887,10 @@ class LiveTrader:
                 holding_period=0,
                 cumulative_return=0.0  # 누적 수익률 초기화
             )
+            # ✅ 수량 정보 추가 저장 (Position 객체에 동적 속성으로 추가)
+            self.positions[code].quantity = quantity
+            self.positions[code].order_no = order_result.get('order_no', '')
+            self.positions[code].status = 'PENDING'  # 체결 대기
             
             # 주문 기록
             self.order_history.append({
@@ -927,9 +937,69 @@ class LiveTrader:
             position.current_price = current_price
             profit_rate = position.profit_rate
             
-            # 매도 수량 (전량 매도)
-            # TODO: 실제로는 보유 수량을 조회해야 함
-            quantity = int(self.config.max_position_size / position.entry_price)
+            # ✅ 매도 수량: 실제 매수한 수량 사용
+            quantity = getattr(position, 'quantity', 0)
+            
+            if quantity <= 0:
+                logger.error(f"[SELL SKIP] {code}: Invalid quantity {quantity} in position")
+                return
+            
+            # ✅ 최소 보유 시간 확인
+            time_since_buy = time.time() - position.entry_time
+            if time_since_buy < self.config.min_hold_time_seconds:
+                logger.debug(
+                    f"[SELL WAIT] {code}: Minimum hold time not met "
+                    f"(elapsed: {time_since_buy:.1f}s < {self.config.min_hold_time_seconds}s)"
+                )
+                return
+            
+            # ✅ 최대 보유 시간 확인 (강제 청산)
+            if time_since_buy > self.config.max_hold_time_seconds:
+                logger.warning(
+                    f"[FORCE SELL] {code}: Maximum hold time exceeded "
+                    f"(elapsed: {time_since_buy:.1f}s > {self.config.max_hold_time_seconds}s)"
+                )
+                reason = "MaxHoldTime"
+            
+            # ✅ 체결 확인 (PENDING 상태면 실제 체결 여부 확인)
+            if self.config.verify_position_before_sell:
+                if getattr(position, 'status', 'FILLED') == 'PENDING':
+                    # 실제 보유 수량 조회
+                    try:
+                        balance = self.koapys.get_equity_balance(account_no=self.account_no)
+                        stocks = balance.get('stocks', [])
+                        actual_qty = 0
+                        
+                        # 종목 코드 매칭 (A 접두사 제거)
+                        code_clean = code[1:] if code.startswith('A') else code
+                        
+                        for stock in stocks:
+                            stock_code = stock.get('종목코드', '')
+                            # A 접두사 제거하여 비교
+                            stock_code_clean = stock_code[1:] if stock_code.startswith('A') else stock_code
+                            
+                            if stock_code_clean == code_clean:
+                                # 보유수량은 문자열로 반환될 수 있음
+                                qty_str = stock.get('보유수량', '0')
+                                actual_qty = int(qty_str) if qty_str else 0
+                                break
+                        
+                        if actual_qty <= 0:
+                            logger.warning(
+                                f"[SELL SKIP] {code}: Position not settled yet "
+                                f"(elapsed: {time_since_buy:.1f}s)"
+                            )
+                            return
+                        
+                        # 실제 수량으로 업데이트
+                        quantity = actual_qty
+                        position.quantity = actual_qty
+                        position.status = 'FILLED'
+                        logger.info(f"[POSITION] {code}: Confirmed quantity={actual_qty}")
+                        
+                    except Exception as e:
+                        logger.error(f"[SELL SKIP] {code}: Failed to verify position: {e}")
+                        return
             
             # 실시간 종목 정보 로그
             if self.realtime_client:
