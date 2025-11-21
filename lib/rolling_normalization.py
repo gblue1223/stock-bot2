@@ -7,6 +7,8 @@ from collections import deque
 from typing import Dict, Optional, Tuple
 import logging
 
+from lib.normalization import get_normalization_strategy, signed_log1p
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,6 +35,12 @@ class RollingNormalizer:
         self.window_size = window_size
         self.min_samples = min_samples
         self.feature_names = feature_names
+        self.num_features = len(feature_names) if feature_names is not None else None
+        self.strategies = (
+            [get_normalization_strategy(name) for name in feature_names]
+            if feature_names is not None
+            else None
+        )
         
         # 초기 시드 통계 (학습 통계 warm start)
         self.seed_mean = seed_mean
@@ -57,23 +65,10 @@ class RollingNormalizer:
         Args:
             features: shape (n_features,) 또는 (batch_size, n_features)
         """
-        if features.ndim == 1:
-            features = features.reshape(1, -1)
-        
-        batch_size, n_features = features.shape
-        
-        # 첫 업데이트시 window 초기화
-        if self.windows is None:
-            self.windows = np.zeros((self.window_size, n_features), dtype=np.float32)
-        
-        # Window에 데이터 추가 (circular buffer)
-        for i in range(batch_size):
-            self.windows[self.current_idx] = features[i]
-            self.current_idx = (self.current_idx + 1) % self.window_size
-            self.n_samples = min(self.n_samples + 1, self.window_size)
-        
-        # 캐시 무효화
-        self.cache_valid = False
+        features_2d = self._ensure_2d(features)
+        transformed = self._transform(features_2d)
+        self._update_window(transformed)
+
     
     def _compute_stats(self) -> Tuple[np.ndarray, np.ndarray]:
         """통계 계산 (캐시 사용)"""
@@ -87,13 +82,7 @@ class RollingNormalizer:
                 std = self.seed_std.astype(np.float32)
                 self.std_cache = np.where(std < 1e-6, 1.0, std)
             else:
-                # windows가 아직 초기화되지 않았을 수 있으므로 안전 처리
-                n_features = self.windows.shape[1] if self.windows is not None else (
-                    len(self.seed_mean) if self.seed_mean is not None else 0
-                )
-                if n_features <= 0:
-                    # 마지막 안전망: 0/1 반환 (호출 측에서 shape 보장 필요)
-                    raise ValueError("RollingNormalizer: insufficient samples and no seed statistics; cannot infer feature dimension.")
+                n_features = self._resolve_feature_count()
                 self.mean_cache = np.zeros(n_features, dtype=np.float32)
                 self.std_cache = np.ones(n_features, dtype=np.float32)
         else:
@@ -120,24 +109,63 @@ class RollingNormalizer:
             정규화된 특징
         """
         original_shape = features.shape
-        if features.ndim == 1:
-            features = features.reshape(1, -1)
+        features_2d = self._ensure_2d(features)
+        transformed = self._transform(features_2d)
         
         # Window 업데이트
         if update:
-            self.update(features)
+            self._update_window(transformed)
         
         # 통계 계산
         mean, std = self._compute_stats()
         
         # 정규화
-        normalized = (features - mean) / std
+        normalized = (transformed - mean) / std
         
         # 원래 shape으로 복원
         if len(original_shape) == 1:
             normalized = normalized.reshape(-1)
         
         return normalized
+
+    def _ensure_2d(self, features: np.ndarray) -> np.ndarray:
+        if features.ndim == 1:
+            return features.reshape(1, -1)
+        return features
+
+    def _transform(self, features: np.ndarray) -> np.ndarray:
+        if self.strategies is None:
+            return features.astype(np.float32, copy=True)
+        transformed = features.astype(np.float32, copy=True)
+        for idx, strategy in enumerate(self.strategies):
+            if strategy == "log_std":
+                transformed[:, idx] = signed_log1p(transformed[:, idx])
+            # "derived"와 "std_only"는 추가 변환 불필요
+        return transformed
+
+    def _update_window(self, transformed: np.ndarray) -> None:
+        batch_size, n_features = transformed.shape
+        if self.windows is None:
+            self.windows = np.zeros((self.window_size, n_features), dtype=np.float32)
+            self.num_features = n_features
+        elif self.num_features is None:
+            self.num_features = n_features
+        
+        for i in range(batch_size):
+            self.windows[self.current_idx] = transformed[i]
+            self.current_idx = (self.current_idx + 1) % self.window_size
+            self.n_samples = min(self.n_samples + 1, self.window_size)
+        
+        self.cache_valid = False
+
+    def _resolve_feature_count(self) -> int:
+        if self.num_features is not None:
+            return self.num_features
+        if self.windows is not None:
+            return self.windows.shape[1]
+        if self.seed_mean is not None:
+            return len(self.seed_mean)
+        raise ValueError("RollingNormalizer: feature dimension is undefined. Provide feature_names or seed statistics before normalization.")
     
     def get_stats(self) -> Dict[str, np.ndarray]:
         """현재 통계 반환"""

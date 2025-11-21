@@ -9,7 +9,7 @@
   "max_position_size": 1000000,
   "max_positions": 3,
 
-  "min_buy_confidence": 0.8,
+  "min_buy_confidence": 0.62,
   "min_sell_confidence": 0.0,
   "stop_loss_rate": -2.0,
   "take_profit_rate": 5.0,
