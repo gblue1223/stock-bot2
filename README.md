@@ -87,6 +87,17 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 
 ```bash
 # GRPO로 스캘핑 전략 학습
+.venv64/Scripts/python ai_trader/grpo/train_scalping.py \
+    --env scalping \
+    --policy grpo \
+    --db "C:\\Users\\user\\Workspace\\datasets@20251013\\datasets_norm_all.duckdb" \
+    --embedding_model "models/autoencoder@20251013/model.pt" \
+    --load_policy "models/grpo_scalping/model.pt" \
+    --total_timesteps 50000 \
+    --entropy_coef 0.005 \
+    --lr 0.0001 \
+    --output_dir "models/grpo_scalping_finetuned"
+# OR
 python -m ai_trader.grpo.train_grpo \
     --embedding-model models/autoencoder/best_model.pt \
     --db "datasets_norm_all.duckdb" \

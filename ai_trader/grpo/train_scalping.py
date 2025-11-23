@@ -160,6 +160,8 @@ def main():
                         help='Checkpoint interval')
     parser.add_argument('--output_dir', type=str, default='models/grpo_modular',
                         help='Output directory')
+    parser.add_argument('--load_policy', type=str, default=None,
+                        help='Path to policy checkpoint to load for fine-tuning')
     
     args = parser.parse_args()
     
@@ -186,6 +188,28 @@ def main():
         # 2. 정책 생성
         policy = create_policy(args, env, device)
         logger.info(f"Policy created: {type(policy).__name__}")
+
+        # 기존 모델 로드 (Fine-tuning)
+        if args.load_policy:
+            logger.info(f"Loading policy from {args.load_policy}...")
+            checkpoint = torch.load(args.load_policy, map_location=device)
+            
+            if 'policy_state_dict' in checkpoint:
+                state_dict = checkpoint['policy_state_dict']
+            elif 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+                
+            # 호환되지 않는 키 무시 (strict=False)
+            missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+            if missing:
+                logger.warning(f"Missing keys: {len(missing)}")
+            if unexpected:
+                logger.warning(f"Unexpected keys: {len(unexpected)}")
+            logger.info("Policy loaded successfully!")
         
         # 3. 훈련기 설정
         logger.info("Creating trainer...")

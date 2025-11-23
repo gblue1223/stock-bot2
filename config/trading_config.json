@@ -1,20 +1,16 @@
 {
-  "# model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
-  "model_path": "models/grpo_scalping@2025120/model.pt",
-  "normalization_stats_path": "models/grpo_scalping@2025120/raw_normalization_stats.json",
+  "model_path": "models/grpo_scalping_finetuned@20251123/scalping_grpo_model.pt",
+  "normalization_stats_path": "models/grpo_scalping_finetuned@20251123/raw_normalization_stats.json",
   "embedding_model_path": "models/autoencoder@20251013/model.pt",
   "device": "cuda",
-
   "target_stocks": [],
   "max_position_size": 1000000,
   "max_positions": 3,
-
-  "min_buy_confidence": 0.62,
-  "min_sell_confidence": 0.0,
+  "min_buy_confidence": 0.8,
+  "min_sell_confidence": 0.8,
   "stop_loss_rate": -2.0,
   "take_profit_rate": 5.0,
   "max_holding_period": 100,
-
   "# market_start": "09:00",
   "# market_end": "20:00",
   "# trading_start": "09:00",
@@ -23,20 +19,16 @@
   "market_end": "13:20",
   "trading_start": "09:00",
   "trading_end": "13:20",
-
   "seq_len": 60,
   "num_features": 28,
   "update_interval": 1.0,
-
   "# DEPRECATED: online_window_size and online_warmup_samples": "Now using rolling window normalization",
   "online_window_size": 1000,
   "online_warmup_samples": 100,
-
   "use_condition_monitor": true,
   "condition_collect_delay": 2.0,
   "keep_monitoring_after_out": true,
   "# keep_monitoring_after_out": "한번 포착된 종목은 조건검색 이탈 후에도 계속 모니터링",
-
   "min_hold_time_seconds": 3,
   "# min_hold_time_seconds": "매수 후 최소 보유 시간 (초) - 체결 대기",
   "max_hold_time_seconds": 60,

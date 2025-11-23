@@ -624,7 +624,7 @@ class GRPOScalpingEnv(gym.Env):
                 self.entry_price = self.current_price
                 self.entry_time = self.current_time
                 # 🔧 매수 행동에 작은 양의 보상 (거래 유도)
-                reward = 0.1  # 매수 자체에 작은 보상
+                reward = 0.5  # 매수 자체에 작은 보상
                 logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
             else:
                 # 이미 포지션 보유 중: 페널티

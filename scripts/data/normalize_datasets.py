@@ -13,6 +13,10 @@ import pickle as _pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+# 프로젝트 루트 추가
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 # 공통 정규화 모듈 import
 from lib.normalization import (
     signed_log1p as _signed_log1p_np,
