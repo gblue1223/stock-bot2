@@ -33,7 +33,10 @@ class Position:
     entry_time: int
     current_price: float
     holding_period: int
+    current_price: float
+    holding_period: int
     cumulative_return: float = 0.0  # 누적 수익률 (비율, 0.01 = 1%)
+    max_price: float = 0.0  # 최고가 (트레일링 스탑용)
     
     @property
     def profit_rate(self) -> float:
@@ -81,6 +84,10 @@ class EnhancedGRPOInference:
         stop_loss_rate: float = -2.0,
         take_profit_rate: float = 5.0,
         max_holding_period: int = 100,
+        take_profit_rate: float = 5.0,
+        trailing_stop_activation_rate: float = 3.0,
+        trailing_stop_callback_rate: float = 1.0,
+        max_holding_period: int = 100,
         enable_auto_exit: bool = True
     ):
         self.base_inference = base_inference
@@ -92,6 +99,10 @@ class EnhancedGRPOInference:
         # 리스크 관리 파라미터
         self.stop_loss_rate = stop_loss_rate
         self.take_profit_rate = take_profit_rate
+        self.stop_loss_rate = stop_loss_rate
+        self.take_profit_rate = take_profit_rate
+        self.trailing_stop_activation_rate = trailing_stop_activation_rate
+        self.trailing_stop_callback_rate = trailing_stop_callback_rate
         self.max_holding_period = max_holding_period
         self.enable_auto_exit = enable_auto_exit
         
@@ -111,7 +122,9 @@ class EnhancedGRPOInference:
         logger.info(f"  Min Buy Confidence: {min_buy_confidence}")
         logger.info(f"  Min Sell Confidence: {min_sell_confidence}")
         logger.info(f"  Stop Loss: {stop_loss_rate}%")
+        logger.info(f"  Stop Loss: {stop_loss_rate}%")
         logger.info(f"  Take Profit: {take_profit_rate}%")
+        logger.info(f"  Trailing Stop: Activation={trailing_stop_activation_rate}%, Callback={trailing_stop_callback_rate}%")
         logger.info(f"  Max Holding Period: {max_holding_period}")
         logger.info(f"  Auto Exit: {enable_auto_exit}")
     
@@ -195,7 +208,12 @@ class EnhancedGRPOInference:
             current_return = sequence[-1, 0] / 100.0  # 등락률 → 비율
             current_position.cumulative_return += current_return
             current_position.current_price = current_price
+            current_position.current_price = current_price
             current_position.holding_period += 1
+            
+            # 최고가 업데이트 (트레일링 스탑용)
+            if current_price > current_position.max_price:
+                current_position.max_price = current_price
             
             exit_action, exit_reason = self._check_auto_exit(current_position)
             
@@ -289,7 +307,20 @@ class EnhancedGRPOInference:
         # 익절 체크
         if position.profit_rate >= self.take_profit_rate:
             self.stats['take_profits'] += 1
+        if position.profit_rate >= self.take_profit_rate:
+            self.stats['take_profits'] += 1
             return Action.SELL.value, f"Take profit (profit={position.profit_rate:.2f}%)"
+        
+        # 트레일링 스탑 체크
+        # 1. 발동 조건: 수익률이 activation_rate 이상일 때
+        if position.profit_rate >= self.trailing_stop_activation_rate:
+            # 2. 매도 조건: 고점 대비 callback_rate 이상 하락했을 때
+            # 고점 대비 하락률 계산
+            if position.max_price > 0:
+                drop_rate = (position.max_price - position.current_price) / position.max_price * 100
+                if drop_rate >= self.trailing_stop_callback_rate:
+                    self.stats['take_profits'] += 1  # 익절로 간주
+                    return Action.SELL.value, f"Trailing stop (max={position.max_price:.0f}, current={position.current_price:.0f}, drop={drop_rate:.2f}%)"
         
         # 최대 보유 기간 체크
         if position.holding_period >= self.max_holding_period:

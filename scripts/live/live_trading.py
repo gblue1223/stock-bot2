@@ -125,6 +125,8 @@ class TradingConfig:
         self.min_sell_confidence = 0.0  # Sell 최소 신뢰도
         self.stop_loss_rate = -2.0  # 손절 비율 (%)
         self.take_profit_rate = 5.0  # 익절 비율 (%)
+        self.trailing_stop_activation_rate = 3.0  # 트레일링 스탑 발동 수익률 (%)
+        self.trailing_stop_callback_rate = 1.0  # 트레일링 스탑 콜백 비율 (%)
         self.max_holding_period = 100  # 최대 보유 기간 (틱)
         
         # 시장 시간 설정 (문자열로 저장)
@@ -317,6 +319,8 @@ class LiveTrader:
             min_sell_confidence=config.min_sell_confidence,
             stop_loss_rate=config.stop_loss_rate,
             take_profit_rate=config.take_profit_rate,
+            trailing_stop_activation_rate=config.trailing_stop_activation_rate,
+            trailing_stop_callback_rate=config.trailing_stop_callback_rate,
             max_holding_period=config.max_holding_period,
             enable_auto_exit=True
         )
@@ -927,8 +931,10 @@ class LiveTrader:
                 entry_price=current_price,
                 entry_time=int(time.time()),
                 current_price=current_price,
+                current_price=current_price,
                 holding_period=0,
-                cumulative_return=0.0  # 누적 수익률 초기화
+                cumulative_return=0.0,  # 누적 수익률 초기화
+                max_price=current_price  # 최고가 초기화
             )
             # ✅ 수량 정보 추가 저장 (Position 객체에 동적 속성으로 추가)
             self.positions[code].quantity = quantity
