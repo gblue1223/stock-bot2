@@ -153,6 +153,7 @@ class TradingConfig:
         self.verify_position_before_sell = True  # 매도 전 포지션 확인
         self.max_sell_attempts = 3  # 매도 재시도 횟수
         self.min_profit_rate = 0.0  # 최소 이익률 (%, 수수료 고려)
+        self.buy_cooldown_seconds = 60  # 매도 후 재매수 금지 시간 (초)
         
         # 설정 파일에서 로드
         if config_path and os.path.exists(config_path):
@@ -348,7 +349,10 @@ class LiveTrader:
         
         # 실행 상태
         self.is_running = False
+        self.is_running = False
         self.last_update_time = {}  # code -> timestamp
+        self.last_sell_times = {}  # code -> timestamp (매도 후 쿨다운용)
+        self.start_time = time.time()  # 시작 시간 (자동 재시작용)
         
         # 실시간 데이터 클라이언트
         self.realtime_client: Optional[RealtimeStockClient] = None
@@ -840,6 +844,22 @@ class LiveTrader:
             logger.debug(f"Already in position for {code}")
             return
         
+        # 쿨다운 확인
+        last_sell_time = self.last_sell_times.get(code, 0)
+        time_since_sell = time.time() - last_sell_time
+        if time_since_sell < self.config.buy_cooldown_seconds:
+            # 쿨다운 중이면 로그는 디버그 레벨로 (너무 자주 찍히지 않게)
+            # 단, 10초마다 한 번씩만 로그
+            current_time = int(time.time())
+            log_attr = f'_cooldown_log_{code}'
+            if not hasattr(self, log_attr) or current_time - getattr(self, log_attr) >= 10:
+                setattr(self, log_attr, current_time)
+                logger.debug(
+                    f"[BUY SKIP] {code}: Cooldown active "
+                    f"({time_since_sell:.1f}s < {self.config.buy_cooldown_seconds}s)"
+                )
+            return
+        
         # 최대 포지션 수 확인
         if len(self.positions) >= self.config.max_positions:
             logger.debug(f"Max positions reached ({self.config.max_positions})")
@@ -1088,6 +1108,11 @@ class LiveTrader:
             
             self.stats['total_profit'] += profit_rate
             
+            self.stats['total_profit'] += profit_rate
+            
+            # 매도 시간 기록 (쿨다운용)
+            self.last_sell_times[code] = time.time()
+            
             logger.info(f"[OK] Sell order executed: {order_result}")
             
         except Exception as e:
@@ -1293,6 +1318,23 @@ class LiveTrader:
                 
                 # 대기
                 time.sleep(self.config.update_interval)
+                
+                # ✅ 9시 자동 재시작 (장 시작 전 리프레시)
+                # 조건: 09:00:00 ~ 09:00:05 사이이고, 실행된 지 60초 이상 지났을 때
+                now = datetime.now()
+                if now.hour == 9 and now.minute == 0 and 0 <= now.second <= 5:
+                    uptime = time.time() - self.start_time
+                    if uptime > 60:
+                        logger.info("=" * 80)
+                        logger.info(f"[AUTO RESTART] Scheduled restart at {now.strftime('%H:%M:%S')}")
+                        logger.info("=" * 80)
+                        
+                        # 정리 및 재시작
+                        self.shutdown()
+                        
+                        # 현재 프로세스 재시작
+                        logger.info("Restarting process...")
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
                 
         except KeyboardInterrupt:
             logger.info("\n[STOP] Interrupted by user")
