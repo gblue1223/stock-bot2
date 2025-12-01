@@ -931,7 +931,6 @@ class LiveTrader:
                 entry_price=current_price,
                 entry_time=int(time.time()),
                 current_price=current_price,
-                current_price=current_price,
                 holding_period=0,
                 cumulative_return=0.0,  # 누적 수익률 초기화
                 max_price=current_price  # 최고가 초기화

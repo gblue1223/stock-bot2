@@ -83,8 +83,6 @@ class EnhancedGRPOInference:
         min_sell_confidence: float = 0.0,
         stop_loss_rate: float = -2.0,
         take_profit_rate: float = 5.0,
-        max_holding_period: int = 100,
-        take_profit_rate: float = 5.0,
         trailing_stop_activation_rate: float = 3.0,
         trailing_stop_callback_rate: float = 1.0,
         max_holding_period: int = 100,
@@ -99,8 +97,7 @@ class EnhancedGRPOInference:
         # 리스크 관리 파라미터
         self.stop_loss_rate = stop_loss_rate
         self.take_profit_rate = take_profit_rate
-        self.stop_loss_rate = stop_loss_rate
-        self.take_profit_rate = take_profit_rate
+
         self.trailing_stop_activation_rate = trailing_stop_activation_rate
         self.trailing_stop_callback_rate = trailing_stop_callback_rate
         self.max_holding_period = max_holding_period
@@ -122,7 +119,7 @@ class EnhancedGRPOInference:
         logger.info(f"  Min Buy Confidence: {min_buy_confidence}")
         logger.info(f"  Min Sell Confidence: {min_sell_confidence}")
         logger.info(f"  Stop Loss: {stop_loss_rate}%")
-        logger.info(f"  Stop Loss: {stop_loss_rate}%")
+
         logger.info(f"  Take Profit: {take_profit_rate}%")
         logger.info(f"  Trailing Stop: Activation={trailing_stop_activation_rate}%, Callback={trailing_stop_callback_rate}%")
         logger.info(f"  Max Holding Period: {max_holding_period}")
