@@ -86,40 +86,44 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 ### 3단계: GRPO 강화학습 훈련
 
 ```bash
-# GRPO로 스캘핑 전략 학습
-.venv64/Scripts/python ai_trader/grpo/train_scalping.py \
-    --env scalping \
-    --policy grpo \
-    --db "C:\\Users\\user\\Workspace\\datasets@20251013\\datasets_norm_all.duckdb" \
+# GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장)
+python ai_trader/grpo/train_scalping.py \
+    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
     --embedding_model "models/autoencoder@20251013/model.pt" \
-    --load_policy "models/grpo_scalping/model.pt" \
+    --seq_len 60 \
+    --features 28 \
+    --total_timesteps 100000 \
+    --use_raw_data true \
+    --output_dir "models/grpo_scalping"
+
+# 또는 JSON 설정 파일 사용
+python ai_trader/grpo/train_scalping.py --config config/training_config.json
+
+# Fine-tuning (기존 모델 로드)
+python ai_trader/grpo/train_scalping.py \
+    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+    --embedding_model "models/autoencoder@20251013/model.pt" \
+    --load_policy "models/grpo_scalping/checkpoint_iter100.pt" \
     --total_timesteps 50000 \
-    --entropy_coef 0.005 \
     --lr 0.0001 \
+    --entropy_coef 0.005 \
     --output_dir "models/grpo_scalping_finetuned"
-# OR
-python -m ai_trader.grpo.train_grpo \
-    --embedding-model models/autoencoder/best_model.pt \
-    --db "datasets_norm_all.duckdb" \
-    --out models/grpo_scalping \
-    --episodes-per-group 12 \
-    --quick-exit-threshold 1.5 \
-    --device cuda
 ```
 
 ### 4단계: 실시간 추론 (2.87ms)
 
 ```python
-from ai_trader.inference.grpo_infer import GRPOInference
+from ai_trader.grpo.inference.grpo_infer import GRPOInference
 
 # 초고속 실시간 매매 결정
 inference = GRPOInference(
+    policy_path='models/grpo_scalping/policy_final.pt',
     embedding_model_path='models/autoencoder/best_model.pt',
-    policy_path='models/grpo_scalping/policy_final.pt'
+    device='cuda'
 )
 
 # 실시간 데이터로 매매 결정
-action = inference.predict(live_market_data)  # 0: 매도, 1: 보유, 2: 매수
+action, confidence = inference.predict(live_market_data)  # action: 0=보유, 1=매수, 2=매도
 ```
 
 ## 🧠 AutoEncoder 임베딩
@@ -180,31 +184,44 @@ finetuned_model = FineTunedEmbedding(
 
 ### 그룹 상대 정책 최적화
 
+#### 훈련-추론 일관성 (중요!)
+
+훈련 환경과 실시간 거래가 **동일한 정규화 전략**을 사용합니다:
+- **RollingNormalizer**: 최근 1000개 샘플의 mean/std로 적응형 정규화
+- **분포 이동 문제 해결**: 훈련과 추론의 데이터 분포 일치
+- **실시간 성능 향상**: 일관된 전처리 파이프라인
+
 ```bash
-# GRPO로 스캘핑 전략 학습
-python -m ai_trader.grpo.train_grpo \
-    --embedding-model models/autoencoder/best_model.pt \
-    --db "datasets_norm_all.duckdb" \
-    --out models/grpo_scalping \
-    --episodes-per-group 12 \
-    --quick-exit-threshold 1.5 \
-    --device cuda
+# 원본 데이터 + RollingNormalizer 사용 (권장)
+python ai_trader/grpo/train_scalping.py \
+    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+    --embedding_model models/autoencoder/best_model.pt \
+    --total_timesteps 100000 \
+    --use_raw_data true \
+    --rolling_window_size 1000 \
+    --output_dir models/grpo_scalping
+
+# JSON 설정 파일 사용
+python ai_trader/grpo/train_scalping.py --config config/training_config.json
 ```
 
 ### 실시간 추론 파이프라인
 
 ```python
-from ai_trader.inference.grpo_infer import GRPOInference
+from ai_trader.grpo.inference.grpo_infer import GRPOInference
 
 # 초고속 실시간 매매 결정 (2.87ms)
 inference = GRPOInference(
-    embedding_model_path='models/autoencoder/best_model.pt',
     policy_path='models/grpo_scalping/policy_final.pt',
-    device='cuda'
+    embedding_model_path='models/autoencoder/best_model.pt',
+    device='cuda',
+    use_torchscript=True  # TorchScript 컴파일로 속도 향상
 )
 
 # 실시간 데이터로 매매 결정
-action = inference.predict(live_market_data)  # 0: 매도, 1: 보유, 2: 매수
+action, confidence = inference.predict(live_market_data)
+# action: 0=보유, 1=매수, 2=매도
+# confidence: 예측 신뢰도 (0.0 ~ 1.0)
 ```
 
 ### 스캘핑 특화 보상 구조
@@ -309,23 +326,28 @@ ai_trader/
 │   ├── fine_tuning.py          # Fine-tuning 시스템
 │   └── data.py                 # 데이터 로더
 ├── grpo/                   # GRPO 강화학습
-│   ├── env.py                  # 스캘핑 환경
+│   ├── environments/
+│   │   └── scalping_env.py     # 스캘핑 환경 (RollingNormalizer 통합)
+│   ├── policies/
+│   │   └── scalping_policy.py  # GRPO 정책 네트워크
 │   ├── grpo.py                 # GRPO 알고리즘
-│   ├── policy.py               # 정책 네트워크
-│   └── train_grpo.py           # 훈련 스크립트
-├── inference/              # 실시간 추론
-│   └── grpo_infer.py           # 추론 엔진
+│   ├── train_scalping.py       # 훈련 스크립트 (Enhanced)
+│   └── inference/
+│       ├── grpo_infer.py       # 기본 추론 엔진
+│       └── enhanced_grpo_infer.py  # 향상된 추론 엔진
 └── reporting/              # 보고서 생성
     └── html_report.py          # HTML 리포트
 
-examples/                   # 사용 예제
-├── autoencoder_training_example.py
-└── complete_workflow_example.py
+lib/                        # 공통 라이브러리
+├── rolling_normalization.py    # RollingNormalizer
+└── normalization.py            # 정규화 전략
 
 scripts/                    # 데이터 처리
-├── normalize_datasets.py
-├── merge_datasets.py
-└── benchmark_autoencoder.py
+├── data/
+│   ├── normalize_datasets.py   # 데이터 정규화
+│   └── merge_datasets.py       # 데이터 병합
+└── live/
+    └── live_trading.py         # 실시간 거래 시스템
 
 tests/                      # 테스트 스위트
 ├── test_autoencoder_*.py
