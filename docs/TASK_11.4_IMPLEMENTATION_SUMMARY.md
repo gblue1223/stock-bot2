@@ -233,7 +233,7 @@ ai_trader/
 └── inference/
     ├── __init__.py              # TradeLogger export
     ├── trade_logger.py          # TradeLogger 구현
-    └── infer_grpo.py            # GRPOInference (통합)
+    └── grpo_infer.py            # GRPOInference (통합)
 
 tests/
 └── test_trade_logger.py         # 포괄적인 테스트

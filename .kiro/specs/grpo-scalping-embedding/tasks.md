@@ -182,7 +182,7 @@
 
   - [x] 10.1 GRPOInference 클래스 구현
 
-    - ai_trader/inference/infer_grpo.py에 추론 엔진 정의
+    - ai_trader/inference/grpo_infer.py에 추론 엔진 정의
     - 임베딩 모델 및 정책 로드
     - TorchScript 컴파일로 최적화
     - 임베딩 캐시 구현

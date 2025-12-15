@@ -110,7 +110,7 @@ python -m ai_trader.grpo.train_grpo \
 ### 4단계: 실시간 추론 (2.87ms)
 
 ```python
-from ai_trader.inference.infer_grpo import GRPOInference
+from ai_trader.inference.grpo_infer import GRPOInference
 
 # 초고속 실시간 매매 결정
 inference = GRPOInference(
@@ -194,7 +194,7 @@ python -m ai_trader.grpo.train_grpo \
 ### 실시간 추론 파이프라인
 
 ```python
-from ai_trader.inference.infer_grpo import GRPOInference
+from ai_trader.inference.grpo_infer import GRPOInference
 
 # 초고속 실시간 매매 결정 (2.87ms)
 inference = GRPOInference(
@@ -314,7 +314,7 @@ ai_trader/
 │   ├── policy.py               # 정책 네트워크
 │   └── train_grpo.py           # 훈련 스크립트
 ├── inference/              # 실시간 추론
-│   └── infer_grpo.py           # 추론 엔진
+│   └── grpo_infer.py           # 추론 엔진
 └── reporting/              # 보고서 생성
     └── html_report.py          # HTML 리포트
 

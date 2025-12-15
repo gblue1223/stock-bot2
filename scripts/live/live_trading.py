@@ -45,8 +45,8 @@ from koapys import KoapyRestSimple
 from koapys import ConditionSearchClient, RealtimeStockClient, StockRealtimeData
 from koapys import FINAL_COLUMNS
 from kiwoom_rest_api.websocket import WebSocketError
-from ai_trader.grpo.inference.infer_grpo import GRPOInference
-from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
+from ai_trader.grpo.inference.grpo_infer import GRPOInference
+from ai_trader.grpo.inference.enhanced_grpo_infer import EnhancedGRPOInference, Position, Action
 
 from lib.rolling_normalization import RollingNormalizer
 from lib.normalization import FEATURE_NAMES

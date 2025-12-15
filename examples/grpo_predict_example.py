@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from pathlib import Path
 
-from ai_trader.inference.infer_grpo import GRPOInference
+from ai_trader.inference.grpo_infer import GRPOInference
 
 
 def main():

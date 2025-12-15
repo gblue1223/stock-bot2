@@ -1,0 +1,388 @@
+"""
+개선된 GRPO 추론 엔진 (실전 거래용)
+
+분석에서 발견한 주의점을 반영:
+1. Buy 신호 과다 (91%) → 신뢰도 기반 필터링
+2. Sell 신호 부족 (4.1%) → 자동 손절/익절 로직
+3. Look-ahead bias 경고
+"""
+
+import logging
+from typing import Dict, Optional, Tuple, Union
+from dataclasses import dataclass
+from enum import Enum
+
+import numpy as np
+import time
+
+from .grpo_infer import GRPOInference
+
+logger = logging.getLogger(__name__)
+
+
+class Action(Enum):
+    """행동 타입"""
+    HOLD = 0
+    BUY = 1
+    SELL = 2
+
+
+@dataclass
+class Position:
+    """포지션 정보"""
+    entry_price: float
+    entry_time: int
+    current_price: float
+    holding_period: int
+    current_price: float
+    holding_period: int
+    cumulative_return: float = 0.0  # 누적 수익률 (비율, 0.01 = 1%)
+    max_price: float = 0.0  # 최고가 (트레일링 스탑용)
+    
+    @property
+    def profit_rate(self) -> float:
+        """수익률 계산 (백분율)"""
+        return self.cumulative_return * 100
+    
+    @property
+    def is_profit(self) -> bool:
+        """수익 포지션 여부"""
+        return self.cumulative_return > 0
+
+
+class EnhancedGRPOInference:
+    """
+    실전 거래를 위한 개선된 GRPO 추론 엔진
+    
+    주요 개선사항:
+    1. 신뢰도 기반 Buy 필터링 (과다 진입 방지)
+    2. 자동 손절/익절 (Sell 신호 보완)
+    3. 포지션 관리 및 리스크 제어
+    
+    Args:
+        base_inference: 기본 GRPOInference 인스턴스
+        min_buy_confidence: Buy 신호 최소 신뢰도 (기본값: 0.0, 필터링 없음)
+        min_sell_confidence: Sell 신호 최소 신뢰도 (기본값: 0.0, 필터링 없음)
+        stop_loss_rate: 손절 비율 (기본값: -2.0%)
+        take_profit_rate: 익절 비율 (기본값: 5.0%)
+        enable_auto_exit: 자동 손절/익절 활성화 (기본값: True)
+        
+    Note:
+        검증 결과, 신뢰도 필터링 없이 자동 청산만 사용하는 것이 최고 성과.
+        - None (0.0): Mean Reward 299.39, 75% 승률
+        - Light (0.36): Mean Reward 4.70 (거래 거의 없음)
+        - Moderate (0.358): Mean Reward 217.21 (27% 감소)
+        
+        포지션 관리(중복 진입 방지)로 이미 88.96% 자동 필터링됨.
+    """
+    
+    def __init__(
+        self,
+        base_inference: GRPOInference,
+        min_buy_confidence: float = 0.0,
+        min_sell_confidence: float = 0.0,
+        stop_loss_rate: float = -2.0,
+        take_profit_rate: float = 5.0,
+        trailing_stop_activation_rate: float = 3.0,
+        trailing_stop_callback_rate: float = 1.0,
+        stagnation_exit_seconds: int = 2,
+        stagnation_threshold: float = 0.5,
+        enable_auto_exit: bool = True
+    ):
+        self.base_inference = base_inference
+        
+        # 신뢰도 임계값
+        self.min_buy_confidence = min_buy_confidence
+        self.min_sell_confidence = min_sell_confidence
+        
+        # 리스크 관리 파라미터
+        self.stop_loss_rate = stop_loss_rate
+        self.take_profit_rate = take_profit_rate
+
+        self.trailing_stop_activation_rate = trailing_stop_activation_rate
+        self.trailing_stop_callback_rate = trailing_stop_callback_rate
+        self.stagnation_exit_seconds = stagnation_exit_seconds
+        self.stagnation_threshold = stagnation_threshold
+        self.enable_auto_exit = enable_auto_exit
+        
+        # 통계
+        self.stats = {
+            'total_predictions': 0,
+            'buy_signals': 0,
+            'buy_filtered': 0,
+            'sell_signals': 0,
+            'auto_exits': 0,
+            'stop_losses': 0,
+            'take_profits': 0,
+            'max_holding_exits': 0
+        }
+        
+        logger.info("EnhancedGRPOInference initialized")
+        logger.info(f"  Min Buy Confidence: {min_buy_confidence}")
+        logger.info(f"  Min Sell Confidence: {min_sell_confidence}")
+        logger.info(f"  Stop Loss: {stop_loss_rate}%")
+
+        logger.info(f"  Take Profit: {take_profit_rate}%")
+        logger.info(f"  Trailing Stop: Activation={trailing_stop_activation_rate}%, Callback={trailing_stop_callback_rate}%")
+        logger.info(f"  Stagnation Exit: {stagnation_exit_seconds}s, Threshold={stagnation_threshold}%")
+        logger.info(f"  Auto Exit: {enable_auto_exit}")
+    
+    def predict(
+        self,
+        sequence: np.ndarray,
+        current_position: Optional[Position] = None,
+        current_price: float = 0.0,
+        deterministic: bool = True
+    ) -> Tuple[int, float, Dict]:
+        """
+        개선된 행동 예측
+        
+        Args:
+            sequence: 입력 시퀀스 (seq_len, num_features)
+            current_position: 현재 포지션 (있으면)
+            current_price: 현재 가격 (등락률)
+            deterministic: 결정적 예측 여부
+            
+        Returns:
+            (action, confidence, info) 튜플
+            - action: 최종 행동 (0: Hold, 1: Buy, 2: Sell)
+            - confidence: 신뢰도
+            - info: 추가 정보 (원본 행동, 필터링 이유 등)
+        """
+        self.stats['total_predictions'] += 1
+        
+        # ✅ 입력 데이터 검증 (정규화 확인)
+        max_abs_value = np.abs(sequence).max()
+        if max_abs_value > 100:
+            logger.warning(
+                f"[INFERENCE] 입력 데이터가 정규화되지 않은 것으로 보임! "
+                f"max_abs={max_abs_value:.2f}, "
+                f"mean={sequence.mean():.2f}, "
+                f"std={sequence.std():.2f}"
+            )
+            logger.warning(
+                "[INFERENCE] 예측 결과가 부정확할 수 있습니다. "
+                "정규화 통계를 확인하세요."
+            )
+        
+        # 주기적으로 입력 시퀀스 통계 로깅 (100번마다)
+        if self.stats['total_predictions'] % 100 == 1:
+            seq_mean = np.mean(sequence)
+            seq_std = np.std(sequence)
+            seq_min = np.min(sequence)
+            seq_max = np.max(sequence)
+            non_zero = np.count_nonzero(sequence)
+            logger.info(
+                f"[INFERENCE] Input sequence stats (prediction #{self.stats['total_predictions']}): "
+                f"shape={sequence.shape}, mean={seq_mean:.4f}, std={seq_std:.4f}, "
+                f"range=[{seq_min:.4f}, {seq_max:.4f}], non-zero={non_zero}/{sequence.size}"
+            )
+        
+        # 기본 추론
+        raw_action, raw_confidence = self.base_inference.predict(
+            sequence, 
+            deterministic=deterministic
+        )
+        
+        # 원시 예측 결과 로깅 (10번마다)
+        if self.stats['total_predictions'] % 10 == 1:
+            action_name = ['HOLD', 'BUY', 'SELL'][raw_action] if raw_action in [0, 1, 2] else 'UNKNOWN'
+            logger.debug(
+                f"[INFERENCE] Raw prediction #{self.stats['total_predictions']}: "
+                f"action={action_name}({raw_action}), confidence={raw_confidence:.4f}"
+            )
+        
+        info = {
+            'raw_action': raw_action,
+            'raw_confidence': raw_confidence,
+            'filtered': False,
+            'filter_reason': None,
+            'auto_exit': False,
+            'exit_reason': None
+        }
+        
+        # 포지션이 있으면 자동 손절/익절 체크
+        if current_position is not None and self.enable_auto_exit:
+            # 현재 등락률로 누적 수익률 업데이트
+            current_return = sequence[-1, 0] / 100.0  # 등락률 → 비율
+            current_position.cumulative_return += current_return
+            current_position.current_price = current_price
+            current_position.current_price = current_price
+            current_position.holding_period += 1
+            
+            # 최고가 업데이트 (트레일링 스탑용)
+            if current_price > current_position.max_price:
+                current_position.max_price = current_price
+            
+            exit_action, exit_reason = self._check_auto_exit(current_position)
+            
+            if exit_action == Action.SELL.value:
+                self.stats['auto_exits'] += 1
+                info['auto_exit'] = True
+                info['exit_reason'] = exit_reason
+                
+                logger.debug(
+                    f"Auto exit: {exit_reason}, "
+                    f"profit={current_position.profit_rate:.2f}%, "
+                    f"holding={current_position.holding_period}"
+                )
+                
+                return Action.SELL.value, 1.0, info
+        
+        # Buy 신호 필터링
+        if raw_action == Action.BUY.value:
+            self.stats['buy_signals'] += 1
+            
+            if raw_confidence < self.min_buy_confidence:
+                self.stats['buy_filtered'] += 1
+                info['filtered'] = True
+                info['filter_reason'] = f"Low confidence ({raw_confidence:.3f} < {self.min_buy_confidence})"
+                
+                logger.debug(
+                    f"Buy signal filtered: confidence={raw_confidence:.3f} "
+                    f"< threshold={self.min_buy_confidence}"
+                )
+                
+                return Action.HOLD.value, raw_confidence, info
+            
+            # 이미 포지션이 있으면 추가 매수 방지
+            if current_position is not None:
+                self.stats['buy_filtered'] += 1
+                info['filtered'] = True
+                info['filter_reason'] = "Position already exists"
+                
+                logger.debug("Buy signal filtered: already in position")
+                
+                return Action.HOLD.value, raw_confidence, info
+        
+        # Sell 신호 검증
+        elif raw_action == Action.SELL.value:
+            self.stats['sell_signals'] += 1
+            
+            # 포지션이 없으면 Sell 무시 (로그 제거)
+            if current_position is None:
+                info['filtered'] = True
+                info['filter_reason'] = "No position to sell"
+                # ✅ 불필요한 로그 제거 (너무 많이 발생)
+                return Action.HOLD.value, raw_confidence, info
+            
+            # 신뢰도가 너무 낮으면 Hold로 변경
+            if raw_confidence < self.min_sell_confidence:
+                info['filtered'] = True
+                info['filter_reason'] = f"Low confidence ({raw_confidence:.3f} < {self.min_sell_confidence})"
+                
+                logger.debug(
+                    f"Sell signal filtered: confidence={raw_confidence:.3f} "
+                    f"< threshold={self.min_sell_confidence}"
+                )
+                
+                return Action.HOLD.value, raw_confidence, info
+        
+        # 필터링 통과 - 최종 결과 로깅 (Buy/Sell만)
+        if raw_action in [Action.BUY.value, Action.SELL.value]:
+            action_name = 'BUY' if raw_action == Action.BUY.value else 'SELL'
+            logger.info(
+                f"[INFERENCE] Final action: {action_name}, confidence={raw_confidence:.4f}, "
+                f"position={'YES' if current_position else 'NO'}"
+            )
+        
+        return raw_action, raw_confidence, info
+    
+    def _check_auto_exit(self, position: Position) -> Tuple[int, str]:
+        """
+        자동 손절/익절 체크
+        
+        Args:
+            position: 현재 포지션
+            
+        Returns:
+            (action, reason) 튜플
+        """
+        # 손절 체크
+        if position.profit_rate <= self.stop_loss_rate:
+            self.stats['stop_losses'] += 1
+            return Action.SELL.value, f"Stop loss (profit={position.profit_rate:.2f}%)"
+        
+        # 익절 체크
+        if position.profit_rate >= self.take_profit_rate:
+            self.stats['take_profits'] += 1
+        if position.profit_rate >= self.take_profit_rate:
+            self.stats['take_profits'] += 1
+            return Action.SELL.value, f"Take profit (profit={position.profit_rate:.2f}%)"
+        
+        # 트레일링 스탑 체크
+        # 1. 발동 조건: 수익률이 activation_rate 이상일 때
+        if position.profit_rate >= self.trailing_stop_activation_rate:
+            # 2. 매도 조건: 고점 대비 callback_rate 이상 하락했을 때
+            # 고점 대비 하락률 계산
+            if position.max_price > 0:
+                drop_rate = (position.max_price - position.current_price) / position.max_price * 100
+                if drop_rate >= self.trailing_stop_callback_rate:
+                    self.stats['take_profits'] += 1  # 익절로 간주
+                    return Action.SELL.value, f"Trailing stop (max={position.max_price:.0f}, current={position.current_price:.0f}, drop={drop_rate:.2f}%)"
+        
+        # 정체 매도 (Stagnation Exit) 체크
+        # 일정 시간 동안 수익률이 임계값 미만이면 매도
+        holding_seconds = time.time() - position.entry_time
+        if holding_seconds >= self.stagnation_exit_seconds:
+            if position.profit_rate <= self.stagnation_threshold:
+                self.stats['auto_exits'] += 1
+                return Action.SELL.value, f"Stagnation exit (time={holding_seconds:.1f}s, profit={position.profit_rate:.2f}%)"
+        
+        return Action.HOLD.value, None
+    
+    def get_stats(self) -> Dict:
+        """
+        통계 반환
+        
+        Returns:
+            통계 딕셔너리
+        """
+        stats = self.stats.copy()
+        
+        if stats['total_predictions'] > 0:
+            stats['buy_signal_rate'] = stats['buy_signals'] / stats['total_predictions']
+            stats['buy_filter_rate'] = stats['buy_filtered'] / stats['buy_signals'] if stats['buy_signals'] > 0 else 0
+            stats['sell_signal_rate'] = stats['sell_signals'] / stats['total_predictions']
+            stats['auto_exit_rate'] = stats['auto_exits'] / stats['total_predictions']
+        
+        return stats
+    
+    def reset_stats(self):
+        """통계 초기화"""
+        for key in self.stats:
+            self.stats[key] = 0
+        logger.info("Statistics reset")
+    
+    def update_thresholds(
+        self,
+        min_buy_confidence: Optional[float] = None,
+        min_sell_confidence: Optional[float] = None,
+        stop_loss_rate: Optional[float] = None,
+        take_profit_rate: Optional[float] = None,
+    ):
+        """
+        임계값 업데이트
+        
+        Args:
+            min_buy_confidence: Buy 최소 신뢰도
+            min_sell_confidence: Sell 최소 신뢰도
+            stop_loss_rate: 손절 비율
+            take_profit_rate: 익절 비율
+        """
+        if min_buy_confidence is not None:
+            self.min_buy_confidence = min_buy_confidence
+            logger.info(f"Updated min_buy_confidence: {min_buy_confidence}")
+        
+        if min_sell_confidence is not None:
+            self.min_sell_confidence = min_sell_confidence
+            logger.info(f"Updated min_sell_confidence: {min_sell_confidence}")
+        
+        if stop_loss_rate is not None:
+            self.stop_loss_rate = stop_loss_rate
+            logger.info(f"Updated stop_loss_rate: {stop_loss_rate}%")
+        
+        if take_profit_rate is not None:
+            self.take_profit_rate = take_profit_rate
+            logger.info(f"Updated take_profit_rate: {take_profit_rate}%")
+        

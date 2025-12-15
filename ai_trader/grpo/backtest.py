@@ -13,7 +13,7 @@ import torch
 import duckdb
 from datetime import datetime
 
-from ai_trader.inference.infer_grpo import GRPOInference
+from ai_trader.inference.grpo_infer import GRPOInference
 from ai_trader.grpo.evaluation import GRPOEvaluationMetrics
 from ai_trader.grpo.alerts import PerformanceAlertSystem, AlertThreshold
 

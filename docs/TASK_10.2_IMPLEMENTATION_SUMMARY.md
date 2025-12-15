@@ -6,7 +6,7 @@ Task 10.2는 GRPOInference 클래스의 `predict()` 메서드 구현을 다룹�
 
 ## 구현 내용
 
-### 1. predict() 메서드 (`ai_trader/inference/infer_grpo.py`)
+### 1. predict() 메서드 (`ai_trader/inference/grpo_infer.py`)
 
 ```python
 def predict(
@@ -104,7 +104,7 @@ tests/test_grpo_inference.py::test_inference_time_target PASSED
 ### 기본 사용법
 
 ```python
-from ai_trader.inference.infer_grpo import GRPOInference
+from ai_trader.inference.grpo_infer import GRPOInference
 import numpy as np
 
 # 추론 엔진 초기화
@@ -166,7 +166,7 @@ print(f"Cache hit rate: {stats['cache_hit_rate']:.2%}")
 ```
 ai_trader/inference/
 ├── __init__.py
-└── infer_grpo.py          # GRPOInference 클래스 (predict 메서드 포함)
+└── grpo_infer.py          # GRPOInference 클래스 (predict 메서드 포함)
 
 tests/
 └── test_grpo_inference.py # 추론 엔진 테스트

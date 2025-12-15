@@ -62,7 +62,7 @@ Task 10.1에서는 실시간 매매를 위한 GRPO 추론 엔진인 `GRPOInferen
 ```
 ai_trader/inference/
 ├── __init__.py              # GRPOInference 내보내기
-└── infer_grpo.py           # GRPOInference 클래스 구현
+└── grpo_infer.py           # GRPOInference 클래스 구현
 
 tests/
 └── test_grpo_inference.py  # 단위 테스트 (11개 테스트)

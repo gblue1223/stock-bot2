@@ -214,7 +214,7 @@ python -m ai_trader.grpo.train_grpo \
 
 ### 3. 추론 파이프라인 (`ai_trader/inference/`)
 
-#### 3.1 실시간 추론 (`infer_grpo.py`)
+#### 3.1 실시간 추론 (`grpo_infer.py`)
 
 ```python
 class GRPOInference:
@@ -533,7 +533,7 @@ ai_trader/
 │   └── train_grpo.py       # 훈련 CLI
 └── inference/
     ├── __init__.py
-    └── infer_grpo.py       # GRPOInference
+    └── grpo_infer.py       # GRPOInference
 
 models/
 ├── autoencoder/

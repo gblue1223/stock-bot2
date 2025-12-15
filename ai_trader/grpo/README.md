@@ -134,7 +134,7 @@ python -m ai_trader.grpo.evaluate_grpo \
 ### 실시간 추론
 
 ```bash
-python -m ai_trader.inference.infer_grpo \
+python -m ai_trader.inference.grpo_infer \
   --embedding-model models/embedding/checkpoint_epoch50.pt \
   --policy models/grpo_scalping/checkpoint_step1000000.pt \
   --device cuda \
