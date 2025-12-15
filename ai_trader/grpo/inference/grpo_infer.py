@@ -18,7 +18,6 @@ import numpy as np
 
 from ai_trader.embedding import AutoEncoderEmbedding
 from ai_trader.grpo.policies import GRPOPolicy
-from ai_trader.grpo.policies.direct_feature_policy import DirectFeaturePolicy
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +26,7 @@ class GRPOInference:
     """
     실시간 매매를 위한 GRPO 추론 엔진
     
-    DirectFeaturePolicy와 GRPOPolicy 모두 지원 (기본값: DirectFeaturePolicy)
+    GRPOPolicy 지원 (기본값: GRPOPolicy)
     
     최적화:
     - TorchScript 컴파일로 추론 속도 향상
@@ -65,15 +64,11 @@ class GRPOInference:
         self.policy, self.policy_type = self._load_policy(policy_path)
         logger.info(f"Policy loaded successfully: {self.policy_type}")
         
-        # 임베딩 모델 로드 (DirectFeaturePolicy는 필요 없음)
-        if self.policy_type == 'DirectFeaturePolicy':
-            self.embedding_model = None
-            logger.info("DirectFeaturePolicy: Skipping embedding model")
-        else:
-            if embedding_model_path is None:
-                raise ValueError("embedding_model_path is required for GRPOPolicy")
-            self.embedding_model = self._load_embedding_model(embedding_model_path)
-            logger.info("Embedding model loaded successfully")
+        # 임베딩 모델 로드
+        if embedding_model_path is None:
+            raise ValueError("embedding_model_path is required for GRPOPolicy")
+        self.embedding_model = self._load_embedding_model(embedding_model_path)
+        logger.info("Embedding model loaded successfully")
         
         # 정규화 통계 설정 (임베딩 모델 로드 후 업데이트될 수 있음)
         if normalization_stats is not None:
@@ -254,13 +249,8 @@ class GRPOInference:
             state_dict_key = 'policy_state_dict' if 'policy_state_dict' in checkpoint else 'state_dict'
             state_dict = checkpoint.get(state_dict_key, {})
             
-            # input_projection이 있으면 DirectFeaturePolicy
-            if any('input_projection' in k for k in state_dict.keys()):
-                policy_type = 'DirectFeaturePolicy'
-                logger.info("Auto-detected policy type: DirectFeaturePolicy")
-            else:
-                policy_type = 'GRPOPolicy'
-                logger.info("Auto-detected policy type: GRPOPolicy")
+            policy_type = 'GRPOPolicy'
+            logger.info("Auto-detected policy type: GRPOPolicy")
         
         # state_dict 가져오기
         if 'policy_state_dict' in checkpoint:
@@ -270,39 +260,21 @@ class GRPOInference:
         else:
             raise KeyError("Neither 'policy_state_dict' nor 'state_dict' found in checkpoint")
         
-        # 정책 타입에 따라 생성 (config에 없으면 state_dict에서 차원 추론)
-        if policy_type == 'DirectFeaturePolicy':
-            # state_dict에서 실제 차원 추론
-            if 'input_dim' not in config:
-                # input_projection.weight: (hidden_dim, input_dim)
-                input_dim = state_dict['input_projection.weight'].shape[1]
-                hidden_dim = state_dict['input_projection.weight'].shape[0]
-                logger.info(f"Inferred from state_dict: input_dim={input_dim}, hidden_dim={hidden_dim}")
-            else:
-                input_dim = config.get('input_dim', 3600)
-                hidden_dim = config.get('hidden_dim', 128)
-            
-            policy = DirectFeaturePolicy(
-                input_dim=input_dim,
-                hidden_dim=hidden_dim,
-                action_dim=config.get('action_dim', 3)
-            )
+        # state_dict에서 실제 차원 추론
+        if 'embedding_dim' not in config:
+            # fc1.weight: (hidden_dim, embedding_dim)
+            embedding_dim = state_dict['fc1.weight'].shape[1]
+            hidden_dim = state_dict['fc1.weight'].shape[0]
+            logger.info(f"Inferred from state_dict: embedding_dim={embedding_dim}, hidden_dim={hidden_dim}")
         else:
-            # state_dict에서 실제 차원 추론
-            if 'embedding_dim' not in config:
-                # fc1.weight: (hidden_dim, embedding_dim)
-                embedding_dim = state_dict['fc1.weight'].shape[1]
-                hidden_dim = state_dict['fc1.weight'].shape[0]
-                logger.info(f"Inferred from state_dict: embedding_dim={embedding_dim}, hidden_dim={hidden_dim}")
-            else:
-                embedding_dim = config.get('embedding_dim', 128)
-                hidden_dim = config.get('hidden_dim', 256)
-            
-            policy = GRPOPolicy(
-                embedding_dim=embedding_dim,
-                hidden_dim=hidden_dim,
-                action_dim=config.get('action_dim', 3)
-            )
+            embedding_dim = config.get('embedding_dim', 128)
+            hidden_dim = config.get('hidden_dim', 256)
+        
+        policy = GRPOPolicy(
+            embedding_dim=embedding_dim,
+            hidden_dim=hidden_dim,
+            action_dim=config.get('action_dim', 3)
+        )
         
         # 가중치 로드
         policy.load_state_dict(state_dict)
@@ -486,7 +458,7 @@ class GRPOInference:
         
         이 메서드는 다음 단계를 수행합니다:
         1. 입력 시퀀스 정규화
-        2. 임베딩 생성 (GRPOPolicy) 또는 평탄화 (DirectFeaturePolicy)
+        2. 임베딩 생성 (GRPOPolicy)
         3. 정책 실행 및 행동 반환
         
         목표 지연 시간: < 10ms
@@ -516,22 +488,10 @@ class GRPOInference:
         if sequence.device != self.device:
             sequence = sequence.to(self.device)
         
-        # 정책 타입에 따라 입력 처리
-        if self.policy_type == 'DirectFeaturePolicy':
-            # 직접 특징 사용: 시퀀스를 평탄화
-            if sequence.dim() == 2:
-                # (seq_len, input_dim) -> (seq_len * input_dim,)
-                policy_input = sequence.flatten()
-            else:
-                raise ValueError(f"Expected 2D sequence for DirectFeaturePolicy, got {sequence.dim()}D")
-            
-            # 배치 차원 추가: (input_dim,) -> (1, input_dim)
-            policy_input = policy_input.unsqueeze(0)
-        else:
-            # GRPOPolicy: 임베딩 생성 (캐시 활용)
-            embedding = self._generate_embedding(sequence)
-            # 배치 차원 추가: (embedding_dim,) -> (1, embedding_dim)
-            policy_input = embedding.unsqueeze(0)
+        # GRPOPolicy: 임베딩 생성 (캐시 활용)
+        embedding = self._generate_embedding(sequence)
+        # 배치 차원 추가: (embedding_dim,) -> (1, embedding_dim)
+        policy_input = embedding.unsqueeze(0)
         
         # 정책 실행
         with torch.no_grad():
@@ -594,19 +554,10 @@ class GRPOInference:
         if sequences.device != self.device:
             sequences = sequences.to(self.device)
         
-        # 정책 타입에 따라 입력 처리
-        if self.policy_type == 'DirectFeaturePolicy':
-            # 직접 특징 사용: 시퀀스를 평탄화
-            if sequences.dim() == 3:
-                # (batch_size, seq_len, input_dim) -> (batch_size, seq_len * input_dim)
-                policy_input = sequences.flatten(start_dim=1)
-            else:
-                raise ValueError(f"Expected 3D sequences for batch DirectFeaturePolicy, got {sequences.dim()}D")
-        else:
-            # GRPOPolicy: 정규화 및 임베딩 생성
-            normalized_seqs = self._normalize_input(sequences)
-            with torch.no_grad():
-                policy_input = self.embedding_model.encode(normalized_seqs)  # (batch_size, embedding_dim)
+        # GRPOPolicy: 정규화 및 임베딩 생성
+        normalized_seqs = self._normalize_input(sequences)
+        with torch.no_grad():
+            policy_input = self.embedding_model.encode(normalized_seqs)  # (batch_size, embedding_dim)
         
         # 정책 실행 (배치)
         with torch.no_grad():

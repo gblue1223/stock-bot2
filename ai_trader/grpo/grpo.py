@@ -575,28 +575,7 @@ class GRPOTrainer:
             
             # 정책 클래스별 초기화 파라미터 결정
             # 순서 중요: 더 구체적인 속성부터 체크
-            if hasattr(self.policy, 'input_dim'):
-                # DirectFeaturePolicy
-                self.reference_policy = policy_class(
-                    input_dim=self.policy.input_dim,
-                    hidden_dim=self.policy.hidden_dim,
-                    action_dim=self.policy.action_dim
-                ).to(self.device)
-            elif hasattr(self.policy, 'feature_dim'):
-                # NormalizedFeaturePolicy
-                self.reference_policy = policy_class(
-                    feature_dim=self.policy.feature_dim,
-                    hidden_dim=self.policy.hidden_dim,
-                    action_dim=self.policy.action_dim
-                ).to(self.device)
-            elif hasattr(self.policy, 'indicator_dim'):
-                # TechnicalIndicatorPolicy
-                self.reference_policy = policy_class(
-                    indicator_dim=self.policy.indicator_dim,
-                    hidden_dim=self.policy.hidden_dim,
-                    action_dim=self.policy.action_dim
-                ).to(self.device)
-            elif hasattr(self.policy, 'embedding_dim'):
+            if hasattr(self.policy, 'embedding_dim'):
                 # 기존 GRPOPolicy (마지막에 체크)
                 self.reference_policy = policy_class(
                     embedding_dim=self.policy.embedding_dim,
@@ -1078,9 +1057,6 @@ class GRPOTrainer:
             'hidden_dim': self.policy.hidden_dim if hasattr(self.policy, 'hidden_dim') else 128,
         }
         
-        # DirectFeaturePolicy의 경우 input_dim 저장
-        if hasattr(self.policy, 'input_dim'):
-            policy_config['input_dim'] = self.policy.input_dim
         # GRPOPolicy의 경우 embedding_dim 저장
         if hasattr(self.policy, 'embedding_dim'):
             policy_config['embedding_dim'] = self.policy.embedding_dim

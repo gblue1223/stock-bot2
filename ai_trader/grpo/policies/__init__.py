@@ -5,9 +5,7 @@ GRPO 정책 모듈
 """
 
 from .scalping_policy import GRPOPolicy
-from .direct_feature_policy import DirectFeaturePolicy
 
 __all__ = [
     'GRPOPolicy',
-    'DirectFeaturePolicy',
 ]

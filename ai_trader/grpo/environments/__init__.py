@@ -5,9 +5,7 @@ GRPO 환경 모듈
 """
 
 from .scalping_env import GRPOScalpingEnv
-from .direct_feature_env import Action
 
 __all__ = [
     'GRPOScalpingEnv',
-    'Action',
 ]
