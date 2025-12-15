@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
+import time
 
 from .infer_grpo import GRPOInference
 
@@ -64,7 +65,6 @@ class EnhancedGRPOInference:
         min_sell_confidence: Sell 신호 최소 신뢰도 (기본값: 0.0, 필터링 없음)
         stop_loss_rate: 손절 비율 (기본값: -2.0%)
         take_profit_rate: 익절 비율 (기본값: 5.0%)
-        max_holding_period: 최대 보유 기간 (기본값: 100)
         enable_auto_exit: 자동 손절/익절 활성화 (기본값: True)
         
     Note:
@@ -85,7 +85,8 @@ class EnhancedGRPOInference:
         take_profit_rate: float = 5.0,
         trailing_stop_activation_rate: float = 3.0,
         trailing_stop_callback_rate: float = 1.0,
-        max_holding_period: int = 100,
+        stagnation_exit_seconds: int = 2,
+        stagnation_threshold: float = 0.5,
         enable_auto_exit: bool = True
     ):
         self.base_inference = base_inference
@@ -100,7 +101,8 @@ class EnhancedGRPOInference:
 
         self.trailing_stop_activation_rate = trailing_stop_activation_rate
         self.trailing_stop_callback_rate = trailing_stop_callback_rate
-        self.max_holding_period = max_holding_period
+        self.stagnation_exit_seconds = stagnation_exit_seconds
+        self.stagnation_threshold = stagnation_threshold
         self.enable_auto_exit = enable_auto_exit
         
         # 통계
@@ -122,7 +124,7 @@ class EnhancedGRPOInference:
 
         logger.info(f"  Take Profit: {take_profit_rate}%")
         logger.info(f"  Trailing Stop: Activation={trailing_stop_activation_rate}%, Callback={trailing_stop_callback_rate}%")
-        logger.info(f"  Max Holding Period: {max_holding_period}")
+        logger.info(f"  Stagnation Exit: {stagnation_exit_seconds}s, Threshold={stagnation_threshold}%")
         logger.info(f"  Auto Exit: {enable_auto_exit}")
     
     def predict(
@@ -319,10 +321,13 @@ class EnhancedGRPOInference:
                     self.stats['take_profits'] += 1  # 익절로 간주
                     return Action.SELL.value, f"Trailing stop (max={position.max_price:.0f}, current={position.current_price:.0f}, drop={drop_rate:.2f}%)"
         
-        # 최대 보유 기간 체크
-        if position.holding_period >= self.max_holding_period:
-            self.stats['max_holding_exits'] += 1
-            return Action.SELL.value, f"Max holding period (period={position.holding_period})"
+        # 정체 매도 (Stagnation Exit) 체크
+        # 일정 시간 동안 수익률이 임계값 미만이면 매도
+        holding_seconds = time.time() - position.entry_time
+        if holding_seconds >= self.stagnation_exit_seconds:
+            if position.profit_rate <= self.stagnation_threshold:
+                self.stats['auto_exits'] += 1
+                return Action.SELL.value, f"Stagnation exit (time={holding_seconds:.1f}s, profit={position.profit_rate:.2f}%)"
         
         return Action.HOLD.value, None
     
@@ -355,7 +360,6 @@ class EnhancedGRPOInference:
         min_sell_confidence: Optional[float] = None,
         stop_loss_rate: Optional[float] = None,
         take_profit_rate: Optional[float] = None,
-        max_holding_period: Optional[int] = None
     ):
         """
         임계값 업데이트
@@ -365,7 +369,6 @@ class EnhancedGRPOInference:
             min_sell_confidence: Sell 최소 신뢰도
             stop_loss_rate: 손절 비율
             take_profit_rate: 익절 비율
-            max_holding_period: 최대 보유 기간
         """
         if min_buy_confidence is not None:
             self.min_buy_confidence = min_buy_confidence
@@ -383,6 +386,3 @@ class EnhancedGRPOInference:
             self.take_profit_rate = take_profit_rate
             logger.info(f"Updated take_profit_rate: {take_profit_rate}%")
         
-        if max_holding_period is not None:
-            self.max_holding_period = max_holding_period
-            logger.info(f"Updated max_holding_period: {max_holding_period}")

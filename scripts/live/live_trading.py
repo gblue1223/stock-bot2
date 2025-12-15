@@ -44,6 +44,7 @@ from koapys.types import OrderType, OrderBookType
 from koapys import KoapyRestSimple
 from koapys import ConditionSearchClient, RealtimeStockClient, StockRealtimeData
 from koapys import FINAL_COLUMNS
+from kiwoom_rest_api.websocket import WebSocketError
 from ai_trader.grpo.inference.infer_grpo import GRPOInference
 from ai_trader.grpo.inference.enhanced_inference import EnhancedGRPOInference, Position, Action
 
@@ -127,7 +128,8 @@ class TradingConfig:
         self.take_profit_rate = 5.0  # 익절 비율 (%)
         self.trailing_stop_activation_rate = 3.0  # 트레일링 스탑 발동 수익률 (%)
         self.trailing_stop_callback_rate = 1.0  # 트레일링 스탑 콜백 비율 (%)
-        self.max_holding_period = 100  # 최대 보유 기간 (틱)
+        self.stagnation_exit_seconds = 2  # 정체 판단 시간 (초)
+        self.stagnation_threshold = 0.0  # 정체 판단 수익률 (%)
         
         # 시장 시간 설정 (문자열로 저장)
         self.market_start = "09:00"  # 장 시작
@@ -150,8 +152,6 @@ class TradingConfig:
         self.condition_collect_delay = 2.0  # 최초 등록 직후 딜레이(초)
         
         # 포지션 관리 설정
-        self.min_hold_time_seconds = 3  # 최소 보유 시간 (초)
-        self.max_hold_time_seconds = 300  # 최대 보유 시간 (초, 5분)
         self.verify_position_before_sell = True  # 매도 전 포지션 확인
         self.max_sell_attempts = 3  # 매도 재시도 횟수
         self.min_profit_rate = 0.0  # 최소 이익률 (%, 수수료 고려)
@@ -321,7 +321,8 @@ class LiveTrader:
             take_profit_rate=config.take_profit_rate,
             trailing_stop_activation_rate=config.trailing_stop_activation_rate,
             trailing_stop_callback_rate=config.trailing_stop_callback_rate,
-            max_holding_period=config.max_holding_period,
+            stagnation_exit_seconds=config.stagnation_exit_seconds,
+            stagnation_threshold=config.stagnation_threshold,
             enable_auto_exit=True
         )
         
@@ -426,6 +427,12 @@ class LiveTrader:
             
             # 비동기 메인 실행
             loop.run_until_complete(self._run_realtime_async())
+        except WebSocketError as e:
+            # WebSocketError는 명시적으로 처리
+            logger.error(f"WebSocket error in realtime client: {e}")
+            if "Token" in str(e) or "8005" in str(e):
+                logger.error("Token invalid error detected. Triggering auto-restart...")
+                self.restart_process("Token invalid error")
         except Exception as e:
             logger.error(f"Realtime client error: {e}", exc_info=True)
         finally:
@@ -992,25 +999,9 @@ class LiveTrader:
                 logger.error(f"[SELL SKIP] {code}: Invalid quantity {quantity} in position")
                 return
             
-            # ✅ 최소 보유 시간 확인
-            time_since_buy = time.time() - position.entry_time
-            if time_since_buy < self.config.min_hold_time_seconds:
-                logger.debug(
-                    f"[SELL WAIT] {code}: Minimum hold time not met "
-                    f"(elapsed: {time_since_buy:.1f}s < {self.config.min_hold_time_seconds}s)"
-                )
-                return
-            
-            # ✅ 최대 보유 시간 확인 (강제 청산)
-            force_sell = False
-            if time_since_buy > self.config.max_hold_time_seconds:
-                logger.warning(
-                    f"[FORCE SELL] {code}: Maximum hold time exceeded "
-                    f"(elapsed: {time_since_buy:.1f}s > {self.config.max_hold_time_seconds}s)"
-                )
-                reason = "MaxHoldTime"
-                force_sell = True
-            
+            # ✅ 강제 청산 여부 확인 (신호에 의한 매도가 아니면 강제 청산으로 간주)
+            force_sell = reason != "Signal"
+
             # ✅ 수수료 고려한 최소 이익률 확인 (강제 청산이 아닐 때만)
             if not force_sell and hasattr(self.config, 'min_profit_rate'):
                 if profit_rate < self.config.min_profit_rate and self.config.min_profit_rate > 0:
@@ -1330,23 +1321,31 @@ class LiveTrader:
                 if now.hour == 9 and now.minute == 0 and 0 <= now.second <= 5:
                     uptime = time.time() - self.start_time
                     if uptime > 60:
-                        logger.info("=" * 80)
-                        logger.info(f"[AUTO RESTART] Scheduled restart at {now.strftime('%H:%M:%S')}")
-                        logger.info("=" * 80)
-                        
-                        # 정리 및 재시작
-                        self.shutdown()
-                        
-                        # 현재 프로세스 재시작
-                        logger.info("Restarting process...")
-                        os.execv(sys.executable, [sys.executable] + sys.argv)
-                
+                        self.restart_process("Scheduled restart at 09:00")
+        
         except KeyboardInterrupt:
             logger.info("\n[STOP] Interrupted by user")
         except Exception as e:
             logger.error(f"[ERROR] Fatal error: {e}", exc_info=True)
         finally:
             self.shutdown()
+    
+    def restart_process(self, reason: str = "Unknown"):
+        """프로세스 재시작"""
+        logger.info("=" * 80)
+        logger.info(f"[AUTO RESTART] {reason}")
+        logger.info("=" * 80)
+        
+        # 정리 및 재시작
+        self.shutdown()
+        
+        # 현재 프로세스 재시작
+        logger.info("Restarting process...")
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            logger.error(f"Failed to restart process: {e}")
+            sys.exit(1)
     
     def print_stats(self):
         """통계 출력"""
