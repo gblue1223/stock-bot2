@@ -463,8 +463,12 @@ class GRPOScalpingEnv(gym.Env):
         """
         등락률로부터 가격 계산
         
-        등락률(첫 번째 특징)을 누적하여 실제 가격을 생성합니다.
+        등락률(두 번째 특징, 인덱스 1)을 누적하여 실제 가격을 생성합니다.
         기준 가격 100,000원에서 시작하여 등락률을 적용합니다.
+        
+        주의: 
+        - 데이터베이스 컬럼 순서: 현재가(0), 등락률(1), 거래량(2), ...
+        - 원본 데이터의 등락률은 백분율(%) 단위이므로 100으로 나눠야 합니다.
         """
         self.base_price = 100000.0  # 기준 가격 (10만원)
         self.prices = np.zeros(len(self.episode_data))
@@ -473,11 +477,16 @@ class GRPOScalpingEnv(gym.Env):
         # 등락률을 누적하여 가격 계산
         for i in range(1, len(self.episode_data)):
             # price[i] = price[i-1] * (1 + return[i])
-            # 등락률은 첫 번째 특징 (인덱스 0)
-            return_rate = self.episode_data[i, 0]
+            # ✅ 등락률은 두 번째 특징 (인덱스 1) - 첫 번째는 현재가!
+            return_rate = self.episode_data[i, 1]  # 인덱스 0=현재가, 1=등락률
+            
+            # ✅ 원본 데이터 사용 시: 등락률이 백분율(%)이므로 100으로 나눔
+            # 예: 1.5% -> 0.015
+            if self.use_raw_data:
+                return_rate = return_rate / 100.0
             
             # 🔧 등락률 클리핑: -0.3 ~ +0.3 (±30%)
-            # 극단적인 등락률로 인한 가격 0 방지
+            # 극단적인 등락률로 인한 가격 폭발 방지
             return_rate = np.clip(return_rate, -0.3, 0.3)
             
             self.prices[i] = self.prices[i-1] * (1 + return_rate)
