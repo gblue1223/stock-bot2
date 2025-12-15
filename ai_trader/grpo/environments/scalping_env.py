@@ -13,6 +13,9 @@ import gymnasium as gym
 from gymnasium import spaces
 import duckdb
 
+# ✅ RollingNormalizer import
+from lib.rolling_normalization import RollingNormalizer
+
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +70,9 @@ class GRPOScalpingEnv(gym.Env):
         holding_penalty_rate: float = 0.001,
         max_episode_steps: Optional[int] = None,
         quick_exit_mode: str = 'penalty_only',
+        use_raw_data: bool = True,  # ✅ 원본 데이터 사용 여부
+        rolling_window_size: int = 1000,  # ✅ Rolling window 크기
+        rolling_min_samples: int = 100,  # ✅ 최소 샘플 수
         device: str = 'cpu'
     ):
         super().__init__()
@@ -102,6 +108,25 @@ class GRPOScalpingEnv(gym.Env):
         
         # 에피소드 길이 제한
         self.max_episode_steps = max_episode_steps
+        
+        # ✅ 정규화 설정
+        self.use_raw_data = use_raw_data
+        self.rolling_window_size = rolling_window_size
+        self.rolling_min_samples = rolling_min_samples
+        
+        # ✅ RollingNormalizer 초기화 (원본 데이터 사용 시)
+        if use_raw_data:
+            # FEATURE_NAMES는 live_trading.py와 동일한 순서여야 함
+            from lib.normalization import FEATURE_NAMES
+            self.normalizer = RollingNormalizer(
+                window_size=rolling_window_size,
+                min_samples=rolling_min_samples,
+                feature_names=FEATURE_NAMES
+            )
+            logger.info(f"RollingNormalizer enabled: window={rolling_window_size}, min_samples={rolling_min_samples}")
+        else:
+            self.normalizer = None
+            logger.info("Using pre-normalized data from database")
         
         # 관측 공간: 임베딩 벡터
         self.observation_space = spaces.Box(
@@ -139,7 +164,8 @@ class GRPOScalpingEnv(gym.Env):
         logger.info(f"GRPOScalpingEnv initialized with embedding_dim={embedding_dim}, "
                    f"quick_exit_threshold={quick_exit_threshold}s, "
                    f"quick_exit_mode={quick_exit_mode}, "
-                   f"transaction_cost={transaction_cost_rate*100:.3f}%")
+                   f"transaction_cost={transaction_cost_rate*100:.3f}%, "
+                   f"use_raw_data={use_raw_data}")
     
     def _connect_db(self):
         """데이터베이스 연결"""
@@ -315,11 +341,21 @@ class GRPOScalpingEnv(gym.Env):
         시퀀스를 임베딩으로 변환
         
         Args:
-            sequence: (seq_len, n_features)
+            sequence: (seq_len, n_features) - 원본 또는 사전 정규화된 데이터
             
         Returns:
             임베딩 벡터 (embedding_dim,)
         """
+        # ✅ Rolling normalization 적용 (원본 데이터 사용 시)
+        if self.use_raw_data and self.normalizer is not None:
+            normalized_seq = np.zeros_like(sequence, dtype=np.float32)
+            for t in range(len(sequence)):
+                normalized_seq[t] = self.normalizer.normalize(
+                    sequence[t],
+                    update=True  # 훈련 중이므로 통계 업데이트
+                )
+            sequence = normalized_seq
+        
         with torch.no_grad():
             # (seq_len, n_features) -> (1, seq_len, n_features)
             seq_tensor = torch.from_numpy(sequence).float().unsqueeze(0).to(self.device)
@@ -384,6 +420,11 @@ class GRPOScalpingEnv(gym.Env):
             (observation, info) 튜플
         """
         super().reset(seed=seed)
+        
+        # ✅ 에피소드마다 normalizer 리셋 (각 에피소드가 독립적인 종목/날짜)
+        if self.use_raw_data and self.normalizer is not None:
+            self.normalizer.reset()
+            logger.debug("Normalizer reset for new episode")
         
         # 에피소드 데이터 샘플링
         self.episode_data, self.episode_metadata = self._sample_episode_start()
