@@ -7,9 +7,6 @@ live_trading.py 아키텍처 기반으로 재구성:
 - 설정 관리 클래스
 - 강화된 에러 처리
 - 진행 상황 모니터링
-
-사용법:
-    python ai_trader/grpo/train_scalping.py --config config/training_config.json
 """
 
 import os
@@ -278,11 +275,15 @@ def main():
   python ai_trader/grpo/train_scalping.py --config config/training_config.json
 
   # CLI 인자 사용 (scalping env + grpo policy)
-  python ai_trader/grpo/train_scalping.py \\
-    --db data/scalping_data.db \\
-    --embedding_model models/embedding/checkpoint_epoch50.pt \\
-    --seq_len 60 --features 28 \\
-    --total_timesteps 10000
+  python ai_trader/grpo/train_scalping.py \
+    --db "C:\\Users\\user\\Workspace\\datasets@raw\\datasets_all.duckdb" \
+    --embedding_model "models/autoencoder@20251013/model.pt" \
+    --seq_len 60 \
+    --features 28 \
+    --total_timesteps 100000 \
+    --use_raw_data true \
+    --output_dir "models/grpo_scalping" \
+    --load_policy "models/grpo_scalping/checkpoint_iter1650.pt"
         """
     )
     
