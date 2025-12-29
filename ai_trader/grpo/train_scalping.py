@@ -283,7 +283,7 @@ def main():
     --total_timesteps 100000 \
     --use_raw_data true \
     --output_dir "models/grpo_scalping" \
-    --load_policy "models/grpo_scalping/checkpoint_iter1650.pt"
+    --load_policy "models/grpo_scalping/checkpoints/checkpoint_iter1650.pt"
         """
     )
     

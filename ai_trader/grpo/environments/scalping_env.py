@@ -143,6 +143,19 @@ class GRPOScalpingEnv(gym.Env):
         self.conn = None
         self._connect_db()
         
+        # ✅ 특징 컬럼 및 주요 인덱스 식별
+        # 컬럼 순서 변경으로 인한 버그 방지를 위해 동적으로 인덱스 찾기
+        self.feature_columns = self._get_feature_columns()
+        
+        try:
+            self.return_rate_index = self.feature_columns.index('등락률')
+            self.current_price_index = self.feature_columns.index('현재가')
+            logger.info(f"Column Mapping Identified: '등락률' at Index {self.return_rate_index}, '현재가' at Index {self.current_price_index}")
+        except ValueError as e:
+            logger.error(f"Critical Column Missing: {e}")
+            logger.error(f"Available columns: {self.feature_columns}")
+            raise RuntimeError(f"Required columns (등락률, 현재가) missing from database features")
+        
         # 에피소드 상태
         self.current_step = 0
         self.position = 0  # 0: 포지션 없음, 1: 매수 포지션
@@ -463,7 +476,7 @@ class GRPOScalpingEnv(gym.Env):
         """
         등락률로부터 가격 계산
         
-        등락률(두 번째 특징, 인덱스 1)을 누적하여 실제 가격을 생성합니다.
+        등락률(동적으로 식별된 인덱스)을 누적하여 실제 가격을 생성합니다.
         기준 가격 100,000원에서 시작하여 등락률을 적용합니다.
         
         주의: 
@@ -477,8 +490,8 @@ class GRPOScalpingEnv(gym.Env):
         # 등락률을 누적하여 가격 계산
         for i in range(1, len(self.episode_data)):
             # price[i] = price[i-1] * (1 + return[i])
-            # ✅ 등락률은 두 번째 특징 (인덱스 1) - 첫 번째는 현재가!
-            return_rate = self.episode_data[i, 1]  # 인덱스 0=현재가, 1=등락률
+            # ✅ 동적으로 식별된 등락률 인덱스 사용
+            return_rate = self.episode_data[i, self.return_rate_index]
             
             # ✅ 원본 데이터 사용 시: 등락률이 백분율(%)이므로 100으로 나눔
             # 예: 1.5% -> 0.015
