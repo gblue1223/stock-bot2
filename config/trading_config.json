@@ -15,7 +15,7 @@
   "# trailing_stop_activation_rate": "트레일링 스탑 발동 수익률 (%)",
   "trailing_stop_callback_rate": 1.0,
   "# trailing_stop_callback_rate": "트레일링 스탑 콜백 비율 (%)",
-  "stagnation_exit_seconds": 2,
+  "stagnation_exit_seconds": 5,
   "# stagnation_exit_seconds": "정체 판단 시간 (초)",
   "stagnation_threshold": 0.3,
   "# stagnation_threshold": "정체 판단 수익률 (%)",

@@ -32,7 +32,7 @@ class GRPOScalpingEnv(gym.Env):
     - 총 거래비용: 0.43% (왕복)
     - 양의 보상 조건: 수익률 > 0.43%
     - 빠른 손절 룰 위반: -0.01 페널티 (시간 임계값 설정 가능, 기본값 1.5초)
-    - 장기 보유 페널티: -0.001 * (보유시간 - 60초)
+    - 빠른 손절 룰 위반: -0.01 페널티 (시간 임계값 설정 가능, 기본값 1.5초)
     
     Args:
         embedding_model: 훈련된 임베딩 모델
@@ -44,8 +44,6 @@ class GRPOScalpingEnv(gym.Env):
         transaction_cost_rate: 거래 비용 비율 (기본값: 0.00215 = 0.215%)
         quick_exit_threshold: 빠른 손절 시간 임계값 (초, 기본값: 1.5)
         quick_exit_penalty: 빠른 손절 룰 위반 페널티 (기본값: 0.01)
-        max_holding_time: 최대 보유 시간 (초, 기본값: 10)
-        holding_penalty_rate: 장기 보유 페널티 비율 (기본값: 0.001)
         max_episode_steps: 에피소드당 최대 스텝 수 (기본값: None, 제한 없음)
         quick_exit_mode: 빠른 손절 룰 동작 모드 (기본값: 'penalty_only')
             - 'penalty_only': 페널티만 부여, 정책이 학습
@@ -66,10 +64,8 @@ class GRPOScalpingEnv(gym.Env):
         transaction_cost_rate: float = 0.00215,
         quick_exit_threshold: float = 1.5,
         quick_exit_penalty: float = 0.01,
-        max_holding_time: float = 10.0,
-        holding_penalty_rate: float = 0.001,
-        max_episode_steps: Optional[int] = None,
         quick_exit_mode: str = 'penalty_only',
+        max_episode_steps: Optional[int] = None,
         use_raw_data: bool = True,  # ✅ 원본 데이터 사용 여부
         rolling_window_size: int = 1000,  # ✅ Rolling window 크기
         rolling_min_samples: int = 100,  # ✅ 최소 샘플 수
@@ -102,9 +98,7 @@ class GRPOScalpingEnv(gym.Env):
             raise ValueError(f"Invalid quick_exit_mode: {quick_exit_mode}. "
                            f"Must be 'penalty_only' or 'force_close'")
         
-        # 보유 시간 페널티 설정
-        self.max_holding_time = max_holding_time
-        self.holding_penalty_rate = holding_penalty_rate
+
         
         # 에피소드 길이 제한
         self.max_episode_steps = max_episode_steps
@@ -746,15 +740,8 @@ class GRPOScalpingEnv(gym.Env):
                 # 기본 보유 페널티: -0.01 (스케일링 후 -1.0)
                 base_penalty = -0.01
                 
-                # 🔧 시간 기반 추가 페널티: max_holding_time 이상 보유 시 증가
-                # holding_penalty_rate를 사용하여 페널티 강도 조절
-                if holding_time > self.max_holding_time:
-                    # max_holding_time 초과 시 holding_penalty_rate 적용
-                    # 🔧 스케일링 제거: 매 스텝 누적되므로 작은 값 사용
-                    time_penalty = -self.holding_penalty_rate * (holding_time - self.max_holding_time)
-                    reward = base_penalty + time_penalty  # 스케일링 제거
-                else:
-                    reward = base_penalty  # 스케일링 제거
+                # 기본 페널티 적용
+                reward = base_penalty
                 
                 # 빠른 손절 룰 체크 (모드 선택)
                 if self.quick_exit_mode == 'penalty_only':
