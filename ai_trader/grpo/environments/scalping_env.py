@@ -241,21 +241,16 @@ class GRPOScalpingEnv(gym.Env):
             logger.error(f"Failed to get feature columns: {e}")
             raise RuntimeError(f"Cannot get feature columns: {e}")
     
-    def _sample_episode_start(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _sample_episode_start(self, max_attempts=100) -> Tuple[np.ndarray, np.ndarray]:
         """
-        에피소드 시작 지점 샘플링
-        
-        다양한 시장 상황을 가진 시작 지점을 DuckDB에서 샘플링합니다.
-        max_episode_steps가 설정된 경우, 전체 데이터에서 랜덤한 구간을 선택합니다.
+        랜덤한 에피소드 시작 지점 샘플링
         
         Returns:
-            (data, metadata) 튜플
-            - data: (episode_length, n_features)
-            - metadata: (episode_length, 3) - [종목코드, 날짜, 시간]
+            features: (seq_len, n_features)
+            metadata: (seq_len, 3) - [종목코드, 날짜, 시간]
         """
         feature_cols = self._get_feature_columns()
         
-        max_attempts = 10  # 최대 시도 횟수 제한
         attempt = 0
         
         # 필요한 최소 데이터 길이 계산
@@ -324,6 +319,27 @@ class GRPOScalpingEnv(gym.Env):
                             
                             features = features[start_idx:end_idx]
                             metadata = metadata[start_idx:end_idx]
+                            
+                            # ✅ Bad Data Guard: 비정상적인 등락률 검사 (수정된 로직)
+                            # 데이터가 이미 '누적 등락률'이므로, 값 자체가 30%를 넘는지 확인하면 됨
+                            try:
+                                return_rates = features[:, self.return_rate_index]
+                                
+                                # 원본 데이터(%)라면 100으로 나눔
+                                if self.use_raw_data:
+                                    return_rates = return_rates / 100.0
+                                
+                                # 절대값 기준 35% 초과 시 기각 (상/하한가 30% + 여유분)
+                                # 누적 곱(cumprod) 불필요. 값 자체가 기준일 대비 수익률임.
+                                max_abs_return = np.max(np.abs(return_rates))
+                                
+                                if max_abs_return > 0.35:
+                                    logger.warning(f"⚠️ Bad Data (Overflow): stock={stock_code}, date={date}, max_return={max_abs_return*100:.2f}%")
+                                    attempt += 1
+                                    continue
+                                    
+                            except Exception as e:
+                                logger.warning(f"Data validation failed: {e}")
                             
                             logger.debug(f"Sampled episode: stock={stock_code}, date={date}, "
                                        f"total_length={len(df)}, selected_range=[{start_idx}:{end_idx}], "
@@ -474,38 +490,29 @@ class GRPOScalpingEnv(gym.Env):
     
     def _compute_prices(self):
         """
-        등락률로부터 가격 계산
+        등락률로부터 가격 계산 (수정됨)
         
-        등락률(동적으로 식별된 인덱스)을 누적하여 실제 가격을 생성합니다.
-        기준 가격 100,000원에서 시작하여 등락률을 적용합니다.
+        등락률 컬럼이 '기준가 대비 누적 등락률'이므로, 
+        복리 계산 없이 (1 + 등락률)을 기준가에 곱하여 바로 가격을 산출합니다.
         
         주의: 
         - 데이터베이스 컬럼 순서: 현재가(0), 등락률(1), 거래량(2), ...
         - 원본 데이터의 등락률은 백분율(%) 단위이므로 100으로 나눠야 합니다.
         """
         self.base_price = 100000.0  # 기준 가격 (10만원)
-        self.prices = np.zeros(len(self.episode_data))
-        self.prices[0] = self.base_price
         
-        # 등락률을 누적하여 가격 계산
-        for i in range(1, len(self.episode_data)):
-            # price[i] = price[i-1] * (1 + return[i])
-            # ✅ 동적으로 식별된 등락률 인덱스 사용
-            return_rate = self.episode_data[i, self.return_rate_index]
+        # ✅ 올바른 로직: Price = Base * (1 + Return_Rate)
+        # 루프 없이 벡터 연산으로 처리하여 폭발 원천 차단
+        return_rates = self.episode_data[:, self.return_rate_index]
+        
+        if self.use_raw_data:
+            return_rates = return_rates / 100.0
             
-            # ✅ 원본 데이터 사용 시: 등락률이 백분율(%)이므로 100으로 나눔
-            # 예: 1.5% -> 0.015
-            if self.use_raw_data:
-                return_rate = return_rate / 100.0
-            
-            # 🔧 등락률 클리핑: -0.3 ~ +0.3 (±30%)
-            # 극단적인 등락률로 인한 가격 폭발 방지
-            return_rate = np.clip(return_rate, -0.3, 0.3)
-            
-            self.prices[i] = self.prices[i-1] * (1 + return_rate)
-            
-            # 🔧 최소 가격 보장: 1,000원 이상
-            self.prices[i] = max(self.prices[i], 1000.0)
+        # (1 + r) * base
+        self.prices = self.base_price * (1.0 + return_rates)
+        
+        # 🔧 최소 가격 보장: 1,000원 이상 (벡터 연산)
+        self.prices = np.maximum(self.prices, 1000.0)
         
         logger.debug(
             f"Computed prices: min={self.prices.min():.2f}, "

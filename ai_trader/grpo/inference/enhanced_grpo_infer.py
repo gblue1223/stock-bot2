@@ -203,12 +203,12 @@ class EnhancedGRPOInference:
         
         # 포지션이 있으면 자동 손절/익절 체크
         if current_position is not None and self.enable_auto_exit:
-            # 현재 등락률로 누적 수익률 업데이트
-            current_return = sequence[-1, 0] / 100.0  # 등락률 → 비율
-            current_position.cumulative_return += current_return
-            current_position.current_price = current_price
+            # 현재 등락률로 누적 수익률 업데이트 (가격 기반 계산)
             current_position.current_price = current_price
             current_position.holding_period += 1
+            
+            if current_position.entry_price > 0:
+                current_position.cumulative_return = (current_price - current_position.entry_price) / current_position.entry_price
             
             # 최고가 업데이트 (트레일링 스탑용)
             if current_price > current_position.max_price:
