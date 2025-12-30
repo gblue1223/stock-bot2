@@ -49,7 +49,7 @@ date_format = '%Y-%m-%d %H:%M:%S'
 
 # 파일 핸들러 (상세 로그)
 file_handler = logging.FileHandler(log_filename, encoding='utf-8')
-file_handler.setLevel(logging.DEBUG)
+file_handler.setLevel(logging.INFO)  # ✅ DEBUG -> INFO 변경 (속도 향상)
 file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
 
 # 콘솔 핸들러 (요약 로그)
@@ -59,7 +59,7 @@ console_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
 
 # 루트 로거 설정
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,  # ✅ DEBUG -> INFO 변경
     handlers=[file_handler, console_handler]
 )
 
