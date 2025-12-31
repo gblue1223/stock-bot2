@@ -12,6 +12,7 @@ import torch
 import gymnasium as gym
 from gymnasium import spaces
 import duckdb
+from datetime import datetime, timedelta  # ✅ 시간 계산용 추가
 
 # ✅ RollingNormalizer import
 from lib.rolling_normalization import RollingNormalizer
@@ -154,9 +155,10 @@ class GRPOScalpingEnv(gym.Env):
         self.current_step = 0
         self.position = 0  # 0: 포지션 없음, 1: 매수 포지션
         self.entry_price = 0.0
-        self.entry_time = 0.0
+        self.entry_price = 0.0
+        self.entry_time = 0
         self.current_price = 0.0
-        self.current_time = 0.0
+        self.current_time = 0
         
         # 에피소드 메타데이터
         self.episode_trades = []
@@ -699,8 +701,8 @@ class GRPOScalpingEnv(gym.Env):
                 # 포지션 없는데 매도: 페널티
                 reward = -0.1
             elif self.position == 1:
-                # 보유 시간 계산
-                holding_time = self.current_time - self.entry_time
+                # 보유 시간 계산 (HHMMSS 차이 -> 초 단위 변환)
+                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
                 # 보상 계산
                 reward, reward_components = self._calculate_reward(
@@ -735,7 +737,7 @@ class GRPOScalpingEnv(gym.Env):
             
             if self.position == 1:
                 # 포지션 보유 중: 시간에 비례하는 페널티
-                holding_time = self.current_time - self.entry_time
+                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
                 # 기본 보유 페널티: -0.01 (스케일링 후 -1.0)
                 base_penalty = -0.01
@@ -772,7 +774,7 @@ class GRPOScalpingEnv(gym.Env):
         
         # 에피소드 종료 시 포지션 강제 청산
         if (terminated or truncated) and self.position == 1:
-            holding_time = self.current_time - self.entry_time
+            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
             final_reward, final_components = self._calculate_reward(
                 self.entry_price,
                 self.current_price,
@@ -798,6 +800,32 @@ class GRPOScalpingEnv(gym.Env):
                 'forced_liquidation': True
             })
             
+        return self._get_current_observation(), reward, terminated, truncated, self._get_info()
+    
+    def _calculate_seconds_diff(self, start_time_int: int, end_time_int: int) -> float:
+        """
+        HHMMSS 정수 포맷의 두 시간 차이를 초 단위로 계산
+        ex) 100000 - 095959 = 1초 (단순 뺄셈은 4041)
+        """
+        if start_time_int == 0: return 0.0
+        
+        try:
+            # 문자열 변환 및 파싱
+            s_str = f"{int(start_time_int):06d}"
+            e_str = f"{int(end_time_int):06d}"
+            
+            s_dt = datetime.strptime(s_str, "%H%M%S")
+            e_dt = datetime.strptime(e_str, "%H%M%S")
+            
+            # 날짜 경계 처리 (예: 밤 11시 -> 새벽 1시)
+            if e_dt < s_dt:
+                e_dt += timedelta(days=1)
+                
+            return (e_dt - s_dt).total_seconds()
+        except:
+            # 파싱 실패 시 안전장치 (단순 차이 반환하되 로그 남김)
+            logger.warning(f"Time parsing failed: {start_time_int} -> {end_time_int}")
+            return float(end_time_int - start_time_int)
             logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
         
         # 현재 가격 및 시간 업데이트
