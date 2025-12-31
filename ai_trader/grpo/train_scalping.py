@@ -226,10 +226,10 @@ def create_environment(config: TrainingConfig, device: str):
             embedding_dim=config.embedding_dim,
             expected_features=config.features,
             transaction_cost_rate=0.00215,
-            max_episode_steps=config.episode_steps,
             quick_exit_mode=config.quick_exit_mode,
-            quick_exit_threshold=config.stagnation_exit_seconds,
             quick_exit_penalty=config.quick_exit_penalty,
+            quick_exit_threshold=config.stagnation_exit_seconds,
+            max_episode_steps=config.episode_steps,
             use_raw_data=config.use_raw_data,  # ✅ 추가
             rolling_window_size=config.rolling_window_size,  # ✅ 추가
             rolling_min_samples=config.rolling_min_samples,  # ✅ 추가

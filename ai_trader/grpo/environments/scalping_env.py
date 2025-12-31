@@ -62,8 +62,8 @@ class GRPOScalpingEnv(gym.Env):
         embedding_dim: int = 128,
         expected_features: int = 28,
         transaction_cost_rate: float = 0.00215,
-        quick_exit_threshold: float = 1.5,
         quick_exit_penalty: float = 0.01,
+        quick_exit_threshold: float = 1.5,
         quick_exit_mode: str = 'penalty_only',
         max_episode_steps: Optional[int] = None,
         use_raw_data: bool = True,  # ✅ 원본 데이터 사용 여부
