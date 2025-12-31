@@ -26,7 +26,7 @@ from typing import Dict, List, Tuple
 import h5py
 import mmap
 
-from lib.normalization import get_normalization_strategy, signed_log1p
+from lib.normalization import get_normalization_strategy, signed_log1p, compute_stock_name_scalar_batch
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,14 @@ class AutoEncoderPreprocessor:
         """
         
         df = self.conn.execute(query).fetchdf()
+        
+        # ✅ 문자열 컬럼 처리 (Scalar 변환)
+        for col in df.columns:
+            if df[col].dtype == 'object' or df[col].dtype == 'string':
+                logger.info(f"Converting string column to scalar: {col}")
+                # lib/normalization.py의 함수 사용
+                df[col] = compute_stock_name_scalar_batch(df[col])
+        
         data = df.values.astype(np.float32)
         
         # NaN/Inf 처리
@@ -176,7 +184,17 @@ class AutoEncoderPreprocessor:
         
         # 메타데이터와 특징 분리
         metadata = df[['종목코드', '날짜', '시간']].values
-        features = df[feature_cols].values.astype(np.float32)
+        
+        # ✅ 메타데이터 컬럼 제외한 특징만 추출
+        feature_df = df[feature_cols]
+        
+        # ✅ 문자열 컬럼 처리 (Scalar 변환) - create_sequence_batches
+        for col in feature_df.columns:
+            if feature_df[col].dtype == 'object' or feature_df[col].dtype == 'string':
+                # logger.debug(f"Converting string column to scalar: {col}")
+                feature_df[col] = compute_stock_name_scalar_batch(feature_df[col])
+
+        features = feature_df.values.astype(np.float32)
         
         # 데이터 정제
         features = np.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
