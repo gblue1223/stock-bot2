@@ -8,17 +8,25 @@ AutoEncoder 훈련을 위한 데이터 전처리 및 캐싱 스크립트
 - 메모리 맵핑 지원
 """
 
+import sys
+from pathlib import Path
+
+# 프로젝트 루트 추가
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
 import argparse
 import numpy as np
 import duckdb
 import pickle
 import json
-from pathlib import Path
 from tqdm import tqdm
 import logging
 from typing import Dict, List, Tuple
 import h5py
 import mmap
+
+from lib.normalization import get_normalization_strategy, signed_log1p
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +73,10 @@ class AutoEncoderPreprocessor:
         """
         정규화 파라미터 계산 (평균, 표준편차)
         
+        참고: lib/normalization.py의 전략을 따름
+        - log_std: signed_log1p 후 mean/std 계산
+        - std_only: 그냥 mean/std 계산
+        
         Args:
             sample_size: 샘플링할 데이터 크기
         """
@@ -86,13 +98,21 @@ class AutoEncoderPreprocessor:
         # NaN/Inf 처리
         data = np.nan_to_num(data, nan=0.0, posinf=1e10, neginf=-1e10)
         
+        # ✅ 정규화 전략에 따른 전처리 (Log 변환 등)
+        strategies = [get_normalization_strategy(col) for col in feature_cols]
+        
+        for i, strategy in enumerate(strategies):
+            if strategy == 'log_std':
+                data[:, i] = signed_log1p(data[:, i])
+        
         # 정규화 파라미터 계산
         self.normalization_params = {
             'mean': np.mean(data, axis=0).tolist(),
             'std': np.std(data, axis=0).tolist(),
             'min': np.min(data, axis=0).tolist(),
             'max': np.max(data, axis=0).tolist(),
-            'feature_columns': feature_cols
+            'feature_columns': feature_cols,
+            'strategies': strategies  # 전략 정보도 저장
         }
         
         # 저장
@@ -161,10 +181,19 @@ class AutoEncoderPreprocessor:
         # 데이터 정제
         features = np.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
         
-        # 정규화 적용
+        # ✅ 정규화 적용
         if self.normalization_params:
             mean = np.array(self.normalization_params['mean'])
             std = np.array(self.normalization_params['std'])
+            strategies = self.normalization_params.get('strategies', 
+                        [get_normalization_strategy(col) for col in feature_cols])
+            
+            # 1. Log 변환 (필요한 경우)
+            for i, strategy in enumerate(strategies):
+                if strategy == 'log_std':
+                    features[:, i] = signed_log1p(features[:, i])
+            
+            # 2. Z-Score 정규화
             std = np.where(std == 0, 1, std)  # 0으로 나누기 방지
             features = (features - mean) / std
         
