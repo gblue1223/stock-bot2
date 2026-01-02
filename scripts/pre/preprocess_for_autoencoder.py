@@ -146,21 +146,13 @@ class AutoEncoderPreprocessor:
         end_date: str = None
     ):
         """
-        시퀀스 배치 파일 생성
-        
-        Args:
-            seq_len: 시퀀스 길이
-            stride: 스트라이드
-            batch_size: 배치당 시퀀스 수
-            max_samples: 최대 샘플 수
-            start_date: 시작 날짜 (YYYY-MM-DD)
-            end_date: 종료 날짜 (YYYY-MM-DD)
+        시퀀스 배치 파일 생성 (메모리 최적화: 종목별 순차 처리)
         """
-        logger.info("Creating sequence batches...")
+        logger.info("Creating sequence batches (Iterative Processing)...")
         
         feature_cols = self.get_feature_columns()
         
-        # WHERE 절 구성
+        # WHERE 절 구성 (날짜)
         where_clauses = []
         if start_date:
             start_date_str = start_date.replace('-', '')
@@ -169,117 +161,153 @@ class AutoEncoderPreprocessor:
             end_date_str = end_date.replace('-', '')
             where_clauses.append(f"날짜 <= '{end_date_str}'")
         
-        where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
-        limit_clause = f"LIMIT {max_samples}" if max_samples else ""
+        date_where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         
-        # 데이터 로드
-        query = f"""
-            SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
-            FROM datasets
-            WHERE {where_clause}
-            ORDER BY 날짜, 종목코드, 시간
-            {limit_clause}
+        # 1. 대상 종목 코드 조회
+        logger.info("Fetching target stock codes...")
+        code_query = f"""
+            SELECT DISTINCT 종목코드 
+            FROM datasets 
+            WHERE {date_where_clause}
         """
+        stock_codes = self.conn.execute(code_query).fetchdf()['종목코드'].tolist()
+        logger.info(f"Found {len(stock_codes)} stocks to process.")
         
-        logger.info("Loading data...")
-        df = self.conn.execute(query).fetchdf()
+        # 정규화 파라미터 준비
+        mean = np.array(self.normalization_params['mean']) if self.normalization_params else None
+        std = np.array(self.normalization_params['std']) if self.normalization_params else None
+        if std is not None:
+             std = np.where(std == 0, 1, std)
         
-        if len(df) == 0:
-            raise ValueError("No data found")
-        
-        logger.info(f"Loaded {len(df)} rows")
-        
-        # 메타데이터와 특징 분리
-        metadata = df[['종목코드', '날짜', '시간']].values
-        
-        # ✅ 메타데이터 컬럼 제외한 특징만 추출
-        feature_df = df[feature_cols]
-        
-        # ✅ 문자열 컬럼 처리 (Scalar 변환) - create_sequence_batches
-        for col in feature_df.columns:
-            if feature_df[col].dtype == 'object' or feature_df[col].dtype == 'string':
-                # logger.debug(f"Converting string column to scalar: {col}")
-                feature_df[col] = compute_stock_name_scalar_batch(feature_df[col])
-
-        features = feature_df.values.astype(np.float32)
-        
-        # 데이터 정제
-        features = np.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
-        
-        # ✅ 정규화 적용
+        strategies = []
         if self.normalization_params:
-            mean = np.array(self.normalization_params['mean'])
-            std = np.array(self.normalization_params['std'])
             strategies = self.normalization_params.get('strategies', 
                         [get_normalization_strategy(col) for col in feature_cols])
-            
-            # 1. Log 변환 (필요한 경우)
-            for i, strategy in enumerate(strategies):
-                if strategy == 'log_std':
-                    features[:, i] = signed_log1p(features[:, i])
-            
-            # 2. Z-Score 정규화
-            std = np.where(std == 0, 1, std)  # 0으로 나누기 방지
-            features = (features - mean) / std
+
+        # 배치 버퍼 초기화
+        sequence_buffer = []
+        metadata_buffer = []
+        batch_idx = 0
+        total_sequences = 0
         
-        # 시퀀스 생성
-        logger.info("Generating sequences...")
-        sequences = []
-        sequence_metadata = []
-        
-        i = 0
-        while i <= len(features) - seq_len:
-            # 시퀀스 범위의 메타데이터 확인
-            seq_meta = metadata[i:i+seq_len]
-            stock_codes = seq_meta[:, 0]
-            dates = seq_meta[:, 1]
+        # 2. 종목별 순차 처리
+        for stock_code in tqdm(stock_codes, desc="Processing stocks"):
+            # 종목별 데이터 로드
+            query = f"""
+                SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
+                FROM datasets
+                WHERE 종목코드 = '{stock_code}' AND {date_where_clause}
+                ORDER BY 날짜, 시간
+            """
             
-            # 동일 종목, 동일 날짜인지 확인
-            if len(np.unique(stock_codes)) == 1 and len(np.unique(dates)) == 1:
-                sequences.append(features[i:i+seq_len])
-                sequence_metadata.append(metadata[i])  # 시작점 메타데이터
-                i += stride
+            df = self.conn.execute(query).fetchdf()
+            if len(df) <= seq_len:
+                continue
+                
+            # 메타데이터와 특징 분리
+            stock_metadata = df[['종목코드', '날짜', '시간']].values
+            feature_df = df[feature_cols]
+            
+            # 문자열 컬럼 처리 (Scalar 변환)
+            for col in feature_df.columns:
+                if feature_df[col].dtype == 'object' or feature_df[col].dtype == 'string':
+                    feature_df[col] = compute_stock_name_scalar_batch(feature_df[col])
+
+            features = feature_df.values.astype(np.float32)
+            features = np.nan_to_num(features, nan=0.0, posinf=1e10, neginf=-1e10)
+            
+            # 정규화 적용
+            if self.normalization_params:
+                # 1. Log 변환
+                for i, strategy in enumerate(strategies):
+                    if strategy == 'log_std':
+                        features[:, i] = signed_log1p(features[:, i])
+                
+                # 2. Z-Score
+                features = (features - mean) / std
+                
+            # 시퀀스 생성 (Vectorized Sliding Window)
+            # stride가 1일 때만 이 방식 사용 가능, 아니면 기존 루프 방식 사용
+            if stride == 1:
+                # numpy stride tricks could be used here, but for simplicity/readability reusing loop or optimized approach
+                # 간단한 슬라이싱 루프 (메모리 효율 고려)
+                num_seq = len(features) - seq_len + 1
+                for i in range(0, num_seq, stride):
+                    # 날짜가 연속적인지 등 체크는 여기서 생략 (단일 종목이므로 대부분 연속, 날짜 바뀌는 경계만 주의)
+                    # *중요*: 날짜/시간 불연속성이 큰 경우(장 마감 후 다음날)를 구분해야 하면
+                    # 메타데이터의 날짜를 확인해야 함.
+                    # 여기서는 간단히 날짜가 바뀌는 지점 허용 (AutoEncoder는 패턴 학습이므로)
+                    # 단, 기존에는 (동일 종목, 동일 날짜) 조건이 있었음 -> 이를 유지하려면:
+                    
+                    seq_dates = stock_metadata[i:i+seq_len, 1]
+                    if seq_dates[0] == seq_dates[-1]: # 같은 날짜인 경우만
+                        sequence_buffer.append(features[i:i+seq_len])
+                        metadata_buffer.append(stock_metadata[i])
             else:
-                # 다음 유효한 시작점으로 이동
-                i += 1
-        
-        sequences = np.array(sequences, dtype=np.float32)
-        sequence_metadata = np.array(sequence_metadata)
-        
-        logger.info(f"Generated {len(sequences)} sequences")
-        
-        # 배치별로 저장
-        num_batches = (len(sequences) + batch_size - 1) // batch_size
-        
+                 # Stride > 1 인 경우
+                i = 0
+                while i <= len(features) - seq_len:
+                    seq_dates = stock_metadata[i:i+seq_len, 1]
+                    if seq_dates[0] == seq_dates[-1]:
+                        sequence_buffer.append(features[i:i+seq_len])
+                        metadata_buffer.append(stock_metadata[i])
+                        i += stride
+                    else:
+                        i += 1
+
+            # 버퍼가 배치 크기를 넘으면 저장
+            while len(sequence_buffer) >= batch_size:
+                # 배치 추출
+                batch_seqs = np.array(sequence_buffer[:batch_size], dtype=np.float32)
+                batch_meta = np.array(metadata_buffer[:batch_size])
+                
+                # 나머지 버퍼 유지
+                sequence_buffer = sequence_buffer[batch_size:]
+                metadata_buffer = metadata_buffer[batch_size:]
+                
+                # 저장
+                batch_file = self.output_dir / f'batch_{batch_idx:06d}.h5'
+                with h5py.File(batch_file, 'w') as f:
+                    f.create_dataset('sequences', data=batch_seqs, compression='gzip', compression_opts=6)
+                    f.create_dataset('metadata', data=batch_meta.astype('S20'))
+                
+                batch_idx += 1
+                total_sequences += batch_size
+                
+                # Max Samples 체크 (전체 누적 기준)
+                if max_samples and total_sequences >= max_samples:
+                    logger.info(f"Reached max samples limit: {max_samples}")
+                    break
+            
+            if max_samples and total_sequences >= max_samples:
+                break
+
+        # 남은 버퍼 저장
+        if sequence_buffer:
+            batch_seqs = np.array(sequence_buffer, dtype=np.float32)
+            batch_meta = np.array(metadata_buffer)
+            
+            batch_file = self.output_dir / f'batch_{batch_idx:06d}.h5'
+            with h5py.File(batch_file, 'w') as f:
+                f.create_dataset('sequences', data=batch_seqs, compression='gzip', compression_opts=6)
+                f.create_dataset('metadata', data=batch_meta.astype('S20'))
+            
+            batch_idx += 1
+            total_sequences += len(batch_seqs)
+
+        # 배치 정보 저장
         batch_info = {
-            'num_batches': num_batches,
+            'num_batches': batch_idx,
             'batch_size': batch_size,
             'seq_len': seq_len,
-            'num_features': features.shape[1],
-            'total_sequences': len(sequences)
+            'num_features': len(feature_cols),
+            'total_sequences': total_sequences
         }
         
-        logger.info(f"Saving {num_batches} batches...")
-        
-        for batch_idx in tqdm(range(num_batches), desc="Saving batches"):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(sequences))
-            
-            batch_sequences = sequences[start_idx:end_idx]
-            batch_metadata = sequence_metadata[start_idx:end_idx]
-            
-            # HDF5로 저장 (압축 및 빠른 로딩)
-            batch_file = self.output_dir / f'batch_{batch_idx:06d}.h5'
-            
-            with h5py.File(batch_file, 'w') as f:
-                f.create_dataset('sequences', data=batch_sequences, compression='gzip', compression_opts=6)
-                f.create_dataset('metadata', data=batch_metadata.astype('S20'))  # 문자열을 바이트로 저장
-        
-        # 배치 정보 저장
         with open(self.output_dir / 'batch_info.json', 'w') as f:
             json.dump(batch_info, f, indent=2)
-        
-        logger.info(f"Sequence batches saved to {self.output_dir}")
+            
+        logger.info(f"Completed! Total sequences: {total_sequences}, Batches: {batch_idx}")
         return batch_info
     
     def create_memory_mapped_file(self, sequences: np.ndarray, filename: str = 'sequences.dat'):
