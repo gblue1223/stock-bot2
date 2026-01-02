@@ -128,6 +128,13 @@ class AutoEncoderPreprocessor:
             json.dump(self.normalization_params, f, indent=2)
         
         logger.info("Normalization parameters computed and saved")
+
+    def load_normalization_params(self, params_path: str):
+        """외부 파일에서 정규화 파라미터 로드"""
+        logger.info(f"Loading normalization parameters from {params_path}")
+        with open(params_path, 'r') as f:
+            self.normalization_params = json.load(f)
+        logger.info("Normalization parameters loaded")
     
     def create_sequence_batches(
         self,
@@ -315,6 +322,7 @@ def main():
     parser.add_argument('--start-date', help='시작 날짜 (YYYY-MM-DD)')
     parser.add_argument('--end-date', help='종료 날짜 (YYYY-MM-DD)')
     parser.add_argument('--compute-norm-params', action='store_true', help='정규화 파라미터 계산')
+    parser.add_argument('--load-norm-params', help='기존 정규화 파라미터 파일 경로')
     parser.add_argument('--create-batches', action='store_true', help='배치 파일 생성')
     
     args = parser.parse_args()
@@ -325,7 +333,9 @@ def main():
     preprocessor.connect()
     
     try:
-        if args.compute_norm_params:
+        if args.load_norm_params:
+            preprocessor.load_normalization_params(args.load_norm_params)
+        elif args.compute_norm_params:
             preprocessor.compute_normalization_params()
         
         if args.create_batches:

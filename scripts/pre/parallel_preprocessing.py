@@ -23,12 +23,12 @@ def process_month_data(args_tuple: Tuple) -> dict:
     단일 월 데이터 처리
     
     Args:
-        args_tuple: (db_path, year, month, output_base_dir, seq_len, batch_size, max_samples)
+        args_tuple: (db_path, year, month, output_base_dir, seq_len, batch_size, max_samples, norm_params_path)
     
     Returns:
         처리 결과 딕셔너리
     """
-    db_path, year, month, output_base_dir, seq_len, batch_size, max_samples = args_tuple
+    db_path, year, month, output_base_dir, seq_len, batch_size, max_samples, norm_params_path = args_tuple
     
     # 월별 출력 디렉토리
     output_dir = f"{output_base_dir}/{year}_{month:02d}"
@@ -53,7 +53,7 @@ def process_month_data(args_tuple: Tuple) -> dict:
             "--batch-size", str(batch_size),
             "--start-date", start_date_str,
             "--end-date", end_date_str,
-            "--compute-norm-params",
+            "--load-norm-params", norm_params_path,
             "--create-batches"
         ]
         
@@ -137,6 +137,27 @@ def parallel_preprocess_months(
     
     logger.info(f"Processing {len(months)} months in parallel: {months}")
     
+    # 0. 정규화 파라미터 전역 계산 (1회)
+    norm_params_path = f"{output_base_dir}/normalization_params.json"
+    logger.info("Computing global normalization parameters (once)...")
+    
+    try:
+        cmd = [
+            ".venv64/Scripts/python", "scripts/pre/preprocess_for_autoencoder.py",
+            "--db", db_path,
+            "--output-dir", output_base_dir,
+            "--compute-norm-params"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error(f"Failed to compute normalization params: {result.stderr}")
+            return []
+        logger.info(f"Global normalization parameters saved to {norm_params_path}")
+        
+    except Exception as e:
+        logger.error(f"Exception while computing normalization params: {e}")
+        return []
+
     # 워커 수 결정
     if max_workers is None:
         max_workers = min(len(months), mp.cpu_count() - 1)
@@ -145,7 +166,7 @@ def parallel_preprocess_months(
     
     # 작업 인수 준비
     task_args = [
-        (db_path, year, month, output_base_dir, seq_len, batch_size, max_samples)
+        (db_path, year, month, output_base_dir, seq_len, batch_size, max_samples, norm_params_path)
         for year, month in months
     ]
     
