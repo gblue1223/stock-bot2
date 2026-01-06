@@ -139,24 +139,27 @@ def parallel_preprocess_months(
     
     # 0. 정규화 파라미터 전역 계산 (1회)
     norm_params_path = f"{output_base_dir}/normalization_params.json"
-    logger.info("Computing global normalization parameters (once)...")
     
-    try:
-        cmd = [
-            ".venv64/Scripts/python", "scripts/pre/preprocess_for_autoencoder.py",
-            "--db", db_path,
-            "--output-dir", output_base_dir,
-            "--compute-norm-params"
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            logger.error(f"Failed to compute normalization params: {result.stderr}")
+    if Path(norm_params_path).exists():
+        logger.info(f"Found existing normalization params at {norm_params_path}. Skipping computation.")
+    else:
+        logger.info("Computing global normalization parameters (once)...")
+        try:
+            cmd = [
+                ".venv64/Scripts/python", "scripts/pre/preprocess_for_autoencoder.py",
+                "--db", db_path,
+                "--output-dir", output_base_dir,
+                "--compute-norm-params"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logger.error(f"Failed to compute normalization params: {result.stderr}")
+                return []
+            logger.info(f"Global normalization parameters saved to {norm_params_path}")
+            
+        except Exception as e:
+            logger.error(f"Exception while computing normalization params: {e}")
             return []
-        logger.info(f"Global normalization parameters saved to {norm_params_path}")
-        
-    except Exception as e:
-        logger.error(f"Exception while computing normalization params: {e}")
-        return []
 
     # 워커 수 결정
     if max_workers is None:
@@ -165,10 +168,26 @@ def parallel_preprocess_months(
     logger.info(f"Using {max_workers} parallel workers")
     
     # 작업 인수 준비
-    task_args = [
-        (db_path, year, month, output_base_dir, seq_len, batch_size, max_samples, norm_params_path)
-        for year, month in months
-    ]
+    task_args = []
+    skipped_count = 0
+    
+    for year, month in months:
+        month_output_dir = Path(output_base_dir) / f"{year}_{month:02d}"
+        if (month_output_dir / "batch_info.json").exists():
+            logger.info(f"Skipping {year}-{month:02d} (already completed)")
+            skipped_count += 1
+            continue
+            
+        task_args.append(
+            (db_path, year, month, output_base_dir, seq_len, batch_size, max_samples, norm_params_path)
+        )
+    
+    if skipped_count > 0:
+        logger.info(f"Skipped {skipped_count} already completed months.")
+    
+    if not task_args:
+        logger.info("All months are already processed. Nothing to do.")
+        return []
     
     # 병렬 처리 실행
     results = []
