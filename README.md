@@ -46,6 +46,64 @@
 
 ## 🚀 빠른 시작
 
+## 0단계: 데이터 정규화
+
+```bash
+python scripts/data/generate_datasets.py \
+  "D:\Workspace\Project\stock-bot\hoga-crawler\data" \
+  -o "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+  --workers 12 \
+  --tmp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
+  --checkpoint-interval 50 \
+  --single-output \
+  --start-date 20250922 --end-date 20250930
+
+python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
+  --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+  --temp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
+  --threads 4 \
+  --memory-limit 64GB
+
+python scripts/data/normalize_datasets.py \
+  "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+  -o "C:\Users\user\Workspace\datasets\datasets_norm.duckdb" \
+  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
+  --workers 12 \
+  --time-start 90000000 \
+  --time-end 110000000 \
+  --checkpoint-interval 50 \
+  --ignoring-stocks-csv scripts/data/ignoring_stocks.csv \
+  --trade-threshold 3000.0 \
+  --qualifying-minutes 1
+
+python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
+  --out "C:\Users\user\Workspace\datasets\datasets_norm_all.duckdb" \
+  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
+  --threads 4 \
+  --memory-limit 64GB
+
+# OR
+
+python scripts/data/export_datasets.py \
+  --input-db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+  --output-db "C:\Users\user\Workspace\datasets\datasets_raw.duckdb" \
+  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
+  --table-name datasets_raw \
+  --workers 12 \
+  --time-start 90000000 \
+  --time-end 110000000 \
+  --checkpoint-interval 50 \
+  --trade-threshold-per-minute 3000 \
+  --qualifying-minutes 1
+
+python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
+  --out "C:\Users\user\Workspace\datasets\datasets_raw_all.duckdb" \
+  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
+  --table datasets_raw \
+  --threads 4 \
+  --memory-limit 64GB
+```
+
 ### 1단계: AutoEncoder 훈련
 
 ```bash
@@ -89,7 +147,7 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장)
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-    --embedding_model "models/autoencoder@20251013/model.pt" \
+    --embedding_model "models/autoencoder@20260109/model.pt" \
     --seq_len 60 \
     --features 28 \
     --total_timesteps 100000 \
@@ -102,7 +160,7 @@ python ai_trader/grpo/train_scalping.py --config config/training_config.json
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-    --embedding_model "models/autoencoder@20251013/model.pt" \
+    --embedding_model "models/autoencoder@20260109/model.pt" \
     --load_policy "models/grpo_scalping/checkpoint_iter100.pt" \
     --total_timesteps 50000 \
     --lr 0.0001 \
@@ -389,65 +447,7 @@ pip install -e .
 
 ```bash
 # .env 파일 생성
-DB_PATH="C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
+DB_PATH="C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb"
 MODEL_DIR="models"
 DEVICE="cuda"  # 또는 "cpu"
-```
-
-## 데이터 정규화
-
-```bash
-python scripts/data/generate_datasets.py \
-  "D:\Workspace\Project\stock-bot\hoga-crawler\data" \
-  -o "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  --workers 12 \
-  --tmp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
-  --checkpoint-interval 50 \
-  --single-output \
-  --start-date 20250922 --end-date 20250930
-
-python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
-  --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  --temp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
-  --threads 4 \
-  --memory-limit 64GB
-
-python scripts/data/normalize_datasets.py \
-  "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  -o "C:\Users\user\Workspace\datasets\datasets_norm.duckdb" \
-  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --workers 12 \
-  --time-start 90000000 \
-  --time-end 110000000 \
-  --checkpoint-interval 50 \
-  --ignoring-stocks-csv scripts/data/ignoring_stocks.csv \
-  --trade-threshold 3000.0 \
-  --qualifying-minutes 1
-
-python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
-  --out "C:\Users\user\Workspace\datasets\datasets_norm_all.duckdb" \
-  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --threads 4 \
-  --memory-limit 64GB
-
-# OR
-
-python scripts/data/export_datasets.py \
-  --input-db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  --output-db "C:\Users\user\Workspace\datasets\datasets_raw.duckdb" \
-  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --table-name datasets_raw \
-  --workers 12 \
-  --time-start 90000000 \
-  --time-end 110000000 \
-  --checkpoint-interval 50 \
-  --trade-threshold-per-minute 3000 \
-  --qualifying-minutes 1
-
-python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
-  --out "C:\Users\user\Workspace\datasets\datasets_raw_all.duckdb" \
-  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --table datasets_raw \
-  --threads 4 \
-  --memory-limit 64GB
 ```

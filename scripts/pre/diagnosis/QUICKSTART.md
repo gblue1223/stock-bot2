@@ -27,8 +27,8 @@ python scripts/pre/diagnosis/evaluate_autoencoder.py
 ```
 
 기본 경로:
-- 모델: `C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt`
-- DB: `C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb`
+- 모델: `C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt`
+- DB: `C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb`
 - 출력: `scripts/pre/diagnosis/results/`
 
 ### 방법 2: Windows 배치 파일 사용
@@ -118,7 +118,7 @@ python scripts/pre/diagnosis/test_imports.py
 
 ```bash
 # 파일 존재 확인
-ls -l "C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb"
+ls -l "C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb"
 
 # 읽기 권한 확인
 # 다른 프로세스가 파일을 사용 중인지 확인

@@ -62,8 +62,8 @@ python examples/autoencoder_training_example.py \
 ```bash
 # 단일 월 전처리
 python scripts/pre/preprocess_for_autoencoder.py \
-    --db "C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb" \
-    --output-dir "C:\Users\user\Workspace\datasets@20251013\pre_training_data\2024_09" \
+    --db "C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb" \
+    --output-dir "C:\Users\user\Workspace\datasets@20260109\pre_training_data\2024_09" \
     --seq-len 60 \
     --batch-size 5000 \
     --start-date 2024-09-01 \
@@ -73,12 +73,12 @@ python scripts/pre/preprocess_for_autoencoder.py \
 
 # 병렬 전처리 (권장)
 python scripts/pre/parallel_preprocessing.py \
-    --db "C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb" \
+    --db "C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb" \
     --seq-len 60 \
     --batch-size 5000 \
     --start-year 2024 --start-month 9 \
     --end-year 2025 --end-month 9 \
-    --output "C:\Users\user\Workspace\datasets@20251013\pre_training_data" \
+    --output "C:\Users\user\Workspace\datasets@20260109\pre_training_data" \
     --max-workers 2
 ```
 

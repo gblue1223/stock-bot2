@@ -1,7 +1,7 @@
 {
   "timestamp": "2025-10-18T15:20:47.681438",
-  "model_path": "C:\\Users\\user\\Workspace\\datasets@20251013\\autoencoder\\model.pt",
-  "db_path": "C:\\Users\\user\\Workspace\\datasets@20251013\\datasets_norm_all.duckdb",
+  "model_path": "C:\\Users\\user\\Workspace\\datasets@20260109\\autoencoder\\model.pt",
+  "db_path": "C:\\Users\\user\\Workspace\\datasets@20260109\\datasets_norm_all.duckdb",
   "config": {
     "input_dim": 28,
     "embedding_dim": 128,

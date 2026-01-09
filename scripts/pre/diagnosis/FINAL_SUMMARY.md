@@ -3,7 +3,7 @@
 ## 평가 완료 ✅
 
 **일시:** 2025-10-18  
-**모델:** C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt  
+**모델:** C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt  
 **데이터베이스:** 685개 종목, 312,195,250 레코드
 
 ## 핵심 결과
@@ -80,8 +80,8 @@
 **명령어:**
 ```bash
 python -m ai_trader.grpo.train_grpo \
-    --embedding-model C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt \
-    --db C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb \
+    --embedding-model C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt \
+    --db C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb \
     --out models/grpo_scalping \
     --episodes-per-group 12 \
     --device cuda
@@ -136,8 +136,8 @@ Silhouette Score를 평가하지 못한 것은 아쉽지만, 이는 평가 샘�
 ```bash
 # 1. GRPO 학습 시작
 python -m ai_trader.grpo.train_grpo \
-    --embedding-model C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt \
-    --db C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb \
+    --embedding-model C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt \
+    --db C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb \
     --out models/grpo_scalping \
     --device cuda
 

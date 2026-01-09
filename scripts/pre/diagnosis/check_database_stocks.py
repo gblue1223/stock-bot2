@@ -121,7 +121,7 @@ def main():
     parser.add_argument(
         "--db",
         type=str,
-        default=r"C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb",
+        default=r"C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb",
         help="DuckDB 데이터베이스 경로",
     )
     parser.add_argument(

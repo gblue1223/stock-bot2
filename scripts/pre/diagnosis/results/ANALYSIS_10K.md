@@ -1,8 +1,8 @@
 # AutoEncoder 모델 평가 결과 분석 (10,000 샘플)
 
 **평가 일시:** 2025-10-18 15:20:47  
-**모델:** C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt  
-**데이터:** C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb  
+**모델:** C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt  
+**데이터:** C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb  
 **샘플 수:** 10,000 (Test: 1,500, Sequences: 1,441)
 
 ## 모델 구성
@@ -166,8 +166,8 @@
 ```bash
 # GRPO 학습 시작
 python -m ai_trader.grpo.train_grpo \
-    --embedding-model C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt \
-    --db C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb \
+    --embedding-model C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt \
+    --db C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb \
     --out models/grpo_scalping \
     --device cuda
 ```
@@ -214,7 +214,7 @@ python -m ai_trader.grpo.train_grpo \
 # 데이터베이스 내 종목 확인
 python -c "
 import duckdb
-conn = duckdb.connect('C:/Users/user/Workspace/datasets@20251013/datasets_norm_all.duckdb')
+conn = duckdb.connect('C:/Users/user/Workspace/datasets@20260109/datasets_norm_all.duckdb')
 print(conn.execute('SELECT DISTINCT 종목코드 FROM datasets LIMIT 10').fetchall())
 "
 ```

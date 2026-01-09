@@ -279,7 +279,7 @@ def main():
   # CLI 인자 사용 (scalping env + grpo policy)
   python ai_trader/grpo/train_scalping.py \
     --db "C:\\Users\\user\\Workspace\\datasets@raw\\datasets_all.duckdb" \
-    --embedding_model "models/autoencoder@20251013/model.pt" \
+    --embedding_model "models/autoencoder@20260109/model.pt" \
     --seq_len 60 \
     --features 28 \
     --total_timesteps 100000 \

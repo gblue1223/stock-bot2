@@ -1,37 +1,29 @@
 {
   "_comment": "실전 거래 설정 예시 파일",
   "_usage": "cp config/trading_config.example.json config/trading_config.json",
-  
-  "model_path": "models/grpo_direct_features@20251016/direct_features_model.pt",
+  "model_path": "models/grpo_direct_features@20260109/direct_features_model.pt",
   "embedding_model_path": null,
   "device": "cuda",
-  
   "target_stocks": [
     "005930",
     "000660"
   ],
-  
   "max_position_size": 1000000,
   "max_positions": 3,
-  
   "min_buy_confidence": 0.0,
   "min_sell_confidence": 0.0,
   "stop_loss_rate": -2.0,
   "take_profit_rate": 5.0,
   "max_holding_period": 100,
-  
   "market_start": "09:00",
   "market_end": "15:30",
   "trading_start": "09:00",
   "trading_end": "11:00",
-  
   "seq_len": 30,
   "num_features": 24,
   "update_interval": 1.0,
-  
   "koapys_base_url": "http://localhost:5000",
   "simulation": true,
-  
   "_notes": {
     "target_stocks": "거래 대상 종목 코드 (005930: 삼성전자, 000660: SK하이닉스)",
     "max_position_size": "종목당 최대 투자 금액 (원)",

@@ -1,8 +1,8 @@
 # AutoEncoder 모델 평가 결과 분석
 
 **평가 일시:** 2025-10-18 15:17:39  
-**모델:** C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt  
-**데이터:** C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb
+**모델:** C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt  
+**데이터:** C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb
 
 ## 모델 구성
 

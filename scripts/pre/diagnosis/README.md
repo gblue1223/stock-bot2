@@ -60,8 +60,8 @@ python scripts/pre/diagnosis/evaluate_autoencoder.py --device cpu
 ```
 
 **파라미터:**
-- `--model`: 모델 파일 경로 (기본값: `C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt`)
-- `--db`: DuckDB 데이터베이스 경로 (기본값: `C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb`)
+- `--model`: 모델 파일 경로 (기본값: `C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt`)
+- `--db`: DuckDB 데이터베이스 경로 (기본값: `C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb`)
 - `--device`: 디바이스 선택 (cuda/cpu, 기본값: cuda)
 - `--output`: 결과 저장 디렉토리 (기본값: `scripts/pre/diagnosis/results`)
 - `--max-samples`: 평가에 사용할 최대 샘플 수 (기본값: 10000)
@@ -106,8 +106,8 @@ pip install torch numpy matplotlib seaborn scikit-learn duckdb
 Starting Full Evaluation
 =============================================================
 Device: cuda
-Model: C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt
-Database: C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb
+Model: C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt
+Database: C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb
 Output: scripts/pre/diagnosis/results
 
 Loading model...

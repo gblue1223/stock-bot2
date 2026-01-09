@@ -13,8 +13,8 @@ echo Current directory: %CD%
 echo.
 
 REM 기본 경로 설정
-set MODEL_PATH=C:\Users\user\Workspace\datasets@20251013\autoencoder\model.pt
-set DB_PATH=C:\Users\user\Workspace\datasets@20251013\datasets_norm_all.duckdb
+set MODEL_PATH=C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt
+set DB_PATH=C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb
 set OUTPUT_DIR=scripts\pre\diagnosis\results
 set DEVICE=cuda
 set MAX_SAMPLES=10000
