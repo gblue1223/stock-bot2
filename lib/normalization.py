@@ -460,4 +460,32 @@ def compute_time_features_batch(time_series: pd.Series, use_zscore_for_scalar: b
     
     return pd.Series(time_sin, index=time_series.index), \
            pd.Series(time_cos, index=time_series.index), \
-           pd.Series(time_scalar, index=time_series.index)
+
+# ============================================================================
+# Feature Definition Functions (Moved from ai_trader/lstm/train.py)
+# ============================================================================
+
+def get_requested_features() -> list[str]:
+    """
+    Returns all columns needed for data loading and grouping.
+    Note: 날짜, 종목코드, 종목명, 시간 are used for grouping/filtering but excluded from model features.
+    Only their encoded versions (종목명_scalar, 시간_sin, etc.) are used as model inputs.
+    """
+    return [
+        "날짜", "종목코드", "종목명", "시간", "등락률", "누적거래대금", "거래회전율", "체결강도", 
+        "매도대기금액1", "매도대기금액2", "매도대기금액3", "매도대기금액4", "매도대기금액5",
+        "매도대기금액6", "매도대기금액7", "매도대기금액8", "매도대기금액9", "매도대기금액10",
+        "매수대기금액1", "매수대기금액2", "매수대기금액3", "매수대기금액4", "매수대기금액5",
+        "매수대기금액6", "매수대기금액7", "매수대기금액8", "매수대기금액9", "매수대기금액10",
+        "종목명_scalar", "시간_sin", "시간_cos", "시간_scalar"
+    ]
+
+
+def get_model_features(all_features: list[str]) -> list[str]:
+    """
+    Filters out non-numeric identifier columns that cannot be used as model inputs.
+    Excludes: 날짜, 종목코드, 종목명, 시간 (string/identifier columns)
+    Keeps: their encoded versions and all numeric features
+    """
+    exclude_cols = {"날짜", "종목코드", "종목명", "시간"}
+    return [c for c in all_features if c not in exclude_cols]
