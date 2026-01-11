@@ -51,7 +51,7 @@ FINAL_COLUMNS: List[str] = [
     *[f"매수대기금액{i}" for i in range(1, 11)],
 ]
 
-def _to_time_ms(val: object) -> int:
+def to_time_ms(val: object) -> int:
     """Convert various time formats to a 9-digit HHMMSSmmm integer.
     Supports:
     - 'HHMMSSmmm' (9 digits)
@@ -89,16 +89,16 @@ def _to_time_ms(val: object) -> int:
     except Exception:
         return 0
 
-def _normalize_cli_time(t: int) -> int:
-    """Normalize CLI time argument to a 9-digit HHMMSSmmm integer using _to_time_ms.
+def normalize_cli_time(t: int) -> int:
+    """Normalize CLI time argument to a 9-digit HHMMSSmmm integer using to_time_ms.
     Accepts digit-only inputs; if colon format is used upstream, ensure it's converted to digits before passing.
     """
     try:
-        return _to_time_ms(t)
+        return to_time_ms(t)
     except Exception:
         return 0
 
-def _load_ignoring_stocks(csv_path: Optional[str]) -> set[str]:
+def load_ignoring_stocks(csv_path: Optional[str]) -> set[str]:
     """Load ignoring stock names from a CSV file that contains a '종목명' column.
     Returns a set of stripped names. Returns empty set on error or if path is None.
     """
@@ -176,7 +176,7 @@ def find_duckdb_groups(input_db: str) -> Dict[str, Dict[str, Tuple[str, str, str
     return groups
 
 
-def _clean_column_name(col: str) -> str:
+def clean_column_name(col: str) -> str:
     # 내부 공백 제거 및 알려진 별칭 통일
     c = re.sub(r"\s+", "", col)
     if c == "스탬프":
@@ -184,7 +184,7 @@ def _clean_column_name(col: str) -> str:
     return c
 
 
-def _count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: float) -> Optional[int]:
+def count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: float) -> Optional[int]:
     """
     각 분(minute) 단위로 누적거래대금이 임계값 이상 증가한 분의 개수를 계산합니다.
     
@@ -224,7 +224,7 @@ def _count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: flo
     trade_values = pd.to_numeric(df['누적거래대금'], errors='coerce')
     
     # 시간을 초 단위로 변환 (HHMMSSmmm 형식 -> 초)
-    time_secs = df['시간'].apply(_time_ms_to_seconds)
+    time_secs = df['시간'].apply(time_ms_to_seconds)
     time_secs = pd.to_numeric(time_secs, errors='coerce')
 
     # 3. 유효한 데이터 필터링: NaN이 아닌 값만 선택
@@ -261,7 +261,8 @@ def _count_trade_value_minutes(df: pd.DataFrame, trade_threshold_per_minute: flo
 def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str, 
                                 time_start: int = 90000000, time_end: int = 110000000,
                                 trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
-                                min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES) -> pd.DataFrame:
+                                min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES,
+                                ignoring_stocks_set: Optional[set[str]] = None) -> pd.DataFrame:
     """
     DuckDB에서 특정 종목코드/날짜의 데이터를 로드하고 기본 정리
     time_start: 시작 시간 (기본: 90000000 = 오전 9시)
@@ -282,12 +283,18 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
                 return pd.DataFrame()
             
             # 컬럼명 정규화 (이미 정규화되어 있을 수 있지만 안전장치)
-            df = df.rename(columns={c: _clean_column_name(c) for c in df.columns})
+            df = df.rename(columns={c: clean_column_name(c) for c in df.columns})
 
             # 종목명 필터링: IGNORING_STOCKS에 포함된 종목은 제외
             if '종목명' in df.columns:
                 n_before_ignore = len(df)
-                mask_ignore = df['종목명'].astype(str).str.strip().isin(IGNORING_STOCKS_SET)
+                # Use passed set or empty set (stateless preference) or fallback to global if compatible? 
+                # Better to rely on passed set for purity, but for backward compat in this file we can check global.
+                # However, for pure statelessness, caller should pass it.
+                # Let's default to global IGNORING_STOCKS_SET if argument is None
+                target_set = ignoring_stocks_set if ignoring_stocks_set is not None else IGNORING_STOCKS_SET
+                
+                mask_ignore = df['종목명'].astype(str).str.strip().isin(target_set)
                 if mask_ignore.any():
                     df = df[~mask_ignore]
                     removed = n_before_ignore - len(df)
@@ -299,7 +306,7 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
             # 시간 필터링 적용 (HHMMSSmmm 정수 기준)
             if '시간' in df.columns:
                 # 각 행의 시간값을 9자리 HHMMSSmmm 정수로 정규화 (한 번만 계산)
-                conv = df['시간'].apply(_to_time_ms)
+                conv = df['시간'].apply(to_time_ms)
                 # 진단 로그: 시간창, 변환 최소/최대, 샘플
                 if not conv.empty:
                     try:
@@ -322,7 +329,7 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
                 df = df.drop(columns=['시간_hhmmssmmm'])
             
             if trade_threshold_per_minute > 0:
-                qualifying_minutes = _count_trade_value_minutes(df, trade_threshold_per_minute)
+                qualifying_minutes = count_trade_value_minutes(df, trade_threshold_per_minute)
                 if qualifying_minutes is None:
                     print(f"[FILTER] 누적거래대금 데이터 부족으로 제외 ({name}, {date})")
                     return pd.DataFrame()
@@ -374,7 +381,7 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _compute_order_book_amounts(df: pd.DataFrame) -> pd.DataFrame:
+def compute_order_book_amounts(df: pd.DataFrame) -> pd.DataFrame:
     """Multiply price and quantity columns to derive waiting amounts."""
     add_cols: Dict[str, pd.Series] = {}
     for i in range(1, 11):
@@ -402,7 +409,8 @@ def _compute_order_book_amounts(df: pd.DataFrame) -> pd.DataFrame:
 def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: str, name: str, date: str,
                       time_start: int = 90000000, time_end: int = 110000000,
                       trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
-                      min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES) -> pd.DataFrame:
+                      min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES,
+                      ignoring_stocks_set: Optional[set[str]] = None) -> pd.DataFrame:
     """
     DuckDB에서 데이터를 로드하여 병합 (이미 병합된 데이터인 경우 그대로 반환)
     """
@@ -418,6 +426,7 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
             time_end,
             trade_threshold_per_minute=trade_threshold_per_minute,
             min_qualifying_minutes=min_qualifying_minutes,
+            ignoring_stocks_set=ignoring_stocks_set,
         )
         
         if df.empty:
@@ -431,7 +440,7 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
         df['종목명'] = df.get('종목명', pd.Series(index=df.index, dtype=object)).fillna(name).replace({"": name})
 
         # 호가 기반 대기금액 계산
-        df = _compute_order_book_amounts(df)
+        df = compute_order_book_amounts(df)
 
         # 누락 컬럼 생성 (최종 스키마 강제)
         missing_final_columns = [col for col in FINAL_COLUMNS if col not in df.columns]
@@ -467,15 +476,15 @@ def _signed_log1p(arr: pd.Series) -> pd.Series:
     return pd.Series(result, index=arr.index)
 
 
-def _time_ms_to_seconds(t: int) -> int:
+def time_ms_to_seconds(t: int) -> int:
     """
     Convert a 9-digit HHMMSSmmm integer (milliseconds) to seconds since 00:00:00.
 
-    - If input is malformed, it is coerced via `_to_time_ms` first.
+    - If input is malformed, it is coerced via `to_time_ms` first.
     - Milliseconds are discarded.
     """
     try:
-        t9 = _to_time_ms(t)
+        t9 = to_time_ms(t)
         s = str(int(t9)).rjust(9, '0')
         hh = int(s[0:2])
         mm = int(s[2:4])
@@ -663,8 +672,7 @@ def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame):
-    table = "datasets"
+def ensure_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame, table: str = "datasets"):
     # Create table if not exists
     try:
         conn.execute(f"DESCRIBE {table}")
@@ -716,12 +724,12 @@ def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFra
         "CREATE INDEX IF NOT EXISTS idx_datasets_code_date_time ON datasets(\"날짜\", \"종목코드\", \"시간\")")
 
 
-def _month_key_from_yyyymmdd(date_str: str) -> str:
+def month_key_from_yyyymmdd(date_str: str) -> str:
     """Extract YYYYMM from YYYYMMDD string."""
     return date_str[:6] if len(date_str) >= 6 else date_str
 
 
-def _monthly_db_path(base_db_path: str, yyyymm: str) -> str:
+def monthly_db_path(base_db_path: str, yyyymm: str) -> str:
     """Return a per-month DuckDB path based on base path and yyyymm.
     Example: base 'datasets.duckdb' -> 'datasets_YYYYMM.duckdb' in same directory.
     """
@@ -731,6 +739,23 @@ def _monthly_db_path(base_db_path: str, yyyymm: str) -> str:
     return str(p.with_name(f"{stem}_{yyyymm}{suffix}"))
 
 
+def valid_yyyymmdd(s: Optional[str]) -> Optional[str]:
+    """Return s if it matches YYYYMMDD (8 digits), else None."""
+    if s is None:
+        return None
+    s = s.strip()
+    return s if re.fullmatch(r"\d{8}", s) else None
+
+
+def date_in_range(date: str, start: Optional[str], end: Optional[str]) -> bool:
+    """Check if YYYYMMDD `date` is within [start, end] (inclusive). None means open bound."""
+    if start is not None and date < start:
+        return False
+    if end is not None and date > end:
+        return False
+    return True
+
+
 def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: str, group_key: str):
     """Open a DuckDB connection to db_path and ingest the pickle contents, then remove the pickle."""
     try:
@@ -738,7 +763,7 @@ def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: st
             merged_df = _pickle.load(f)
         conn = duckdb.connect(db_path)
         try:
-            ensure_datasets_table_duckdb(conn, merged_df)
+            ensure_table_duckdb(conn, merged_df)
             conn.register("_batch_df", merged_df)
             try:
                 conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
@@ -786,7 +811,7 @@ def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[
         # Ensure ignore set is loaded inside worker/subprocess
         global IGNORING_STOCKS_SET
         if not IGNORING_STOCKS_SET:
-            IGNORING_STOCKS_SET = _load_ignoring_stocks(ignoring_stocks_csv)
+            IGNORING_STOCKS_SET = load_ignoring_stocks(ignoring_stocks_csv)
         parts = group_key.split('_')
         code = parts[0]
         date = parts[-1]
@@ -801,6 +826,7 @@ def _process_single_group_to_pickle(group_key: str, group_info: Dict[str, Tuple[
             time_end,
             trade_threshold_per_minute=trade_threshold_per_minute,
             min_qualifying_minutes=min_qualifying_minutes,
+            ignoring_stocks_set=IGNORING_STOCKS_SET,
         )
         
         if merged_df.empty:
@@ -852,7 +878,7 @@ def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, ch
             # Write to DB
             conn = duckdb.connect(db_path)
             try:
-                ensure_datasets_table_duckdb(conn, merged_df)
+                ensure_table_duckdb(conn, merged_df)
                 conn.register("_batch_df", merged_df)
                 try:
                     conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
@@ -989,7 +1015,7 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, Tuple[str, s
     return processed_count
 
 
-def _checkpoint_db_once(db_path: str) -> Tuple[str, bool, str]:
+def checkpoint_db_once(db_path: str) -> Tuple[str, bool, str]:
     """Run DuckDB CHECKPOINT once for the given DB file. Returns (path, ok, msg)."""
     try:
         conn = duckdb.connect(db_path)
@@ -1002,14 +1028,14 @@ def _checkpoint_db_once(db_path: str) -> Tuple[str, bool, str]:
         return db_path, False, f"{type(e).__name__}: {e}"
 
 
-def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: int) -> None:
+def parallel_checkpoint_months(base_db_path: str, months: List[str], workers: int) -> None:
     """Run CHECKPOINT across the given months' DB shards in parallel using up to `workers` processes."""
     if not months:
         return
     # Build existing paths only
     month_paths = []
     for m in months:
-        p = _monthly_db_path(base_db_path, m)
+        p = monthly_db_path(base_db_path, m)
         if os.path.exists(p):
             month_paths.append(p)
     if not month_paths:
@@ -1022,7 +1048,7 @@ def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: i
     if used_workers > 1:
         print(f"  병렬 실행 (workers={used_workers})")
         with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
-            futs = {ex.submit(_checkpoint_db_once, path): path for path in month_paths}
+            futs = {ex.submit(checkpoint_db_once, path): path for path in month_paths}
             completed = 0
             for fut in _fut.as_completed(futs):
                 path = futs[fut]
@@ -1039,7 +1065,7 @@ def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: i
     else:
         print("  순차 실행")
         for i, path in enumerate(month_paths, 1):
-            _, ok, msg = _checkpoint_db_once(path)
+            _, ok, msg = checkpoint_db_once(path)
             if ok:
                 print(f"  [{i}/{len(month_paths)}] CHECKPOINT 완료: {os.path.basename(path)}")
             else:
@@ -1090,8 +1116,8 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
     month_counts: Dict[str, int] = {}
     for i, (group_key, code, date, pkl_path) in enumerate(prepared, 1):
         try:
-            yyyymm = _month_key_from_yyyymmdd(date)
-            db_path = _monthly_db_path(base_db_path, yyyymm)
+            yyyymm = month_key_from_yyyymmdd(date)
+            db_path = monthly_db_path(base_db_path, yyyymm)
             _ingest_pickle_into_db_path(db_path, pkl_path, code, date, group_key)
             # per-month checkpoint interval
             if checkpoint_interval > 0:
@@ -1173,13 +1199,13 @@ def normalize_datasets(input_db: str, output_db: str, *,
     for group_key, group_info in complete_groups.items():
         parts = group_key.split("_")
         date = parts[-1]
-        yyyymm = _month_key_from_yyyymmdd(date)
+        yyyymm = month_key_from_yyyymmdd(date)
         monthly_groups.setdefault(yyyymm, []).append((group_key, group_info))
 
     # force-recreate: 대상 월 DB 삭제
     if force_recreate:
         for yyyymm in monthly_groups.keys():
-            db_path = _monthly_db_path(output_db, yyyymm)
+            db_path = monthly_db_path(output_db, yyyymm)
             if os.path.exists(db_path):
                 try:
                     os.remove(db_path)
@@ -1191,7 +1217,7 @@ def normalize_datasets(input_db: str, output_db: str, *,
     def _filter_skip_existing_for_month(yyyymm: str, groups: List[Tuple[str, Dict[str, Tuple[str, str, str, str]]]]) -> List[Tuple[str, Dict[str, Tuple[str, str, str, str]]]]:
         if not skip_existing:
             return groups
-        db_path = _monthly_db_path(output_db, yyyymm)
+        db_path = monthly_db_path(output_db, yyyymm)
         if not os.path.exists(db_path):
             return groups
         try:
@@ -1253,7 +1279,7 @@ def normalize_datasets(input_db: str, output_db: str, *,
         with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
             futs = {}
             for yyyymm in months:
-                db_path = _monthly_db_path(output_db, yyyymm)
+                db_path = monthly_db_path(output_db, yyyymm)
                 groups = monthly_groups[yyyymm]
                 fut = ex.submit(
                     _process_monthly_groups,
@@ -1282,7 +1308,7 @@ def normalize_datasets(input_db: str, output_db: str, *,
                     done += 1
     else:
         for yyyymm in months:
-            db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
+            db_path = output_db if single_output else monthly_db_path(output_db, yyyymm)
             groups = monthly_groups[yyyymm]
             processed = _process_monthly_groups(
                 groups,
@@ -1302,11 +1328,11 @@ def normalize_datasets(input_db: str, output_db: str, *,
     # 최종 CHECKPOINT 수행
     try:
         if single_output:
-            _checkpoint_db_once(output_db)
+            checkpoint_db_once(output_db)
         else:
             processed_months = months
             if processed_months:
-                _parallel_checkpoint_months(output_db, processed_months, max_workers)
+                parallel_checkpoint_months(output_db, processed_months, max_workers)
     except Exception:
         pass
 

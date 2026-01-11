@@ -1,34 +1,48 @@
 import argparse
 import os
 import re
-import duckdb
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import concurrent.futures as _fut
-import tempfile as _tempfile
+import sys
 import shutil as _shutil
 import pickle as _pickle
+import concurrent.futures as _fut
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
+import duckdb
 import numpy as np
 import pandas as pd
 
 # Global sequential counter for '번호'
 NO_COUNTER: int = 1
 
-FILENAME_PATTERN = re.compile(r"^(?P<code>\d{6})_(?P<name>.+?)_(?P<type>[^_]+)_(?P<date>\d{8})\.csv$")
-TEXT_COLUMNS = {"종목코드", "종목명", "시간", *{f"매도거래원{i}" for i in range(1, 6)}, *{f"매수거래원{i}" for i in range(1, 6)}}
-DROP_COLUMNS = {"종류", "씨리얼"}
-REQUIRED_TYPES = {"execution", "orderbook", "trader"}
-
 # Add project root to sys.path to ensure we can import ai_trader
 project_root = Path(__file__).resolve().parent.parent.parent
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from lib.normalization import get_requested_features
+# Import from shared library
+try:
+    from scripts.data.normalize_datasets import (
+        TEXT_COLUMNS, DROP_COLUMNS, FINAL_COLUMNS,
+        clean_column_name, fill_missing_values,
+        ensure_table_duckdb,
+        month_key_from_yyyymmdd, monthly_db_path,
+        checkpoint_db_once, parallel_checkpoint_months,
+        valid_yyyymmdd, date_in_range
+    )
+except ImportError:
+    sys.path.append(str(Path(__file__).parent))
+    from normalize_datasets import (
+        TEXT_COLUMNS, DROP_COLUMNS, FINAL_COLUMNS,
+        clean_column_name, fill_missing_values,
+        ensure_table_duckdb,
+        month_key_from_yyyymmdd, monthly_db_path,
+        checkpoint_db_once, parallel_checkpoint_months,
+        valid_yyyymmdd, date_in_range
+    )
 
-# Final column order required (dynamically fetched from training logic)
-FINAL_COLUMNS: List[str] = get_requested_features()
+FILENAME_PATTERN = re.compile(r"^(?P<code>\d{6})_(?P<name>.+?)_(?P<type>[^_]+)_(?P<date>\d{8})\.csv$")
+REQUIRED_TYPES = {"execution", "orderbook", "trader"}
 
 
 def find_csv_files(folder_path: str) -> Dict[str, List[str]]:
@@ -66,14 +80,6 @@ def find_csv_files(folder_path: str) -> Dict[str, List[str]]:
     return complete_groups
 
 
-def _clean_column_name(col: str) -> str:
-    # 내부 공백 제거 및 알려진 별칭 통일
-    c = re.sub(r"\s+", "", col)
-    if c == "스탬프":
-        return "시간"
-    return c
-
-
 def load_and_clean_csv(file_path: str) -> pd.DataFrame:
     """
     CSV 파일을 로드하고 기본 정리: 컬럼 이름 정규화 및 불필요 컬럼 제거
@@ -89,23 +95,20 @@ def load_and_clean_csv(file_path: str) -> pd.DataFrame:
         df = pd.read_csv(file_path)
 
     # 컬럼명 정규화
-    df = df.rename(columns={c: _clean_column_name(c) for c in df.columns})
+    df = df.rename(columns={c: clean_column_name(c) for c in df.columns})
     
-    # 중복 컬럼명 처리: 동일 이름 컬럼이 여러 개면, 행 단위로 첫 번째 유효값을 선택해 단일 컬럼으로 축약
+    # 중복 컬럼명 처리
     if df.columns.duplicated().any():
         new_cols = {}
-        for col in dict.fromkeys(df.columns):  # preserve order, unique keys
+        for col in dict.fromkeys(df.columns):
             same = [c for c in df.columns if c == col]
             if len(same) == 1:
                 continue
-            # coalesce across duplicates
             block = df[same]
             new_col = block.bfill(axis=1).iloc[:, 0]
             new_cols[col] = new_col
-        # assign coalesced
         for col, series in new_cols.items():
             df[col] = series
-        # drop duplicates keeping first
         df = df.loc[:, ~df.columns.duplicated()]
  
     # 불필요 컬럼 제거
@@ -118,49 +121,13 @@ def load_and_clean_csv(file_path: str) -> pd.DataFrame:
     return df
 
 
-def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    비어있는 데이터를 직전/직후 데이터로 채우기
-    """
-    # 최후 방어: 중복 컬럼 제거(이미 로드 시 처리했지만 합병 과정에서 생길 수 있음)
-    if df.columns.duplicated().any():
-        df = df.loc[:, ~df.columns.duplicated()]
-    
-    # 번호 컬럼 기준으로 정렬
-    df = df.sort_values('번호').reset_index(drop=True)
-    
-    # 텍스트 컬럼과 숫자 컬럼 분리
-    text_cols = [col for col in df.columns if col in TEXT_COLUMNS]
-    numeric_cols = [col for col in df.columns if col not in TEXT_COLUMNS and col != '번호']
-    
-    # 텍스트 컬럼: forward fill 후 backward fill, 그래도 없으면 빈 문자열
-    for col in text_cols:
-        if col in df.columns:
-            df[col] = df[col].ffill().bfill().fillna('').infer_objects(copy=False)
-    
-    # 숫자 컬럼: forward fill 후 backward fill, 그래도 없으면 0
-    for col in numeric_cols:
-        if col in df.columns:
-            series = df[col]
-            if isinstance(series, pd.DataFrame):
-                # 안전장치: 만약 여전히 DataFrame이면 첫 열 사용
-                series = series.iloc[:, 0]
-            series = pd.to_numeric(series, errors='coerce')
-            series = series.ffill().bfill().fillna(0)
-            df[col] = series
-    
-    return df
-
-
 def _coalesce_into_base(base: pd.DataFrame, temp: pd.DataFrame, overlap_cols: List[str]) -> pd.DataFrame:
     """
     base와 temp(번호로 병합된 상태)에서 동일 컬럼이 있을 때 base의 NaN을 temp의 값으로 보완
-    overlap_cols에 대해 base[col] = base[col].combine_first(temp[f"{col}_new"]) 수행
     """
     for col in overlap_cols:
         new_col = f"{col}_new"
         if new_col in temp.columns:
-            # 숫자/문자 모두 지원되는 combine_first 사용
             base[col] = base[col].combine_first(temp[new_col])
             temp = temp.drop(columns=[new_col])
     return base, temp
@@ -178,23 +145,19 @@ def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame
         df = fill_missing_values(df)
         dfs[file_type] = df
     
-    # 번호의 합집합 구성 (세 소스 모두 포함)
+    # 번호의 합집합 구성
     all_nums = sorted(set().union(*(df['번호'].dropna().astype(int).tolist() for df in dfs.values())))
     merged_df = pd.DataFrame({"번호": all_nums})
 
-    # 세 소스 순차 병합: 겹치는 컬럼은 값 보완(coalesce), 새로운 컬럼은 추가
+    # 세 소스 순차 병합
     for key in ("execution", "orderbook", "trader"):
         src = dfs.get(key)
         if src is None:
             continue
-        # 번호만 남기거나 전체를 준비
         to_merge = src.copy()
-        # full outer를 흉내내기 위해 base 기준 left merge
         temp = merged_df.merge(to_merge, on="번호", how="left", suffixes=("", "_new"))
-        # 겹치는 컬럼 목록 산출 (번호 제외, _new 붙은 대상만)
         overlap = [c for c in to_merge.columns if c != "번호" and c in merged_df.columns]
         merged_df, temp = _coalesce_into_base(merged_df, temp, overlap)
-        # non-overlap 신규 컬럼들을 merged_df에 반영
         new_cols = [c for c in temp.columns if c not in merged_df.columns]
         if new_cols:
             merged_df = temp[[*merged_df.columns, *new_cols]]
@@ -210,97 +173,13 @@ def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame
         if col not in merged_df.columns:
             merged_df[col] = "" if col in TEXT_COLUMNS else 0
 
-    # 채우기(직전/직후)로 결측 제거
+    # 채우기
     merged_df = fill_missing_values(merged_df)
 
-    # 최종 컬럼 순서 맞추기 (정확히 스키마 강제)
+    # 최종 컬럼 순서
     merged_df = merged_df[["번호", *FINAL_COLUMNS]]
     
     return merged_df
-
-
-def ensure_datasets_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame):
-    table = "datasets"
-    # Create table if not exists
-    try:
-        conn.execute(f"DESCRIBE {table}")
-        exists = True
-    except Exception:
-        exists = False
-    if not exists:
-        # Build explicit schema to preserve types (avoid df.head(0) inference)
-        col_defs: list[str] = []
-        for col in df.columns:
-            series = df[col]
-            if col == '번호' or pd.api.types.is_integer_dtype(series):
-                duck_type = 'BIGINT'
-            elif col in TEXT_COLUMNS or col in {'날짜', '종목명'} or series.dtype == object:
-                duck_type = 'VARCHAR'
-            else:
-                duck_type = 'DOUBLE'
-            col_defs.append(f'"{col}" {duck_type}')
-        create_sql = f"CREATE TABLE {table} ({', '.join(col_defs)})"
-        conn.execute(create_sql)
-    else:
-        # Use correct indices from PRAGMA table_info: (cid, name, type, null, default, pk)
-        existing_info = conn.execute(f"PRAGMA table_info('{table}')").fetchall()
-        existing_cols = [row[1] for row in existing_info]
-        existing_types = {row[1]: (row[2] or "").upper() for row in existing_info}
-        for col in df.columns:
-            if col not in existing_cols:
-                series = df[col]
-                if col in TEXT_COLUMNS or col == '날짜' or series.dtype == object:
-                    col_type = 'VARCHAR'
-                elif pd.api.types.is_integer_dtype(series) or col == '번호':
-                    col_type = 'BIGINT'
-                else:
-                    col_type = 'DOUBLE'
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN \"{col}\" {col_type}")
-        # Enforce VARCHAR for known text columns if mismatched (e.g., '종목명' mistakenly INT)
-        text_like = set(TEXT_COLUMNS) | {"날짜", "종목명"}
-        # Drop dependent index before altering types to avoid catalog error
-        try:
-            conn.execute("DROP INDEX IF EXISTS idx_datasets_code_date")
-        except Exception:
-            pass
-        for col in (c for c in df.columns if c in text_like and c in existing_types):
-            ctype = existing_types.get(col, "")
-            if "CHAR" not in ctype and "STRING" not in ctype and "VARCHAR" not in ctype:
-                conn.execute(f"ALTER TABLE {table} ALTER COLUMN \"{col}\" TYPE VARCHAR")
-    # Helpful index (recreate if dropped)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_datasets_code_date ON datasets(\"종목코드\", \"날짜\")")
-
-
-def _month_key_from_yyyymmdd(date_str: str) -> str:
-    """Extract YYYYMM from YYYYMMDD string."""
-    return date_str[:6] if len(date_str) >= 6 else date_str
-
-
-def _monthly_db_path(base_db_path: str, yyyymm: str) -> str:
-    """Return a per-month DuckDB path based on base path and yyyymm.
-    Example: base 'datasets.duckdb' -> 'datasets_YYYYMM.duckdb' in same directory.
-    """
-    p = Path(base_db_path)
-    stem = p.stem
-    suffix = p.suffix or ".duckdb"
-    return str(p.with_name(f"{stem}_{yyyymm}{suffix}"))
-
-
-def _valid_yyyymmdd(s: Optional[str]) -> Optional[str]:
-    """Return s if it matches YYYYMMDD (8 digits), else None."""
-    if s is None:
-        return None
-    s = s.strip()
-    return s if re.fullmatch(r"\d{8}", s) else None
-
-
-def _date_in_range(date: str, start: Optional[str], end: Optional[str]) -> bool:
-    """Check if YYYYMMDD `date` is within [start, end] (inclusive). None means open bound."""
-    if start is not None and date < start:
-        return False
-    if end is not None and date > end:
-        return False
-    return True
 
 
 def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: str, group_key: str):
@@ -316,7 +195,7 @@ def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: st
             NO_COUNTER += n_rows
         conn = duckdb.connect(db_path)
         try:
-            ensure_datasets_table_duckdb(conn, merged_df)
+            ensure_table_duckdb(conn, merged_df)
             conn.register("_batch_df", merged_df)
             try:
                 conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
@@ -338,9 +217,7 @@ def _ingest_pickle_into_db_path(db_path: str, pkl_path: str, code: str, date: st
 
 
 def _prep_pkl_metadata(pkl_path: str) -> Optional[Tuple[str, str, str, str]]:
-    """Top-level helper: from a pickle file path, extract (group_key, code, date, pkl_path).
-    Returns None if filename doesn't match expected pattern. Using only built-in types for pickling safety.
-    """
+    """Top-level helper: from a pickle file path, extract (group_key, code, date, pkl_path)."""
     try:
         name = os.path.basename(pkl_path)
         group_key = os.path.splitext(name)[0]
@@ -388,7 +265,6 @@ def _process_single_group_to_pickle(group_key: str, files: Dict[str, str], tmp_r
 
 def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, checkpoint_interval: int) -> int:
     """Ingest pickle files to DB sequentially with periodic checkpoints."""
-    import duckdb
     processed_count = 0
     
     for pkl_path in pickle_paths:
@@ -414,7 +290,7 @@ def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, ch
             # Write to DB
             conn = duckdb.connect(db_path)
             try:
-                ensure_datasets_table_duckdb(conn, merged_df)
+                ensure_table_duckdb(conn, merged_df)
                 conn.register("_batch_df", merged_df)
                 try:
                     conn.execute("DELETE FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=?", [code, date])
@@ -436,30 +312,14 @@ def _ingest_pickles_to_db(pickle_paths: List[str], db_path: str, yyyymm: str, ch
             
             # Periodic checkpoint
             if checkpoint_interval > 0 and processed_count % checkpoint_interval == 0:
-                try:
-                    conn_ck = duckdb.connect(db_path)
-                    try:
-                        conn_ck.execute("CHECKPOINT")
-                        print(f"  {yyyymm}: 체크포인트 실행 ({processed_count} 그룹 완료)")
-                    finally:
-                        conn_ck.close()
-                except Exception:
-                    pass
+                checkpoint_db_once(db_path)
                     
         except Exception as e:
             print(f"  경고: {yyyymm} pickle 처리 실패({pkl_path}): {type(e).__name__}: {e}")
     
     # Final checkpoint
     if processed_count > 0:
-        try:
-            conn_ck = duckdb.connect(db_path)
-            try:
-                conn_ck.execute("CHECKPOINT")
-                print(f"  {yyyymm}: 최종 체크포인트 실행 ({processed_count} 그룹 완료)")
-            finally:
-                conn_ck.close()
-        except Exception:
-            pass
+        checkpoint_db_once(db_path)
     
     return processed_count
 
@@ -542,63 +402,6 @@ def _process_monthly_groups(month_groups: List[Tuple[str, Dict[str, str]]],
     return processed_count
 
 
-def _checkpoint_db_once(db_path: str) -> Tuple[str, bool, str]:
-    """Run DuckDB CHECKPOINT once for the given DB file. Returns (path, ok, msg)."""
-    try:
-        conn = duckdb.connect(db_path)
-        try:
-            conn.execute("CHECKPOINT")
-        finally:
-            conn.close()
-        return db_path, True, ""
-    except Exception as e:
-        return db_path, False, f"{type(e).__name__}: {e}"
-
-
-def _parallel_checkpoint_months(base_db_path: str, months: List[str], workers: int) -> None:
-    """Run CHECKPOINT across the given months' DB shards in parallel using up to `workers` processes."""
-    if not months:
-        return
-    # Build existing paths only
-    month_paths = []
-    for m in months:
-        p = _monthly_db_path(base_db_path, m)
-        if os.path.exists(p):
-            month_paths.append(p)
-    if not month_paths:
-        return
-    max_workers = max(1, int(workers))
-    used_workers = min(max_workers, len(month_paths))
-    
-    print(f"최종 체크포인트 실행: {len(month_paths)}개 DB 파일")
-    
-    if used_workers > 1:
-        print(f"  병렬 실행 (workers={used_workers})")
-        with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
-            futs = {ex.submit(_checkpoint_db_once, path): path for path in month_paths}
-            completed = 0
-            for fut in _fut.as_completed(futs):
-                path = futs[fut]
-                try:
-                    _, ok, msg = fut.result()
-                    completed += 1
-                    if ok:
-                        print(f"  [{completed}/{len(month_paths)}] CHECKPOINT 완료: {os.path.basename(path)}")
-                    else:
-                        print(f"  [{completed}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {msg}")
-                except Exception as e:
-                    completed += 1
-                    print(f"  [{completed}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {type(e).__name__}: {e}")
-    else:
-        print("  순차 실행")
-        for i, path in enumerate(month_paths, 1):
-            _, ok, msg = _checkpoint_db_once(path)
-            if ok:
-                print(f"  [{i}/{len(month_paths)}] CHECKPOINT 완료: {os.path.basename(path)}")
-            else:
-                print(f"  [{i}/{len(month_paths)}] CHECKPOINT 실패: {os.path.basename(path)} -> {msg}")
-
-
 def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, checkpoint_interval: int = 20, *, single_output: bool = False):
     """Scan tmp_root for any leftover .pkl files and ingest them in the current process.
     This supports resume-on-start and graceful Ctrl+C handling.
@@ -623,7 +426,6 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
                     if res is not None:
                         prepared.append(res)
                     else:
-                        # remove unknown naming
                         pass
                 finally:
                     done += 1
@@ -643,23 +445,15 @@ def _sweep_and_ingest_tmp(base_db_path: str, tmp_root: Path, workers: int = 1, c
     month_counts: Dict[str, int] = {}
     for i, (group_key, code, date, pkl_path) in enumerate(prepared, 1):
         try:
-            yyyymm = _month_key_from_yyyymmdd(date)
-            db_path = base_db_path if single_output else _monthly_db_path(base_db_path, yyyymm)
+            yyyymm = month_key_from_yyyymmdd(date)
+            db_path = base_db_path if single_output else monthly_db_path(base_db_path, yyyymm)
             _ingest_pickle_into_db_path(db_path, pkl_path, code, date, group_key)
             # per-month checkpoint interval
             if checkpoint_interval > 0:
                 month_counts[yyyymm] = month_counts.get(yyyymm, 0) + 1
                 if month_counts[yyyymm] % checkpoint_interval == 0:
-                    try:
-                        conn_ck = duckdb.connect(db_path)
-                        try:
-                            conn_ck.execute("CHECKPOINT")
-                        finally:
-                            conn_ck.close()
-                    except Exception:
-                        pass
+                    checkpoint_db_once(db_path)
         finally:
-            # Always try to remove the pickle to free disk space
             try:
                 os.remove(pkl_path)
             except Exception:
@@ -678,13 +472,6 @@ def generate_datasets(input_folder: str, output_db: str, *,
                       single_output: bool = False):
     """
     메인 데이터 생성 함수 (정규화 없음, DuckDB 전용)
-    - 입력 폴더를 스캔하여 유효 CSV 그룹을 찾음
-    - 그룹을 날짜(YYYYMMDD)에서 월(YYYYMM)로 묶어 월별 DuckDB 샤드에 기록
-    - 최대 `workers`개의 월을 병렬로 처리
-    - 각 월 내부에서는 최대 `group_workers`개의 그룹을 병렬 처리
-    - `checkpoint-interval`마다 CHECKPOINT 실행
-    - 작업 중단 복구를 위해 temp 디렉토리에 단계별 체크포인트(.pkl)를 사용하고 시작 시 반영
-    - 선택적으로 `start_date` ~ `end_date` (YYYYMMDD) 범위의 날짜만 처리
     """
 
     # 입력 폴더 검증
@@ -704,7 +491,6 @@ def generate_datasets(input_folder: str, output_db: str, *,
         except Exception:
             pass
     # 이전 실행의 완료된 체크포인트 반영
-    # 이전 실행의 완료된 체크포인트 반영 (single-output 모드 고려)
     _sweep_and_ingest_tmp(output_db, _tmp_base, workers=group_workers, checkpoint_interval=checkpoint_interval, single_output=single_output)
 
     # CSV 그룹 스캔
@@ -716,8 +502,8 @@ def generate_datasets(input_folder: str, output_db: str, *,
 
     # 날짜 범위 필터링 (옵션)
     if start_date or end_date:
-        s = _valid_yyyymmdd(start_date)
-        e = _valid_yyyymmdd(end_date)
+        s = valid_yyyymmdd(start_date)
+        e = valid_yyyymmdd(end_date)
         if start_date and s is None:
             print(f"경고: start-date 형식이 잘못되었습니다(YYYYMMDD 기대): {start_date} -> 무시합니다")
         if end_date and e is None:
@@ -730,7 +516,7 @@ def generate_datasets(input_folder: str, output_db: str, *,
         for group_key, files in complete_groups.items():
             parts = group_key.split("_")
             date = parts[-1]
-            if _date_in_range(date, s, e):
+            if date_in_range(date, s, e):
                 filt[group_key] = files
         complete_groups = filt
         if not complete_groups:
@@ -742,7 +528,7 @@ def generate_datasets(input_folder: str, output_db: str, *,
     for group_key, files in complete_groups.items():
         parts = group_key.split("_")
         date = parts[-1]
-        yyyymm = _month_key_from_yyyymmdd(date)
+        yyyymm = month_key_from_yyyymmdd(date)
         monthly_groups.setdefault(yyyymm, []).append((group_key, files))
 
     # force-recreate 처리
@@ -756,7 +542,7 @@ def generate_datasets(input_folder: str, output_db: str, *,
                     print(f"경고: 단일 DB 삭제 실패 {output_db}: {type(e).__name__}: {e}")
         else:
             for yyyymm in monthly_groups.keys():
-                db_path = _monthly_db_path(output_db, yyyymm)
+                db_path = monthly_db_path(output_db, yyyymm)
                 if os.path.exists(db_path):
                     try:
                         os.remove(db_path)
@@ -768,7 +554,7 @@ def generate_datasets(input_folder: str, output_db: str, *,
     def _filter_skip_existing_for_month(yyyymm: str, groups: List[Tuple[str, Dict[str, str]]]) -> List[Tuple[str, Dict[str, str]]]:
         if not skip_existing:
             return groups
-        db_path = _monthly_db_path(output_db, yyyymm)
+        db_path = monthly_db_path(output_db, yyyymm)
         # DB가 없으면 전부 유지
         if not os.path.exists(db_path):
             return groups
@@ -783,7 +569,6 @@ def generate_datasets(input_folder: str, output_db: str, *,
                 if not table_exists:
                     return groups
                 keep: List[Tuple[str, Dict[str, str]]] = []
-                # Batch existence check by date per code would be ideal; simple loop for clarity
                 for group_key, files in groups:
                     parts = group_key.split('_')
                     code = parts[0]
@@ -798,57 +583,17 @@ def generate_datasets(input_folder: str, output_db: str, *,
             finally:
                 conn.close()
         except Exception:
-            # 보수적으로 모두 처리
             return groups
 
-    if single_output:
-        # 단일 DB 파일에서 스킵 여부 확인
-        if skip_existing and os.path.exists(output_db):
-            try:
-                conn = duckdb.connect(output_db)
-                try:
-                    try:
-                        conn.execute("DESCRIBE datasets")
-                        table_exists = True
-                    except Exception:
-                        table_exists = False
-                    if table_exists:
-                        for yyyymm in list(monthly_groups.keys()):
-                            orig_n = len(monthly_groups[yyyymm])
-                            keep: List[Tuple[str, Dict[str, str]]] = []
-                            for group_key, files in monthly_groups[yyyymm]:
-                                parts = group_key.split('_')
-                                code = parts[0]
-                                date = parts[-1]
-                                try:
-                                    q = conn.execute("SELECT 1 FROM datasets WHERE \"종목코드\"=? AND \"날짜\"=? LIMIT 1", [code, date]).fetchone()
-                                except Exception:
-                                    q = None
-                                if q is None:
-                                    keep.append((group_key, files))
-                            monthly_groups[yyyymm] = keep
-                            if len(keep) == 0:
-                                print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
-                                del monthly_groups[yyyymm]
-                finally:
-                    conn.close()
-            except Exception:
-                # 에러 시 보수적으로 전부 처리
-                pass
-        else:
-            # 출력 DB가 없거나 skip 비활성화면 그대로 진행
-            pass
-    else:
-        for yyyymm in list(monthly_groups.keys()):
-            orig_n = len(monthly_groups[yyyymm])
-            monthly_groups[yyyymm] = _filter_skip_existing_for_month(yyyymm, monthly_groups[yyyymm])
-            if len(monthly_groups[yyyymm]) == 0:
-                print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
-                del monthly_groups[yyyymm]
+    for yyyymm in list(monthly_groups.keys()):
+        orig_n = len(monthly_groups[yyyymm])
+        monthly_groups[yyyymm] = _filter_skip_existing_for_month(yyyymm, monthly_groups[yyyymm])
+        if len(monthly_groups[yyyymm]) == 0:
+            print(f"{yyyymm}: 스킵할 항목만 존재하여 건너뜁니다 (원래 {orig_n} 그룹)")
+            del monthly_groups[yyyymm]
 
     if not monthly_groups:
         print("처리할 신규 그룹이 없습니다.")
-        # 임시 디렉토리 정리 후 종료
         try:
             _shutil.rmtree(_tmp_base)
         except Exception:
@@ -858,21 +603,32 @@ def generate_datasets(input_folder: str, output_db: str, *,
     # 월 목록 및 병렬 처리 설정
     months = sorted(monthly_groups.keys())
     max_workers = max(1, int(workers))
-    used_workers = 1 if single_output else min(max_workers, len(months))
+    used_workers = min(max_workers, len(months))
 
-    print(f"월별 처리 시작: 대상 {len(months)}개월, 병렬 workers={used_workers}")
+    if single_output:
+        used_workers = 1
+        print(f"월별 처리 시작(단일 출력 모드): 대상 {len(months)}개월, 병렬 workers={used_workers}")
+    else:
+        print(f"월별 처리 시작: 대상 {len(months)}개월, 병렬 workers={used_workers}")
 
     # 병렬로 월별 처리 실행
-    if used_workers > 1:
+    if used_workers > 1 and not single_output:
         with _fut.ProcessPoolExecutor(max_workers=used_workers) as ex:
             futs = {}
             for yyyymm in months:
-                db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
+                db_path = monthly_db_path(output_db, yyyymm)
                 groups = monthly_groups[yyyymm]
-                fut = ex.submit(_process_monthly_groups, groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
+                fut = ex.submit(
+                    _process_monthly_groups,
+                    groups,
+                    db_path,
+                    str(_tmp_base),
+                    yyyymm,
+                    int(checkpoint_interval),
+                    int(group_workers)
+                )
                 futs[fut] = (yyyymm, len(groups), db_path)
             done = 0
-            total = len(futs)
             for fut in _fut.as_completed(futs):
                 yyyymm, n_groups, db_path = futs[fut]
                 try:
@@ -883,26 +639,27 @@ def generate_datasets(input_folder: str, output_db: str, *,
                 finally:
                     done += 1
     else:
-        # 직렬 처리
         for yyyymm in months:
-            db_path = output_db if single_output else _monthly_db_path(output_db, yyyymm)
+            db_path = output_db if single_output else monthly_db_path(output_db, yyyymm)
             groups = monthly_groups[yyyymm]
-            processed = _process_monthly_groups(groups, db_path, str(_tmp_base), yyyymm, int(checkpoint_interval), int(group_workers))
+            processed = _process_monthly_groups(
+                groups,
+                db_path,
+                str(_tmp_base),
+                yyyymm,
+                int(checkpoint_interval),
+                int(group_workers)
+            )
             print(f"월 처리 완료: {yyyymm} ({processed}/{len(groups)}) -> {db_path}")
 
-    # 처리된 월들에 대해 병렬 최종 CHECKPOINT 수행 (선택적)
+    # 최종 CHECKPOINT 수행
     try:
         if single_output:
-            # 단일 파일만 체크포인트
-            conn = duckdb.connect(output_db)
-            try:
-                conn.execute("CHECKPOINT")
-            finally:
-                conn.close()
+            checkpoint_db_once(output_db)
         else:
             processed_months = months
             if processed_months:
-                _parallel_checkpoint_months(output_db, processed_months, max_workers)
+                parallel_checkpoint_months(output_db, processed_months, max_workers)
     except Exception:
         pass
 
@@ -912,37 +669,33 @@ def generate_datasets(input_folder: str, output_db: str, *,
     except Exception:
         pass
 
-    print(f"데이터 생성 완료: {output_db}")
+    print(f"생성 완료: {output_db}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CSV 데이터셋 생성 스크립트 (정규화 없음, DuckDB)")
-    parser.add_argument("input_folder", help="입력 CSV 폴더 경로")
-    parser.add_argument("-o", "--output", default="datasets.duckdb", help="출력 DuckDB 파일명")
-    # Skip-existing 옵션 (기본 활성화). 비활성화하려면 --no-skip-existing 사용
+    parser = argparse.ArgumentParser(description="CSV 파일을 읽어 DuckDB 데이터셋(datasets 테이블) 생성")
+    parser.add_argument("input_folder", help="CSV 파일들이 있는 입력 폴더 경로")
+    parser.add_argument("-o", "--output", default="datasets.duckdb", help="출력 DuckDB 파일명 (기본: datasets.duckdb)")
     parser.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=True,
                         help="이미 DB에 해당 (종목코드, 날짜) 그룹이 존재하면 스킵합니다 (기본: 활성화)")
     parser.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
                         help="이미 존재하는 그룹도 다시 처리합니다")
-    # Force recreate DB if exists (useful when file is corrupted or version-mismatched)
     parser.add_argument("--force-recreate", action="store_true",
-                        help="출력 DuckDB 파일이 존재하면 삭제 후 새로 생성합니다 (손상/버전 문제 해결용)")
-    # 병렬 처리 관련
+                        help="출력 DuckDB 파일이 존재하면 삭제 후 새로 생성합니다")
     parser.add_argument("--workers", type=int, default=os.cpu_count() or 1,
-                        help="월별 병렬 처리에 사용할 프로세스 수 (기본: CPU 코어 수)")
+                        help="월별 병렬 처리 프로세스 수 (기본: CPU 코어 수)")
     parser.add_argument("--group-workers", type=int, default=1,
                         help="각 월 내에서 그룹 병렬 처리에 사용할 프로세스 수 (기본: 1)")
     parser.add_argument("--tmp-dir", default=None,
                         help="임시 결과 저장 디렉토리 (기본: <output>.tmp)")
-    parser.add_argument("--checkpoint-interval", type=int, default=100,
-                        help="몇 개 그룹 처리마다 DuckDB CHECKPOINT를 실행할지 지정 (0이면 비활성화, 기본: 100)")
-    # 날짜 범위 옵션
-    parser.add_argument("--start-date", dest="start_date", default=None,
-                        help="처리 시작 날짜 (YYYYMMDD)")
-    parser.add_argument("--end-date", dest="end_date", default=None,
-                        help="처리 종료 날짜 (YYYYMMDD)")
-    parser.add_argument("--single-output", dest="single_output", action="store_true",
-                        help="모든 월 데이터를 단일 출력 DuckDB 파일에 순차적으로 append 합니다 (병렬 월 처리 비활성화)")
+    parser.add_argument("--checkpoint-interval", type=int, default=20,
+                        help="몇 개 그룹 처리마다 DuckDB CHECKPOINT를 실행할지 지정 (기본: 20)")
+    parser.add_argument("--start-date", default=None,
+                        help="시작 날짜 (YYYYMMDD, 포함)")
+    parser.add_argument("--end-date", default=None,
+                        help="종료 날짜 (YYYYMMDD, 포함)")
+    parser.add_argument("--single-output", action="store_true",
+                        help="월별 샤드가 아닌 단일 DuckDB 파일에 모든 데이터를 저장합니다")
 
     args = parser.parse_args()
 
@@ -957,7 +710,7 @@ def main():
         checkpoint_interval=args.checkpoint_interval,
         start_date=args.start_date,
         end_date=args.end_date,
-        single_output=args.single_output,
+        single_output=args.single_output
     )
 
 

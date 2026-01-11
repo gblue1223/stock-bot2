@@ -12,12 +12,16 @@ from typing import Dict, List, Tuple, Set
 
 import duckdb
 
-# Known text-like columns from normalize_datasets.py (subset sufficient for type decisions)
-TEXT_COLUMNS: Set[str] = {
-    "종목코드", "종목명", "시간",
-    *{f"매도거래원{i}" for i in range(1, 6)},
-    *{f"매수거래원{i}" for i in range(1, 6)},
-}
+# Add project root to sys.path to ensure we can import internal modules
+project_root = Path(__file__).resolve().parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
+
+try:
+    from scripts.data.normalize_datasets import TEXT_COLUMNS
+except ImportError:
+    sys.path.append(str(Path(__file__).parent))
+    from normalize_datasets import TEXT_COLUMNS
 
 DEFAULT_TABLE = "datasets"
 
