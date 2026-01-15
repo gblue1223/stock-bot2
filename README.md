@@ -73,7 +73,6 @@ python scripts/data/normalize_datasets.py \
   --time-end 110000000 \
   --checkpoint-interval 50 \
   --ignoring-stocks-csv scripts/data/ignoring_stocks.csv \
-  --trade-threshold 3000.0 \
   --qualifying-minutes 1
 
 python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
@@ -93,7 +92,6 @@ python scripts/data/export_datasets.py \
   --time-start 90000000 \
   --time-end 110000000 \
   --checkpoint-interval 50 \
-  --trade-threshold-per-minute 3000 \
   --qualifying-minutes 1
 
 python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \

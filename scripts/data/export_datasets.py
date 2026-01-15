@@ -20,7 +20,7 @@ if str(project_root) not in sys.path:
 try:
     from scripts.data.normalize_datasets import (
         TEXT_COLUMNS, DROP_COLUMNS, INPUT_TABLE, FINAL_COLUMNS,
-        DEFAULT_TRADE_VALUE_PER_MINUTE, DEFAULT_MIN_QUALIFYING_MINUTES,
+        DEFAULT_MIN_QUALIFYING_MINUTES,
         clean_column_name, to_time_ms, time_ms_to_seconds,
         load_ignoring_stocks, find_duckdb_groups, load_and_clean_from_duckdb,
         fill_missing_values, compute_order_book_amounts,
@@ -35,7 +35,7 @@ except ImportError:
     sys.path.append(str(Path(__file__).parent))
     from normalize_datasets import (
         TEXT_COLUMNS, DROP_COLUMNS, INPUT_TABLE, FINAL_COLUMNS,
-        DEFAULT_TRADE_VALUE_PER_MINUTE, DEFAULT_MIN_QUALIFYING_MINUTES,
+        DEFAULT_MIN_QUALIFYING_MINUTES,
         clean_column_name, to_time_ms, time_ms_to_seconds,
         load_ignoring_stocks, find_duckdb_groups, load_and_clean_from_duckdb,
         fill_missing_values, compute_order_book_amounts,
@@ -53,11 +53,12 @@ def save_groups_raw(
     table: str = "datasets_raw",
     time_start: int = 90000000,
     time_end: int = 110000000,
-    trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+
     min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES,
     ignoring_stocks_csv: Optional[str] = None,
+    input_table: str = INPUT_TABLE,
 ):
-    groups = find_duckdb_groups(input_db)
+    groups = find_duckdb_groups(input_db, table=input_table)
     if not groups:
         print("입력 DB에서 처리할 그룹을 찾지 못했습니다.")
         return
@@ -99,7 +100,7 @@ def save_groups_raw(
                     date,
                     time_start=time_start,
                     time_end=time_end,
-                    trade_threshold_per_minute=trade_threshold_per_minute,
+
                     min_qualifying_minutes=min_qualifying_minutes,
                     ignoring_stocks_set=ignoring_set,
                 )
@@ -163,10 +164,11 @@ def _process_month_groups(
     table: str,
     time_start: int,
     time_end: int,
-    trade_threshold_per_minute: float,
+
     min_qualifying_minutes: int,
     checkpoint_interval: int,
     ignoring_stocks_csv: Optional[str],
+    input_table: str,
 ) -> int:
     """Process all groups for a specific month and write to month_db_path/table sequentially."""
     # Ensure parent dir
@@ -202,7 +204,7 @@ def _process_month_groups(
                     date,
                     time_start=time_start,
                     time_end=time_end,
-                    trade_threshold_per_minute=trade_threshold_per_minute,
+
                     min_qualifying_minutes=min_qualifying_minutes,
                     ignoring_stocks_set=ignoring_set,
                 )
@@ -259,11 +261,12 @@ def export_datasets(
     checkpoint_interval: int = 100,
     time_start: int = 90000000,
     time_end: int = 110000000,
-    trade_threshold_per_minute: float = DEFAULT_TRADE_VALUE_PER_MINUTE,
+
     min_qualifying_minutes: int = DEFAULT_MIN_QUALIFYING_MINUTES,
     single_output: bool = False,
     tmp_dir: Optional[str] = None,
     ignoring_stocks_csv: Optional[str] = None,
+    input_table: str = "datasets",
 ):
     """Top-level export orchestrator with optional monthly parallelism.
     - If single_output is True: write all into one DB/table (calls save_groups_raw).
@@ -276,9 +279,10 @@ def export_datasets(
             table=table,
             time_start=time_start,
             time_end=time_end,
-            trade_threshold_per_minute=trade_threshold_per_minute,
+
             min_qualifying_minutes=min_qualifying_minutes,
             ignoring_stocks_csv=ignoring_stocks_csv,
+            input_table=input_table,
         )
 
     if not os.path.exists(input_db):
@@ -286,8 +290,8 @@ def export_datasets(
         return
 
     # Scan groups from input
-    print("DuckDB 데이터 스캔 및 그룹화 중...")
-    complete_groups = find_duckdb_groups(input_db)
+    print(f"DuckDB 데이터 스캔 및 그룹화 중... (테이블: {input_table})")
+    complete_groups = find_duckdb_groups(input_db, table=input_table)
     if not complete_groups:
         print("처리할 유효 데이터 그룹을 찾지 못했습니다.")
         return
@@ -321,10 +325,11 @@ def export_datasets(
                     table,
                     time_start,
                     time_end,
-                    trade_threshold_per_minute,
+
                     min_qualifying_minutes,
                     checkpoint_interval,
                     ignoring_stocks_csv,
+                    input_table,
                 )
                 futs[fut] = (yyyymm, month_db, len(pairs))
             for fut in _fut.as_completed(futs):
@@ -345,10 +350,11 @@ def export_datasets(
                 table,
                 time_start,
                 time_end,
-                trade_threshold_per_minute,
+
                 min_qualifying_minutes,
                 checkpoint_interval,
                 ignoring_stocks_csv,
+                input_table,
             )
             print(f"월 처리 완료: {yyyymm} ({processed}/{len(pairs)}) -> {month_db}")
 
@@ -362,11 +368,12 @@ def export_datasets(
 def main():
     ap = argparse.ArgumentParser(description="DuckDB에서 FINAL_COLUMNS 원본(비정규화) 추출/저장")
     ap.add_argument("--input-db", required=True, help="입력 DuckDB 파일 경로 (테이블: datasets)")
+    ap.add_argument("--input-table", default="datasets", help="입력 DuckDB 테이블명 (기본: datasets)")
     ap.add_argument("--output-db", required=True, help="출력 DuckDB 파일 경로")
     ap.add_argument("--table-name", default="datasets_raw", help="출력 테이블명 (기본: datasets_raw)")
     ap.add_argument("--time-start", type=int, default=90000000, help="시작 시간 HHMMSSmmm (기본: 090000000)")
     ap.add_argument("--time-end", type=int, default=110000000, help="종료 시간 HHMMSSmmm 미포함 (기본: 110000000)")
-    ap.add_argument("--trade-threshold-per-minute", type=float, default=DEFAULT_TRADE_VALUE_PER_MINUTE, help="분당 누적거래대금 증가 임계값(백만원)")
+
     ap.add_argument("--qualifying-minutes", type=int, default=DEFAULT_MIN_QUALIFYING_MINUTES, help="임계 충족 분 최소 개수")
     ap.add_argument("--workers", type=int, default=1, help="월별 병렬 처리 프로세스 수 (기본: 1)")
     ap.add_argument("--checkpoint-interval", type=int, default=100, help="몇 개 그룹 처리마다 CHECKPOINT 수행할지 (기본: 100)")
@@ -389,11 +396,12 @@ def main():
         checkpoint_interval=args.checkpoint_interval,
         time_start=args.time_start,
         time_end=args.time_end,
-        trade_threshold_per_minute=args.trade_threshold_per_minute,
+
         min_qualifying_minutes=args.qualifying_minutes,
         single_output=args.single_output,
         tmp_dir=args.tmp_dir,
         ignoring_stocks_csv=args.ignoring_stocks_csv,
+        input_table=args.input_table,
     )
     
     end_dt = datetime.now()
