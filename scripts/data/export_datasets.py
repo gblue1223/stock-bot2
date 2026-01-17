@@ -103,6 +103,7 @@ def save_groups_raw(
 
                     min_qualifying_minutes=min_qualifying_minutes,
                     ignoring_stocks_set=ignoring_set,
+                    input_table=input_table,
                 )
                 
                 # Note: normalize_datasets.merge_from_duckdb returns just df (not tuple with reason)?
@@ -196,7 +197,7 @@ def _process_month_groups(
                 code = parts[0]
                 date = parts[-1]
                 name = '_'.join(parts[1:-1])
-                
+
                 df = merge_from_duckdb(
                     group_info,
                     code,
@@ -207,6 +208,7 @@ def _process_month_groups(
 
                     min_qualifying_minutes=min_qualifying_minutes,
                     ignoring_stocks_set=ignoring_set,
+                    input_table=input_table,
                 )
                 
                 if df.empty:
@@ -285,9 +287,49 @@ def export_datasets(
             input_table=input_table,
         )
 
+
     if not os.path.exists(input_db):
         print(f"입력 DuckDB 파일이 존재하지 않습니다: {input_db}")
         return
+
+    # Check table existence and fallback if needed
+    try:
+        conn = duckdb.connect(input_db, read_only=True)
+        try:
+            # First check if 'datasets_raw' exists, as it is often the intended raw table
+            # If input_table is the default 'datasets', and 'datasets_raw' exists, we prefer 'datasets_raw'
+            fallback = "datasets_raw"
+            should_switch = False
+            
+            if input_table == "datasets":
+                try:
+                    conn.execute(f"DESCRIBE {fallback}")
+                    # datasets_raw exists!
+                    should_switch = True
+                except Exception:
+                    pass
+            
+            if should_switch:
+                print(f"알림: '{fallback}' 테이블이 감지되어 '{input_table}' 대신 사용합니다.")
+                input_table = fallback
+            else:
+                # Ordinary check for the requested table
+                conn.execute(f"DESCRIBE {input_table}")
+
+        except Exception:
+             # If exact table missing, try fallback logic again just in case
+            fallback = "datasets_raw"
+            if input_table != fallback:
+                try:
+                    conn.execute(f"DESCRIBE {fallback}")
+                    print(f"알림: '{input_table}' 테이블이 없어 '{fallback}' 테이블을 사용합니다.")
+                    input_table = fallback
+                except Exception:
+                    pass
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"경고: 테이블 확인 중 오류 발생: {e}")
 
     # Scan groups from input
     print(f"DuckDB 데이터 스캔 및 그룹화 중... (테이블: {input_table})")
@@ -370,7 +412,7 @@ def main():
     ap.add_argument("--input-db", required=True, help="입력 DuckDB 파일 경로 (테이블: datasets)")
     ap.add_argument("--input-table", default="datasets", help="입력 DuckDB 테이블명 (기본: datasets)")
     ap.add_argument("--output-db", required=True, help="출력 DuckDB 파일 경로")
-    ap.add_argument("--table-name", default="datasets_raw", help="출력 테이블명 (기본: datasets_raw)")
+    ap.add_argument("--output-table", default="datasets_raw", help="출력 테이블명 (기본: datasets_raw)")
     ap.add_argument("--time-start", type=int, default=90000000, help="시작 시간 HHMMSSmmm (기본: 090000000)")
     ap.add_argument("--time-end", type=int, default=110000000, help="종료 시간 HHMMSSmmm 미포함 (기본: 110000000)")
 
@@ -391,7 +433,7 @@ def main():
     export_datasets(
         input_db=args.input_db,
         output_db=args.output_db,
-        table=args.table_name,
+        table=args.output_table,
         workers=args.workers,
         checkpoint_interval=args.checkpoint_interval,
         time_start=args.time_start,

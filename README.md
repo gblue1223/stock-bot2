@@ -85,9 +85,10 @@ python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 
 python scripts/data/export_datasets.py \
   --input-db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+  --input-table datasets \
   --output-db "C:\Users\user\Workspace\datasets\datasets_raw.duckdb" \
+  --output-table datasets \
   --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --table-name datasets_raw \
   --workers 12 \
   --time-start 90000000 \
   --time-end 110000000 \
@@ -97,7 +98,7 @@ python scripts/data/export_datasets.py \
 python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
   --out "C:\Users\user\Workspace\datasets\datasets_raw_all.duckdb" \
   --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --table datasets_raw \
+  --table datasets \
   --threads 4 \
   --memory-limit 64GB
 ```
@@ -107,12 +108,12 @@ python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 ```bash
 # 사전 훈련 데이터 생성
 $ python scripts/pre/parallel_preprocessing.py \
-    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
+    --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --seq-len 60 \
     --batch-size 5000 \
     --start-year 2024 --start-month 9 \
     --end-year 2025 --end-month 9 \
-    --output "C:\Users\user\Workspace\datasets@raw\pre_training_data" \
+    --output "C:\Users\user\Workspace\datasets@20260117\pre_training_data" \
     --max-workers 2
 
 # autoencoder_training_complete.ipynb 실행
