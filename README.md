@@ -145,16 +145,13 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 ```bash
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장)
 python ai_trader/grpo/train_scalping.py \
-    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-    --embedding_model "models/autoencoder@20260109/model.pt" \
+    --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
+    --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder\best_model.pt" \
     --seq_len 60 \
     --features 28 \
     --total_timesteps 100000 \
     --use_raw_data true \
     --output_dir "models/grpo_scalping"
-
-# 또는 JSON 설정 파일 사용
-python ai_trader/grpo/train_scalping.py --config config/training_config.json
 
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_scalping.py \

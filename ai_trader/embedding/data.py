@@ -552,6 +552,10 @@ class PreprocessedDataset(Dataset):
         
         logging.info(f"Found {len(self.batch_files)} batch files from {len(months)} months")
         
+        # 기본값 설정 (배치 파일이 없을 경우를 대비)
+        self.seq_len = 60  # 기본값
+        self.num_features = 0  # 기본값
+        
         # 첫 번째 배치에서 데이터 형태 확인
         if self.batch_files:
             with h5py.File(self.batch_files[0], 'r') as f:

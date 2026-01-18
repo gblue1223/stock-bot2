@@ -70,9 +70,12 @@ class GRPOScalpingEnv(gym.Env):
         use_raw_data: bool = True,  # ✅ 원본 데이터 사용 여부
         rolling_window_size: int = 1000,  # ✅ Rolling window 크기
         rolling_min_samples: int = 100,  # ✅ 최소 샘플 수
+        base_price: float = 100000.0,  # ✅ 기준 가격 (기본값: 10만원)
         device: str = 'cpu'
     ):
         super().__init__()
+        
+        self.base_price = base_price
         
         self.embedding_model = embedding_model
         self.embedding_model.eval()  # 추론 모드
@@ -144,12 +147,11 @@ class GRPOScalpingEnv(gym.Env):
         
         try:
             self.return_rate_index = self.feature_columns.index('등락률')
-            self.current_price_index = self.feature_columns.index('현재가')
-            logger.info(f"Column Mapping Identified: '등락률' at Index {self.return_rate_index}, '현재가' at Index {self.current_price_index}")
+            logger.info(f"Column Mapping Identified: '등락률' at Index {self.return_rate_index}")
         except ValueError as e:
             logger.error(f"Critical Column Missing: {e}")
             logger.error(f"Available columns: {self.feature_columns}")
-            raise RuntimeError(f"Required columns (등락률, 현재가) missing from database features")
+            raise RuntimeError(f"Required column (등락률) missing from database features")
         
         # 에피소드 상태
         self.current_step = 0
@@ -175,6 +177,44 @@ class GRPOScalpingEnv(gym.Env):
                    f"quick_exit_mode={quick_exit_mode}, "
                    f"transaction_cost={transaction_cost_rate*100:.3f}%, "
                    f"use_raw_data={use_raw_data}")
+        
+        # ✅ 유효한 에피소드 키 캐싱
+        self.valid_keys = []
+        self._preload_valid_keys()
+
+    def _preload_valid_keys(self):
+        """유효한 에피소드 키(종목코드, 날짜) 미리 로드"""
+        logger.info("Preloading valid episode keys from database...")
+        
+        # 필요한 최소 데이터 길이 계산
+        if self.max_episode_steps is not None:
+            min_required = self.seq_len + self.max_episode_steps + 100
+        else:
+            min_required = self.seq_len + 100
+            
+        try:
+            query = f"""
+                SELECT 종목코드, 날짜
+                FROM {self.table_name}
+                GROUP BY 종목코드, 날짜
+                HAVING COUNT(*) >= ?
+            """
+            result = self.conn.execute(query, [min_required]).fetchdf()
+            
+            if len(result) == 0:
+                logger.warning(f"No keys found with {min_required} samples. Trying with reduced requirement.")
+                min_required = self.seq_len + 10
+                result = self.conn.execute(query, [min_required]).fetchdf()
+            
+            if len(result) > 0:
+                self.valid_keys = list(zip(result['종목코드'], result['날짜']))
+                logger.info(f"✅ Loaded {len(self.valid_keys)} valid episode keys.")
+            else:
+                raise RuntimeError(f"No valid data found in database (min samples={min_required})")
+                
+        except Exception as e:
+            logger.error(f"Failed to preload keys: {e}")
+            raise
     
     def _connect_db(self):
         """데이터베이스 연결"""
@@ -194,7 +234,9 @@ class GRPOScalpingEnv(gym.Env):
             column_types = columns_df['column_type'].tolist()
             
             # 메타데이터 컬럼 및 문자열 컬럼 제외 (번호 컬럼 명시적 제외)
-            exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호'}  # '번호' 컬럼 명시적 제외
+            # 메타데이터 컬럼 및 문자열 컬럼 제외 (번호 컬럼 명시적 제외)
+            # ✅ '현재가' 제외: 등락률과 기준가로 가격을 계산하므로 원본 현재가는 피처에서 제외
+            exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호', '현재가'}  # '번호', '현재가' 컬럼 명시적 제외
             
             # 숫자형 컬럼만 선택
             feature_columns = []
@@ -258,37 +300,15 @@ class GRPOScalpingEnv(gym.Env):
         
         while attempt < max_attempts:
             try:
-                # 랜덤 종목 및 날짜 선택
-                query = f"""
-                    SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
-                    FROM {self.table_name}
-                    GROUP BY 종목코드, 날짜
-                    HAVING COUNT(*) >= ?
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                """
-                result = self.conn.execute(query, [min_required]).fetchdf()
+                if not self.valid_keys:
+                    raise RuntimeError("No valid keys available for sampling")
                 
-                if len(result) == 0:
-                    # 충분한 데이터가 있는 조합이 없으면 요구사항을 낮춤
-                    logger.warning(f"No stock/date combination with {min_required} samples found, trying with lower requirement")
-                    min_required = self.seq_len + 10
-                    query = f"""
-                        SELECT DISTINCT 종목코드, 날짜, COUNT(*) as count
-                        FROM {self.table_name}
-                        GROUP BY 종목코드, 날짜
-                        HAVING COUNT(*) >= ?
-                        ORDER BY RANDOM()
-                        LIMIT 1
-                    """
-                    result = self.conn.execute(query, [min_required]).fetchdf()
-                    
-                    if len(result) == 0:
-                        raise RuntimeError(f"No data found with minimum {min_required} samples per stock/date")
+                # 캐시된 키에서 랜덤 선택
+                stock_code, date = self.valid_keys[np.random.randint(0, len(self.valid_keys))]
                 
-                stock_code = str(result['종목코드'].iloc[0])
-                date = int(result['날짜'].iloc[0])
-                available_count = int(result['count'].iloc[0])
+                stock_code = str(stock_code)
+                date = int(date)
+                # available_count = int(result['count'].iloc[0]) # 캐싱으로 인해 개수 정보는 생략
                 
                 # 해당 종목/날짜의 데이터 로드
                 query = f"""
@@ -492,10 +512,10 @@ class GRPOScalpingEnv(gym.Env):
         복리 계산 없이 (1 + 등락률)을 기준가에 곱하여 바로 가격을 산출합니다.
         
         주의: 
-        - 데이터베이스 컬럼 순서: 현재가(0), 등락률(1), 거래량(2), ...
+        - 데이터베이스 컬럼 순서: 등락률, 거래량, ... ('현재가' 제외됨)
         - 원본 데이터의 등락률은 백분율(%) 단위이므로 100으로 나눠야 합니다.
         """
-        self.base_price = 100000.0  # 기준 가격 (10만원)
+        # self.base_price는 __init__에서 설정됨
         
         # ✅ 올바른 로직: Price = Base * (1 + Return_Rate)
         # 루프 없이 벡터 연산으로 처리하여 폭발 원천 차단
@@ -668,6 +688,48 @@ class GRPOScalpingEnv(gym.Env):
         
         return reward, quick_exit_triggered
     
+    def _calculate_seconds_diff(self, start_time_val, end_time_val) -> float:
+        """
+        두 시간 값의 차이를 초 단위로 계산
+        입력 포맷: HHMMSSmmm (9자리) + 선택적 소수점 (.0)
+        예: 90000000.0 (09:00:00.000)
+        """
+        if str(start_time_val).startswith('0') or start_time_val == 0: return 0.0
+        
+        try:
+            # 1. 문자열 변환 및 소수점 제거 (100000030.0 -> "100000030")
+            s_str = str(start_time_val).split('.')[0]
+            e_str = str(end_time_val).split('.')[0]
+            
+            # 2. 9자리 패딩 (090000000) - 앞자리 0이 생략된 경우 대비
+            s_str = s_str.zfill(9)
+            e_str = e_str.zfill(9)
+            
+            # 3. 파싱 (HH MM SS mmm)
+            # 수동 슬라이싱이 strptime보다 빠르고 안전함
+            def parse_time(t_str):
+                h = int(t_str[:2])
+                m = int(t_str[2:4])
+                s = int(t_str[4:6])
+                ms = int(t_str[6:9])
+                return h * 3600 + m * 60 + s + ms / 1000.0
+            
+            s_seconds = parse_time(s_str)
+            e_seconds = parse_time(e_str)
+            
+            # 4. 날짜 경계 처리 (밤 11시 -> 새벽 1시 인 경우 등을 대비)
+            # 여기선 단순 차이만 계산하되, 음수면 하루(86400초) 더함
+            diff = e_seconds - s_seconds
+            if diff < 0:
+                diff += 86400.0
+                
+            return diff
+            
+        except Exception as e:
+            # 파싱 실패 시 안전장치
+            # logger.warning(f"Time parsing failed: {start_time_val} -> {end_time_val} ({e})")
+            return 1.0  # 기본값 1초 반환하여 에러 방지
+
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
         """
         행동 실행
@@ -800,32 +862,7 @@ class GRPOScalpingEnv(gym.Env):
                 'forced_liquidation': True
             })
             
-        return self._get_current_observation(), reward, terminated, truncated, self._get_info()
-    
-    def _calculate_seconds_diff(self, start_time_int: int, end_time_int: int) -> float:
-        """
-        HHMMSS 정수 포맷의 두 시간 차이를 초 단위로 계산
-        ex) 100000 - 095959 = 1초 (단순 뺄셈은 4041)
-        """
-        if start_time_int == 0: return 0.0
-        
-        try:
-            # 문자열 변환 및 파싱
-            s_str = f"{int(start_time_int):06d}"
-            e_str = f"{int(end_time_int):06d}"
-            
-            s_dt = datetime.strptime(s_str, "%H%M%S")
-            e_dt = datetime.strptime(e_str, "%H%M%S")
-            
-            # 날짜 경계 처리 (예: 밤 11시 -> 새벽 1시)
-            if e_dt < s_dt:
-                e_dt += timedelta(days=1)
-                
-            return (e_dt - s_dt).total_seconds()
-        except:
-            # 파싱 실패 시 안전장치 (단순 차이 반환하되 로그 남김)
-            logger.warning(f"Time parsing failed: {start_time_int} -> {end_time_int}")
-            return float(end_time_int - start_time_int)
+
             logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
         
         # 현재 가격 및 시간 업데이트
