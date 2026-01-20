@@ -586,6 +586,11 @@ class GRPOScalpingEnv(gym.Env):
         # 수익률 1% = 보상 1.0
         reward = reward * 100
         
+        # ✅ 승리 보너스 추가 (수익 발생 시 추가 점수)
+        # 순수익(거래비용 제외)이 0보다 크면 보너스 부여
+        if profit_rate > self.round_trip_cost:
+            reward += 1.0  # 승리 보너스
+        
         # 🔧 장기 보유 페널티 제거 (매 스텝 페널티로 대체됨)
         # 매 스텝마다 보유 페널티가 적용되므로 여기서는 중복 제거
         # holding_penalty = 0.0
@@ -751,8 +756,8 @@ class GRPOScalpingEnv(gym.Env):
                 self.position = 1
                 self.entry_price = self.current_price
                 self.entry_time = self.current_time
-                # 🔧 매수 행동에 작은 양의 보상 (거래 유도)
-                reward = 0.5  # 매수 자체에 작은 보상
+                # 🔧 매수 행동 보상 제거 (수익으로만 평가)
+                reward = 0.0
                 logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
             else:
                 # 이미 포지션 보유 중: 페널티
@@ -799,26 +804,26 @@ class GRPOScalpingEnv(gym.Env):
             
             if self.position == 1:
                 # 포지션 보유 중: 시간에 비례하는 페널티
-                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+                # holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
-                # 기본 보유 페널티: -0.01 (스케일링 후 -1.0)
-                base_penalty = -0.01
-                
-                # 기본 페널티 적용
-                reward = base_penalty
+                # ✅ 대기/보유 페널티 제거 (수익 기회 기다림 권장)
+                # base_penalty = -0.01 
+                reward = 0.0
                 
                 # 빠른 손절 룰 체크 (모드 선택)
                 if self.quick_exit_mode == 'penalty_only':
+                    holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                     # 페널티만 부여 (권장, 학습 효과적)
                     penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
                     reward += penalty  # 스케일링 제거
                 elif self.quick_exit_mode == 'force_close':
+                    holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                     # 강제 청산 (이전 동작, 과도한 거래 유발)
                     penalty, quick_exit_triggered = self._check_quick_exit_force_close(holding_time)
                     reward += penalty  # 스케일링 제거
             else:
-                # 포지션 없음: 더 큰 페널티 (거래 유도)
-                reward = -0.05  # 스케일링 제거
+                # 포지션 없음: 페널티 제거 (기다림 권장)
+                reward = 0.0
         
         # 보상 기록
         self.episode_rewards.append(reward)
