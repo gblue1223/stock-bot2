@@ -5,7 +5,7 @@ GRPO (Group Relative Policy Optimization) 알고리즘 구현
 """
 
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Callable
 import numpy as np
 import torch
 import torch.nn as nn
@@ -778,7 +778,8 @@ class GRPOTrainer:
         self,
         total_episodes: int,
         checkpoint_interval: int = 100,
-        checkpoint_path: Optional[str] = None
+        checkpoint_path: Optional[str] = None,
+        on_iteration_end: Optional[Callable[[int, Dict[str, Any]], None]] = None
     ) -> Dict[str, Any]:
         """
         GRPO 훈련 실행
@@ -787,6 +788,7 @@ class GRPOTrainer:
             total_episodes: 총 훈련 에피소드 수
             checkpoint_interval: 체크포인트 저장 간격
             checkpoint_path: 체크포인트 저장 경로 (format string with {} for iteration)
+            on_iteration_end: 매 반복 종료 시 호출될 콜백 함수 (iteration, metrics) -> None
             
         Returns:
             훈련 메트릭 딕셔너리
@@ -832,6 +834,44 @@ class GRPOTrainer:
                 # Format checkpoint path with iteration number
                 formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
                 self.save_checkpoint(formatted_checkpoint_path, iteration + 1)
+            
+            # 7. 진행률 및 예상 시간 계산
+            iteration_elapsed = time.time() - iteration_start_time
+            iteration_times.append(iteration_elapsed)
+            
+            # 최근 10개 iteration의 평균 시간으로 예상 시간 계산
+            recent_times = iteration_times[-10:]
+            avg_iteration_time = np.mean(recent_times)
+            remaining_iterations = num_iterations - (iteration + 1)
+            estimated_remaining_time = avg_iteration_time * remaining_iterations
+            
+            # 진행률 계산
+            progress_pct = (iteration + 1) / num_iterations * 100
+            
+            # 시간 포맷팅
+            elapsed_time = time.time() - start_time
+            elapsed_str = self._format_time(elapsed_time)
+            remaining_str = self._format_time(estimated_remaining_time)
+            
+            # 평균 보상 및 추가 메트릭 계산
+            mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
+            
+            # 추가 메트릭 계산
+            mean_win_rate = np.mean([ep['metadata'].get('win_rate', 0.0) for ep in episodes])
+            mean_trades = np.mean([ep['metadata'].get('num_trades', 0) for ep in episodes])
+            mean_sharpe = np.mean([ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes])
+            
+            # 콜백 호출 (Curriculum Learning 등)
+            if on_iteration_end:
+                metrics_summary = {
+                    'mean_reward': mean_reward,
+                    'mean_win_rate': mean_win_rate,
+                    'mean_trades': mean_trades,
+                    'mean_sharpe': mean_sharpe,
+                    'iteration': iteration + 1,
+                    'total_iterations': num_iterations
+                }
+                on_iteration_end(iteration + 1, metrics_summary)
             
             # 7. 진행률 및 예상 시간 계산
             iteration_elapsed = time.time() - iteration_start_time

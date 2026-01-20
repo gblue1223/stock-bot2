@@ -630,7 +630,21 @@ class GRPOScalpingEnv(gym.Env):
         }
         
         return reward, reward_components
-    
+
+    def set_transaction_cost_rate(self, rate: float):
+        """
+        거래 비용율을 동적으로 설정합니다 (Curriculum Learning용).
+        
+        Args:
+           rate: 새로운 거래 비용율 (예: 0.00215)
+        """
+        self.transaction_cost_rate = rate
+        # 왕복 비용(매수/매도 각각 적용된다고 가정하면 2배, or 이미 구현된 로직에 맞춤)
+        # _calculate_reward logic: 수수료+세금 = 0.215%, 왕복 0.43%
+        # self.round_trip_cost는 calculate_reward에서 쓰임
+        self.round_trip_cost = rate * 2
+        logger.info(f"Transaction cost rate updated to {rate:.6f} (Round trip: {self.round_trip_cost:.6f})")
+
     def _check_quick_exit_penalty_only(self, holding_time: float) -> Tuple[float, bool]:
         """
         빠른 손절 룰 체크 (penalty_only 모드)
@@ -794,13 +808,13 @@ class GRPOScalpingEnv(gym.Env):
                 
                 logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
             else:
-                # 이미 포지션 보유 중: 불필요한 행동 페널티
-                reward -= 0.1
+                # 이미 포지션 보유 중: 불필요한 행동 페널티 (완화)
+                reward -= 0.01
         
         elif action == 2:  # 매도
             if self.position == 0:
-                # 포지션 없는데 매도: 불필요한 행동 페널티
-                reward -= 0.1
+                # 포지션 없는데 매도: 불필요한 행동 페널티 (완화)
+                reward -= 0.01
             elif self.position == 1:
                 # 보유 시간 계산
                 holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)

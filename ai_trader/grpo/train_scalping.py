@@ -406,7 +406,7 @@ def main():
         logger.info("[STEP 4/6] Creating trainer...")
         os.makedirs(config.output_dir, exist_ok=True)
         tensorboard_dir = os.path.join(config.output_dir, 'tensorboard_logs')
-        
+        # 6. 트레이너 생성
         trainer = GRPOTrainer(
             policy=policy,
             env=env,
@@ -422,6 +422,51 @@ def main():
             device=device,
             tensorboard_log_dir=tensorboard_dir
         )
+        
+        # 7. 커리큘럼 러닝 콜백 정의
+        current_cost_rate = 0.0
+        # Assuming config.transaction_cost_rate is the target cost rate from the environment creation
+        # If not, you might need to get it from env.transaction_cost_rate after env creation
+        target_cost_rate = 0.00215 # Default value used in env creation
+        
+        # Check if transaction_cost_rate was explicitly set via CLI args and is > 0
+        # If not, we assume the default 0.00215 from env creation
+        if hasattr(args, 'transaction_cost_rate') and args.transaction_cost_rate is not None and args.transaction_cost_rate > 0:
+             target_cost_rate = args.transaction_cost_rate
+             logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {target_cost_rate}")
+             env.set_transaction_cost_rate(0.0)
+             current_cost_rate = 0.0
+        else:
+             # If not explicitly set or set to 0, use the default from env creation
+             # If the env was created with 0.00215, we start with that.
+             # If the user wants to force 0 cost, they should set transaction_cost_rate=0 in config or CLI
+             if env.transaction_cost_rate > 0:
+                 logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {env.transaction_cost_rate}")
+                 target_cost_rate = env.transaction_cost_rate
+                 env.set_transaction_cost_rate(0.0)
+                 current_cost_rate = 0.0
+             else:
+                 current_cost_rate = env.transaction_cost_rate # Already 0 or some other value
+                 target_cost_rate = env.transaction_cost_rate # No curriculum if already 0 or user specified
+                 logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
+
+        def curriculum_callback(iteration: int, metrics: dict):
+            nonlocal current_cost_rate
+            nonlocal target_cost_rate
+            
+            # 목표 비용에 도달했으면 패스
+            if current_cost_rate >= target_cost_rate:
+                return
+
+            win_rate = metrics.get('mean_win_rate', 0.0)
+            
+            # 승률이 30% 이상이고 거래가 있을 때 비용 적용 시작 (기준 완화: 30%)
+            # 승률 50%는 상당히 높은 목표이므로, 30% 정도만 되어도 '수익을 낼 줄 안다'고 판단
+            if win_rate >= 0.30 and metrics.get('mean_trades', 0) > 1.0:
+                logger.info(f"Curriculum Step: Win rate {win_rate:.1%} >= 30%. Increasing transaction cost to {target_cost_rate}")
+                env.set_transaction_cost_rate(target_cost_rate)
+                current_cost_rate = target_cost_rate
+        
         logger.info("[OK] Trainer created")
         
         # 5. 훈련 설정 출력
@@ -458,7 +503,8 @@ def main():
         final_metrics = trainer.train(
             total_episodes=total_episodes,
             checkpoint_interval=config.checkpoint_interval,
-            checkpoint_path=checkpoint_path
+            checkpoint_path=checkpoint_path,
+            on_iteration_end=curriculum_callback
         )
         
         training_time = time.time() - start_time
