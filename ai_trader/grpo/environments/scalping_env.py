@@ -774,29 +774,43 @@ class GRPOScalpingEnv(gym.Env):
         truncated = False
         quick_exit_triggered = False
         
-        # 행동 실행
+        # 1. 행동 실행
         if action == 1:  # 매수
             if self.position == 0:
                 self.position = 1
                 self.entry_price = self.current_price
                 self.entry_time = self.current_time
-                # 🔧 매수 행동 보상 제거 (수익으로만 평가)
-                reward = 0.0
+                
+                # 매수 시 거래비용 차감 (Dense Reward)
+                # 비용은 편도 0.215% -> 0.43%? 아니, 매수/매도 각각 0.215%가 맞음?
+                # _calculate_reward에서는 self.round_trip_cost (0.43%)를 한번에 뺐음.
+                # Dense Reward에서는 매수/매도 각각 반씩 뺄 수도 있고, 매수 때 다 뺄 수도 있음.
+                # 편의상 매도 때 비용을 정산하던 기존 방식과 달리, 
+                # 여기선 "진입/청산 비용"을 각각 부과하거나, 왕복 비용을 나눠서 부과.
+                # 기존 round_trip_cost = 0.43%. Half = 0.215%.
+                
+                # 비용 페널티: -0.215 (스케일링 전 %, 즉 0.00215) * 100 = -0.215
+                reward -= self.transaction_cost_rate * 100
+                
                 logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
             else:
-                # 이미 포지션 보유 중: 페널티
-                reward = -0.1
+                # 이미 포지션 보유 중: 불필요한 행동 페널티
+                reward -= 0.1
         
         elif action == 2:  # 매도
             if self.position == 0:
-                # 포지션 없는데 매도: 페널티
-                reward = -0.1
+                # 포지션 없는데 매도: 불필요한 행동 페널티
+                reward -= 0.1
             elif self.position == 1:
-                # 보유 시간 계산 (HHMMSS 차이 -> 초 단위 변환)
+                # 보유 시간 계산
                 holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
-                # 보상 계산
-                reward, reward_components = self._calculate_reward(
+                # 매도 시 거래비용 차감 (Dense Reward)
+                reward -= self.transaction_cost_rate * 100
+                
+                # 거래 통계용 (Realized PnL) 계산 - 보상에는 더하지 않음 (이중 계산 방지)
+                # 단, 로그용으로는 기존 함수 사용
+                realized_reward, reward_components = self._calculate_reward(
                     self.entry_price,
                     self.current_price,
                     holding_time
@@ -808,14 +822,14 @@ class GRPOScalpingEnv(gym.Env):
                     'exit_price': self.current_price,
                     'holding_time': holding_time,
                     'profit_rate': reward_components['profit_rate'],
-                    'reward': reward,
+                    'reward': realized_reward, # 기록용
                     'reward_components': reward_components
                 }
                 self.episode_trades.append(trade_info)
                 
                 logger.debug(f"Sell at price={self.current_price:.4f}, "
                            f"profit_rate={reward_components['profit_rate']:.4f}, "
-                           f"reward={reward:.4f}, holding_time={holding_time:.2f}s")
+                           f"realized_reward={realized_reward:.4f}")
                 
                 # 포지션 청산
                 self.position = 0
@@ -823,31 +837,34 @@ class GRPOScalpingEnv(gym.Env):
                 self.entry_time = 0.0
         
         elif action == 0:  # 보유
-            # 🔧 보유 시 페널티 (과도한 보유 방지)
-            # 스캘핑은 빠른 거래가 목표
-            
-            if self.position == 1:
-                # 포지션 보유 중: 시간에 비례하는 페널티
-                # holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+            # 별도 페널티 없음 (Dense Reward가 알아서 처리)
+            pass
+        
+        # 2. 포지션 보유에 따른 Step Reward (Dense Reward의 핵심)
+        # 포지션을 들고 다음 스텝으로 넘어가면, 가격 변동분을 즉시 보상으로 반영
+        if self.position == 1:
+            # 다음 스텝의 가격 가져오기 (미래 참조가 아님, 시뮬레이션의 다음 상태)
+            next_step_idx = self.current_step + 1
+            if next_step_idx < len(self.prices):
+                next_price = float(self.prices[next_step_idx])
                 
-                # ✅ 대기/보유 페널티 제거 (수익 기회 기다림 권장)
-                # base_penalty = -0.01 
-                reward = 0.0
+                # 변동률 계산
+                # (P_next - P_curr) / P_curr
+                step_return = (next_price - self.current_price) / self.current_price
                 
-                # 빠른 손절 룰 체크 (모드 선택)
+                # 스케일링 (1% = 1.0)
+                step_reward = step_return * 100
+                
+                reward += step_reward
+                
+                # 빠른 손절/익절 체크 (보조)
+                # Dense Reward가 있으므로 강제 청산 로직보다는 
+                # 큰 손실이 누적될 때 페널티를 주는 등의 보조 장치만 유지
+                
+                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 if self.quick_exit_mode == 'penalty_only':
-                    holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-                    # 페널티만 부여 (권장, 학습 효과적)
-                    penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
-                    reward += penalty  # 스케일링 제거
-                elif self.quick_exit_mode == 'force_close':
-                    holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-                    # 강제 청산 (이전 동작, 과도한 거래 유발)
-                    penalty, quick_exit_triggered = self._check_quick_exit_force_close(holding_time)
-                    reward += penalty  # 스케일링 제거
-            else:
-                # 포지션 없음: 페널티 제거 (기다림 권장)
-                reward = 0.0
+                     penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
+                     reward += penalty
         
         # 보상 기록
         self.episode_rewards.append(reward)
@@ -859,28 +876,26 @@ class GRPOScalpingEnv(gym.Env):
         if self.current_step >= self.episode_length - 1:
             terminated = True
         
-        # 최대 스텝 수 체크 (설정된 경우)
+        # 최대 스텝 수 체크
         if self.max_episode_steps is not None and self.current_step >= self.max_episode_steps:
             truncated = True
         
-        # 에피소드 종료 시 포지션 강제 청산
+        # 에피소드 종료 시 강제 청산 (통계용)
         if (terminated or truncated) and self.position == 1:
             holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-            final_reward, final_components = self._calculate_reward(
-                self.entry_price,
-                self.current_price,
-                holding_time
-            )
-            # 최종 보상을 현재 스텝 보상에 합산하여 외부 수집 보상과 일치시킵니다
-            reward += final_reward
-            # 내부 누적 보상 또한 마지막 스텝에 합산되도록 병합합니다
-            if len(self.episode_rewards) > 0:
-                self.episode_rewards[-1] += final_reward
-            else:
-                # 방어적 처리: 이론상 발생하지 않지만 빈 경우엔 추가
-                self.episode_rewards.append(final_reward)
             
-            # 강제 청산 거래 기록
+            # 매도 비용 지불 (Dense Reward 관점)
+            final_step_penalty = -self.transaction_cost_rate * 100
+            
+            reward += final_step_penalty
+            if len(self.episode_rewards) > 0:
+                self.episode_rewards[-1] += final_step_penalty
+            
+            # 통계용 기록
+            final_reward, final_components = self._calculate_reward(
+                self.entry_price, self.current_price, holding_time
+            )
+            
             self.episode_trades.append({
                 'entry_price': self.entry_price,
                 'exit_price': self.current_price,
@@ -891,8 +906,7 @@ class GRPOScalpingEnv(gym.Env):
                 'forced_liquidation': True
             })
             
-
-            logger.debug(f"Forced liquidation: reward={final_reward:.4f}")
+            logger.debug(f"Forced liquidation")
         
         # 현재 가격 및 시간 업데이트
         if not (terminated or truncated):
