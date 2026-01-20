@@ -194,7 +194,7 @@ class GRPOScalpingEnv(gym.Env):
             
         try:
             query = f"""
-                SELECT 종목코드, 날짜
+                SELECT 종목코드, 날짜, COUNT(*) as cnt
                 FROM {self.table_name}
                 GROUP BY 종목코드, 날짜
                 HAVING COUNT(*) >= ?
@@ -207,7 +207,7 @@ class GRPOScalpingEnv(gym.Env):
                 result = self.conn.execute(query, [min_required]).fetchdf()
             
             if len(result) > 0:
-                self.valid_keys = list(zip(result['종목코드'], result['날짜']))
+                self.valid_keys = list(zip(result['종목코드'], result['날짜'], result['cnt']))
                 logger.info(f"✅ Loaded {len(self.valid_keys)} valid episode keys.")
             else:
                 raise RuntimeError(f"No valid data found in database (min samples={min_required})")
@@ -287,7 +287,8 @@ class GRPOScalpingEnv(gym.Env):
             features: (seq_len, n_features)
             metadata: (seq_len, 3) - [종목코드, 날짜, 시간]
         """
-        feature_cols = self._get_feature_columns()
+        # ✅ Cached columns usage
+        feature_cols = self.feature_columns
         
         attempt = 0
         
@@ -304,20 +305,43 @@ class GRPOScalpingEnv(gym.Env):
                     raise RuntimeError("No valid keys available for sampling")
                 
                 # 캐시된 키에서 랜덤 선택
-                stock_code, date = self.valid_keys[np.random.randint(0, len(self.valid_keys))]
+                stock_code, date, total_count = self.valid_keys[np.random.randint(0, len(self.valid_keys))]
                 
                 stock_code = str(stock_code)
                 date = int(date)
-                # available_count = int(result['count'].iloc[0]) # 캐싱으로 인해 개수 정보는 생략
+                total_count = int(total_count)
                 
-                # 해당 종목/날짜의 데이터 로드
-                query = f"""
-                    SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
-                    FROM {self.table_name}
-                    WHERE 종목코드 = ? AND 날짜 = ?
-                    ORDER BY 시간
-                """
-                df = self.conn.execute(query, [stock_code, date]).fetchdf()
+                # 최적화: 필요한 데이터만 부분 로드 (OFFSET/LIMIT)
+                needed_len = self.seq_len + 10
+                if self.max_episode_steps is not None:
+                    needed_len = self.seq_len + self.max_episode_steps
+                
+                # 데이터가 충분히 많고 max_episode_steps가 설정된 경우 최적화
+                use_optimization = (self.max_episode_steps is not None) and (total_count >= needed_len)
+                
+                if use_optimization:
+                    max_start_offset = total_count - needed_len
+                    # 랜덤 시작 위치 결정 (전체 데이터 범위 내)
+                    offset = np.random.randint(0, max_start_offset + 1)
+                    
+                    query = f"""
+                        SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
+                        FROM {self.table_name}
+                        WHERE 종목코드 = ? AND 날짜 = ?
+                        ORDER BY 시간
+                        LIMIT ? OFFSET ?
+                    """
+                    # DuckDB에 정수형 파라미터 전달
+                    df = self.conn.execute(query, [stock_code, date, needed_len, offset]).fetchdf()
+                else:
+                    # 전체 로드 (Fallback)
+                    query = f"""
+                        SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
+                        FROM {self.table_name}
+                        WHERE 종목코드 = ? AND 날짜 = ?
+                        ORDER BY 시간
+                    """
+                    df = self.conn.execute(query, [stock_code, date]).fetchdf()
                 
                 if len(df) >= self.seq_len + 10:  # 최소 요구사항 충족
                     # 메타데이터와 특징 분리

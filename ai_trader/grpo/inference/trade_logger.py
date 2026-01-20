@@ -189,23 +189,16 @@ class TradeLogger:
                     f"holding_time={holding_time:.2f}s")
     
     def _log_to_json(self, trade_data: Dict[str, Any]):
-        """JSON 파일에 거래 기록"""
-        # 기존 데이터 로드
-        if self.json_path.exists():
-            with open(self.json_path, 'r', encoding='utf-8') as f:
-                try:
-                    trades = json.load(f)
-                except json.JSONDecodeError:
-                    trades = []
-        else:
-            trades = []
+        """JSON 파일에 거래 기록 (Optimized: Append-only JSONL)"""
+        # 성능 최적화: 전체 파일을 읽고 다시 쓰는 대신, JSON Lines(ndjson) 형식으로 추가합니다.
+        # 유효한 JSON 배열은 save_summary()에서 최종적으로 생성됩니다.
         
-        # 새 거래 추가
-        trades.append(trade_data)
-        
-        # 파일에 저장
-        with open(self.json_path, 'w', encoding='utf-8') as f:
-            json.dump(trades, f, indent=2, ensure_ascii=False)
+        # 파일 확장자가 .json이어도 내용은 줄 단위 JSON 객체로 저장 (Crash recovery용)
+        try:
+            with open(self.json_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(trade_data, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.error(f"Failed to append to JSON log: {e}")
     
     def _log_to_csv(self, trade_data: Dict[str, Any]):
         """CSV 파일에 거래 기록"""
