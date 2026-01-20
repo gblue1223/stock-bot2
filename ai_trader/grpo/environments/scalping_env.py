@@ -808,13 +808,15 @@ class GRPOScalpingEnv(gym.Env):
                 
                 logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
             else:
-                # 이미 포지션 보유 중: 불필요한 행동 페널티 (완화)
-                reward -= 0.01
+                # 이미 포지션 보유 중: 페널티 제거 (0.0)
+                # reward -= 0.01
+                pass
         
         elif action == 2:  # 매도
             if self.position == 0:
-                # 포지션 없는데 매도: 불필요한 행동 페널티 (완화)
-                reward -= 0.01
+                # 포지션 없는데 매도: 페널티 제거 (0.0)
+                # reward -= 0.01
+                pass
             elif self.position == 1:
                 # 보유 시간 계산
                 holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
