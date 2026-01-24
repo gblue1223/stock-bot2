@@ -378,6 +378,7 @@ def main():
         logger.info(f"  Trainable parameters: {trainable_params:,}")
         
         # 기존 모델 로드 (Fine-tuning)
+        start_iteration = 0  # 기본값 초기화
         if config.load_policy:
             logger.info(f"[LOAD POLICY] Loading from {config.load_policy}...")
             try:
@@ -398,6 +399,17 @@ def main():
                 if unexpected:
                     logger.warning(f"  Unexpected keys: {len(unexpected)}")
                 logger.info("[OK] Policy loaded successfully")
+                
+                # 체크포인트 파일명에서 시작 반복 횟수 추출 (load_policy가 설정된 경우)
+                try:
+                    import re
+                    match = re.search(r'checkpoint_iter(\d+)\.pt', config.load_policy)
+                    if match:
+                        start_iteration = int(match.group(1))
+                        logger.info(f"Resuming from iteration: {start_iteration}")
+                except Exception as e:
+                    logger.warning(f"Could not extract iteration number from checkpoint path: {e}")
+                    start_iteration = 0
             except Exception as e:
                 logger.error(f"Failed to load policy: {e}", exc_info=True)
                 raise
@@ -504,7 +516,8 @@ def main():
             total_episodes=total_episodes,
             checkpoint_interval=config.checkpoint_interval,
             checkpoint_path=checkpoint_path,
-            on_iteration_end=curriculum_callback
+            on_iteration_end=curriculum_callback,
+            start_iteration=start_iteration
         )
         
         training_time = time.time() - start_time

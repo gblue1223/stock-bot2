@@ -779,7 +779,8 @@ class GRPOTrainer:
         total_episodes: int,
         checkpoint_interval: int = 100,
         checkpoint_path: Optional[str] = None,
-        on_iteration_end: Optional[Callable[[int, Dict[str, Any]], None]] = None
+        on_iteration_end: Optional[Callable[[int, Dict[str, Any]], None]] = None,
+        start_iteration: int = 0
     ) -> Dict[str, Any]:
         """
         GRPO 훈련 실행
@@ -789,6 +790,7 @@ class GRPOTrainer:
             checkpoint_interval: 체크포인트 저장 간격
             checkpoint_path: 체크포인트 저장 경로 (format string with {} for iteration)
             on_iteration_end: 매 반복 종료 시 호출될 콜백 함수 (iteration, metrics) -> None
+            start_iteration: 시작 반복 횟수 (재개 시 사용)
             
         Returns:
             훈련 메트릭 딕셔너리
@@ -798,12 +800,12 @@ class GRPOTrainer:
         logger.info(f"Starting GRPO training for {total_episodes} episodes...")
         
         num_iterations = total_episodes // (self.episodes_per_group * self.num_groups)
-        logger.info(f"Total iterations: {num_iterations}")
+        logger.info(f"Total iterations: {num_iterations} (Starting from {start_iteration})")
         
         start_time = time.time()
         iteration_times = []
         
-        for iteration in range(num_iterations):
+        for iteration in range(start_iteration, num_iterations):
             iteration_start_time = time.time()
             # 1. 롤아웃 수집
             num_episodes = self.episodes_per_group * self.num_groups
