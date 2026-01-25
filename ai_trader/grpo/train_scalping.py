@@ -115,7 +115,7 @@ class TrainingConfig:
         self.gamma = 0.99
         self.clip = 0.1  # 0.2 -> 0.1 (안정성 강화)
         self.kl_target = 0.01
-        self.entropy_coef = 0.1  # 0.05 -> 0.1 (탐색 강화)
+        self.entropy_coef = 0.05  # 0.1 -> 0.05 (탐색 줄이고 수익 집중)
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
         
