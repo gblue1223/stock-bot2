@@ -832,6 +832,18 @@ class GRPOScalpingEnv(gym.Env):
                     holding_time
                 )
                 
+                # ✅ 승리/손실 보너스 (비대칭 적용)
+                # 거래비용 제외 순수익률 기준으로 판정
+                profit_rate = reward_components['profit_rate']
+                if profit_rate > self.round_trip_cost:
+                    # 수익 거래: 강한 양의 보상
+                    reward += 1.5
+                    logger.debug(f"Win bonus applied: +1.5")
+                elif profit_rate < 0:
+                    # 손실 거래: 약한 음의 보상
+                    reward -= 0.5
+                    logger.debug(f"Loss penalty applied: -0.5")
+                
                 # 거래 기록
                 trade_info = {
                     'entry_price': self.entry_price,
