@@ -105,7 +105,7 @@ class TrainingConfig:
         self.stagnation_exit_seconds = 180  # 기본값
         
         # 정책 설정
-        self.hidden_dim = 64
+        self.hidden_dim = 128  # 64 -> 128 (네트워크 용량 증가)
         self.action_dim = 3
         
         # 훈련 설정
