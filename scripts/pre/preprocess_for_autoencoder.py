@@ -343,7 +343,7 @@ def main():
     
     parser.add_argument('--db', required=True, help='DuckDB 데이터베이스 경로')
     parser.add_argument('--output-dir', required=True, help='출력 디렉토리')
-    parser.add_argument('--seq-len', type=int, default=60, help='시퀀스 길이')
+    parser.add_argument('--seq-len', type=int, default=120, help='시퀀스 길이')
     parser.add_argument('--stride', type=int, default=1, help='스트라이드')
     parser.add_argument('--batch-size', type=int, default=10000, help='배치당 시퀀스 수')
     parser.add_argument('--max-samples', type=int, help='최대 샘플 수')

@@ -109,7 +109,7 @@ python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 # 사전 훈련 데이터 생성
 $ python scripts/pre/parallel_preprocessing.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --seq-len 60 \
+    --seq-len 120 \
     --batch-size 5000 \
     --start-year 2024 --start-month 9 \
     --end-year 2025 --end-month 9 \

@@ -125,7 +125,7 @@ class AutoEncoderEmbedding(nn.Module):
     """
     
     def __init__(self, input_dim: int, embedding_dim: int = 128, 
-                 hidden_dim: int = 256, seq_len: int = 60,
+                 hidden_dim: int = 256, seq_len: int = 120,
                  num_layers: int = 3, dropout: float = 0.1):
         super().__init__()
         
@@ -217,7 +217,7 @@ def create_autoencoder_model(input_dim: int, config: dict) -> AutoEncoderEmbeddi
             input_dim=input_dim,
             embedding_dim=config.get('embedding_dim', 128),
             hidden_dim=config.get('hidden_dim', 256),
-            seq_len=config.get('seq_len', 60),
+            seq_len=config.get('seq_len', 120),
             num_layers=config.get('num_layers', 3),
             dropout=config.get('dropout', 0.1),
             mask_ratio=config.get('mask_ratio', 0.15)
@@ -227,7 +227,7 @@ def create_autoencoder_model(input_dim: int, config: dict) -> AutoEncoderEmbeddi
             input_dim=input_dim,
             embedding_dim=config.get('embedding_dim', 128),
             hidden_dim=config.get('hidden_dim', 256),
-            seq_len=config.get('seq_len', 60),
+            seq_len=config.get('seq_len', 120),
             num_layers=config.get('num_layers', 3),
             dropout=config.get('dropout', 0.1)
         )
@@ -235,7 +235,7 @@ def create_autoencoder_model(input_dim: int, config: dict) -> AutoEncoderEmbeddi
 
 if __name__ == "__main__":
     # Test the model
-    batch_size, seq_len, input_dim = 32, 60, 50
+    batch_size, seq_len, input_dim = 32, 120, 50
     
     # Standard AutoEncoder
     model = AutoEncoderEmbedding(input_dim=input_dim, embedding_dim=128)

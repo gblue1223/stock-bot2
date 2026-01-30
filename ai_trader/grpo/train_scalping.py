@@ -93,7 +93,7 @@ class TrainingConfig:
         self.policy = 'grpo'
         self.db_path = None
         self.table_name = 'datasets'
-        self.seq_len = 60
+        self.seq_len = 120
         self.features = 28
         self.episode_steps = 150
         

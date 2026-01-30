@@ -367,7 +367,7 @@ def train_autoencoder_embedding(train_data: np.ndarray,
             'model_type': 'masked',  # or 'standard'
             'embedding_dim': 128,
             'hidden_dim': 256,
-            'seq_len': 60,
+            'seq_len': 120,
             'num_layers': 3,
             'dropout': 0.1,
             'mask_ratio': 0.15,

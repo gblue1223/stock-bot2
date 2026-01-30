@@ -195,6 +195,7 @@ def main():
     parser.add_argument('--batch-size', type=int, default=2, help='Batch size (number of batch files)')
     parser.add_argument('--max-sequences', type=int, default=2000, help='Max sequences per training batch')
     parser.add_argument('--max-batches-per-month', type=int, default=50, help='Max batches per month')
+    parser.add_argument('--seq-len', type=int, default=120, help='Sequence length')
     parser.add_argument('--embedding-dim', type=int, default=128, help='Embedding dimension')
     parser.add_argument('--hidden-dim', type=int, default=256, help='Hidden dimension')
     parser.add_argument('--learning-rate', type=float, default=1e-3, help='Learning rate')
@@ -237,7 +238,7 @@ def main():
         'model_type': args.model_type,
         'embedding_dim': args.embedding_dim,
         'hidden_dim': args.hidden_dim,
-        'seq_len': 60,  # From preprocessed data
+        'seq_len': args.seq_len,
         'num_layers': 3,
         'dropout': 0.1,
         'mask_ratio': 0.15,

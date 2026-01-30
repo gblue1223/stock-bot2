@@ -59,7 +59,7 @@ class GRPOScalpingEnv(gym.Env):
         embedding_model: torch.nn.Module,
         db_path: str,
         table_name: str = 'datasets',
-        seq_len: int = 60,
+        seq_len: int = 120,
         embedding_dim: int = 128,
         expected_features: int = 28,
         transaction_cost_rate: float = 0.00215,
