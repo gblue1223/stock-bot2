@@ -114,7 +114,7 @@ $ python scripts/pre/parallel_preprocessing.py \
     --start-year 2024 --start-month 9 \
     --end-year 2025 --end-month 9 \
     --output "C:\Users\user\Workspace\datasets@20260117\pre_training_data" \
-    --max-workers 2
+    --max-workers 4
 
 # autoencoder_training_complete.ipynb 실행
 ```
@@ -146,12 +146,12 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장)
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder\best_model.pt" \
-    --seq_len 60 \
+    --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
+    --seq_len 120 \
     --features 28 \
-    --total_timesteps 100000 \
+    --total_timesteps 200000 \
     --use_raw_data true \
-    --output_dir "models/grpo_scalping"
+    --output_dir "models/grpo_scalping_curriculum_v5"
 
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_scalping.py \
@@ -206,7 +206,7 @@ from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
 model = MaskedAutoEncoder(
     input_dim=60,
     embedding_dim=128,
-    seq_len=60,
+    seq_len=120,
     mask_ratio=0.15  # 15% 마스킹
 )
 
@@ -333,7 +333,7 @@ python -c "
 import torch, time
 from ai_trader.embedding.autoencoder_model import AutoEncoderEmbedding
 
-model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=60)
+model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=120)
 model.eval()
 
 test_input = torch.randn(1, 60, 50)
