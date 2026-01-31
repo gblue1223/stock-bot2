@@ -129,6 +129,7 @@ class TrainingConfig:
         self.checkpoint_interval = 10
         self.output_dir = 'models/grpo_modular'
         self.load_policy = None
+        self.num_workers = 4  # ✅ 병렬 작업자 수 추가 (기본값: 4)
         
         # 디바이스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -195,11 +196,11 @@ class TrainingConfig:
 
 
 # ========================================
-# 환경 및 정책 생성 함수
+# 모델 및 환경 생성 함수
 # ========================================
 
-def create_environment(config: TrainingConfig, device: str):
-    """환경 생성"""
+def load_embedding_model(config: TrainingConfig, device: str):
+    """임베딩 모델 로드 (공유용)"""
     try:
         if config.embedding_model is None:
             raise ValueError("embedding_model is required for scalping environment")
@@ -216,8 +217,15 @@ def create_environment(config: TrainingConfig, device: str):
         embedding_model.to(device)
         embedding_model.eval()
         logger.info("[OK] Embedding model loaded")
-        
-        logger.info("[CREATE ENV] Creating GRPOScalpingEnv...")
+        return embedding_model
+    except Exception as e:
+        logger.error(f"Failed to load embedding model: {e}", exc_info=True)
+        raise
+
+def create_environment(config: TrainingConfig, embedding_model, device: str):
+    """환경 생성 (단일 인스턴스)"""
+    try:
+        # logger.info("[CREATE ENV] Creating GRPOScalpingEnv...") # 너무 시끄러울 수 있으므로 주석 처리하거나 debug로 변경
         env = GRPOScalpingEnv(
             embedding_model=embedding_model,
             db_path=config.db_path,
@@ -230,32 +238,31 @@ def create_environment(config: TrainingConfig, device: str):
             quick_exit_penalty=config.quick_exit_penalty,
             quick_exit_threshold=config.stagnation_exit_seconds,
             max_episode_steps=config.episode_steps,
-            use_raw_data=config.use_raw_data,  # ✅ 추가
-            rolling_window_size=config.rolling_window_size,  # ✅ 추가
-            rolling_min_samples=config.rolling_min_samples,  # ✅ 추가
+            use_raw_data=config.use_raw_data,
+            rolling_window_size=config.rolling_window_size,
+            rolling_min_samples=config.rolling_min_samples,
             device=device
         )
-        logger.info("[OK] GRPOScalpingEnv created")
-        logger.info(f"  Normalization: {'RollingNormalizer' if config.use_raw_data else 'Pre-normalized'}")
-        if config.use_raw_data:
-            logger.info(f"  Rolling window: {config.rolling_window_size}, min_samples: {config.rolling_min_samples}")
-        
         return env
     except Exception as e:
         logger.error(f"Failed to create environment: {e}", exc_info=True)
         raise
 
 
+
 def create_policy(config: TrainingConfig, env, device: str):
     """정책 생성"""
     try:
         logger.info("[CREATE POLICY] Creating GRPOPolicy...")
+        # env가 리스트일 수 있으므로 첫 번째 요소 사용
+        ref_env = env[0] if isinstance(env, list) else env
+        
         policy = GRPOPolicy(
-            embedding_dim=env.embedding_dim,
+            embedding_dim=ref_env.embedding_dim,
             hidden_dim=config.hidden_dim,
             action_dim=config.action_dim
         )
-        logger.info(f"[OK] GRPOPolicy created (embedding_dim={env.embedding_dim})")
+        logger.info(f"[OK] GRPOPolicy created (embedding_dim={ref_env.embedding_dim})")
         
         policy.to(device)
         return policy
@@ -306,6 +313,7 @@ def main():
     parser.add_argument('--embedding_model', type=str, default=None)
     parser.add_argument('--embedding_dim', type=int, default=None)
     parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
+    parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
     
     # ✅ 정규화 설정
     parser.add_argument('--use_raw_data', type=bool, default=None,
@@ -360,15 +368,32 @@ def main():
             logger.info(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         
         # 2. 환경 생성
-        logger.info("[STEP 2/6] Creating environment...")
-        env = create_environment(config, device)
-        logger.info(f"[OK] Environment: {type(env).__name__}")
-        logger.info(f"  Observation space: {env.observation_space.shape}")
-        logger.info(f"  Action space: {env.action_space.n}")
+        # 2. 환경 생성 (병렬 처리 지원)
+        logger.info(f"[STEP 2/6] Creating environments (Workers: {config.num_workers})...")
         
+        # 임베딩 모델 로드 (한 번만 수행하여 공유)
+        embedding_model = load_embedding_model(config, device)
+        
+        # 워커 수만큼 환경 생성
+        envs = []
+        for i in range(config.num_workers):
+            logger.debug(f"Creating env worker {i+1}/{config.num_workers}...")
+            env_instance = create_environment(config, embedding_model, device)
+            envs.append(env_instance)
+        
+        logger.info(f"[OK] Created {len(envs)} environments")
+        
+        # 로깅을 위해 첫 번째 환경 참조
+        ref_env = envs[0]
+        logger.info(f"  Observation space: {ref_env.observation_space.shape}")
+        logger.info(f"  Action space: {ref_env.action_space.n}")
+        logger.info(f"  Avg Transaction Cost: {ref_env.transaction_cost_rate}")
+        if config.use_raw_data:
+            logger.info(f"  Normalization: RollingNormalizer (Window: {config.rolling_window_size})")
+
         # 3. 정책 생성
         logger.info("[STEP 3/6] Creating policy...")
-        policy = create_policy(config, env, device)
+        policy = create_policy(config, envs, device) # 리스트 전달
         logger.info(f"[OK] Policy: {type(policy).__name__}")
         
         # 파라미터 수 계산
@@ -421,7 +446,7 @@ def main():
         # 6. 트레이너 생성
         trainer = GRPOTrainer(
             policy=policy,
-            env=env,
+            env=envs,  # ✅ 환경 리스트 전달
             episodes_per_group=config.episodes_per_group,
             num_groups=config.num_groups,
             learning_rate=config.lr,
@@ -436,47 +461,42 @@ def main():
         )
         
         # 7. 커리큘럼 러닝 콜백 정의
-        current_cost_rate = 0.0
-        # Assuming config.transaction_cost_rate is the target cost rate from the environment creation
-        # If not, you might need to get it from env.transaction_cost_rate after env creation
-        target_cost_rate = 0.00215 # Default value used in env creation
         
-        # Check if transaction_cost_rate was explicitly set via CLI args and is > 0
-        # If not, we assume the default 0.00215 from env creation
+        # Set transaction cost for all environments
+        current_cost_rate = 0.0
+        target_cost_rate = 0.00215
+        
+        # Use first env to determine initial settings if not overridden
+        initial_env_cost = ref_env.transaction_cost_rate
+        
         if hasattr(args, 'transaction_cost_rate') and args.transaction_cost_rate is not None and args.transaction_cost_rate > 0:
              target_cost_rate = args.transaction_cost_rate
              logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {target_cost_rate}")
-             env.set_transaction_cost_rate(0.0)
+             for e in envs: e.set_transaction_cost_rate(0.0)
              current_cost_rate = 0.0
         else:
-             # If not explicitly set or set to 0, use the default from env creation
-             # If the env was created with 0.00215, we start with that.
-             # If the user wants to force 0 cost, they should set transaction_cost_rate=0 in config or CLI
-             if env.transaction_cost_rate > 0:
-                 logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {env.transaction_cost_rate}")
-                 target_cost_rate = env.transaction_cost_rate
-                 env.set_transaction_cost_rate(0.0)
+             if initial_env_cost > 0:
+                 logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {initial_env_cost}")
+                 target_cost_rate = initial_env_cost
+                 for e in envs: e.set_transaction_cost_rate(0.0)
                  current_cost_rate = 0.0
              else:
-                 current_cost_rate = env.transaction_cost_rate # Already 0 or some other value
-                 target_cost_rate = env.transaction_cost_rate # No curriculum if already 0 or user specified
+                 current_cost_rate = initial_env_cost
+                 target_cost_rate = initial_env_cost
                  logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
 
         def curriculum_callback(iteration: int, metrics: dict):
             nonlocal current_cost_rate
             nonlocal target_cost_rate
             
-            # 목표 비용에 도달했으면 패스
             if current_cost_rate >= target_cost_rate:
                 return
 
             win_rate = metrics.get('mean_win_rate', 0.0)
             
-            # 승률이 30% 이상이고 거래가 있을 때 비용 적용 시작 (기준 완화: 30%)
-            # 승률 50%는 상당히 높은 목표이므로, 30% 정도만 되어도 '수익을 낼 줄 안다'고 판단
             if win_rate >= 0.30 and metrics.get('mean_trades', 0) > 1.0:
                 logger.info(f"Curriculum Step: Win rate {win_rate:.1%} >= 30%. Increasing transaction cost to {target_cost_rate}")
-                env.set_transaction_cost_rate(target_cost_rate)
+                for e in envs: e.set_transaction_cost_rate(target_cost_rate)
                 current_cost_rate = target_cost_rate
         
         logger.info("[OK] Trainer created")
@@ -497,6 +517,7 @@ def main():
         logger.info(f"  Gamma: {config.gamma}")
         logger.info(f"  Clip Epsilon: {config.clip}")
         logger.info(f"  Entropy Coef: {config.entropy_coef}")
+        logger.info(f"  Parallel Workers: {config.num_workers}")
         logger.info(f"  Checkpoint Interval: {config.checkpoint_interval}")
         logger.info("=" * 80)
         
@@ -536,11 +557,12 @@ def main():
         trainer.save_checkpoint(final_model_path, final_metrics['num_updates'])
         logger.info(f"  Final Model: {final_model_path}")
         
-        # 정규화 통계 저장 (실시간 거래용)
-        if hasattr(env, 'mean') and hasattr(env, 'std'):
+        # 정규화 통계 저장 (첫 번째 환경 기준)
+        if hasattr(ref_env, 'normalizer') and ref_env.normalizer is not None:
             normalization_stats = {
-                'mean': env.mean.cpu().numpy().tolist() if torch.is_tensor(env.mean) else env.mean.tolist(),
-                'std': env.std.cpu().numpy().tolist() if torch.is_tensor(env.std) else env.std.tolist()
+                'mean': ref_env.normalizer.running_mean.tolist(),
+                'std': ref_env.normalizer.running_std.tolist(),
+                'count': int(ref_env.normalizer.count)
             }
             stats_path = os.path.join(config.output_dir, 'normalization_stats.json')
             with open(stats_path, 'w') as f:
@@ -564,12 +586,13 @@ def main():
     
     finally:
         # 정리
-        if 'env' in locals():
-            try:
-                env.close()
-                logger.debug("Environment closed")
-            except Exception as e:
-                logger.debug(f"Error closing environment: {e}")
+        if 'envs' in locals():
+            for i, e in enumerate(envs):
+                try:
+                    e.close()
+                except:
+                    pass
+            logger.debug(f"Closed {len(envs)} environments")
         
         if device == 'cuda':
             torch.cuda.empty_cache()

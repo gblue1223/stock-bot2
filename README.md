@@ -151,7 +151,9 @@ python ai_trader/grpo/train_scalping.py \
     --features 28 \
     --total_timesteps 200000 \
     --use_raw_data true \
-    --output_dir "models/grpo_scalping_curriculum_v5"
+    --output_dir "models/grpo_scalping_curriculum_v5" \
+    --load_policy "models/grpo_scalping_curriculum_v5/checkpoints/checkpoint_iter280.pt" \
+    --num_workers 8
 
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_scalping.py \

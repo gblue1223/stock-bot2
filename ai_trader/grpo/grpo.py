@@ -15,6 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 
 from .environments import GRPOScalpingEnv
+import concurrent.futures  # ✅ 병렬 처리용 추가
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,15 @@ class GRPOTrainer:
         use_gae: bool = True
     ):
         self.policy = policy
-        self.env = env
+        
+        # 환경 처리: 리스트 또는 단일 인스턴스
+        if isinstance(env, list):
+            self.envs = env
+            self.env = env[0]  # 참조용 (첫 번째 환경)
+        else:
+            self.envs = [env]
+            self.env = env
+            
         self.device = device
         
         # 정책을 디바이스로 이동
@@ -108,113 +117,140 @@ class GRPOTrainer:
     
     def collect_rollouts(self, num_episodes: int) -> List[Dict[str, Any]]:
         """
-        현재 정책으로 롤아웃 수집
-        
-        요구사항 4.1에 따라 현재 정책을 사용하여 여러 에피소드를 실행하고
-        상태, 행동, 보상, 다음 상태를 수집합니다.
-        
-        Args:
-            num_episodes: 수집할 에피소드 수
-            
-        Returns:
-            에피소드 데이터 리스트
-            각 에피소드는 다음을 포함:
-            - states: 상태 리스트
-            - actions: 행동 리스트
-            - rewards: 보상 리스트
-            - next_states: 다음 상태 리스트
-            - dones: 종료 플래그 리스트
-            - log_probs: 로그 확률 리스트
-            - metadata: 에피소드 메타데이터
+        현재 정책으로 롤아웃 수집 (병렬 처리 지원)
         """
+        if len(self.envs) > 1:
+            return self._collect_rollouts_parallel(num_episodes)
+        else:
+            return self._collect_rollouts_sequential(num_episodes)
+
+    def _collect_rollouts_parallel(self, num_episodes: int) -> List[Dict[str, Any]]:
+        """병렬 롤아웃 수집"""
+        logger.info(f"Collecting {num_episodes} rollouts using {len(self.envs)} workers...")
+        
+        episodes = []
+        n_workers = len(self.envs)
+        
+        # 각 워커에 할당할 에피소드 수 계산
+        chunk_size = num_episodes // n_workers
+        remainder = num_episodes % n_workers
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = []
+            
+            for i in range(n_workers):
+                count = chunk_size + (1 if i < remainder else 0)
+                if count > 0:
+                    futures.append(executor.submit(self._worker_task, i, count))
+            
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    res = f.result()
+                    episodes.extend(res)
+                except Exception as e:
+                    logger.error(f"Worker failed: {e}", exc_info=True)
+        
+        self.total_timesteps += sum(len(ep['rewards']) for ep in episodes)
+        logger.info(f"Collected {len(episodes)} rollouts (Parallel), total timesteps: {self.total_timesteps}")
+        return episodes
+
+    def _worker_task(self, worker_idx: int, count: int) -> List[Dict[str, Any]]:
+        """워커 스레드 작업"""
+        env = self.envs[worker_idx]
+        local_episodes = []
+        
+        for _ in range(count):
+            episode_data = self._run_episode(env)
+            local_episodes.append(episode_data)
+            
+        return local_episodes
+
+    def _collect_rollouts_sequential(self, num_episodes: int) -> List[Dict[str, Any]]:
+        """순차적 롤아웃 수집 (기존 로직)"""
+        logger.info(f"Collecting {num_episodes} rollouts (Sequential)...")
         episodes = []
         
-        logger.info(f"Collecting {num_episodes} rollouts...")
-        
-        for episode_idx in range(num_episodes):
-            # 에피소드 데이터 초기화
-            states = []
-            actions = []
-            rewards = []
-            next_states = []
-            dones = []
-            log_probs = []
-            
-            # 환경 리셋
-            state, info = self.env.reset()
-            
-            episode_reward = 0.0
-            episode_steps = 0
-            
-            # 에피소드 실행
-            while True:
-                # 상태를 텐서로 변환
-                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
-                
-                # 정책에서 행동 샘플링 (stochastic mode)
-                with torch.no_grad():
-                    action, log_prob = self._sample_action(state_tensor)
-                
-                # 환경에서 스텝 실행
-                next_state, reward, terminated, truncated, step_info = self.env.step(action)
-                done = terminated or truncated
-                if done:
-                    logger.debug(f"Episode finished: episode={episode_idx}, step={self.env.current_step}")
-                
-                # 데이터 저장
-                states.append(state)
-                actions.append(action)
-                rewards.append(reward)
-                next_states.append(next_state)
-                dones.append(done)
-                log_probs.append(log_prob)
-                
-                episode_reward += reward
-                episode_steps += 1
-                self.total_timesteps += 1
-                
-                # 다음 상태로 이동
-                state = next_state
-                
-                if done:
-                    break
-            
-            # 에피소드 메타데이터
-            episode_metadata = step_info.get('episode', {})
-            # 환경이 제공하는 total_return을 우선 사용해 일관성 유지
-            if 'total_return' in episode_metadata:
-                env_total = float(episode_metadata['total_return'])
-                sum_collected = float(np.sum(rewards))
-                # 내부 누적과 차이가 있으면 경고 로그
-                if abs(env_total - sum_collected) > 1e-6:
-                    logger.warning(
-                        f"Episode reward mismatch: env_total={env_total:.6f} vs collected_sum={sum_collected:.6f}"
-                    )
-                episode_reward = env_total
-            # 메타데이터에 episode_reward로 기록
-            episode_metadata['episode_reward'] = episode_reward
-            episode_metadata['episode_steps'] = episode_steps
-            
-            # 에피소드 데이터 저장
-            episode_data = {
-                'states': np.array(states),
-                'actions': np.array(actions),
-                'rewards': np.array(rewards),
-                'next_states': np.array(next_states),
-                'dones': np.array(dones),
-                'log_probs': np.array(log_probs),
-                'metadata': episode_metadata
-            }
-            
+        for _ in range(num_episodes):
+            episode_data = self._run_episode(self.env)
+            self.total_timesteps += len(episode_data['rewards'])
             episodes.append(episode_data)
             
-            logger.debug(f"Episode {episode_idx + 1}/{num_episodes}: "
-                        f"reward={episode_reward:.4f}, steps={episode_steps}, "
-                        f"trades={episode_metadata.get('num_trades', 0)}")
-        
-        logger.info(f"Collected {num_episodes} rollouts, total timesteps: {self.total_timesteps}")
-        
+        logger.info(f"Collected {len(episodes)} rollouts, total timesteps: {self.total_timesteps}")
         return episodes
+
+    def _run_episode(self, env) -> Dict[str, Any]:
+        """단일 에피소드 실행"""
+        # 에피소드 데이터 초기화
+        states = []
+        actions = []
+        rewards = []
+        next_states = []
+        dones = []
+        log_probs = []
+        
+        # 환경 리셋
+        state, info = env.reset()
+        
+        episode_reward = 0.0
+        episode_steps = 0
+        
+        # 에피소드 실행
+        while True:
+            # 상태를 텐서로 변환
+            # 주의: ThreadPoolExecutor에서 실행 시, CUDA 텐서 생성은 thread-safe하지만
+            # 스트림 동기화 이슈가 있을 수 있음. 그러나 보통의 PyTorch 사용시 문제 없음.
+            with torch.no_grad():
+                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+                
+                # 정책에서 행동 샘플링 (shared policy)
+                action, log_prob = self._sample_action(state_tensor)
+            
+            # 환경에서 스텝 실행
+            next_state, reward, terminated, truncated, step_info = env.step(action)
+            done = terminated or truncated
+            
+            # 데이터 저장
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
+            next_states.append(next_state)
+            dones.append(done)
+            log_probs.append(log_prob)
+            
+            episode_reward += reward
+            episode_steps += 1
+            
+            # 다음 상태로 이동
+            state = next_state
+            
+            if done:
+                break
+        
+        # 에피소드 메타데이터
+        episode_metadata = step_info.get('episode', {})
+        if 'total_return' in episode_metadata:
+            env_total = float(episode_metadata['total_return'])
+            sum_collected = float(np.sum(rewards))
+            if abs(env_total - sum_collected) > 1e-6:
+                # logger.warning(...) # 경합 줄이기 위해 로그 생략 또는 디버그
+                pass
+            episode_reward = env_total
+            
+        episode_metadata['episode_reward'] = episode_reward
+        episode_metadata['episode_steps'] = episode_steps
+        
+        # 에피소드 데이터 저장
+        episode_data = {
+            'states': np.array(states),
+            'actions': np.array(actions),
+            'rewards': np.array(rewards),
+            'next_states': np.array(next_states),
+            'dones': np.array(dones),
+            'log_probs': np.array(log_probs),
+            'metadata': episode_metadata
+        }
+        
+        return episode_data
     
     def _sample_action(self, state: torch.Tensor) -> Tuple[int, float]:
         """
