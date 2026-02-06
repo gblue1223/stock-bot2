@@ -152,8 +152,11 @@ python ai_trader/grpo/train_scalping.py \
     --total_timesteps 200000 \
     --use_raw_data true \
     --output_dir "models/grpo_scalping_curriculum_v5" \
-    --load_policy "models/grpo_scalping_curriculum_v5/checkpoints/checkpoint_iter280.pt" \
-    --num_workers 8
+    --num_workers 2 \
+    --min_holding 2 \
+    --max_holding 100 \
+    --entropy_coef 0.01 \
+    --lr 0.0001
 
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_scalping.py \
@@ -166,10 +169,10 @@ python ai_trader/grpo/train_scalping.py \
     --output_dir "models/grpo_scalping_curriculum_v5_tuned_v2" \
     --load_policy "models/grpo_scalping_curriculum_v5_tuned/checkpoints/checkpoint_iter6400.pt" \
     --num_workers 2 \
-    --entropy_coef 0.01 \
-    --lr 0.0001 \
     --min_holding 2 \
-    --max_holding 100
+    --max_holding 100 \
+    --entropy_coef 0.01 \
+    --lr 0.0001
 ```
 
 ### 4단계: 실시간 추론 (2.87ms)

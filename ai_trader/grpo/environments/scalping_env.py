@@ -134,11 +134,15 @@ class GRPOScalpingEnv(gym.Env):
             self.normalizer = None
             logger.info("Using pre-normalized data from database")
         
-        # 관측 공간: 임베딩 벡터
+        # 관측 공간: 임베딩 벡터 + 포지션 정보(3)
+        # 1. Position (0 or 1)
+        # 2. Position Steps (Normalized)
+        # 3. Holding Time (Normalized)
+        self.obs_dim = embedding_dim + 3
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(embedding_dim,),
+            shape=(self.obs_dim,),
             dtype=np.float32
         )
         
@@ -485,7 +489,25 @@ class GRPOScalpingEnv(gym.Env):
         # 임베딩 생성
         embedding = self._get_embedding(sequence)
         
-        return embedding
+        # ✅ 포지션 상태 정보 추가 (중요: 에이전트가 자신의 상태를 알아야 함)
+        if self.position == 1:
+            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+            holding_time_norm = min(holding_time / (self.max_holding_time + 1e-6), 1.0)
+            steps_norm = self.position_steps / (self.max_split_count or 1)
+        else:
+            holding_time_norm = 0.0
+            steps_norm = 0.0
+            
+        extra_features = np.array([
+            float(self.position),
+            float(steps_norm),
+            float(holding_time_norm)
+        ], dtype=np.float32)
+        
+        # 임베딩 + 추가 정보 결합
+        observation = np.concatenate([embedding, extra_features])
+        
+        return observation
     
     def reset(
         self,
@@ -860,6 +882,8 @@ class GRPOScalpingEnv(gym.Env):
                     # Action이 무시되더라도, 아래 "2. 포지션 보유에 따른 Step Reward" 로직은 타야 함
                     # 따라서 여기서는 아무것도 안 하고 pass하면, 아래에서 Holding 보상을 받게 됨.
                     logger.debug(f"Sell ignored: holding_time {holding_time:.1f}s < min {self.min_holding_time}s")
+                    # 💡 의미 없는 매도 시도에 대한 페널티 (학습 가이드)
+                    reward -= 0.05
                 else:
                     # 전량 매도 진행
                     
@@ -1055,7 +1079,7 @@ class GRPOScalpingEnv(gym.Env):
         if not (terminated or truncated):
             observation = self._get_current_observation()
         else:
-            observation = np.zeros(self.embedding_dim, dtype=np.float32)
+            observation = np.zeros(self.obs_dim, dtype=np.float32)
         
         # 정보
         info = {

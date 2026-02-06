@@ -268,7 +268,7 @@ def create_policy(config: TrainingConfig, env, device: str):
         ref_env = env[0] if isinstance(env, list) else env
         
         policy = GRPOPolicy(
-            embedding_dim=ref_env.embedding_dim,
+            embedding_dim=ref_env.observation_space.shape[0],
             hidden_dim=config.hidden_dim,
             action_dim=config.action_dim
         )
