@@ -73,6 +73,8 @@ class GRPOScalpingEnv(gym.Env):
         base_price: float = 100000.0,  # ✅ 기준 가격 (기본값: 10만원)
         stop_loss_pct: float = 2.0,     # ✅ 손절 기준 (%)
         max_split_count: int = 1,       # ✅ 최대 분할 매수 횟수
+        min_holding_time: float = 2.0,  # ✅ 최소 보유 시간
+        max_holding_time: float = 100.0,# ✅ 최대 보유 시간
         device: str = 'cpu'
     ):
         super().__init__()
@@ -80,6 +82,8 @@ class GRPOScalpingEnv(gym.Env):
         self.base_price = base_price
         self.stop_loss_pct = stop_loss_pct
         self.max_split_count = max_split_count
+        self.min_holding_time = min_holding_time
+        self.max_holding_time = max_holding_time
         
         self.embedding_model = embedding_model
         self.embedding_model.eval()  # 추론 모드
@@ -185,6 +189,7 @@ class GRPOScalpingEnv(gym.Env):
                    f"quick_exit_mode={quick_exit_mode}, "
                    f"transaction_cost={transaction_cost_rate*100:.3f}%, "
                    f"stop_loss={stop_loss_pct}%, max_split={max_split_count}, "
+                   f"holding_time_range=[{min_holding_time}s, {max_holding_time}s], "
                    f"use_raw_data={use_raw_data}")
         
         # ✅ 유효한 에피소드 키 캐싱
@@ -846,11 +851,20 @@ class GRPOScalpingEnv(gym.Env):
         
         elif action == 2:  # 매도
             if self.position == 1:
-                # 전량 매도
+                # 보유 시간 계산
                 holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
-                # 매도 가중치 (전량 매도이므로 현재 보유 비중)
-                weight = self.position_steps / self.max_split_count
+                # ✅ 최소 보유 시간 체크
+                if holding_time < self.min_holding_time:
+                    # 아직 팔 수 없음 (무시) -> 보유로 처리됨?
+                    # Action이 무시되더라도, 아래 "2. 포지션 보유에 따른 Step Reward" 로직은 타야 함
+                    # 따라서 여기서는 아무것도 안 하고 pass하면, 아래에서 Holding 보상을 받게 됨.
+                    logger.debug(f"Sell ignored: holding_time {holding_time:.1f}s < min {self.min_holding_time}s")
+                else:
+                    # 전량 매도 진행
+                    
+                    # 매도 가중치 (전량 매도이므로 현재 보유 비중)
+                    weight = self.position_steps / self.max_split_count
                 
                 # 매도 비용 차감 (보유 수량만큼)
                 reward -= self.transaction_cost_rate * 100 * weight
@@ -954,9 +968,18 @@ class GRPOScalpingEnv(gym.Env):
                      force_exit_reason = "Breakeven"
                      # 본전 청산은 중립적이거나 약한 보상
                      reward += 0.1
+                     
+                # 3. 최대 보유 시간 초과 (Time Limit)
+                # 시간이 너무 지체되면 강제 청산
+                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+                if not force_exit_reason and holding_time >= self.max_holding_time:
+                    force_exit_reason = "TimeLimit"
+                    # 시간 초과 페널티 (지루하게 오래 끌면 안됨)
+                    reward -= 0.5
                 
                 # 강제 청산 실행
                 if force_exit_reason:
+                    # 최소 보유 시간 체크 무시 (손절/본전청산/시간초과는 강제성이 있으므로)
                     exit_reward = self._force_close_position(force_exit_reason)
                     reward += exit_reward  # 청산 시 실현 손익 반영
                     
@@ -964,7 +987,7 @@ class GRPOScalpingEnv(gym.Env):
                     pass
                 else:
                     # 기존의 '시간 경과에 따른 빠른 손절' 로직 유지 (Only if not forced closed)
-                    holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+                    # holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time) # 위에서 계산함
                     if self.quick_exit_mode == 'penalty_only':
                          penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
                          reward += penalty

@@ -167,7 +167,9 @@ python ai_trader/grpo/train_scalping.py \
     --load_policy "models/grpo_scalping_curriculum_v5_tuned/checkpoints/checkpoint_iter6400.pt" \
     --num_workers 2 \
     --entropy_coef 0.01 \
-    --lr 0.0001
+    --lr 0.0001 \
+    --min_holding 2 \
+    --max_holding 100
 ```
 
 ### 4단계: 실시간 추론 (2.87ms)

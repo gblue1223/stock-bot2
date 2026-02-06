@@ -134,6 +134,8 @@ class TrainingConfig:
         # ✅ 손절 및 분할 매수 설정
         self.stop_loss_pct = 2.0      # 손절 퍼센트 (2.0%)
         self.max_split_count = 1      # 최대 분할 매수 횟수 (1 = 단일 진입)
+        self.min_holding_time = 2     # 최소 보유 시간 (초)
+        self.max_holding_time = 100   # 최대 보유 시간 (초)
         
         # 디바이스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -247,6 +249,8 @@ def create_environment(config: TrainingConfig, embedding_model, device: str):
             rolling_min_samples=config.rolling_min_samples,
             stop_loss_pct=config.stop_loss_pct,
             max_split_count=config.max_split_count,
+            min_holding_time=config.min_holding_time,
+            max_holding_time=config.max_holding_time,
             device=device
         )
         return env
@@ -326,6 +330,10 @@ def main():
                         help='Stop loss percentage (default: 2.0)')
     parser.add_argument('--max_split', dest='max_split_count', type=int, default=None,
                         help='Max split buy count (default: 1)')
+    parser.add_argument('--min_holding', dest='min_holding_time', type=float, default=None,
+                        help='Min holding time in seconds (default: 2)')
+    parser.add_argument('--max_holding', dest='max_holding_time', type=float, default=None,
+                        help='Max holding time in seconds (default: 100)')
     
     # ✅ 정규화 설정
     parser.add_argument('--use_raw_data', type=bool, default=None,
