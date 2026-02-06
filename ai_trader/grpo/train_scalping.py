@@ -244,7 +244,6 @@ def create_environment(config: TrainingConfig, embedding_model, device: str):
             max_episode_steps=config.episode_steps,
             use_raw_data=config.use_raw_data,
             rolling_window_size=config.rolling_window_size,
-            rolling_window_size=config.rolling_window_size,
             rolling_min_samples=config.rolling_min_samples,
             stop_loss_pct=config.stop_loss_pct,
             max_split_count=config.max_split_count,
