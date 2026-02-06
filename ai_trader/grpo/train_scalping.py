@@ -131,6 +131,10 @@ class TrainingConfig:
         self.load_policy = None
         self.num_workers = 4  # ✅ 병렬 작업자 수 추가 (기본값: 4)
         
+        # ✅ 손절 및 분할 매수 설정
+        self.stop_loss_pct = 2.0      # 손절 퍼센트 (2.0%)
+        self.max_split_count = 1      # 최대 분할 매수 횟수 (1 = 단일 진입)
+        
         # 디바이스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
@@ -240,7 +244,10 @@ def create_environment(config: TrainingConfig, embedding_model, device: str):
             max_episode_steps=config.episode_steps,
             use_raw_data=config.use_raw_data,
             rolling_window_size=config.rolling_window_size,
+            rolling_window_size=config.rolling_window_size,
             rolling_min_samples=config.rolling_min_samples,
+            stop_loss_pct=config.stop_loss_pct,
+            max_split_count=config.max_split_count,
             device=device
         )
         return env
@@ -314,6 +321,12 @@ def main():
     parser.add_argument('--embedding_dim', type=int, default=None)
     parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
+    
+    # ✅ 손절 및 분할 매수 설정
+    parser.add_argument('--stop_loss', dest='stop_loss_pct', type=float, default=None,
+                        help='Stop loss percentage (default: 2.0)')
+    parser.add_argument('--max_split', dest='max_split_count', type=int, default=None,
+                        help='Max split buy count (default: 1)')
     
     # ✅ 정규화 설정
     parser.add_argument('--use_raw_data', type=bool, default=None,

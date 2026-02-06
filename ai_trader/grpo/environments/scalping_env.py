@@ -71,11 +71,15 @@ class GRPOScalpingEnv(gym.Env):
         rolling_window_size: int = 1000,  # ✅ Rolling window 크기
         rolling_min_samples: int = 100,  # ✅ 최소 샘플 수
         base_price: float = 100000.0,  # ✅ 기준 가격 (기본값: 10만원)
+        stop_loss_pct: float = 2.0,     # ✅ 손절 기준 (%)
+        max_split_count: int = 1,       # ✅ 최대 분할 매수 횟수
         device: str = 'cpu'
     ):
         super().__init__()
         
         self.base_price = base_price
+        self.stop_loss_pct = stop_loss_pct
+        self.max_split_count = max_split_count
         
         self.embedding_model = embedding_model
         self.embedding_model.eval()  # 추론 모드
@@ -155,12 +159,16 @@ class GRPOScalpingEnv(gym.Env):
         
         # 에피소드 상태
         self.current_step = 0
-        self.position = 0  # 0: 포지션 없음, 1: 매수 포지션
-        self.entry_price = 0.0
-        self.entry_price = 0.0
+        self.position = 0  # 0: 포지션 없음, 1: 보유 중 (호환성 유지)
+        self.position_steps = 0  # 현재 분할 매수 단계 (0 ~ max_split_count)
+        self.avg_entry_price = 0.0  # 평단가
+
         self.entry_time = 0
         self.current_price = 0.0
         self.current_time = 0
+        
+        # 리스크 관리용 상태
+        self.max_price_since_entry = 0.0  # 진입 후 최고가 (본전 청산용)
         
         # 에피소드 메타데이터
         self.episode_trades = []
@@ -176,6 +184,7 @@ class GRPOScalpingEnv(gym.Env):
                    f"quick_exit_threshold={quick_exit_threshold}s, "
                    f"quick_exit_mode={quick_exit_mode}, "
                    f"transaction_cost={transaction_cost_rate*100:.3f}%, "
+                   f"stop_loss={stop_loss_pct}%, max_split={max_split_count}, "
                    f"use_raw_data={use_raw_data}")
         
         # ✅ 유효한 에피소드 키 캐싱
@@ -505,8 +514,10 @@ class GRPOScalpingEnv(gym.Env):
         # 에피소드 상태 초기화
         self.current_step = self.seq_len - 1  # 최소 seq_len만큼의 히스토리 필요
         self.position = 0
-        self.entry_price = 0.0
+        self.position_steps = 0
+        self.avg_entry_price = 0.0
         self.entry_time = 0.0
+        self.max_price_since_entry = 0.0
         
         # 현재 가격 및 시간 (메타데이터의 시간 컬럼 사용)
         self.current_price = self._get_current_price()
@@ -674,62 +685,55 @@ class GRPOScalpingEnv(gym.Env):
         
         return reward, quick_exit_triggered
     
-    def _check_quick_exit_force_close(self, holding_time: float) -> Tuple[float, bool]:
-        """
-        빠른 손절 룰 체크 (force_close 모드)
-        
-        임계값 이내에 가격이 상승하지 않으면 자동 매도.
-        과도한 거래를 유발할 수 있음 (이전 동작).
-        
-        Args:
-            holding_time: 보유 시간 (초)
-            
-        Returns:
-            (reward, quick_exit_triggered) 튜플
-        """
-        reward = 0.0
-        quick_exit_triggered = False
-        
-        # 임계값 이내이고 가격이 상승하지 않으면 강제 매도
-        if holding_time <= self.quick_exit_threshold and self.current_price <= self.entry_price:
-            quick_exit_triggered = True
-            self.quick_exit_violations += 1
-            
-            # 자동 매도 및 페널티 적용
-            reward, reward_components = self._calculate_reward(
-                self.entry_price,
-                self.current_price,
-                holding_time
-            )
-            
-            # 빠른 손절 룰 위반 페널티 추가
-            reward -= self.quick_exit_penalty
-            
-            # 거래 기록
-            trade_info = {
-                'entry_price': self.entry_price,
-                'exit_price': self.current_price,
-                'holding_time': holding_time,
-                'profit_rate': reward_components['profit_rate'],
-                'reward': reward,
-                'reward_components': reward_components,
-                'quick_exit_violation': True,
-                'quick_exit_penalty': self.quick_exit_penalty
-            }
-            self.episode_trades.append(trade_info)
-            
-            logger.debug(f"Quick exit rule triggered (force close): price={self.current_price:.4f}, "
-                       f"entry_price={self.entry_price:.4f}, "
-                       f"holding_time={holding_time:.2f}s, "
-                       f"penalty={self.quick_exit_penalty:.4f}, "
-                       f"reward={reward:.4f}")
-            
-            # 포지션 청산
-            self.position = 0
-            self.entry_price = 0.0
-            self.entry_time = 0.0
-        
         return reward, quick_exit_triggered
+    
+    def _force_close_position(self, reason: str, penalty: float = 0.0) -> float:
+        """
+        포지션 강제 청산 (손절, 본전청산 등)
+        Returns:
+            청산에 따른 보상(reward)
+        """
+        if self.position == 0:
+            return 0.0
+            
+        holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+        
+        # 거래 통계용 계산
+        realized_reward, reward_components = self._calculate_reward(
+            self.avg_entry_price,
+            self.current_price,
+            holding_time
+        )
+        
+        # 강제 청산 페널티 적용
+        final_reward = realized_reward + penalty
+        
+        # 거래 기록
+        trade_info = {
+            'entry_price': self.avg_entry_price,
+            'exit_price': self.current_price,
+            'holding_time': holding_time,
+            'profit_rate': reward_components['profit_rate'],
+            'reward': final_reward,
+            'reward_components': reward_components,
+            'exit_reason': reason,
+            'position_steps': self.position_steps
+        }
+        self.episode_trades.append(trade_info)
+        
+        logger.debug(f"Forced Exit ({reason}): price={self.current_price:.4f}, "
+                   f"avg_entry={self.avg_entry_price:.4f}, "
+                   f"steps={self.position_steps}, "
+                   f"reward={final_reward:.4f}")
+        
+        # 상태 초기화
+        self.position = 0
+        self.position_steps = 0
+        self.avg_entry_price = 0.0
+        self.entry_time = 0.0
+        self.max_price_since_entry = 0.0
+        
+        return final_reward
     
     def _calculate_seconds_diff(self, start_time_val, end_time_val) -> float:
         """
@@ -790,109 +794,151 @@ class GRPOScalpingEnv(gym.Env):
         
         # 1. 행동 실행
         if action == 1:  # 매수
-            if self.position == 0:
-                self.position = 1
-                self.entry_price = self.current_price
-                self.entry_time = self.current_time
+            if self.position_steps < self.max_split_count:
+                # 분할 매수 (또는 신규 진입)
+                old_steps = self.position_steps
+                new_steps = old_steps + 1
                 
-                # 매수 시 거래비용 차감 (Dense Reward)
-                # 비용은 편도 0.215% -> 0.43%? 아니, 매수/매도 각각 0.215%가 맞음?
-                # _calculate_reward에서는 self.round_trip_cost (0.43%)를 한번에 뺐음.
-                # Dense Reward에서는 매수/매도 각각 반씩 뺄 수도 있고, 매수 때 다 뺄 수도 있음.
-                # 편의상 매도 때 비용을 정산하던 기존 방식과 달리, 
-                # 여기선 "진입/청산 비용"을 각각 부과하거나, 왕복 비용을 나눠서 부과.
-                # 기존 round_trip_cost = 0.43%. Half = 0.215%.
+                # 평단가 갱신 (가중 평균)
+                # 이전 총액 + 현재 매수액 / 총 수량
+                prev_total_value = self.avg_entry_price * old_steps
+                new_total_value = prev_total_value + self.current_price
+                self.avg_entry_price = new_total_value / new_steps
                 
-                # 비용 페널티: -0.215 (스케일링 전 %, 즉 0.00215) * 100 = -0.215
+                self.position_steps = new_steps
+                self.position = 1  # 1개라도 있으면 포지션 ON
+                
+                if old_steps == 0:
+                    self.entry_time = self.current_time
+                    self.max_price_since_entry = self.current_price
+                
+                # 매수 비용 차감 (1회분)
                 reward -= self.transaction_cost_rate * 100
                 
-                logger.debug(f"Buy at price={self.entry_price:.4f}, time={self.entry_time}")
+                logger.debug(f"Buy (Step {new_steps}/{self.max_split_count}): "
+                           f"price={self.current_price:.1f}, "
+                           f"new_avg={self.avg_entry_price:.1f}")
             else:
-                # 이미 포지션 보유 중: 페널티 제거 (0.0)
-                # reward -= 0.01
+                # 이미 풀매수 상태: 과도한 매수 시도 페널티 (선택사항)
                 pass
         
         elif action == 2:  # 매도
-            if self.position == 0:
-                # 포지션 없는데 매도: 페널티 제거 (0.0)
-                # reward -= 0.01
-                pass
-            elif self.position == 1:
-                # 보유 시간 계산
+            if self.position == 1:
+                # 전량 매도
                 holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
-                # 매도 시 거래비용 차감 (Dense Reward)
+                # 매도 비용 차감 (보유 수량만큼 내야 하지만, 여기선 비율 보상이므로 1회분 or 전체?
+                # 분할 매수 시 진입 비용은 냈고, 청산 비용은 '전체 금액'에 대해 냄.
+                # 여기서는 간단히 총 자산 비례 비용을 적용해야 함.
+                # 편의상 '평단가 수익률' 모델이므로 1회분 기준 비율로 처리해도 무방.
+                # (1% 수익은 100만원이든 1000만원이든 1%임)
                 reward -= self.transaction_cost_rate * 100
                 
-                # 거래 통계용 (Realized PnL) 계산 - 보상에는 더하지 않음 (이중 계산 방지)
-                # 단, 로그용으로는 기존 함수 사용
+                # 수익률 계산 (평단가 기준)
                 realized_reward, reward_components = self._calculate_reward(
-                    self.entry_price,
+                    self.avg_entry_price,
                     self.current_price,
                     holding_time
                 )
                 
-                # ✅ 승리/손실 보너스 (비대칭 적용)
-                # 거래비용 제외 순수익률 기준으로 판정
+                # 보상 가중치 적용 (많이 샀으면 보상도 큼)
+                # reward_weight = self.position_steps / self.max_split_count
+                # realized_reward *= reward_weight
+                # -> 강화학습에서는 '결정적인 순간에 풀매수'를 유도하기 위해 가중치를 두는 게 좋음.
+                # 다만 너무 복잡해질 수 있으니 우선은 수익률 자체에 집중.
+                
                 profit_rate = reward_components['profit_rate']
                 if profit_rate > self.round_trip_cost:
-                    # 수익 거래: 강한 양의 보상
                     reward += 1.5
                     logger.debug(f"Win bonus applied: +1.5")
                 elif profit_rate < 0:
-                    # 손실 거래: 약한 음의 보상
                     reward -= 0.5
                     logger.debug(f"Loss penalty applied: -0.5")
                 
-                # 거래 기록
                 trade_info = {
-                    'entry_price': self.entry_price,
+                    'entry_price': self.avg_entry_price,
                     'exit_price': self.current_price,
                     'holding_time': holding_time,
-                    'profit_rate': reward_components['profit_rate'],
-                    'reward': realized_reward, # 기록용
-                    'reward_components': reward_components
+                    'profit_rate': profit_rate,
+                    'reward': realized_reward,
+                    'reward_components': reward_components,
+                    'position_steps': self.position_steps
                 }
                 self.episode_trades.append(trade_info)
                 
-                logger.debug(f"Sell at price={self.current_price:.4f}, "
-                           f"profit_rate={reward_components['profit_rate']:.4f}, "
-                           f"realized_reward={realized_reward:.4f}")
+                logger.debug(f"Sell at price={self.current_price:.1f}, "
+                           f"avg={self.avg_entry_price:.1f}, "
+                           f"steps={self.position_steps}, "
+                           f"profit={profit_rate*100:.2f}%")
                 
-                # 포지션 청산
+                # 상태 초기화
                 self.position = 0
-                self.entry_price = 0.0
+                self.position_steps = 0
+                self.avg_entry_price = 0.0
                 self.entry_time = 0.0
+                self.max_price_since_entry = 0.0
         
         elif action == 0:  # 보유
-            # 별도 페널티 없음 (Dense Reward가 알아서 처리)
             pass
         
         # 2. 포지션 보유에 따른 Step Reward (Dense Reward의 핵심)
         # 포지션을 들고 다음 스텝으로 넘어가면, 가격 변동분을 즉시 보상으로 반영
-        if self.position == 1:
-            # 다음 스텝의 가격 가져오기 (미래 참조가 아님, 시뮬레이션의 다음 상태)
+        if self.position == 1 and self.avg_entry_price > 0:
+            # 최고가 갱신
+            self.max_price_since_entry = max(self.max_price_since_entry, self.current_price)
+            
+            # 다음 스텝 가격으로 변동분 보상 계산
             next_step_idx = self.current_step + 1
             if next_step_idx < len(self.prices):
                 next_price = float(self.prices[next_step_idx])
-                
-                # 변동률 계산
-                # (P_next - P_curr) / P_curr
                 step_return = (next_price - self.current_price) / self.current_price
                 
-                # 스케일링 (1% = 1.0)
+                # 분할 매수 비중에 따른 가중치 적용 가능 (현재는 단순 수익률)
                 step_reward = step_return * 100
-                
                 reward += step_reward
                 
-                # 빠른 손절/익절 체크 (보조)
-                # Dense Reward가 있으므로 강제 청산 로직보다는 
-                # 큰 손실이 누적될 때 페널티를 주는 등의 보조 장치만 유지
+                # --- 리스크 관리 (손절 & 본전청산) ---
                 
-                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-                if self.quick_exit_mode == 'penalty_only':
-                     penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
-                     reward += penalty
+                # 현재 누적 수익률 (평단가 기준)
+                current_return = (self.current_price - self.avg_entry_price) / self.avg_entry_price
+                
+                # 최고 수익률 (진입 이후)
+                max_return = (self.max_price_since_entry - self.avg_entry_price) / self.avg_entry_price
+                
+                # 1. 손절매 (Stop Loss)
+                # 예: -2% 이하 시 손절
+                stop_loss_threshold = -(self.stop_loss_pct / 100.0)
+                
+                # 2. 본전 청산 (Breakeven)
+                # 예: 최고 수익률이 0.5% 이상이었다가, 다시 0.05% 이하로 떨어지면 청산
+                breakeven_activation = 0.005  # 0.5%
+                breakeven_trigger = 0.0005    # 0.05%
+                
+                force_exit_reason = None
+                
+                if current_return <= stop_loss_threshold:
+                    force_exit_reason = "Stop Loss"
+                    # 손절 페널티 부여
+                    reward -= 1.0
+                
+                elif max_return >= breakeven_activation and current_return <= breakeven_trigger:
+                     force_exit_reason = "Breakeven"
+                     # 본전 청산은 중립적이거나 약한 보상
+                     reward += 0.1
+                
+                # 강제 청산 실행
+                if force_exit_reason:
+                    exit_reward = self._force_close_position(force_exit_reason)
+                    reward += exit_reward  # 청산 시 실현 손익 반영
+                    
+                    # 빠른 손절 체크 로직은 해제 (이 로직이 대체)
+                    pass
+                else:
+                    # 기존의 '시간 경과에 따른 빠른 손절' 로직 유지 (Only if not forced closed)
+                    holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+                    if self.quick_exit_mode == 'penalty_only':
+                         penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
+                         reward += penalty
         
         # 보상 기록
         self.episode_rewards.append(reward)
@@ -919,13 +965,22 @@ class GRPOScalpingEnv(gym.Env):
             if len(self.episode_rewards) > 0:
                 self.episode_rewards[-1] += final_step_penalty
             
+            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+            
+            # 매도 비용 지불
+            final_step_penalty = -self.transaction_cost_rate * 100
+            
+            reward += final_step_penalty
+            if len(self.episode_rewards) > 0:
+                self.episode_rewards[-1] += final_step_penalty
+            
             # 통계용 기록
             final_reward, final_components = self._calculate_reward(
-                self.entry_price, self.current_price, holding_time
+                self.avg_entry_price, self.current_price, holding_time
             )
             
             self.episode_trades.append({
-                'entry_price': self.entry_price,
+                'entry_price': self.avg_entry_price,
                 'exit_price': self.current_price,
                 'holding_time': holding_time,
                 'profit_rate': final_components['profit_rate'],
