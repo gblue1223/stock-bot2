@@ -673,13 +673,13 @@ class GRPOScalpingEnv(gym.Env):
         quick_exit_triggered = False
         
         # 임계값을 초과하고 손실 중이면 페널티
-        if holding_time > self.quick_exit_threshold and self.current_price < self.entry_price:
+        if holding_time > self.quick_exit_threshold and self.current_price < self.avg_entry_price:
             quick_exit_triggered = True
             self.quick_exit_violations += 1
             reward = -self.quick_exit_penalty
             
             logger.debug(f"Quick exit penalty: price={self.current_price:.4f}, "
-                       f"entry_price={self.entry_price:.4f}, "
+                       f"avg_entry_price={self.avg_entry_price:.4f}, "
                        f"holding_time={holding_time:.2f}s, "
                        f"penalty={self.quick_exit_penalty:.4f}")
         

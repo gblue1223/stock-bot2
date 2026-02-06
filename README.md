@@ -157,13 +157,17 @@ python ai_trader/grpo/train_scalping.py \
 
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_scalping.py \
-    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-    --embedding_model "models/autoencoder@20260109/model.pt" \
-    --load_policy "models/grpo_scalping/checkpoint_iter100.pt" \
-    --total_timesteps 50000 \
-    --lr 0.0001 \
-    --entropy_coef 0.005 \
-    --output_dir "models/grpo_scalping_finetuned"
+    --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
+    --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
+    --seq_len 120 \
+    --features 28 \
+    --total_timesteps 200000 \
+    --use_raw_data true \
+    --output_dir "models/grpo_scalping_curriculum_v5_tuned_v2" \
+    --load_policy "models/grpo_scalping_curriculum_v5_tuned/checkpoints/checkpoint_iter6400.pt" \
+    --num_workers 2 \
+    --entropy_coef 0.01 \
+    --lr 0.0001
 ```
 
 ### 4단계: 실시간 추론 (2.87ms)
