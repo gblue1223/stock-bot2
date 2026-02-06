@@ -866,57 +866,57 @@ class GRPOScalpingEnv(gym.Env):
                     # 매도 가중치 (전량 매도이므로 현재 보유 비중)
                     weight = self.position_steps / self.max_split_count
                 
-                # 매도 비용 차감 (보유 수량만큼)
-                reward -= self.transaction_cost_rate * 100 * weight
-                
-                # 수익률 계산 (평단가 기준)
-                profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
-                
-                # 가중치가 적용된 수익 보상 시뮬레이션
-                # (단순 수익률이 아니라, '내 돈이 얼마나 들어갔나'에 비례한 수익금 개념)
-                weighted_profit_reward = profit_rate * 100 * weight
-                reward += weighted_profit_reward
-                
-                # 승리/손실 보너스에도 가중치 적용
-                # 풀매수 성공 시 보너스 큼, 짤짤이 성공 시 보너스 작음
-                if profit_rate > self.round_trip_cost:
-                    bonus = 1.5 * weight
-                    reward += bonus
-                    logger.debug(f"Win bonus applied: +{bonus:.2f} (weight={weight:.2f})")
-                elif profit_rate < 0:
-                    penalty = 0.5 * weight
-                    reward -= penalty
-                    logger.debug(f"Loss penalty applied: -{penalty:.2f} (weight={weight:.2f})")
-                
-                # 기록용 (호환성 유지)
-                _, reward_components = self._calculate_reward(
-                    self.avg_entry_price, self.current_price, holding_time
-                )
-                
-                trade_info = {
-                    'entry_price': self.avg_entry_price,
-                    'exit_price': self.current_price,
-                    'holding_time': holding_time,
-                    'profit_rate': profit_rate,
-                    'reward': reward,
-                    'reward_components': reward_components,
-                    'position_steps': self.position_steps,
-                    'weight': weight
-                }
-                self.episode_trades.append(trade_info)
-                
-                logger.debug(f"Sell at price={self.current_price:.1f}, "
-                           f"avg={self.avg_entry_price:.1f}, "
-                           f"steps={self.position_steps}, "
-                           f"profit={profit_rate*100:.2f}%, "
-                           f"weighted_reward={weighted_profit_reward:.4f}")
-                
-                # 상태 초기화
-                self.position = 0
-                self.position_steps = 0
-                self.avg_entry_price = 0.0
-                self.entry_time = 0.0
-                self.max_price_since_entry = 0.0
+                    # 매도 비용 차감 (보유 수량만큼)
+                    reward -= self.transaction_cost_rate * 100 * weight
+                    
+                    # 수익률 계산 (평단가 기준)
+                    profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
+                    
+                    # 가중치가 적용된 수익 보상 시뮬레이션
+                    # (단순 수익률이 아니라, '내 돈이 얼마나 들어갔나'에 비례한 수익금 개념)
+                    weighted_profit_reward = profit_rate * 100 * weight
+                    reward += weighted_profit_reward
+                    
+                    # 승리/손실 보너스에도 가중치 적용
+                    # 풀매수 성공 시 보너스 큼, 짤짤이 성공 시 보너스 작음
+                    if profit_rate > self.round_trip_cost:
+                        bonus = 1.5 * weight
+                        reward += bonus
+                        logger.debug(f"Win bonus applied: +{bonus:.2f} (weight={weight:.2f})")
+                    elif profit_rate < 0:
+                        penalty = 0.5 * weight
+                        reward -= penalty
+                        logger.debug(f"Loss penalty applied: -{penalty:.2f} (weight={weight:.2f})")
+                    
+                    # 기록용 (호환성 유지)
+                    _, reward_components = self._calculate_reward(
+                        self.avg_entry_price, self.current_price, holding_time
+                    )
+                    
+                    trade_info = {
+                        'entry_price': self.avg_entry_price,
+                        'exit_price': self.current_price,
+                        'holding_time': holding_time,
+                        'profit_rate': profit_rate,
+                        'reward': reward,
+                        'reward_components': reward_components,
+                        'position_steps': self.position_steps,
+                        'weight': weight
+                    }
+                    self.episode_trades.append(trade_info)
+                    
+                    logger.debug(f"Sell at price={self.current_price:.1f}, "
+                               f"avg={self.avg_entry_price:.1f}, "
+                               f"steps={self.position_steps}, "
+                               f"profit={profit_rate*100:.2f}%, "
+                               f"weighted_reward={weighted_profit_reward:.4f}")
+                    
+                    # 상태 초기화
+                    self.position = 0
+                    self.position_steps = 0
+                    self.avg_entry_price = 0.0
+                    self.entry_time = 0.0
+                    self.max_price_since_entry = 0.0
         
         elif action == 0:  # 보유
             pass
