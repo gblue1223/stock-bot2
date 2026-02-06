@@ -698,6 +698,13 @@ class GRPOScalpingEnv(gym.Env):
             
         holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
         
+        # 매도 비용 (보유 물량 전체에 대한 비용)
+        # 비용 = 요율 * 100 * (보유비중)
+        weight = self.position_steps / self.max_split_count if self.max_split_count > 0 else 1.0
+        
+        # 매도 비용 지불
+        exit_cost = self.transaction_cost_rate * 100 * weight
+        
         # 거래 통계용 계산
         realized_reward, reward_components = self._calculate_reward(
             self.avg_entry_price,
@@ -705,19 +712,33 @@ class GRPOScalpingEnv(gym.Env):
             holding_time
         )
         
-        # 강제 청산 페널티 적용
-        final_reward = realized_reward + penalty
+        # 강제 청산 페널티 적용 (실현 손익 - 비용 + 페널티)
+        # 여기서 realized_reward는 단순히 (수익률 - 0.43%) * 100 형태이므로,
+        # 가중치를 적용하려면 수익률 부분에도 가중치를 곱해야 함.
+        # 기존 _calculate_reward는 가중치 개념이 없음.
+        
+        # ✅ 가중치 적용된 보상 계산 직접 수행
+        profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
+        # 수익금 보상 = 수익률 * 100 * 가중치
+        weighted_profit_reward = profit_rate * 100 * weight
+        
+        # 최종 보상 = 가중 수익금 - 매도비용 + 페널티 (매수 비용은 이미 지불됨)
+        # 주의: _calculate_reward는 왕복 비용을 포함하고 있음.
+        # 여기서는 매도 비용만 따로 빼고, 수익 부분만 가중치 적용.
+        
+        final_reward = weighted_profit_reward - exit_cost + penalty
         
         # 거래 기록
         trade_info = {
             'entry_price': self.avg_entry_price,
             'exit_price': self.current_price,
             'holding_time': holding_time,
-            'profit_rate': reward_components['profit_rate'],
-            'reward': final_reward,
+            'profit_rate': profit_rate,
+            'reward': final_reward, # Logged reward
             'reward_components': reward_components,
             'exit_reason': reason,
-            'position_steps': self.position_steps
+            'position_steps': self.position_steps,
+            'weight': weight  # 가중치 기록
         }
         self.episode_trades.append(trade_info)
         
@@ -812,12 +833,15 @@ class GRPOScalpingEnv(gym.Env):
                     self.entry_time = self.current_time
                     self.max_price_since_entry = self.current_price
                 
-                # 매수 비용 차감 (1회분)
-                reward -= self.transaction_cost_rate * 100
+                # 매수 비용 차감 (1회분 = 1/max_split)
+                # 예: 10분할이면 전체 자산의 10%만 매수했으므로 비용도 10%만 발생
+                buy_weight = 1.0 / self.max_split_count
+                reward -= self.transaction_cost_rate * 100 * buy_weight
                 
                 logger.debug(f"Buy (Step {new_steps}/{self.max_split_count}): "
                            f"price={self.current_price:.1f}, "
-                           f"new_avg={self.avg_entry_price:.1f}")
+                           f"new_avg={self.avg_entry_price:.1f}, "
+                           f"cost_weight={buy_weight:.2f}")
             else:
                 # 이미 풀매수 상태: 과도한 매수 시도 페널티 (선택사항)
                 pass
@@ -827,49 +851,53 @@ class GRPOScalpingEnv(gym.Env):
                 # 전량 매도
                 holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
                 
-                # 매도 비용 차감 (보유 수량만큼 내야 하지만, 여기선 비율 보상이므로 1회분 or 전체?
-                # 분할 매수 시 진입 비용은 냈고, 청산 비용은 '전체 금액'에 대해 냄.
-                # 여기서는 간단히 총 자산 비례 비용을 적용해야 함.
-                # 편의상 '평단가 수익률' 모델이므로 1회분 기준 비율로 처리해도 무방.
-                # (1% 수익은 100만원이든 1000만원이든 1%임)
-                reward -= self.transaction_cost_rate * 100
+                # 매도 가중치 (전량 매도이므로 현재 보유 비중)
+                weight = self.position_steps / self.max_split_count
+                
+                # 매도 비용 차감 (보유 수량만큼)
+                reward -= self.transaction_cost_rate * 100 * weight
                 
                 # 수익률 계산 (평단가 기준)
-                realized_reward, reward_components = self._calculate_reward(
-                    self.avg_entry_price,
-                    self.current_price,
-                    holding_time
-                )
+                profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
                 
-                # 보상 가중치 적용 (많이 샀으면 보상도 큼)
-                # reward_weight = self.position_steps / self.max_split_count
-                # realized_reward *= reward_weight
-                # -> 강화학습에서는 '결정적인 순간에 풀매수'를 유도하기 위해 가중치를 두는 게 좋음.
-                # 다만 너무 복잡해질 수 있으니 우선은 수익률 자체에 집중.
+                # 가중치가 적용된 수익 보상 시뮬레이션
+                # (단순 수익률이 아니라, '내 돈이 얼마나 들어갔나'에 비례한 수익금 개념)
+                weighted_profit_reward = profit_rate * 100 * weight
+                reward += weighted_profit_reward
                 
-                profit_rate = reward_components['profit_rate']
+                # 승리/손실 보너스에도 가중치 적용
+                # 풀매수 성공 시 보너스 큼, 짤짤이 성공 시 보너스 작음
                 if profit_rate > self.round_trip_cost:
-                    reward += 1.5
-                    logger.debug(f"Win bonus applied: +1.5")
+                    bonus = 1.5 * weight
+                    reward += bonus
+                    logger.debug(f"Win bonus applied: +{bonus:.2f} (weight={weight:.2f})")
                 elif profit_rate < 0:
-                    reward -= 0.5
-                    logger.debug(f"Loss penalty applied: -0.5")
+                    penalty = 0.5 * weight
+                    reward -= penalty
+                    logger.debug(f"Loss penalty applied: -{penalty:.2f} (weight={weight:.2f})")
+                
+                # 기록용 (호환성 유지)
+                _, reward_components = self._calculate_reward(
+                    self.avg_entry_price, self.current_price, holding_time
+                )
                 
                 trade_info = {
                     'entry_price': self.avg_entry_price,
                     'exit_price': self.current_price,
                     'holding_time': holding_time,
                     'profit_rate': profit_rate,
-                    'reward': realized_reward,
+                    'reward': reward,
                     'reward_components': reward_components,
-                    'position_steps': self.position_steps
+                    'position_steps': self.position_steps,
+                    'weight': weight
                 }
                 self.episode_trades.append(trade_info)
                 
                 logger.debug(f"Sell at price={self.current_price:.1f}, "
                            f"avg={self.avg_entry_price:.1f}, "
                            f"steps={self.position_steps}, "
-                           f"profit={profit_rate*100:.2f}%")
+                           f"profit={profit_rate*100:.2f}%, "
+                           f"weighted_reward={weighted_profit_reward:.4f}")
                 
                 # 상태 초기화
                 self.position = 0
@@ -893,8 +921,11 @@ class GRPOScalpingEnv(gym.Env):
                 next_price = float(self.prices[next_step_idx])
                 step_return = (next_price - self.current_price) / self.current_price
                 
-                # 분할 매수 비중에 따른 가중치 적용 가능 (현재는 단순 수익률)
-                step_reward = step_return * 100
+                # ✅ 분할 매수 비중에 따른 가중치 적용 (핵심)
+                # 1단계만 보유 시 보상 10%, 10단계(풀매수) 보유 시 보상 100%
+                weight = self.position_steps / self.max_split_count
+                
+                step_reward = step_return * 100 * weight
                 reward += step_reward
                 
                 # --- 리스크 관리 (손절 & 본전청산) ---
@@ -965,17 +996,19 @@ class GRPOScalpingEnv(gym.Env):
             if len(self.episode_rewards) > 0:
                 self.episode_rewards[-1] += final_step_penalty
             
-            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-            
-            # 매도 비용 지불
-            final_step_penalty = -self.transaction_cost_rate * 100
+            # 매도 비용 지불 (가중치 적용)
+            weight = self.position_steps / self.max_split_count
+            final_step_penalty = -self.transaction_cost_rate * 100 * weight
             
             reward += final_step_penalty
             if len(self.episode_rewards) > 0:
                 self.episode_rewards[-1] += final_step_penalty
             
-            # 통계용 기록
-            final_reward, final_components = self._calculate_reward(
+            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+            
+            # 통계용 기록 (가중치 반영된 최종 보상 근사치)
+            # 여기서는 편의상 단순 기록
+            _, reward_components = self._calculate_reward(
                 self.avg_entry_price, self.current_price, holding_time
             )
             
@@ -983,9 +1016,9 @@ class GRPOScalpingEnv(gym.Env):
                 'entry_price': self.avg_entry_price,
                 'exit_price': self.current_price,
                 'holding_time': holding_time,
-                'profit_rate': final_components['profit_rate'],
-                'reward': final_reward,
-                'reward_components': final_components,
+                'profit_rate': reward_components['profit_rate'],
+                'reward': reward,
+                'reward_components': reward_components,
                 'forced_liquidation': True
             })
             
