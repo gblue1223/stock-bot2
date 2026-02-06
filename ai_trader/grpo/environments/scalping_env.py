@@ -685,8 +685,6 @@ class GRPOScalpingEnv(gym.Env):
         
         return reward, quick_exit_triggered
     
-        return reward, quick_exit_triggered
-    
     def _force_close_position(self, reason: str, penalty: float = 0.0) -> float:
         """
         포지션 강제 청산 (손절, 본전청산 등)
