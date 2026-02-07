@@ -334,6 +334,8 @@ def main():
                         help='Min holding time in seconds (default: 2)')
     parser.add_argument('--max_holding', dest='max_holding_time', type=float, default=None,
                         help='Max holding time in seconds (default: 100)')
+    parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,
+                        help='Target transaction cost rate (default: 0.00215)')
     
     # ✅ 정규화 설정
     parser.add_argument('--use_raw_data', type=bool, default=None,
@@ -514,11 +516,6 @@ def main():
 
             win_rate = metrics.get('mean_win_rate', 0.0)
             
-            if win_rate >= 0.30 and metrics.get('mean_trades', 0) > 1.0:
-                logger.info(f"Curriculum Step: Win rate {win_rate:.1%} >= 30%. Increasing transaction cost to {target_cost_rate}")
-                for e in envs: e.set_transaction_cost_rate(target_cost_rate)
-                current_cost_rate = target_cost_rate
-        
         logger.info("[OK] Trainer created")
         
         # 5. 훈련 설정 출력

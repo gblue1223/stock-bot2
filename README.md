@@ -156,6 +156,7 @@ python ai_trader/grpo/train_scalping.py \
     --min_holding 2 \
     --max_holding 100 \
     --entropy_coef 0.01 \
+    --transaction_cost 0.0 \
     --lr 0.0001
 
 # Fine-tuning (기존 모델 로드)
@@ -172,6 +173,7 @@ python ai_trader/grpo/train_scalping.py \
     --min_holding 2 \
     --max_holding 100 \
     --entropy_coef 0.01 \
+    --transaction_cost 0.00215 \
     --lr 0.0001
 ```
 
