@@ -143,19 +143,20 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 ### 3단계: GRPO 강화학습 훈련
 
 ```bash
-# GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장)
+# GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
+    --load_policy "models/grpo_scalping_curriculum_v6/checkpoints/checkpoint_iter30.pt" \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
     --use_raw_data true \
-    --output_dir "models/grpo_scalping_curriculum_v5" \
+    --output_dir "models/grpo_scalping_curriculum_v6" \
     --num_workers 2 \
     --min_holding 2 \
-    --max_holding 100 \
-    --entropy_coef 0.01 \
+    --max_holding 300 \
+    --entropy_coef 0.05 \
     --transaction_cost 0.0 \
     --lr 0.0001
 
@@ -167,11 +168,11 @@ python ai_trader/grpo/train_scalping.py \
     --features 28 \
     --total_timesteps 200000 \
     --use_raw_data true \
-    --output_dir "models/grpo_scalping_curriculum_v5_tuned_v2" \
-    --load_policy "models/grpo_scalping_curriculum_v5_tuned/checkpoints/checkpoint_iter6400.pt" \
+    --output_dir "models/grpo_scalping_curriculum_v6_tuned" \
+    --load_policy "models/grpo_scalping_curriculum_v6/checkpoints/checkpoint_iter6400.pt" \
     --num_workers 2 \
     --min_holding 2 \
-    --max_holding 100 \
+    --max_holding 300 \
     --entropy_coef 0.01 \
     --transaction_cost 0.00215 \
     --lr 0.0001
