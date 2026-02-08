@@ -147,12 +147,11 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
-    --load_policy "models/grpo_scalping_curriculum_v6/checkpoints/checkpoint_iter30.pt" \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
     --use_raw_data true \
-    --output_dir "models/grpo_scalping_curriculum_v6" \
+    --output_dir "models/grpo_scalping_v7_holding_rule" \
     --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
