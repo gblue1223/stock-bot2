@@ -878,9 +878,9 @@ class GRPOScalpingEnv(gym.Env):
                 
                 # ✅ 최소 보유 시간 체크 (Dense Reward로 가이드)
                 if holding_time < self.min_holding_time:
-                    # 너무 빨리 파는 경우: 강력한 페널티 부여 (-0.5점 = -0.5% 손실 상당)
-                    # 하지만 매도는 허용함 (모델이 행동의 결과를 알 수 있도록)
-                    early_exit_penalty = 0.5
+                    # 너무 빨리 파는 경우: 약한 페널티 부여 (-0.2점)
+                    # 거래를 아예 포기하지 않도록 페널티 완화
+                    early_exit_penalty = 0.2
                     reward -= early_exit_penalty
                     logger.debug(f"Early Exit Penalty applied: -{early_exit_penalty} (holding_time {holding_time:.2f}s < {self.min_holding_time}s)")
                 else:

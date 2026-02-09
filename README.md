@@ -152,6 +152,7 @@ python ai_trader/grpo/train_scalping.py \
     --total_timesteps 200000 \
     --use_raw_data true \
     --output_dir "models/grpo_scalping_v7_holding_rule" \
+    --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
     --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
@@ -167,8 +168,8 @@ python ai_trader/grpo/train_scalping.py \
     --features 28 \
     --total_timesteps 200000 \
     --use_raw_data true \
-    --output_dir "models/grpo_scalping_curriculum_v6_tuned" \
-    --load_policy "models/grpo_scalping_curriculum_v6/checkpoints/checkpoint_iter6400.pt" \
+    --output_dir "models/grpo_scalping_v7_holding_rule_soft" \
+    --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
     --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
