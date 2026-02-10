@@ -147,12 +147,12 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 python scripts/data/generate_embeddings_v3_parallel.py \
   --db_path "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
   --model_path "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
-  --output_dir "data/embeddings_v2" \
-  --state_file "data/embeddings_v2/processed_stocks.txt" \
+  --output_dir "C:\Users\user\Workspace\datasets@20260117\embeddings_v2" \
+  --state_file "C:\Users\user\Workspace\datasets@20260117\embeddings_v2\processed_stocks.txt" \
   --table_name "datasets" \
   --seq_len 120 \
   --batch_size 4096 \
-  --num_workers 4 \
+  --num_workers 2 \
   --device cuda
 ```
 

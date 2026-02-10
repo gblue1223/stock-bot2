@@ -136,3 +136,4 @@ scripts/gcp/config.sh
 
 # etc
 *.parquet
+*.npy

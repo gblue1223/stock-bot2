@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-데이터 임베딩 일괄 생성 (Parallel & Resume)
+데이터 임베딩 일괄 생성 (Parallel & Resume & IPC optimized & Memory Efficient)
 
 1. Resume 기능: processed_stocks.txt에 완료된 종목 기록 및 로드
 2. 병렬 처리: Producer-Consumer 패턴 (ProcessPoolExecutor)
-   - Worker: DB Fetch -> Normalize -> Tensor 변환
-   - Main: GPU Inference -> Save
+   - Worker: DB Fetch -> Normalize -> Tensor 변환 (Chunk 단위) -> Temp File Save
+   - Main: Load Temp File -> GPU Inference -> Save
 
 수정 내역:
-- DuckDB Concurrency Issue 해결을 위해 read_only=True 명시 및 설정 변경
-- Worker 프로세스에서 DB 연결 시 설정 추가 ('duckdb.connect(..., config={"access_mode": "READ_ONLY"})')
+- Memory Error (Unable to allocate 20GB+) 방지를 위해 
+  Worker 내부에서 데이터를 한 번에 거대한 3D Array로 만들지 않고, 
+  작은 청크 단위로 나누어 임시 파일에 저장하도록 변경.
 """
 
 import os
@@ -21,10 +22,10 @@ import torch
 import numpy as np
 import pandas as pd
 import time
+import uuid
 from pathlib import Path
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import Manager
 
 # 프로젝트 루트 추가
 project_root = Path(__file__).parent.parent.parent
@@ -33,16 +34,14 @@ sys.path.insert(0, str(project_root))
 from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
 
 # --- Worker Function ---
-def process_stock_data(stock_code, db_path, table_name, feature_cols, means, stds, seq_len, col_map):
+def process_stock_data(stock_code, db_path, table_name, feature_cols, means, stds, seq_len, col_map, temp_dir):
     """
     Worker Process에서 실행되는 함수
+    메모리 효율성을 위해 데이터를 청크 파일로 분할 저장합니다.
     """
     try:
-        # 각 프로세스마다 별도 DB 연결 (Read Only)
-        # config dictionary를 사용하여 명시적으로 읽기 전용 설정
         con = duckdb.connect(db_path, read_only=True, config={'access_mode': 'READ_ONLY'})
         
-        # 쿼리 구성
         select_cols = [f"\"{col_map['date']}\"", f"\"{col_map['time']}\"", f"\"{col_map['code']}\""] + \
                       [f"\"{c}\"" for c in feature_cols]
         select_clause = ", ".join(select_cols)
@@ -62,18 +61,65 @@ def process_stock_data(stock_code, db_path, table_name, feature_cols, means, std
         feats = df[feature_cols].values.astype(np.float32)
         feats = (feats - means) / stds
         
-        # 시퀀스 데이터 생성
+        # 시퀀스 데이터 생성 (Chunk 단위 처리)
+        # 전체를 (N, 120, 28)로 만들면 20GB 넘게 필요하므로 절대 금지.
+        # 대신 (chunk_size, 120, 28)씩 잘라서 저장.
+        
         num_samples = len(feats) - seq_len + 1
+        chunk_size = 10000  # 한 번에 처리할 샘플 수 (약 130MB 메모리 사용)
         
-        shape = (num_samples, seq_len, feats.shape[1])
-        strides = (feats.strides[0], feats.strides[0], feats.strides[1])
-        sequences = np.lib.stride_tricks.as_strided(feats, shape=shape, strides=strides, writeable=False)
+        file_paths = []
+        unique_id = str(uuid.uuid4())
         
-        # copy to make it contiguous and independent
-        return (stock_code, meta, np.ascontiguousarray(sequences))
+        # Meta 데이터도 분할해서 저장해야 할까? 
+        # Meta는 (N, 3)이라 작음. 그냥 한 번에 저장해도 됨.
+        meta_path = os.path.join(temp_dir, f"{stock_code}_{unique_id}_meta.parquet")
+        meta.to_parquet(meta_path, engine='pyarrow', index=False)
+        
+        # Sequence 데이터 분할 저장
+        try:
+            for i in range(0, num_samples, chunk_size):
+                end = min(i + chunk_size, num_samples)
+                
+                slice_start = i
+                slice_end = end + seq_len - 1
+                
+                if slice_end > len(feats):
+                    slice_end = len(feats)
+                    
+                sub_feats = feats[slice_start:slice_end]
+                
+                sub_num_samples = len(sub_feats) - seq_len + 1
+                if sub_num_samples <= 0: continue
+                
+                shape = (sub_num_samples, seq_len, sub_feats.shape[1])
+                strides = (sub_feats.strides[0], sub_feats.strides[0], sub_feats.strides[1])
+                
+                sub_seqs = np.lib.stride_tricks.as_strided(sub_feats, shape=shape, strides=strides, writeable=False)
+                
+                sub_seqs_contig = np.ascontiguousarray(sub_seqs)
+                
+                chunk_path = os.path.join(temp_dir, f"{stock_code}_{unique_id}_seq_{i}.npy")
+                np.save(chunk_path, sub_seqs_contig)
+                file_paths.append(chunk_path)
+                
+                del sub_seqs
+                del sub_seqs_contig
+                
+            return (stock_code, meta_path, file_paths)
+            
+        except Exception as e:
+            # 에러 발생 시(디스크 부족 등) 생성된 안쓰는 파일 즉시 삭제
+            for p in file_paths:
+                if os.path.exists(p):
+                    try: os.remove(p)
+                    except: pass
+            if os.path.exists(meta_path):
+                try: os.remove(meta_path)
+                except: pass
+            raise e
         
     except Exception as e:
-        # 에러 메시지에 stock_code 포함
         return (stock_code, Exception(f"[{stock_code}] {e}"))
 
 # --- Main Script ---
@@ -104,7 +150,7 @@ def save_chunk(df, output_dir):
     file_counter += 1
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate Embeddings (Parallel)')
+    parser = argparse.ArgumentParser(description='Generate Embeddings (Parallel IPC Safe Memory Efficient)')
     parser.add_argument('--db_path', type=str, required=True)
     parser.add_argument('--model_path', type=str, required=True)
     parser.add_argument('--table_name', type=str, default='datasets')
@@ -112,13 +158,16 @@ def main():
     parser.add_argument('--state_file', type=str, default='processed_stocks.txt')
     parser.add_argument('--seq_len', type=int, default=120)
     parser.add_argument('--batch_size', type=int, default=4096)
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda')
     
     args = parser.parse_args()
     
     # Init
     os.makedirs(args.output_dir, exist_ok=True)
+    temp_dir = os.path.join(args.output_dir, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
+    
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}, Workers: {args.num_workers}")
     
@@ -129,12 +178,10 @@ def main():
             processed_stocks = set(line.strip() for line in f if line.strip())
     print(f"Resuming... {len(processed_stocks)} stocks already processed.")
     
-    # DB Setup (Main Process)
-    # 메인 프로세스도 read_only로 염
+    # DB Setup
     con = duckdb.connect(args.db_path, read_only=True)
     all_cols = get_column_names(con, args.table_name)
     
-    # Column Mapping
     col_map = {
         'date': all_cols[0],
         'code': all_cols[2],
@@ -142,15 +189,11 @@ def main():
     }
     feature_cols = all_cols[5:33]
     
-    # Stats
     means, stds = get_global_stats(con, args.table_name, feature_cols)
     
-    # Stock List
     all_stocks = [s[0] for s in con.sql(f"SELECT DISTINCT \"{col_map['code']}\" FROM {args.table_name}").fetchall()]
     stocks_to_process = [s for s in all_stocks if s not in processed_stocks]
     print(f"Total: {len(all_stocks)}, To Process: {len(stocks_to_process)}")
-    
-    # 메인 프로세스의 DB 연결 종료 (Worker들과 충돌 방지 위해)
     con.close()
     
     # Model
@@ -160,15 +203,16 @@ def main():
     model.to(device)
     model.eval()
     
+    # Clean up old temp files
+    # (주의: 실행 중인 프로세스가 있다면 삭제하면 안 됨. 시작 시에만)
+    
     # --- Parallel Processing Loop ---
     
     buffer_meta = []
-    buffer_sequences = []
-    buffer_limit = args.batch_size * 20 
+    buffer_embeddings = []
+    # Progress를 더 자주 저장하기 위해 버퍼 크기 줄임
+    buffer_limit = args.batch_size * 5 
     
-    total_saved = 0
-    
-    # max_workers=1로 테스트 해보는 것도 방법 (디버깅용), 하지만 병렬성을 위해 args.num_workers 사용
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
         futures = {
             executor.submit(
@@ -179,7 +223,8 @@ def main():
                 feature_cols, 
                 means, stds, 
                 args.seq_len, 
-                col_map
+                col_map,
+                temp_dir
             ): stock for stock in stocks_to_process
         }
         
@@ -189,70 +234,85 @@ def main():
         
         for future in as_completed(futures):
             res = future.result()
-            
             pbar.update(1)
             
             if res is None: continue 
             if len(res) == 2 and isinstance(res[1], Exception):
-                # 에러 발생 시 출력하고 계속 진행 (파일 잠금 등 일시적 오류일 수 있음)
-                # 단, 너무 많이 발생하면 문제.
                 tqdm.write(f"Error: {res[1]}")
                 continue
                 
-            stock_code, meta, sequences = res
+            stock_code, meta_path, seq_file_paths = res
             
-            buffer_meta.append(meta)
-            buffer_sequences.append(sequences)
-            stock_batch_completed.append(stock_code)
-            
-            current_samples = sum(len(s) for s in buffer_sequences)
-            
-            if current_samples >= buffer_limit:
-                all_seqs = np.concatenate(buffer_sequences, axis=0)
-                all_meta = pd.concat(buffer_meta, ignore_index=True)
+            try:
+                # 1. Meta Load
+                meta = pd.read_parquet(meta_path)
+                os.remove(meta_path)
                 
+                # 2. Sequence Load & Inference (Chunk by Chunk)
                 embeddings_list = []
-                dataset_size = len(all_seqs)
                 
-                with torch.no_grad():
-                    for i in range(0, dataset_size, args.batch_size):
-                        batch = torch.from_numpy(all_seqs[i : i + args.batch_size]).to(device)
-                        out = model(batch)
-                        if isinstance(out, tuple): out = out[1] if len(out) == 3 else out[1]
-                        embeddings_list.append(out.cpu().numpy())
+                for seq_path in seq_file_paths:
+                    chunk_seqs = np.load(seq_path)
+                    os.remove(seq_path)
+                    
+                    # GPU Inference for this chunk
+                    with torch.no_grad():
+                        for i in range(0, len(chunk_seqs), args.batch_size):
+                            batch = torch.from_numpy(chunk_seqs[i : i + args.batch_size]).to(device)
+                            out = model(batch)
+                            if isinstance(out, tuple): out = out[1] if len(out) == 3 else out[1]
+                            embeddings_list.append(out.cpu().numpy())
+                            
+                    del chunk_seqs
                 
-                embeddings_array = np.concatenate(embeddings_list, axis=0)
-                all_meta['embedding'] = list(embeddings_array)
+                # 3. Merge Embeddings for this stock
+                stock_embeddings = np.concatenate(embeddings_list, axis=0)
                 
+                # Verify length
+                if len(stock_embeddings) != len(meta):
+                    tqdm.write(f"Warning: Length mismatch for {stock_code}. Meta: {len(meta)}, Emb: {len(stock_embeddings)}")
+                    # Truncate to match (usually meta is larger if anything goes wrong?)
+                    min_len = min(len(meta), len(stock_embeddings))
+                    meta = meta.iloc[:min_len]
+                    stock_embeddings = stock_embeddings[:min_len]
+                
+                meta['embedding'] = list(stock_embeddings)
+                
+                buffer_meta.append(meta)
+                stock_batch_completed.append(stock_code)
+                
+            except Exception as e:
+                tqdm.write(f"Error loading temp files for {stock_code}: {e}")
+                continue
+            
+            # Check buffer (row count)
+            current_rows = sum(len(df) for df in buffer_meta)
+            if current_rows >= buffer_limit:
+                all_meta = pd.concat(buffer_meta, ignore_index=True)
                 save_chunk(all_meta, args.output_dir)
+                tqdm.write(f"Saved chunk with {len(all_meta)} rows. Stocks: {stock_batch_completed[:3]}...")
                 
                 with open(args.state_file, 'a') as f:
                     for s in stock_batch_completed:
                         f.write(f"{s}\n")
                         
                 buffer_meta = []
-                buffer_sequences = []
                 stock_batch_completed = []
                 gc.collect()
 
-        if buffer_sequences:
-            all_seqs = np.concatenate(buffer_sequences, axis=0)
+        # Final Flush
+        if buffer_meta:
             all_meta = pd.concat(buffer_meta, ignore_index=True)
-            
-            embeddings_list = []
-            for i in range(0, len(all_seqs), args.batch_size):
-                batch = torch.from_numpy(all_seqs[i : i + args.batch_size]).to(device)
-                out = model(batch)
-                if isinstance(out, tuple): out = out[1] if len(out) == 3 else out[1]
-                embeddings_list.append(out.cpu().numpy())
-                
-            embeddings_array = np.concatenate(embeddings_list, axis=0)
-            all_meta['embedding'] = list(embeddings_array)
             save_chunk(all_meta, args.output_dir)
             
             with open(args.state_file, 'a') as f:
                 for s in stock_batch_completed:
                     f.write(f"{s}\n")
+                    
+    # Remove temp dir
+    try:
+        os.rmdir(temp_dir)
+    except: pass
 
     print(f"Done. Files saved in {args.output_dir}")
 
