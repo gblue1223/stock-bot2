@@ -143,6 +143,20 @@ ft_model, trainer, history = fine_tune_for_trading_task(
 ### 3단계: GRPO 강화학습 훈련
 
 ```bash
+# 속도를 위한 전처리 작업.
+python scripts/data/generate_embeddings_v3_parallel.py \
+  --db_path "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
+  --model_path "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
+  --output_dir "data/embeddings_v2" \
+  --state_file "data/embeddings_v2/processed_stocks.txt" \
+  --table_name "datasets" \
+  --seq_len 120 \
+  --batch_size 4096 \
+  --num_workers 4 \
+  --device cuda
+```
+
+```bash
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \

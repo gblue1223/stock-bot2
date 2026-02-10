@@ -133,3 +133,6 @@ screenshots/
 
 # GCP scripts config (contains credentials)
 scripts/gcp/config.sh
+
+# etc
+*.parquet
