@@ -249,7 +249,25 @@ def main():
         
         stock_batch_completed = [] 
         
+        # Max temp size: 500GB (approx in bytes)
+        MAX_TEMP_SIZE = 500 * 1024 * 1024 * 1024 
+        
         for future in as_completed(futures):
+            # Check temp dir size periodically (e.g. every 10 stocks or when buffer is full)
+            # Simple check: sum of file sizes in temp_dir
+            if len(stock_batch_completed) % 10 == 0:
+                try:
+                    total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
+                    if total_size > MAX_TEMP_SIZE:
+                        tqdm.write(f"WARNING: Temp dir size {total_size / (1024**3):.2f} GB exceeds limit {MAX_TEMP_SIZE / (1024**3):.2f} GB. Pausing producer...")
+                        # Wait until size decreases (consumer processes files)
+                        while total_size > MAX_TEMP_SIZE * 0.8: # Wait until drops to 80%
+                            time.sleep(10)
+                            total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
+                        tqdm.write("Resuming producer...")
+                except Exception as e:
+                    pass
+
             res = future.result()
             pbar.update(1)
             
