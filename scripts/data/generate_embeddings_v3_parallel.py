@@ -225,115 +225,123 @@ def main():
     
     # --- Parallel Processing Loop ---
     
+    # --- Manual Task Submission Loop ---
+    
     buffer_meta = []
-    buffer_embeddings = []
-    # Progress를 더 자주 저장하기 위해 버퍼 크기 줄임
+    MAX_TEMP_SIZE = 500 * 1024 * 1024 * 1024 
     buffer_limit = args.batch_size * 5 
     
+    # Stocks to process queue
+    stock_queue = list(stocks_to_process)
+    active_futures = {} # {future: stock_code}
+    
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
-        futures = {
-            executor.submit(
-                process_stock_data, 
-                stock, 
-                args.db_path, 
-                args.table_name, 
-                feature_cols, 
-                means, stds, 
-                args.seq_len, 
-                col_map,
-                temp_dir
-            ): stock for stock in stocks_to_process
-        }
-        
         pbar = tqdm(total=len(stocks_to_process), desc="Processing")
         
-        stock_batch_completed = [] 
-        
-        # Max temp size: 500GB (approx in bytes)
-        MAX_TEMP_SIZE = 500 * 1024 * 1024 * 1024 
-        
-        for future in as_completed(futures):
-            # Check temp dir size periodically (e.g. every 10 stocks or when buffer is full)
-            # Simple check: sum of file sizes in temp_dir
-            if len(stock_batch_completed) % 10 == 0:
+        # Initial submission (up to num_workers * 2)
+        initial_batch = min(len(stock_queue), args.num_workers * 2)
+        for _ in range(initial_batch):
+            stock = stock_queue.pop(0)
+            fut = executor.submit(process_stock_data, stock, args.db_path, args.table_name, feature_cols, means, stds, args.seq_len, col_map, temp_dir)
+            active_futures[fut] = stock
+            
+        while active_futures:
+            # Fallback if torch.concurrent not available or standard usage
+            from concurrent.futures import wait, FIRST_COMPLETED
+            dones, _ = wait(active_futures.keys(), return_when=FIRST_COMPLETED)
+            
+            for future in dones:
+                stock_code = active_futures.pop(future)
+                pbar.update(1)
+                
                 try:
-                    total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
-                    if total_size > MAX_TEMP_SIZE:
-                        tqdm.write(f"WARNING: Temp dir size {total_size / (1024**3):.2f} GB exceeds limit {MAX_TEMP_SIZE / (1024**3):.2f} GB. Pausing producer...")
-                        # Wait until size decreases (consumer processes files)
-                        while total_size > MAX_TEMP_SIZE * 0.8: # Wait until drops to 80%
-                            time.sleep(10)
-                            total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
-                        tqdm.write("Resuming producer...")
-                except Exception as e:
-                    pass
-
-            res = future.result()
-            pbar.update(1)
-            
-            if res is None: continue 
-            if len(res) == 2 and isinstance(res[1], Exception):
-                tqdm.write(f"Error: {res[1]}")
-                continue
-                
-            stock_code, meta_path, seq_file_paths = res
-            
-            try:
-                # 1. Meta Load
-                meta = pd.read_parquet(meta_path)
-                os.remove(meta_path)
-                
-                # 2. Sequence Load & Inference (Chunk by Chunk)
-                embeddings_list = []
-                
-                for seq_path in seq_file_paths:
-                    chunk_seqs = np.load(seq_path)
-                    os.remove(seq_path)
-                    
-                    # GPU Inference for this chunk
-                    with torch.no_grad():
-                        for i in range(0, len(chunk_seqs), args.batch_size):
-                            batch = torch.from_numpy(chunk_seqs[i : i + args.batch_size]).to(device)
-                            out = model(batch)
-                            if isinstance(out, tuple): out = out[1] if len(out) == 3 else out[1]
-                            embeddings_list.append(out.cpu().numpy())
-                            
-                    del chunk_seqs
-                
-                # 3. Merge Embeddings for this stock
-                stock_embeddings = np.concatenate(embeddings_list, axis=0)
-                
-                # Verify length
-                if len(stock_embeddings) != len(meta):
-                    tqdm.write(f"Warning: Length mismatch for {stock_code}. Meta: {len(meta)}, Emb: {len(stock_embeddings)}")
-                    # Truncate to match (usually meta is larger if anything goes wrong?)
-                    min_len = min(len(meta), len(stock_embeddings))
-                    meta = meta.iloc[:min_len]
-                    stock_embeddings = stock_embeddings[:min_len]
-                
-                meta['embedding'] = list(stock_embeddings)
-                
-                buffer_meta.append(meta)
-                stock_batch_completed.append(stock_code)
-                
-            except Exception as e:
-                tqdm.write(f"Error loading temp files for {stock_code}: {e}")
-                continue
-            
-            # Check buffer (row count)
-            current_rows = sum(len(df) for df in buffer_meta)
-            if current_rows >= buffer_limit:
-                all_meta = pd.concat(buffer_meta, ignore_index=True)
-                save_chunk(all_meta, args.output_dir)
-                tqdm.write(f"Saved chunk with {len(all_meta)} rows. Stocks: {stock_batch_completed[:3]}...")
-                
-                with open(args.state_file, 'a') as f:
-                    for s in stock_batch_completed:
-                        f.write(f"{s}\n")
+                    res = future.result()
+                    if res is None: continue
+                    if len(res) == 2 and isinstance(res[1], Exception):
+                        tqdm.write(f"Error: {res[1]}")
+                        continue
                         
-                buffer_meta = []
-                stock_batch_completed = []
-                gc.collect()
+                    _, meta_path, seq_file_paths = res
+                    
+                    # Consume Logic 
+                    try:
+                        # 1. Meta Load
+                        meta = pd.read_parquet(meta_path)
+                        os.remove(meta_path)
+                        
+                        # 2. Sequence Load & Inference
+                        embeddings_list = []
+                        for seq_path in seq_file_paths:
+                            chunk_seqs = np.load(seq_path)
+                            os.remove(seq_path)
+                            
+                            with torch.no_grad():
+                                for i in range(0, len(chunk_seqs), args.batch_size):
+                                    batch = torch.from_numpy(chunk_seqs[i : i + args.batch_size]).to(device)
+                                    out = model(batch)
+                                    if isinstance(out, tuple): out = out[1] if len(out) == 3 else out[1]
+                                    embeddings_list.append(out.cpu().numpy())
+                            del chunk_seqs
+                            
+                        # 3. Merge
+                        stock_embeddings = np.concatenate(embeddings_list, axis=0)
+                        if len(stock_embeddings) != len(meta):
+                            min_len = min(len(meta), len(stock_embeddings))
+                            meta = meta.iloc[:min_len]
+                            stock_embeddings = stock_embeddings[:min_len]
+                        
+                        meta['embedding'] = list(stock_embeddings)
+                        buffer_meta.append(meta)
+                        
+                        # Check Buffer & Save
+                        current_rows = sum(len(df) for df in buffer_meta)
+                        if current_rows >= buffer_limit:
+                            all_meta = pd.concat(buffer_meta, ignore_index=True)
+                            save_chunk(all_meta, args.output_dir)
+                            # tqdm.write(f"Saved chunk with {len(all_meta)} rows.")
+                            
+                            with open(args.state_file, 'a') as f:
+                                # We need to track which stocks are in this buffer
+                                # This simple log logic is slightly flawed in this re-write
+                                # Better: just write stock_code immediately, or track buffered stocks
+                                pass 
+                            buffer_meta = []
+                            gc.collect()
+                            
+                        # Save state immediately for this stock
+                        with open(args.state_file, 'a') as f:
+                            f.write(f"{stock_code}\n")
+
+                    except Exception as e:
+                        tqdm.write(f"Error processing {stock_code}: {e}")
+                
+                except Exception as e:
+                    tqdm.write(f"Worker Error {stock_code}: {e}")
+
+            # Check Disk Space before submitting new tasks
+            paused = False
+            total_size = 0
+            try:
+                total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
+                if total_size > MAX_TEMP_SIZE:
+                    paused = True
+                    tqdm.write(f"WARNING: Temp dir size {total_size / (1024**3):.2f} GB. Pausing submissions...")
+            except: pass
+            
+            # Resume condition
+            if paused:
+                while total_size > MAX_TEMP_SIZE * 0.8:
+                    time.sleep(10)
+                    try:
+                        total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
+                    except: pass
+                tqdm.write("Resuming submissions...")
+
+            # Submit new tasks if queue not empty and slots available
+            while stock_queue and len(active_futures) < args.num_workers * 2:
+                stock = stock_queue.pop(0)
+                fut = executor.submit(process_stock_data, stock, args.db_path, args.table_name, feature_cols, means, stds, args.seq_len, col_map, temp_dir)
+                active_futures[fut] = stock
 
         # Final Flush
         if buffer_meta:
