@@ -170,6 +170,23 @@ def main():
     
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}, Workers: {args.num_workers}")
+
+    # Initialize file_counter based on existing files to avoid overwriting
+    existing_files = [f for f in os.listdir(args.output_dir) if f.startswith('embeddings_') and f.endswith('.parquet')]
+    max_idx = -1
+    for f in existing_files:
+        try:
+            # Extract number from embeddings_XXXX.parquet
+            part = f.split('_')[1].split('.')[0]
+            idx = int(part)
+            if idx > max_idx:
+                max_idx = idx
+        except:
+            pass
+    
+    global file_counter
+    file_counter = max_idx + 1
+    print(f"Resuming file counter from {file_counter} (Found {len(existing_files)} existing files)")
     
     # Load Completed Stocks
     processed_stocks = set()
