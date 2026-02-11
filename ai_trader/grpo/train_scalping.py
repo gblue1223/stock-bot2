@@ -28,8 +28,10 @@ load_dotenv()
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+# V2 환경 임포트
+from ai_trader.grpo.environments.scalping_env_v2 import GRPOScalpingEnvV2
 from ai_trader.grpo.grpo import GRPOTrainer
-from ai_trader.grpo.environments import GRPOScalpingEnv
+from ai_trader.grpo.inference.trade_logger import TradeLogger
 from ai_trader.grpo.policies import GRPOPolicy
 
 # ========================================
@@ -100,6 +102,7 @@ class TrainingConfig:
         # 임베딩 설정 (scalping env용)
         self.embedding_model = None
         self.embedding_dim = 128
+        self.parquet_path = None # V2: Pre-computed embeddings path
         self.quick_exit_mode = 'penalty_only'
         self.quick_exit_penalty = 0.01  # 기본값
         self.stagnation_exit_seconds = 180  # 기본값
@@ -132,6 +135,7 @@ class TrainingConfig:
         self.num_workers = 4  # ✅ 병렬 작업자 수 추가 (기본값: 4)
         
         # ✅ 손절 및 분할 매수 설정
+        self.base_price = 100000.0    # 기준 가격 (기본값: 10만원)
         self.stop_loss_pct = 2.0      # 손절 퍼센트 (2.0%)
         self.max_split_count = 1      # 최대 분할 매수 횟수 (1 = 단일 진입)
         self.min_holding_time = 2     # 최소 보유 시간 (초)
@@ -190,8 +194,19 @@ class TrainingConfig:
         if self.policy != 'grpo':
             errors.append(f"Only 'grpo' policy is supported (got: {self.policy})")
         
-        if self.embedding_model is None:
-            errors.append("embedding_model is required for scalping environment")
+        # V2: embedding_model OR parquet_path required
+        # If both are missing, try to see if we can infer parquet_path from db_path
+        if self.embedding_model is None and self.parquet_path is None:
+             inferred = False
+             if self.db_path:
+                 base_dir = os.path.dirname(self.db_path)
+                 potential_path = os.path.join(base_dir, 'embeddings_v2')
+                 if os.path.isdir(potential_path):
+                     self.parquet_path = potential_path # Auto-set
+                     inferred = True
+             
+             if not inferred:
+                errors.append("embedding_model or parquet_path is required (and could not be inferred)")
         
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -206,47 +221,32 @@ class TrainingConfig:
 # ========================================
 
 def load_embedding_model(config: TrainingConfig, device: str):
-    """임베딩 모델 로드 (공유용)"""
-    try:
-        if config.embedding_model is None:
-            raise ValueError("embedding_model is required for scalping environment")
-        
-        logger.info(f"[LOAD MODEL] Loading embedding model from {config.embedding_model}...")
-        from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
-        
-        embedding_model = MaskedAutoEncoder(
-            input_dim=config.features,
-            embedding_dim=config.embedding_dim
-        )
-        checkpoint = torch.load(config.embedding_model, map_location=device)
-        embedding_model.load_state_dict(checkpoint['model_state_dict'])
-        embedding_model.to(device)
-        embedding_model.eval()
-        logger.info("[OK] Embedding model loaded")
-        return embedding_model
-    except Exception as e:
-        logger.error(f"Failed to load embedding model: {e}", exc_info=True)
-        raise
+    """임베딩 모델 로드 (공유용) - GRPOScalpingEnvV2에서는 사용되지 않음"""
+    # V2 환경에서는 임베딩 모델을 직접 로드하지 않고 Parquet 파일을 사용합니다.
+    # 하지만 기존 코드가 이 함수를 호출할 수 있으므로 None을 반환하거나 더미를 반환.
+    return None
 
-def create_environment(config: TrainingConfig, embedding_model, device: str):
+def create_environment(config: TrainingConfig, device: str):
     """환경 생성 (단일 인스턴스)"""
     try:
-        # logger.info("[CREATE ENV] Creating GRPOScalpingEnv...") # 너무 시끄러울 수 있으므로 주석 처리하거나 debug로 변경
-        env = GRPOScalpingEnv(
-            embedding_model=embedding_model,
+        # parquet_path는 config.validate()에서 이미 설정되었거나 검증됨
+        if not hasattr(config, 'parquet_path') or config.parquet_path is None:
+             # 기본 추론: dataset 경로 기반
+             base_dir = os.path.dirname(config.db_path)
+             config.parquet_path = os.path.join(base_dir, 'embeddings_v2')
+
+        logging.info(f"Using Embeddings from: {config.parquet_path}")
+        
+        env = GRPOScalpingEnvV2(
+            parquet_path=config.parquet_path,
             db_path=config.db_path,
             table_name=config.table_name,
-            seq_len=config.seq_len,
             embedding_dim=config.embedding_dim,
-            expected_features=config.features,
-            transaction_cost_rate=0.00215,
+            transaction_cost_rate=0.00215, # Fixed for now, can be made configurable
             quick_exit_mode=config.quick_exit_mode,
             quick_exit_penalty=config.quick_exit_penalty,
-            quick_exit_threshold=config.stagnation_exit_seconds,
             max_episode_steps=config.episode_steps,
-            use_raw_data=config.use_raw_data,
-            rolling_window_size=config.rolling_window_size,
-            rolling_min_samples=config.rolling_min_samples,
+            base_price=config.base_price,
             stop_loss_pct=config.stop_loss_pct,
             max_split_count=config.max_split_count,
             min_holding_time=config.min_holding_time,
@@ -400,7 +400,7 @@ def main():
         envs = []
         for i in range(config.num_workers):
             logger.debug(f"Creating env worker {i+1}/{config.num_workers}...")
-            env_instance = create_environment(config, embedding_model, device)
+            env_instance = create_environment(config, device)
             envs.append(env_instance)
         
         logger.info(f"[OK] Created {len(envs)} environments")
