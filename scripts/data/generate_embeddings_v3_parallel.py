@@ -31,6 +31,13 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+# TPU 지원 (torch_xla)
+try:
+    import torch_xla.core.xla_model as xm
+    XLA_AVAILABLE = True
+except ImportError:
+    XLA_AVAILABLE = False
+
 from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
 
 # --- Worker Function ---
@@ -159,7 +166,7 @@ def main():
     parser.add_argument('--seq_len', type=int, default=120)
     parser.add_argument('--batch_size', type=int, default=4096)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--device', type=str, default='cuda', help='cuda, cpu, or tpu')
     
     args = parser.parse_args()
     
@@ -168,7 +175,14 @@ def main():
     temp_dir = os.path.join(args.output_dir, "temp")
     os.makedirs(temp_dir, exist_ok=True)
     
-    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    if args.device == 'tpu':
+        if not XLA_AVAILABLE:
+            print("Error: torch_xla not found. Please install it (e.g. pip install torch-xla)")
+            sys.exit(1)
+        device = xm.xla_device()
+    else:
+        device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+        
     print(f"Device: {device}, Workers: {args.num_workers}")
 
     # Initialize file_counter based on existing files to avoid overwriting
@@ -286,6 +300,10 @@ def main():
                                     out = model(batch)
                                     if isinstance(out, tuple): out = out[1] if len(out) == 3 else out[1]
                                     embeddings_list.append(out.cpu().numpy())
+                            
+                            if args.device == 'tpu':
+                                xm.mark_step() # TPU 실행 트리거
+                                
                             del chunk_seqs
                             
                         # 3. Merge
