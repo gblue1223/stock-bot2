@@ -152,8 +152,8 @@ python scripts/data/generate_embeddings_v3_parallel.py \
   --table_name "datasets" \
   --seq_len 120 \
   --batch_size 4096 \
-  --num_workers 2 \
-  --device cuda
+  --num_workers 4 \
+  --device cpu
 ```
 
 ```bash

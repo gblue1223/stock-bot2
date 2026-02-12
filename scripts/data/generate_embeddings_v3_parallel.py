@@ -221,8 +221,13 @@ def main():
     model.eval()
     
     # Clean up old temp files
-    # (주의: 실행 중인 프로세스가 있다면 삭제하면 안 됨. 시작 시에만)
-    
+    print(f"Cleaning up temp dir: {temp_dir}")
+    for f in os.listdir(temp_dir):
+        fp = os.path.join(temp_dir, f)
+        if os.path.isfile(fp):
+            try: os.remove(fp)
+            except: pass
+            
     # --- Parallel Processing Loop ---
     
     # --- Manual Task Submission Loop ---
@@ -300,11 +305,6 @@ def main():
                             save_chunk(all_meta, args.output_dir)
                             # tqdm.write(f"Saved chunk with {len(all_meta)} rows.")
                             
-                            with open(args.state_file, 'a') as f:
-                                # We need to track which stocks are in this buffer
-                                # This simple log logic is slightly flawed in this re-write
-                                # Better: just write stock_code immediately, or track buffered stocks
-                                pass 
                             buffer_meta = []
                             gc.collect()
                             
@@ -320,7 +320,6 @@ def main():
 
             # Check Disk Space before submitting new tasks
             paused = False
-            total_size = 0
             try:
                 total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
                 if total_size > MAX_TEMP_SIZE:
@@ -328,20 +327,18 @@ def main():
                     tqdm.write(f"WARNING: Temp dir size {total_size / (1024**3):.2f} GB. Pausing submissions...")
             except: pass
             
-            # Resume condition
-            if paused:
-                while total_size > MAX_TEMP_SIZE * 0.8:
-                    time.sleep(10)
-                    try:
-                        total_size = sum(os.path.getsize(os.path.join(temp_dir, f)) for f in os.listdir(temp_dir) if os.path.isfile(os.path.join(temp_dir, f)))
-                    except: pass
-                tqdm.write("Resuming submissions...")
-
-            # Submit new tasks if queue not empty and slots available
-            while stock_queue and len(active_futures) < args.num_workers * 2:
-                stock = stock_queue.pop(0)
-                fut = executor.submit(process_stock_data, stock, args.db_path, args.table_name, feature_cols, means, stds, args.seq_len, col_map, temp_dir)
-                active_futures[fut] = stock
+            # Submit new tasks if queue not empty and slots available AND NOT PAUSED
+            if not paused:
+                while stock_queue and len(active_futures) < args.num_workers * 2:
+                    stock = stock_queue.pop(0)
+                    fut = executor.submit(process_stock_data, stock, args.db_path, args.table_name, feature_cols, means, stds, args.seq_len, col_map, temp_dir)
+                    active_futures[fut] = stock
+            else:
+                 # If paused and no active futures, we are stuck (orphaned files from *current* run?)
+                 # But we just cleaned at startup.
+                 # This would only happen if the currently running N workers produced > 500GB.
+                 # 500GB / 16 workers = 31GB per worker. Unlikely for one stock.
+                 pass
 
         # Final Flush
         if buffer_meta:
