@@ -58,34 +58,47 @@ def get_global_stats(con, table_name, feature_col_names):
 def process_stock_inline(stock_code, con, table_name, feature_cols, means, stds, seq_len, col_map, model, device, batch_size):
     """
     단일 종목을 메모리 내에서 처리: DB 읽기 → 정규화 → GPU 인퍼런스 → 결과 반환
-    Temp 파일을 사용하지 않음.
     """
+    import time as _time
+    
+    # 1. DB Query
+    t0 = _time.time()
     select_cols = [f"\"{col_map['date']}\"", f"\"{col_map['time']}\"", f"\"{col_map['code']}\""] + \
                   [f"\"{c}\"" for c in feature_cols]
     select_clause = ", ".join(select_cols)
     
     query = f"SELECT {select_clause} FROM {table_name} WHERE \"{col_map['code']}\" = '{stock_code}' ORDER BY \"{col_map['date']}\", \"{col_map['time']}\""
     df = con.sql(query).df()
+    t_query = _time.time() - t0
     
     if len(df) < seq_len:
+        tqdm.write(f"  [{stock_code}] rows={len(df)} < seq_len, skip (query: {t_query:.1f}s)")
         return None
     
-    # Meta Data
+    tqdm.write(f"  [{stock_code}] rows={len(df):,} (query: {t_query:.1f}s)")
+    
+    # 2. Meta Data
     meta = df.iloc[seq_len-1:][[col_map['date'], col_map['time'], col_map['code']]].reset_index(drop=True)
     meta.columns = ['date', 'time', 'code']
     
-    # Features & Norm
+    # 3. Features & Norm
+    t1 = _time.time()
     feats = df[feature_cols].values.astype(np.float32)
     del df
     feats = (feats - means) / stds
+    t_norm = _time.time() - t1
     
-    # 시퀀스 생성 & GPU 인퍼런스 (청크 단위, 파일 저장 없이)
+    # 4. 시퀀스 생성 & GPU 인퍼런스 (청크 단위)
     num_samples = len(feats) - seq_len + 1
-    chunk_size = 10000
+    chunk_size = 5000  # Colab 메모리에 맞춤
+    num_chunks = (num_samples + chunk_size - 1) // chunk_size
+    
+    tqdm.write(f"  [{stock_code}] samples={num_samples:,}, chunks={num_chunks} (norm: {t_norm:.1f}s)")
     
     embeddings_list = []
+    t_infer_total = 0
     
-    for i in range(0, num_samples, chunk_size):
+    for ci, i in enumerate(range(0, num_samples, chunk_size)):
         end = min(i + chunk_size, num_samples)
         slice_end = end + seq_len - 1
         if slice_end > len(feats):
@@ -96,13 +109,14 @@ def process_stock_inline(stock_code, con, table_name, feature_cols, means, stds,
         if sub_num <= 0:
             continue
         
-        # Sliding window (메모리 효율적)
+        # Sliding window
         shape = (sub_num, seq_len, sub_feats.shape[1])
         strides_val = (sub_feats.strides[0], sub_feats.strides[0], sub_feats.strides[1])
         sub_seqs = np.lib.stride_tricks.as_strided(sub_feats, shape=shape, strides=strides_val, writeable=False)
         sub_seqs = np.ascontiguousarray(sub_seqs)
         
-        # GPU Inference (배치 단위)
+        # GPU Inference
+        t_inf = _time.time()
         with torch.no_grad():
             for j in range(0, len(sub_seqs), batch_size):
                 batch = torch.from_numpy(sub_seqs[j:j+batch_size]).to(device)
@@ -110,10 +124,17 @@ def process_stock_inline(stock_code, con, table_name, feature_cols, means, stds,
                 if isinstance(out, tuple):
                     out = out[1] if len(out) == 3 else out[1]
                 embeddings_list.append(out.cpu().numpy())
+                del batch, out
+        t_infer_total += _time.time() - t_inf
         
         del sub_seqs
+        
+        # 진행 상황 로그 (대용량 종목에서 유용)
+        if (ci + 1) % 50 == 0 or ci == num_chunks - 1:
+            tqdm.write(f"    chunk {ci+1}/{num_chunks}")
     
     del feats
+    gc.collect()
     
     if not embeddings_list:
         return None
@@ -128,6 +149,7 @@ def process_stock_inline(stock_code, con, table_name, feature_cols, means, stds,
         stock_embeddings = stock_embeddings[:min_len]
     
     meta['embedding'] = list(stock_embeddings)
+    tqdm.write(f"  [{stock_code}] done. infer={t_infer_total:.1f}s, total={_time.time()-t0:.1f}s")
     return meta
 
 
