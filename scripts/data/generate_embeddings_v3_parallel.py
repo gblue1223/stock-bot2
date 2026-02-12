@@ -229,7 +229,7 @@ def main():
     
     # Model
     model = MaskedAutoEncoder(input_dim=len(feature_cols), embedding_dim=128)
-    checkpoint = torch.load(args.model_path, map_location=device)
+    checkpoint = torch.load(args.model_path, map_location='cpu')
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
     model.eval()
