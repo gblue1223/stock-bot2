@@ -167,12 +167,13 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4096)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--device', type=str, default='cuda', help='cuda, cpu, or tpu')
+    parser.add_argument('--temp_dir', type=str, default=None, help='Temp dir for intermediate files (default: output_dir/temp). Use local disk on Colab!')
     
     args = parser.parse_args()
     
     # Init
     os.makedirs(args.output_dir, exist_ok=True)
-    temp_dir = os.path.join(args.output_dir, "temp")
+    temp_dir = args.temp_dir if args.temp_dir else os.path.join(args.output_dir, "temp")
     os.makedirs(temp_dir, exist_ok=True)
     
     if args.device == 'tpu':
