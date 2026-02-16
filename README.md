@@ -160,11 +160,9 @@ python scripts/data/generate_embeddings_v3_parallel.py \
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
 python ai_trader/grpo/train_scalping.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --use_raw_data true \
     --output_dir "models/grpo_scalping_v7_holding_rule" \
     --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
     --num_workers 2 \

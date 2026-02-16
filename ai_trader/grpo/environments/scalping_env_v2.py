@@ -14,6 +14,7 @@ import duckdb
 import os
 import glob
 import time
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -102,65 +103,122 @@ class GRPOScalpingEnvV2(gym.Env):
         
         logger.info(f"GRPOScalpingEnvV2 initialized. Embedding source: {parquet_path}")
 
-    # Shared connection for same-process instances
-    _SHARED_CONN = None
+    # Shared across instances (built once, read-only after init)
+    _KEY_INDEX = None       # {(code, date): (file_path, row_count)}
+    _LRU_CACHE = None       # OrderedDict for LRU: (code, date) -> DataFrame
+    _LRU_MAX_SIZE = 100     # 최대 캐시 항목 수
+    _INDEX_BUILT = False
     
     def _connect_db(self):
         try:
-            # Singleton Pattern for DB Connection
-            if GRPOScalpingEnvV2._SHARED_CONN is not None:
-                self.conn = GRPOScalpingEnvV2._SHARED_CONN
-                self.raw_db_alias = "raw_db" # Assumed fixed alias for shared conn
-                return
-
-            import uuid
-            # DuckDB In-Memory 연결 후, 원본 DB와 Parquet를 attach/read
-            self.conn = duckdb.connect(database=':memory:') # 메인은 메모리 DB
+            # 각 환경 인스턴스마다 독립적인 DuckDB 연결 (thread-safety)
+            # 직접 파일에 read_only 연결 (ATTACH 충돌 방지)
+            self.conn = duckdb.connect(database=self.db_path, read_only=True)
+            self.raw_db_alias = "main"  # 직접 연결이므로 main schema 사용
+            logger.info(f"Connected to DB (Instance Connection)")
             
-            # 원본 DB Attach (Read Only)
-            self.raw_db_alias = "raw_db"
-            self.conn.execute(f"ATTACH '{self.db_path}' AS {self.raw_db_alias} (READ_ONLY)")
-            
-            # Parquet 파일 경로 패턴
-            # 윈도우 경로인 경우 역슬래시 처리 주의
-            pq_pattern = os.path.join(self.parquet_path, "*.parquet").replace("\\", "/")
-            
-            # 뷰 생성 (Parquet 파일들 전체를 하나의 테이블처럼)
-            # datasets 테이블과 조인하기 위해 뷰 생성
-            self.conn.execute(f"""
-                CREATE VIEW embeddings_view AS 
-                SELECT * FROM read_parquet('{pq_pattern}')
-            """)
-            
-            logger.info(f"Connected to DB and created embeddings_view (Shared Connection)")
-            
-            # Save to class variable
-            GRPOScalpingEnvV2._SHARED_CONN = self.conn
+            # 메타데이터 인덱스는 한 번만 빌드 (클래스 레벨 공유)
+            if not GRPOScalpingEnvV2._INDEX_BUILT:
+                self._build_key_index()
+                from collections import OrderedDict
+                GRPOScalpingEnvV2._LRU_CACHE = OrderedDict()
+                GRPOScalpingEnvV2._INDEX_BUILT = True
             
         except Exception as e:
             logger.error(f"DB Connect Failed: {e}")
             raise
+    
+    def _build_key_index(self):
+        """parquet 파일에서 메타데이터만 스캔하여 (code, date) -> file 인덱스 구축"""
+        import glob as _glob
+        logger.info(f"Building key index from {self.parquet_path} (metadata only)...")
+        
+        pq_files = sorted(_glob.glob(os.path.join(self.parquet_path, "*.parquet")))
+        if not pq_files:
+            raise FileNotFoundError(f"No parquet files in {self.parquet_path}")
+        
+        key_index = {}  # (code, date) -> (file_path, count)
+        
+        for f in pq_files:
+            try:
+                # embedding 컬럼 제외하고 code, date만 읽기 → 매우 가벼움
+                df = pd.read_parquet(f, columns=['code', 'date'])
+                for (code, date), group in df.groupby(['code', 'date']):
+                    key = (code, date)
+                    if key in key_index:
+                        # 여러 파일에 분산된 경우 → 리스트로 관리
+                        existing = key_index[key]
+                        if isinstance(existing, list):
+                            existing.append((f, len(group)))
+                        else:
+                            key_index[key] = [existing, (f, len(group))]
+                    else:
+                        key_index[key] = (f, len(group))
+            except Exception as e:
+                logger.warning(f"Failed to read metadata from {f}: {e}")
+        
+        GRPOScalpingEnvV2._KEY_INDEX = key_index
+        logger.info(f"Key index built: {len(key_index)} (code, date) pairs from {len(pq_files)} files")
+    
+    def _get_embedding_data(self, code, date):
+        """LRU 캐시에서 (code, date) 데이터 가져오기. 없으면 parquet에서 로드."""
+        cache = GRPOScalpingEnvV2._LRU_CACHE
+        key = (code, date)
+        
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        
+        # 캐시 미스 → parquet에서 로드
+        index_entry = GRPOScalpingEnvV2._KEY_INDEX.get(key)
+        if index_entry is None:
+            return None
+        
+        # 파일 목록 구성
+        if isinstance(index_entry, list):
+            file_entries = index_entry
+        else:
+            file_entries = [index_entry]
+        
+        dfs = []
+        for file_path, _ in file_entries:
+            df = pd.read_parquet(file_path)
+            filtered = df[(df['code'] == code) & (df['date'] == date)]
+            if len(filtered) > 0:
+                dfs.append(filtered)
+        
+        if not dfs:
+            return None
+        
+        result = pd.concat(dfs, ignore_index=True).sort_values('time').reset_index(drop=True)
+        
+        # LRU 캐시에 저장
+        cache[key] = result
+        if len(cache) > GRPOScalpingEnvV2._LRU_MAX_SIZE:
+            cache.popitem(last=False)  # 가장 오래된 항목 제거
+        
+        return result
 
     def _preload_valid_keys(self):
-        """임베딩이 존재하는 종목/날짜 목록 로드"""
-        logger.info("Loading valid keys from EMBEDDINGS (this might take a moment)...")
+        """인덱스에서 유효한 종목/날짜 목록 로드"""
+        logger.info("Loading valid keys from index...")
         try:
-            # 임베딩 뷰에서 종목/날짜 추출
-            # DISTINCT가 꽤 느릴 수 있음. processed_stocks.txt가 있으면 그걸 쓰는게 나을수도?
-            # 일단 정확성을 위해 뷰에서 조회.
-            query = """
-                SELECT code, date, COUNT(*) as cnt
-                FROM embeddings_view
-                GROUP BY code, date
-            """
-            df = self.conn.execute(query).fetchdf()
+            key_index = GRPOScalpingEnvV2._KEY_INDEX
+            if key_index is None:
+                raise RuntimeError("Key index not built")
             
-            # 최소 길이 필터링
             min_len = self.max_episode_steps + 10 if self.max_episode_steps else 100
-            valid_df = df[df['cnt'] >= min_len]
             
-            self.valid_keys = list(zip(valid_df['code'], valid_df['date'], valid_df['cnt']))
-            logger.info(f"Loaded {len(self.valid_keys)} valid keys from parquet files.")
+            self.valid_keys = []
+            for (code, date), entry in key_index.items():
+                if isinstance(entry, list):
+                    cnt = sum(c for _, c in entry)
+                else:
+                    cnt = entry[1]
+                if cnt >= min_len:
+                    self.valid_keys.append((code, date, cnt))
+            
+            logger.info(f"Loaded {len(self.valid_keys)} valid keys.")
             
         except Exception as e:
             logger.error(f"Failed to load keys: {e}")
@@ -169,7 +227,7 @@ class GRPOScalpingEnvV2(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        # 1. 에피소드 데이터 로드 (JOIN Query)
+        # 1. 에피소드 데이터 로드
         self._load_episode_data()
         
         # 2. 상태 초기화
@@ -192,7 +250,7 @@ class GRPOScalpingEnvV2(gym.Env):
         return obs, info
 
     def _load_episode_data(self):
-        """랜덤 키 선택 후 데이터 로딩 (Embedding + Market Data)"""
+        """랜덤 키 선택 후 데이터 로딩 (Embedding: lazy load + Market Data: DuckDB)"""
         max_attempts = 10
         for _ in range(max_attempts):
             try:
@@ -201,44 +259,36 @@ class GRPOScalpingEnvV2(gym.Env):
                 idx = np.random.randint(0, len(self.valid_keys))
                 code, date, cnt = self.valid_keys[idx]
                 
-                # Query: Join Embeddings with Raw Data to get Return Rate & Time
-                # 임베딩 Parquet에는 (date, time, code, embedding)이 있음.
-                # Raw DB에는 (날짜, 시간, 종목코드, 등락률)이 있음.
-                # JOIN 조건: code=종목코드, date=날짜, time=시간
-                
-                # 주의: Parquet의 time과 DB의 시간 포맷이 같은지 확인 필요.
-                # generate_embeddings 스크립트는 원본 그대로 저장했으므로 같을 것임.
-                
-                query = f"""
-                    SELECT 
-                        t1.embedding, 
-                        t2.등락률 as return_rate, 
-                        t1.time 
-                    FROM embeddings_view t1
-                    JOIN {self.raw_db_alias}.{self.table_name} t2 
-                        ON t1.code = t2.종목코드 
-                        AND t1.date = t2.날짜 
-                        AND t1.time = t2.시간
-                    WHERE t1.code = ? AND t1.date = ?
-                    ORDER BY t1.time
-                """
-                
-                df = self.conn.execute(query, [code, date]).fetchdf()
-                
-                if len(df) < 10:
+                # 1. 임베딩 lazy load (LRU 캐시)
+                emb_df = self._get_embedding_data(code, date)
+                if emb_df is None or len(emb_df) < 10:
                     continue
-
-                # 데이터 변환
-                # embedding 컬럼은 list/array 형태일 것임. numpy로 변환.
-                # DuckDB fetchdf는 list of floats로 가져옴.
                 
-                # DataFrame -> Numpy Struct array or dict of arrays
-                embeddings = np.stack(df['embedding'].values) # (N, 128)
-                return_rates = df['return_rate'].values.astype(np.float32) / 100.0 # (%) -> ratio
-                times = df['time'].values
+                # 2. Raw DB에서 등락률 가져오기
+                query = f"""
+                    SELECT 시간 as time, 등락률 as return_rate
+                    FROM {self.raw_db_alias}.{self.table_name}
+                    WHERE 종목코드 = ? AND 날짜 = ?
+                    ORDER BY 시간
+                """
+                raw_df = self.conn.execute(query, [code, date]).fetchdf()
+                
+                if len(raw_df) < 10:
+                    continue
+                
+                # 3. time 기준으로 merge
+                merged = emb_df.merge(raw_df, on='time', how='inner')
+                
+                if len(merged) < 10:
+                    continue
+                
+                # 4. 데이터 변환
+                embeddings = np.stack(merged['embedding'].values)
+                return_rates = merged['return_rate'].values.astype(np.float32) / 100.0
+                times = merged['time'].values
                 
                 # 에피소드 길이 제한 (랜덤 스타트)
-                total_len = len(df)
+                total_len = len(merged)
                 if self.max_episode_steps:
                     max_len = self.max_episode_steps
                     if total_len > max_len:
@@ -248,23 +298,15 @@ class GRPOScalpingEnvV2(gym.Env):
                         return_rates = return_rates[start_idx:end_idx]
                         times = times[start_idx:end_idx]
                 
-                # 구조화된 데이터로 저장
-                # (빠른 접근을 위해 numpy array 유지)
                 self.episode_embeddings = embeddings
                 self.episode_returns = return_rates
                 self.episode_times = times
                 self.episode_length = len(embeddings)
                 
-                # 가격 재계산 (Base Price 기준) -> reward 계산용
-                # (1 + r) * base
-                # 벡터 연산
                 self.prices = self.base_price * (1.0 + return_rates)
-                self.prices = np.maximum(self.prices, 1000.0) # 하한가 방어
+                self.prices = np.maximum(self.prices, 1000.0)
                 
-                # Simple access wrapper
-                self.episode_data = [] # Not really used in this struct, keeping for compatibility if needed
-                # Just use indices
-                
+                self.episode_data = []
                 self.episode_metadata = {'code': code, 'date': date}
                 
                 return
