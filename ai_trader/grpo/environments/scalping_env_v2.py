@@ -14,6 +14,7 @@ import duckdb
 import os
 import glob
 import time
+import threading
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -103,26 +104,31 @@ class GRPOScalpingEnvV2(gym.Env):
         
         logger.info(f"GRPOScalpingEnvV2 initialized. Embedding source: {parquet_path}")
 
-    # Shared across instances (built once, read-only after init)
+    # Shared across all instances
     _KEY_INDEX = None       # {(code, date): (file_path, row_count)}
     _LRU_CACHE = None       # OrderedDict for LRU: (code, date) -> DataFrame
-    _LRU_MAX_SIZE = 100     # 최대 캐시 항목 수
+    _LRU_MAX_SIZE = 100
     _INDEX_BUILT = False
+    _SHARED_CONN = None     # 단일 공유 DuckDB 연결
+    _DB_LOCK = threading.Lock()  # DuckDB 접근 보호용 Lock
     
     def _connect_db(self):
         try:
-            # 각 환경 인스턴스마다 독립적인 DuckDB 연결 (thread-safety)
-            # 직접 파일에 read_only 연결 (ATTACH 충돌 방지)
-            self.conn = duckdb.connect(database=self.db_path, read_only=True)
-            self.raw_db_alias = "main"  # 직접 연결이므로 main schema 사용
-            logger.info(f"Connected to DB (Instance Connection)")
-            
-            # 메타데이터 인덱스는 한 번만 빌드 (클래스 레벨 공유)
-            if not GRPOScalpingEnvV2._INDEX_BUILT:
-                self._build_key_index()
-                from collections import OrderedDict
-                GRPOScalpingEnvV2._LRU_CACHE = OrderedDict()
-                GRPOScalpingEnvV2._INDEX_BUILT = True
+            with GRPOScalpingEnvV2._DB_LOCK:
+                if GRPOScalpingEnvV2._SHARED_CONN is None:
+                    GRPOScalpingEnvV2._SHARED_CONN = duckdb.connect(
+                        database=self.db_path, read_only=True
+                    )
+                    logger.info(f"Connected to DB (Shared + Lock)")
+                
+                self.conn = GRPOScalpingEnvV2._SHARED_CONN
+                self.raw_db_alias = "main"
+                
+                if not GRPOScalpingEnvV2._INDEX_BUILT:
+                    self._build_key_index()
+                    from collections import OrderedDict
+                    GRPOScalpingEnvV2._LRU_CACHE = OrderedDict()
+                    GRPOScalpingEnvV2._INDEX_BUILT = True
             
         except Exception as e:
             logger.error(f"DB Connect Failed: {e}")
@@ -271,7 +277,8 @@ class GRPOScalpingEnvV2(gym.Env):
                     WHERE 종목코드 = ? AND 날짜 = ?
                     ORDER BY 시간
                 """
-                raw_df = self.conn.execute(query, [code, date]).fetchdf()
+                with GRPOScalpingEnvV2._DB_LOCK:
+                    raw_df = self.conn.execute(query, [code, date]).fetchdf()
                 
                 if len(raw_df) < 10:
                     continue
