@@ -20,3 +20,8 @@ duckdb>=1.4.0
 
 # Env loader
 python-dotenv>=1.0
+
+# News & Scheduling
+feedparser>=6.0.10
+google-generativeai>=0.3.2
+schedule>=1.2.1
