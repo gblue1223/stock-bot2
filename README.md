@@ -139,14 +139,14 @@ python scripts/data/generate_embeddings_v3_parallel.py \
 
 ```bash
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
-python ai_trader/grpo/train_scalping.py \
+python ai_trader/grpo/train_scalping_v2.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v7_holding_rule_soft" \
     --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
-    --num_workers 2 \
+    --num_workers 4 \
     --min_holding 2 \
     --max_holding 300 \
     --entropy_coef 0.05 \
@@ -154,16 +154,14 @@ python ai_trader/grpo/train_scalping.py \
     --lr 0.0001
 
 # Fine-tuning (기존 모델 로드)
-python ai_trader/grpo/train_scalping.py \
+python ai_trader/grpo/train_scalping_v2.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --embedding_model "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --use_raw_data true \
     --output_dir "models/grpo_scalping_v7_holding_rule_soft" \
     --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
-    --num_workers 2 \
+    --num_workers 4 \
     --min_holding 2 \
     --max_holding 300 \
     --entropy_coef 0.01 \
@@ -254,7 +252,7 @@ finetuned_model = FineTunedEmbedding(
 
 ```bash
 # 원본 데이터 + RollingNormalizer 사용 (권장)
-python ai_trader/grpo/train_scalping.py \
+python ai_trader/grpo/train_scalping_v2.py \
     --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
     --embedding_model models/autoencoder/best_model.pt \
     --total_timesteps 100000 \
@@ -263,7 +261,7 @@ python ai_trader/grpo/train_scalping.py \
     --output_dir models/grpo_scalping
 
 # JSON 설정 파일 사용
-python ai_trader/grpo/train_scalping.py --config config/training_config.json
+python ai_trader/grpo/train_scalping_v2.py --config config/training_config.json
 ```
 
 ### 실시간 추론 파이프라인
@@ -392,7 +390,7 @@ ai_trader/
 │   ├── policies/
 │   │   └── scalping_policy.py  # GRPO 정책 네트워크
 │   ├── grpo.py                 # GRPO 알고리즘
-│   ├── train_scalping.py       # 훈련 스크립트 (Enhanced)
+│   ├── train_scalping_v2.py       # 훈련 스크립트 (Enhanced)
 │   └── inference/
 │       ├── grpo_infer.py       # 기본 추론 엔진
 │       └── enhanced_grpo_infer.py  # 향상된 추론 엔진
