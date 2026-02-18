@@ -38,7 +38,9 @@ RSS_FEEDS = [
     "https://www.thevaluenews.co.kr/rss_view.php?code=m65gpg7",
     "https://rss.etoday.co.kr/eto/market_news.xml",
     "https://rss.etoday.co.kr/eto/finance_news.xml",
-    "https://rss.etoday.co.kr/eto/economy_news.xml"
+    "https://rss.etoday.co.kr/eto/economy_news.xml",
+    "http://www.fnnews.com/rss/r20/fn_realnews_stock.xml",
+    "http://www.fnnews.com/rss/r20/fn_realnews_economy.xml",
 ]
 
 seen_links = set()
