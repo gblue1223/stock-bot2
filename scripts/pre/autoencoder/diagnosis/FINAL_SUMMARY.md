@@ -93,7 +93,7 @@ python -m ai_trader.grpo.train_grpo \
 
 ```bash
 # 종목별 개별 평가
-python scripts/pre/diagnosis/evaluate_autoencoder.py \
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py \
     --max-samples 50000  # 더 많은 샘플로 다양한 종목 포함
 ```
 

@@ -13,7 +13,7 @@ scripts\pre\diagnosis\run_evaluation.bat
 
 ### Python 직접 실행
 ```bash
-python scripts/pre/diagnosis/evaluate_autoencoder.py
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py
 ```
 
 ## 평가 프로세스
@@ -194,7 +194,7 @@ schtasks /create /tn "AutoEncoder Evaluation" /tr "C:\path\to\run_evaluation.bat
 # GitHub Actions 예시
 - name: Evaluate AutoEncoder
   run: |
-    python scripts/pre/diagnosis/evaluate_autoencoder.py
+    python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py
     python scripts/check_evaluation_results.py
 ```
 
@@ -203,10 +203,10 @@ schtasks /create /tn "AutoEncoder Evaluation" /tr "C:\path\to\run_evaluation.bat
 ### 메모리 부족
 ```bash
 # 샘플 수 줄이기
-python scripts/pre/diagnosis/evaluate_autoencoder.py --max-samples 5000
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --max-samples 5000
 
 # CPU 사용
-python scripts/pre/diagnosis/evaluate_autoencoder.py --device cpu
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --device cpu
 ```
 
 ### 시각화 오류

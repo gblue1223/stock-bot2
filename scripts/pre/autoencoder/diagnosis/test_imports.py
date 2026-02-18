@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 # 프로젝트 루트 추가
-# 스크립트: scripts/pre/diagnosis/test_imports.py
+# 스크립트: scripts/pre/autoencoder/diagnosis/test_imports.py
 # 루트: 3단계 위
 script_path = Path(__file__).resolve()
 project_root = script_path.parent.parent.parent.parent

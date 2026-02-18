@@ -45,10 +45,10 @@ AutoEncoder 모델을 다각도로 평가합니다.
 
 ```bash
 # 기본 사용 (기본 경로 사용)
-python scripts/pre/diagnosis/evaluate_autoencoder.py
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py
 
 # 커스텀 경로 지정
-python scripts/pre/diagnosis/evaluate_autoencoder.py \
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py \
     --model path/to/model.pt \
     --db path/to/database.duckdb \
     --device cuda \
@@ -56,14 +56,14 @@ python scripts/pre/diagnosis/evaluate_autoencoder.py \
     --max-samples 10000
 
 # CPU 사용
-python scripts/pre/diagnosis/evaluate_autoencoder.py --device cpu
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --device cpu
 ```
 
 **파라미터:**
 - `--model`: 모델 파일 경로 (기본값: `C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt`)
 - `--db`: DuckDB 데이터베이스 경로 (기본값: `C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb`)
 - `--device`: 디바이스 선택 (cuda/cpu, 기본값: cuda)
-- `--output`: 결과 저장 디렉토리 (기본값: `scripts/pre/diagnosis/results`)
+- `--output`: 결과 저장 디렉토리 (기본값: `scripts/pre/autoencoder/diagnosis/results`)
 - `--max-samples`: 평가에 사용할 최대 샘플 수 (기본값: 10000)
 
 **출력 파일:**
@@ -108,7 +108,7 @@ Starting Full Evaluation
 Device: cuda
 Model: C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt
 Database: C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb
-Output: scripts/pre/diagnosis/results
+Output: scripts/pre/autoencoder/diagnosis/results
 
 Loading model...
 Model loaded: standard
@@ -158,10 +158,10 @@ Evaluation completed!
 ### CUDA Out of Memory
 ```bash
 # 샘플 수 줄이기
-python scripts/pre/diagnosis/evaluate_autoencoder.py --max-samples 5000
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --max-samples 5000
 
 # CPU 사용
-python scripts/pre/diagnosis/evaluate_autoencoder.py --device cpu
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --device cpu
 ```
 
 ### 모델 로드 실패

@@ -99,7 +99,7 @@
 ### 1. 즉시 적용 가능
 ```bash
 # 더 많은 샘플로 재평가
-python scripts/pre/diagnosis/evaluate_autoencoder.py --max-samples 10000
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --max-samples 10000
 
 # 다양한 종목 포함 확인
 ```
@@ -125,7 +125,7 @@ config = {
 ### 평가 데이터 부족 해결
 ```bash
 # 10,000 샘플로 재평가 (더 많은 종목 포함)
-python scripts/pre/diagnosis/evaluate_autoencoder.py --max-samples 10000
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --max-samples 10000
 ```
 
 ### 모델 개선 후 재평가

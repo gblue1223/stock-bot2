@@ -5,7 +5,7 @@
 먼저 모든 의존성이 제대로 설치되어 있는지 확인:
 
 ```bash
-python scripts/pre/diagnosis/test_imports.py
+python scripts/pre/autoencoder/diagnosis/test_imports.py
 ```
 
 성공 시 출력:
@@ -23,13 +23,13 @@ python scripts/pre/diagnosis/test_imports.py
 ### 방법 1: 기본 설정으로 실행
 
 ```bash
-python scripts/pre/diagnosis/evaluate_autoencoder.py
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py
 ```
 
 기본 경로:
 - 모델: `C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt`
 - DB: `C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb`
-- 출력: `scripts/pre/diagnosis/results/`
+- 출력: `scripts/pre/autoencoder/diagnosis/results/`
 
 ### 방법 2: Windows 배치 파일 사용
 
@@ -40,7 +40,7 @@ scripts\pre\diagnosis\run_evaluation.bat
 ### 방법 3: 커스텀 경로 지정
 
 ```bash
-python scripts/pre/diagnosis/evaluate_autoencoder.py \
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py \
     --model "path/to/your/model.pt" \
     --db "path/to/your/database.duckdb" \
     --output "custom/output/dir" \
@@ -50,11 +50,11 @@ python scripts/pre/diagnosis/evaluate_autoencoder.py \
 
 ## 3. 결과 확인
 
-평가가 완료되면 `scripts/pre/diagnosis/results/` 디렉토리에 다음 파일들이 생성됩니다:
+평가가 완료되면 `scripts/pre/autoencoder/diagnosis/results/` 디렉토리에 다음 파일들이 생성됩니다:
 
 ### JSON 결과
 ```bash
-cat scripts/pre/diagnosis/results/evaluation_results.json
+cat scripts/pre/autoencoder/diagnosis/results/evaluation_results.json
 ```
 
 ### 시각화 파일
@@ -94,10 +94,10 @@ Mean Embedding Norm: 3.4567
 
 ```bash
 # 샘플 수 줄이기
-python scripts/pre/diagnosis/evaluate_autoencoder.py --max-samples 5000
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --max-samples 5000
 
 # CPU 사용
-python scripts/pre/diagnosis/evaluate_autoencoder.py --device cpu
+python scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py --device cpu
 ```
 
 ### 모듈을 찾을 수 없음 (ModuleNotFoundError)
@@ -111,7 +111,7 @@ which python  # Linux/Mac
 where python  # Windows
 
 # 임포트 테스트 실행
-python scripts/pre/diagnosis/test_imports.py
+python scripts/pre/autoencoder/diagnosis/test_imports.py
 ```
 
 ### 데이터베이스 연결 실패

@@ -15,7 +15,7 @@ echo.
 REM 기본 경로 설정
 set MODEL_PATH=C:\Users\user\Workspace\datasets@20260109\autoencoder\model.pt
 set DB_PATH=C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb
-set OUTPUT_DIR=scripts\pre\diagnosis\results
+set OUTPUT_DIR=scripts\pre\autoencoder\diagnosis\results
 set DEVICE=cuda
 set MAX_SAMPLES=10000
 
@@ -27,7 +27,7 @@ echo Max Samples: %MAX_SAMPLES%
 echo.
 
 REM Python 스크립트 실행
-python scripts\pre\diagnosis\evaluate_autoencoder.py ^
+python scripts\pre\autoencoder\diagnosis\evaluate_autoencoder.py ^
     --model "%MODEL_PATH%" ^
     --db "%DB_PATH%" ^
     --output "%OUTPUT_DIR%" ^

@@ -107,7 +107,7 @@ python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
 
 ```bash
 # 사전 훈련 데이터 생성
-$ python scripts/pre/parallel_preprocessing.py \
+$ python scripts/pre/autoencoder/parallel_preprocessing.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --seq-len 120 \
     --batch-size 5000 \

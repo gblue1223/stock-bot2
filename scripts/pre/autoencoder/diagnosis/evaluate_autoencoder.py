@@ -25,7 +25,7 @@ from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 
 # 프로젝트 루트를 경로에 추가
-# 스크립트 위치: scripts/pre/diagnosis/evaluate_autoencoder.py
+# 스크립트 위치: scripts/pre/autoencoder/diagnosis/evaluate_autoencoder.py
 # 프로젝트 루트: 3단계 위 (diagnosis -> pre -> scripts -> root)
 script_path = Path(__file__).resolve()
 project_root = script_path.parent.parent.parent.parent
@@ -68,7 +68,7 @@ class AutoEncoderEvaluator:
         model_path: str,
         db_path: str,
         device: str = 'cuda',
-        output_dir: str = 'scripts/pre/diagnosis/results'
+        output_dir: str = 'scripts/pre/autoencoder/diagnosis/results'
     ):
         self.model_path = Path(model_path)
         self.db_path = Path(db_path)
@@ -560,7 +560,7 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        default='scripts/pre/diagnosis/results',
+        default='scripts/pre/autoencoder/diagnosis/results',
         help='결과 저장 디렉토리'
     )
     parser.add_argument(
