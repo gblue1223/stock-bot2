@@ -119,31 +119,12 @@ $ python scripts/pre/parallel_preprocessing.py \
 # autoencoder_training_complete.ipynb 실행
 ```
 
-### 2단계: 트레이딩 특화 Fine-tuning
-
-```python
-from ai_trader.embedding.fine_tuning import fine_tune_for_trading_task
-
-# 사전 훈련된 모델을 트레이딩 태스크에 맞게 Fine-tuning
-ft_model, trainer, history = fine_tune_for_trading_task(
-    pretrained_model_path='models/autoencoder/best_model.pt',
-    train_sequences=sequences,
-    train_labels=labels,
-    task_type='classification',
-    num_classes=3,  # 매수/보유/매도
-    config={
-        'batch_size': 128,
-        'max_epochs': 30,
-        'encoder_lr': 1e-4,
-        'head_lr': 1e-3
-    }
-)
-```
-
-### 3단계: GRPO 강화학습 훈련
+### 2단계: GRPO 강화학습 훈련
 
 ```bash
 # 속도를 위한 전처리 작업.
+# colab_embedding_gen.ipynb
+# OR
 python scripts/data/generate_embeddings_v3_parallel.py \
   --db_path "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
   --model_path "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
@@ -190,7 +171,7 @@ python ai_trader/grpo/train_scalping.py \
     --lr 0.0001
 ```
 
-### 4단계: 실시간 추론 (2.87ms)
+### 3단계: 실시간 추론 (2.87ms)
 
 ```python
 from ai_trader.grpo.inference.grpo_infer import GRPOInference

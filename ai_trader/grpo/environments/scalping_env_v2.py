@@ -188,10 +188,17 @@ class GRPOScalpingEnvV2(gym.Env):
         
         dfs = []
         for file_path, _ in file_entries:
-            df = pd.read_parquet(file_path)
-            filtered = df[(df['code'] == code) & (df['date'] == date)]
-            if len(filtered) > 0:
-                dfs.append(filtered)
+            try:
+                df = pd.read_parquet(file_path)
+                filtered = df[(df['code'] == code) & (df['date'] == date)]
+                if len(filtered) > 0:
+                    dfs.append(filtered)
+            except Exception as e:
+                # Log error but don't crash. 
+                # In threading environment, this prevents taking down the thread/process if possible.
+                # If it's a hard segfault in C++, this might not help, but it catches Python-level issues.
+                logger.error(f"Failed to read parquet file {file_path} for {code}/{date}: {e}")
+                continue
         
         if not dfs:
             return None
