@@ -151,52 +151,6 @@ model = AutoEncoderEmbedding(
 reconstruction, embedding = model(input_sequence)
 ```
 
-## 🎯 Fine-tuning 시스템
-
-Fine-tuning을 통해 기존 모델을 새로운 데이터에 빠르게 적응시킬 수 있습니다.
-
-### 빠른 Fine-tuning
-
-```bash
-# CLI를 통한 Fine-tuning
-python scripts/fine_tuning/finetune_autoencoder.py \
-    --model models/pretrained/model.pt \
-    --data data/preprocessed \
-    --output models/finetuned \
-    --train-months 2025_01 2025_02 \
-    --val-months 2025_03 \
-    --learning-rate 1e-4 \
-    --max-epochs 5
-
-# Google Colab에서 Fine-tuning
-# scripts/colab/autoencoder_finetuning.ipynb 사용
-```
-
-### 프로그래밍 방식 Fine-tuning
-
-```python
-from ai_trader.embedding.fine_tuning import FineTuner, create_fine_tuning_config
-
-# Fine-tuning 설정
-config = create_fine_tuning_config(
-    learning_rate=1e-4,
-    max_epochs=5,
-    freeze_layers=1,
-    warmup_epochs=1
-)
-
-# Fine-tuner 생성
-fine_tuner = FineTuner(model, device, config)
-
-# Fine-tuning 실행
-results = fine_tuner.fine_tune(train_loader, val_loader)
-
-print(f"개선도: {results['improvement_percent']:.2f}%")
-print(f"훈련 시간: {results['training_time_minutes']:.1f}분")
-```
-
-자세한 Fine-tuning 가이드는 [FINE_TUNING.md](FINE_TUNING.md)를 참조하세요.
-
 ### 트레이딩 태스크별 헤드
 
 ```python

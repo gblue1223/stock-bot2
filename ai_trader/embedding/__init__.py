@@ -14,7 +14,6 @@
 
 from .autoencoder_model import AutoEncoderEmbedding, MaskedAutoEncoder, create_autoencoder_model
 from .autoencoder_trainer import AutoEncoderTrainer, TimeSeriesDataset, train_autoencoder_embedding
-from .fine_tuning.fine_tuning import FineTuner, create_fine_tuning_config, fine_tune_model
 
 __all__ = [
     'AutoEncoderEmbedding',
@@ -24,6 +23,6 @@ __all__ = [
     'TimeSeriesDataset',
     'train_autoencoder_embedding',
     'FineTuner',
-    'create_fine_tuning_config',
+    '',
     'fine_tune_model'
 ]
