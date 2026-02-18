@@ -227,7 +227,12 @@ class GRPOTrainer:
                 break
         
         # 에피소드 메타데이터
-        episode_metadata = step_info.get('episode', {})
+        episode_metadata = step_info.get('episode', {}).copy()
+        
+        # 커스텀 통계 키 병합
+        for k in ['num_trades', 'win_rate', 'sharpe_ratio', 'avg_holding_time', 'quick_exit_violations']:
+            if k in step_info:
+                episode_metadata[k] = step_info[k]
         if 'total_return' in episode_metadata:
             env_total = float(episode_metadata['total_return'])
             sum_collected = float(np.sum(rewards))

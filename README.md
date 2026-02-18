@@ -144,7 +144,7 @@ python ai_trader/grpo/train_scalping.py \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v7_holding_rule" \
+    --output_dir "models/grpo_scalping_v7_holding_rule_soft" \
     --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
     --num_workers 2 \
     --min_holding 2 \

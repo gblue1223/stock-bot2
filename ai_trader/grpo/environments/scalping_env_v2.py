@@ -466,7 +466,8 @@ class GRPOScalpingEnvV2(gym.Env):
                 self.episode_trades.append({
                     'profit': profit_rate, 
                     'reward': reward,
-                    'step': self.current_step
+                    'step': self.current_step,
+                    'holding_time': holding_time
                 })
 
         # --- Position Holding Penalty ---
@@ -494,6 +495,15 @@ class GRPOScalpingEnvV2(gym.Env):
                  
                  reward += (profit_val - cost)
                  
+                 # Record forced trade
+                 self.episode_trades.append({
+                    'profit': profit_rate,
+                    'reward': (profit_val - cost),
+                    'step': self.current_step,
+                    'holding_time': holding_time,
+                    'is_forced': True
+                 })
+                 
                  self.position = 0
                  self.position_steps = 0
                  
@@ -505,10 +515,43 @@ class GRPOScalpingEnvV2(gym.Env):
         # New Observation
         obs = self._get_observation()
         
-        info = {
-            'price': current_price,
-            'time': current_time
-        }
+        if terminated:
+            # Calculate episode statistics
+            num_trades = len(self.episode_trades)
+            if num_trades > 0:
+                profits = [t['profit'] for t in self.episode_trades]
+                win_count = sum(1 for p in profits if p > 0)
+                win_rate = win_count / num_trades
+                
+                # Sharpe Ratio (using trade profits)
+                if len(profits) > 1:
+                    sharpe_ratio = np.mean(profits) / (np.std(profits) + 1e-8)
+                else:
+                    sharpe_ratio = 0.0
+                    
+                # Holding Time
+                holding_times = [t.get('holding_time', 0.0) for t in self.episode_trades]
+                avg_holding_time = np.mean(holding_times)
+                
+            else:
+                win_rate = 0.0
+                sharpe_ratio = 0.0
+                avg_holding_time = 0.0
+                
+            info = {
+                'price': current_price,
+                'time': current_time,
+                'num_trades': num_trades,
+                'win_rate': win_rate,
+                'sharpe_ratio': sharpe_ratio,
+                'quick_exit_violations': self.quick_exit_violations,
+                'avg_holding_time': avg_holding_time
+            }
+        else:
+            info = {
+                'price': current_price,
+                'time': current_time
+            }
         
         return obs, reward, terminated, truncated, info
 
