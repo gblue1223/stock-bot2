@@ -60,8 +60,21 @@ console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
 
 # 루트 로거 설정
+# Argument Parsing for Logging Level (Done early to configure logging)
+parser_pre = argparse.ArgumentParser(add_help=False)
+parser_pre.add_argument('--debug', action='store_true', help='Enable DEBUG logging')
+args_pre, _ = parser_pre.parse_known_args()
+
+log_level = logging.DEBUG if args_pre.debug else logging.INFO
+
+if args_pre.debug:
+    print("DEBUG logging enabled")
+    file_handler.setLevel(logging.DEBUG)
+    console_handler.setLevel(logging.DEBUG)
+
+# 루트 로거 설정
 logging.basicConfig(
-    level=logging.INFO,  # ✅ DEBUG -> INFO 변경
+    level=log_level,
     handlers=[file_handler, console_handler]
 )
 
@@ -309,6 +322,7 @@ def main():
     # 설정 파일
     parser.add_argument('--config', type=str, default=None,
                         help='Configuration file path (JSON)')
+    parser.add_argument('--debug', action='store_true', help='Enable DEBUG logging')
     
     # 데이터
     parser.add_argument('--db', dest='db_path', type=str, default=None,

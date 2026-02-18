@@ -189,6 +189,8 @@ class GRPOScalpingEnvV2(gym.Env):
         dfs = []
         for file_path, _ in file_entries:
             try:
+                # Log reading attempt for debugging Segfaults
+                logger.debug(f"Reading parquet: {file_path}")
                 df = pd.read_parquet(file_path)
                 filtered = df[(df['code'] == code) & (df['date'] == date)]
                 if len(filtered) > 0:
