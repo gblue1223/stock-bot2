@@ -253,6 +253,7 @@ class GRPOScalpingEnvV2(gym.Env):
         self.entry_time = 0.0
         self.max_price_since_entry = 0.0
         self.episode_trades = []
+        self.quick_exit_violations = 0
         
         # 3. 초기 관측값
         obs = self._get_observation()
@@ -482,6 +483,7 @@ class GRPOScalpingEnvV2(gym.Env):
             # Quick Exit Check
             if holding_time > self.quick_exit_threshold and current_price < self.avg_entry_price:
                  reward -= self.quick_exit_penalty
+                 self.quick_exit_violations += 1
             
             # Max Holding Force Close
             if holding_time > self.max_holding_time:
