@@ -903,6 +903,7 @@ class GRPOTrainer:
             mean_win_rate = np.mean([ep['metadata'].get('win_rate', 0.0) for ep in episodes])
             mean_trades = np.mean([ep['metadata'].get('num_trades', 0) for ep in episodes])
             mean_sharpe = np.mean([ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes])
+            mean_holding_time = np.mean([ep['metadata'].get('avg_holding_time', 0.0) for ep in episodes])
             
             # 콜백 호출 (Curriculum Learning 등)
             if on_iteration_end:
@@ -911,6 +912,7 @@ class GRPOTrainer:
                     'mean_win_rate': mean_win_rate,
                     'mean_trades': mean_trades,
                     'mean_sharpe': mean_sharpe,
+                    'mean_holding_time': mean_holding_time,
                     'iteration': iteration + 1,
                     'total_iterations': num_iterations
                 }
@@ -934,20 +936,13 @@ class GRPOTrainer:
             elapsed_str = self._format_time(elapsed_time)
             remaining_str = self._format_time(estimated_remaining_time)
             
-            # 평균 보상 및 추가 메트릭 계산
-            mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
-            
-            # 추가 메트릭 계산
-            mean_win_rate = np.mean([ep['metadata'].get('win_rate', 0.0) for ep in episodes])
-            mean_trades = np.mean([ep['metadata'].get('num_trades', 0) for ep in episodes])
-            mean_sharpe = np.mean([ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes])
-            
             logger.info(f"Iteration {iteration + 1}/{num_iterations} ({progress_pct:.1f}%) | "
                        f"Timesteps: {self.total_timesteps} | "
                        f"Mean Reward: {mean_reward:.4f} | "
                        f"Win Rate: {mean_win_rate:.1%} | "
                        f"Trades: {mean_trades:.0f} | "
                        f"Sharpe: {mean_sharpe:.2f} | "
+                       f"AvgHold: {mean_holding_time:.1f}s | "
                        f"Policy Loss: {update_metrics['policy_loss']:.4f} | "
                        f"Elapsed: {elapsed_str} | "
                        f"ETA: {remaining_str}")
