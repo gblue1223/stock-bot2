@@ -1,8 +1,8 @@
 """
-GRPO 스캘핑 환경 V2 (Pre-computed Embeddings)
+GRPO 스캘핑 환경 V2 (Pre-computed Embeddings + Market Data)
 
-기존 env와 달리, 실시간 추론을 수행하지 않고 
-미리 계산된 Parquet 임베딩 데이터를 로드하여 사용합니다.
+Parquet 파일에 embedding + 등락률 등 모든 시장 데이터가 포함되어 있어
+DuckDB 없이 Parquet 파일만으로 동작합니다 (속도 향상).
 """
 
 import logging
@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
-import duckdb
 import os
 import glob
 import time
@@ -21,14 +20,14 @@ logger = logging.getLogger(__name__)
 
 class GRPOScalpingEnvV2(gym.Env):
     """
-    스캘핑을 위한 GRPO 훈련 환경 (V2: Pre-computed Embeddings)
+    스캘핑을 위한 GRPO 훈련 환경 (V2: Pre-computed Embeddings + Market Data)
     
     관측 공간: 임베딩 벡터 (embedding_dim,) + 포지션 정보
     행동 공간: Discrete(3) - 0: 보유, 1: 매수, 2: 매도
     
     특징:
-    - Parquet 파일에서 임베딩을 직접 로드 (Inference 제거 -> 속도 향상)
-    - DuckDB에서 등락률/가격 정보 로드 (Reward 계산용 = 정확도 유지)
+    - Parquet 파일(embeddings_v3)에서 embedding + 등락률 등 모든 데이터 로드
+    - DuckDB 의존성 완전 제거 → 에피소드마다 DB 쿼리 없음 → 속도 향상
     """
     
     metadata = {'render_modes': []}
@@ -36,8 +35,8 @@ class GRPOScalpingEnvV2(gym.Env):
     def __init__(
         self,
         parquet_path: str,
-        db_path: str,
-        table_name: str = 'datasets',
+        db_path: str = None,       # 하위호환 유지 (사용 안 함)
+        table_name: str = 'datasets',  # 하위호환 유지 (사용 안 함)
         embedding_dim: int = 128,
         transaction_cost_rate: float = 0.00215,
         quick_exit_penalty: float = 0.01,
@@ -49,16 +48,14 @@ class GRPOScalpingEnvV2(gym.Env):
         max_split_count: int = 1,
         min_holding_time: float = 2.0,
         max_holding_time: float = 100.0,
-        seq_len: int = 120, # 시퀀스 길이 (임베딩 생성시 사용된 값)
-        device: str = 'cpu', # 호환성 유지용
-        no_trade_penalty: float = 0.5,  # Fix1: 에피소드 내 거래 0회 시 패널티
-        max_rows_limit: int = 5_000_000, # Fix2: 메모리 안전 — 행수 초과 키 제외
+        seq_len: int = 120,
+        device: str = 'cpu',
+        no_trade_penalty: float = 0.5,
+        max_rows_limit: int = 5_000_000,
     ):
         super().__init__()
         
         self.parquet_path = parquet_path
-        self.db_path = db_path
-        self.table_name = table_name
         self.seq_len = seq_len
         self.embedding_dim = embedding_dim
         
@@ -67,8 +64,8 @@ class GRPOScalpingEnvV2(gym.Env):
         self.max_split_count = max_split_count
         self.min_holding_time = min_holding_time
         self.max_holding_time = max_holding_time
-        self.no_trade_penalty = no_trade_penalty  # Fix1
-        self.max_rows_limit = max_rows_limit       # Fix2
+        self.no_trade_penalty = no_trade_penalty
+        self.max_rows_limit = max_rows_limit
         
         self.transaction_cost_rate = transaction_cost_rate
         self.round_trip_cost = transaction_cost_rate * 2
@@ -85,11 +82,9 @@ class GRPOScalpingEnvV2(gym.Env):
         )
         self.action_space = spaces.Discrete(3)
         
-        # DB 연결
-        self._connect_db()
-        
-        # 유효한 키(종목, 날짜) 로드
+        # 유효한 키(종목, 날짜) 인덱스 구축 및 로드
         self.valid_keys = []
+        self._build_key_index_if_needed()
         self._preload_valid_keys()
         
         # 상태 변수
@@ -100,43 +95,29 @@ class GRPOScalpingEnvV2(gym.Env):
         self.entry_time = 0
         self.max_price_since_entry = 0.0
         
-        self.episode_data = None #(N, features) - 여기선 embedding과 return_rate만 필요
+        self.episode_data = None
         self.episode_metadata = None
         self.episode_length = 0
         
         self.episode_trades = []
         
-        logger.info(f"GRPOScalpingEnvV2 initialized. Embedding source: {parquet_path}")
+        logger.info(f"GRPOScalpingEnvV2 initialized (DuckDB-free). Source: {parquet_path}")
 
     # Shared across all instances
     _KEY_INDEX = None       # {(code, date): (file_path, row_count)}
     _LRU_CACHE = None       # OrderedDict for LRU: (code, date) -> DataFrame
     _LRU_MAX_SIZE = 100
     _INDEX_BUILT = False
-    _SHARED_CONN = None     # 단일 공유 DuckDB 연결
-    _DB_LOCK = threading.Lock()  # DuckDB 접근 보호용 Lock
-    
-    def _connect_db(self):
-        try:
-            with GRPOScalpingEnvV2._DB_LOCK:
-                if GRPOScalpingEnvV2._SHARED_CONN is None:
-                    GRPOScalpingEnvV2._SHARED_CONN = duckdb.connect(
-                        database=self.db_path, read_only=True
-                    )
-                    logger.info(f"Connected to DB (Shared + Lock)")
-                
-                self.conn = GRPOScalpingEnvV2._SHARED_CONN
-                self.raw_db_alias = "main"
-                
-                if not GRPOScalpingEnvV2._INDEX_BUILT:
-                    self._build_key_index()
-                    from collections import OrderedDict
-                    GRPOScalpingEnvV2._LRU_CACHE = OrderedDict()
-                    GRPOScalpingEnvV2._INDEX_BUILT = True
-            
-        except Exception as e:
-            logger.error(f"DB Connect Failed: {e}")
-            raise
+    _INDEX_LOCK = threading.Lock()  # 인덱스 구축 보호용 Lock (DuckDB 제거)
+
+    def _build_key_index_if_needed(self):
+        """인덱스가 아직 구축되지 않은 경우에만 구축 (스레드 안전)"""
+        with GRPOScalpingEnvV2._INDEX_LOCK:
+            if not GRPOScalpingEnvV2._INDEX_BUILT:
+                self._build_key_index()
+                from collections import OrderedDict
+                GRPOScalpingEnvV2._LRU_CACHE = OrderedDict()
+                GRPOScalpingEnvV2._INDEX_BUILT = True
     
     def _build_key_index(self):
         """parquet 파일에서 메타데이터만 스캔하여 (code, date) -> file 인덱스 구축"""
@@ -237,7 +218,6 @@ class GRPOScalpingEnvV2(gym.Env):
                     cnt = entry[1]
                 if cnt < min_len:
                     continue
-                # Fix2: 메모리 안전 — 행 수가 너무 많으면 OOM 발생 가능성 차단
                 if cnt > self.max_rows_limit:
                     skipped_oom += 1
                     continue
@@ -278,7 +258,7 @@ class GRPOScalpingEnvV2(gym.Env):
         return obs, info
 
     def _load_episode_data(self):
-        """랜덤 키 선택 후 데이터 로딩 (Embedding: lazy load + Market Data: DuckDB)"""
+        """랜덤 키 선택 후 데이터 로딩 (Parquet only — DuckDB 없음)"""
         max_attempts = 10
         for _ in range(max_attempts):
             try:
@@ -287,37 +267,23 @@ class GRPOScalpingEnvV2(gym.Env):
                 idx = np.random.randint(0, len(self.valid_keys))
                 code, date, cnt = self.valid_keys[idx]
                 
-                # 1. 임베딩 lazy load (LRU 캐시)
-                emb_df = self._get_embedding_data(code, date)
-                if emb_df is None or len(emb_df) < 10:
+                # Parquet LRU 캐시에서 로드 (embedding + 등락률 모두 포함)
+                df = self._get_embedding_data(code, date)
+                if df is None or len(df) < 10:
                     continue
                 
-                # 2. Raw DB에서 등락률 가져오기
-                query = f"""
-                    SELECT 시간 as time, 등락률 as return_rate
-                    FROM {self.raw_db_alias}.{self.table_name}
-                    WHERE 종목코드 = ? AND 날짜 = ?
-                    ORDER BY 시간
-                """
-                with GRPOScalpingEnvV2._DB_LOCK:
-                    raw_df = self.conn.execute(query, [code, date]).fetchdf()
-                
-                if len(raw_df) < 10:
+                # 등락률 컬럼 확인
+                if '등락률' not in df.columns:
+                    logger.warning(f"'등락률' column missing in parquet for {code}/{date}. 재생성 필요.")
                     continue
                 
-                # 3. time 기준으로 merge
-                merged = emb_df.merge(raw_df, on='time', how='inner')
-                
-                if len(merged) < 10:
-                    continue
-                
-                # 4. 데이터 변환
-                embeddings = np.stack(merged['embedding'].values)
-                return_rates = merged['return_rate'].values.astype(np.float32) / 100.0
-                times = merged['time'].values
+                # 데이터 변환
+                embeddings = np.stack(df['embedding'].values)
+                return_rates = df['등락률'].values.astype(np.float32) / 100.0
+                times = df['time'].values
                 
                 # 에피소드 길이 제한 (랜덤 스타트)
-                total_len = len(merged)
+                total_len = len(df)
                 if self.max_episode_steps:
                     max_len = self.max_episode_steps
                     if total_len > max_len:
