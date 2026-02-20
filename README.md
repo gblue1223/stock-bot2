@@ -125,11 +125,11 @@ $ python scripts/pre/autoencoder/parallel_preprocessing.py \
 # 속도를 위한 전처리 작업.
 # colab_embedding_gen.ipynb
 # OR
-python scripts/data/generate_embeddings_v3_parallel.py \
+python scripts/data/generate_embeddings_parallel.py \
   --db_path "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
   --model_path "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
-  --output_dir "C:\Users\user\Workspace\datasets@20260117\embeddings_v2" \
-  --state_file "C:\Users\user\Workspace\datasets@20260117\embeddings_v2\processed_stocks.txt" \
+  --output_dir "C:\Users\user\Workspace\datasets@20260117\embeddings_v4" \
+  --state_file "C:\Users\user\Workspace\datasets@20260117\embeddings_v4\processed_stocks.txt" \
   --table_name "datasets" \
   --seq_len 120 \
   --batch_size 4096 \
@@ -144,8 +144,7 @@ python ai_trader/grpo/train_scalping_v2.py \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v7_holding_rule_soft" \
-    --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
+    --output_dir "models/grpo_scalping_v8_holding_rule_soft" \
     --num_workers 4 \
     --min_holding 2 \
     --max_holding 300 \
@@ -159,8 +158,8 @@ python ai_trader/grpo/train_scalping_v2.py \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v7_holding_rule_soft" \
-    --load_policy "models/grpo_scalping_v7_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
+    --output_dir "models/grpo_scalping_v8_holding_rule_soft" \
+    --load_policy "models/grpo_scalping_v8_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
     --num_workers 4 \
     --min_holding 2 \
     --max_holding 300 \
