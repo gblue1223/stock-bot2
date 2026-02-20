@@ -131,7 +131,7 @@ class TrainingConfig:
         self.gamma = 0.99
         self.clip = 0.1  # 0.2 -> 0.1 (안정성 강화)
         self.kl_target = 0.01
-        self.entropy_coef = 0.05  # 0.1 -> 0.05 (탐색 줄이고 수익 집중)
+        self.entropy_coef = 0.15  # Fix3: 0.05 → 0.15 (정책 탐색 강화, no-trade collapse 방지)
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
         
@@ -507,15 +507,19 @@ def main():
         
         if hasattr(args, 'transaction_cost_rate') and args.transaction_cost_rate is not None and args.transaction_cost_rate > 0:
              target_cost_rate = args.transaction_cost_rate
-             logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {target_cost_rate}")
-             for e in envs: e.set_transaction_cost_rate(0.0)
-             current_cost_rate = 0.0
+             # Fix4: 0.0 대신 목표값의 30%로 초기화 (no-trade trivial solution 차단)
+             initial_curriculum_cost = target_cost_rate * 0.30
+             logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost (30% of target {target_cost_rate}), targeting {target_cost_rate}")
+             for e in envs: e.set_transaction_cost_rate(initial_curriculum_cost)
+             current_cost_rate = initial_curriculum_cost
         else:
              if initial_env_cost > 0:
-                 logger.info(f"Curriculum Learning: Starting with 0 transaction cost, targeting {initial_env_cost}")
                  target_cost_rate = initial_env_cost
-                 for e in envs: e.set_transaction_cost_rate(0.0)
-                 current_cost_rate = 0.0
+                 # Fix4: 0.0 대신 목표값의 30%로 초기화 (no-trade trivial solution 차단)
+                 initial_curriculum_cost = target_cost_rate * 0.30
+                 logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost (30% of target {target_cost_rate}), targeting {target_cost_rate}")
+                 for e in envs: e.set_transaction_cost_rate(initial_curriculum_cost)
+                 current_cost_rate = initial_curriculum_cost
              else:
                  current_cost_rate = initial_env_cost
                  target_cost_rate = initial_env_cost

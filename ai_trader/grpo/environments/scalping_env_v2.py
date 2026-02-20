@@ -50,7 +50,9 @@ class GRPOScalpingEnvV2(gym.Env):
         min_holding_time: float = 2.0,
         max_holding_time: float = 100.0,
         seq_len: int = 120, # 시퀀스 길이 (임베딩 생성시 사용된 값)
-        device: str = 'cpu' # 호환성 유지용
+        device: str = 'cpu', # 호환성 유지용
+        no_trade_penalty: float = 0.5,  # Fix1: 에피소드 내 거래 0회 시 패널티
+        max_rows_limit: int = 5_000_000, # Fix2: 메모리 안전 — 행수 초과 키 제외
     ):
         super().__init__()
         
@@ -65,6 +67,8 @@ class GRPOScalpingEnvV2(gym.Env):
         self.max_split_count = max_split_count
         self.min_holding_time = min_holding_time
         self.max_holding_time = max_holding_time
+        self.no_trade_penalty = no_trade_penalty  # Fix1
+        self.max_rows_limit = max_rows_limit       # Fix2
         
         self.transaction_cost_rate = transaction_cost_rate
         self.round_trip_cost = transaction_cost_rate * 2
@@ -225,14 +229,22 @@ class GRPOScalpingEnvV2(gym.Env):
             min_len = self.max_episode_steps + 10 if self.max_episode_steps else 100
             
             self.valid_keys = []
+            skipped_oom = 0
             for (code, date), entry in key_index.items():
                 if isinstance(entry, list):
                     cnt = sum(c for _, c in entry)
                 else:
                     cnt = entry[1]
-                if cnt >= min_len:
-                    self.valid_keys.append((code, date, cnt))
+                if cnt < min_len:
+                    continue
+                # Fix2: 메모리 안전 — 행 수가 너무 많으면 OOM 발생 가능성 차단
+                if cnt > self.max_rows_limit:
+                    skipped_oom += 1
+                    continue
+                self.valid_keys.append((code, date, cnt))
             
+            if skipped_oom > 0:
+                logger.info(f"Skipped {skipped_oom} keys with rows > {self.max_rows_limit:,} (OOM prevention)")
             logger.info(f"Loaded {len(self.valid_keys)} valid keys.")
             
         except Exception as e:
@@ -539,6 +551,8 @@ class GRPOScalpingEnvV2(gym.Env):
                 win_rate = 0.0
                 sharpe_ratio = 0.0
                 avg_holding_time = 0.0
+                # Fix1: 거래가 하나도 없으면 패널티 — no-trade collapse 방지
+                reward -= self.no_trade_penalty
                 
             info = {
                 'price': current_price,
