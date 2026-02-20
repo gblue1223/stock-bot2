@@ -375,9 +375,203 @@ def main():
 
     print(f"Done. Files saved in {args.output_dir}")
 
+    # ── 자동 병합: embedding 생성 완료 후 DuckDB 데이터를 parquet에 병합 ──
+    print("\n" + "=" * 60)
+    print("[AUTO-MERGE] Parquet 생성 완료 → DuckDB 데이터 병합 시작...")
+    print("=" * 60)
+    merge_main(
+        parquet_dir=args.output_dir,
+        db_path=args.db_path,
+        table_name=args.table_name,
+        output_dir=args.output_dir,  # 같은 폴더에 덮어쓰기
+        workers=args.num_workers,
+    )
+
+
 if __name__ == "__main__":
     try:
         torch.multiprocessing.set_start_method('spawn', force=True)
     except RuntimeError:
         pass
+
+    # --mode merge: 병합만 단독 실행
+    if '--mode' in sys.argv:
+        idx = sys.argv.index('--mode')
+        if idx + 1 < len(sys.argv) and sys.argv[idx + 1] == 'merge':
+            merge_main()
+            sys.exit(0)
+
     main()
+
+
+# =============================================================================
+# DuckDB → Parquet 병합 (merge mode)
+#
+# 사용법:
+#   python scripts/pre/parquet/generate_embeddings_v3_parallel.py --mode merge \
+#     --parquet_dir "C:/Users/user/Workspace/datasets@20260117/embeddings_v2" \
+#     --db_path    "C:/Users/user/Workspace/datasets@20260117/datasets_raw_09_11.duckdb" \
+#     --output_dir "C:/Users/user/Workspace/datasets@20260117/embeddings_v3" \
+#     --workers 4
+#
+# 현재 Parquet 컬럼: date, time, code, embedding
+# DuckDB 컬럼:      날짜, 번호, 종목코드, 종목명, 시간, 종목명_scalar, 시간_sin/cos/scalar,
+#                   등락률, 누적거래대금, 거래회전율, 체결강도, 매도/매수대기금액1~10
+# Join key: (date, code, time)
+# =============================================================================
+
+import logging as _logging
+import glob as _glob
+from pathlib import Path as _Path
+from concurrent.futures import ProcessPoolExecutor as _PPE, as_completed as _as_completed
+
+_MERGE_DONE_SUFFIX = '.merged'
+
+
+def _merge_one_file(args_tuple):
+    """단일 parquet 파일에 DuckDB 데이터를 병합 (ProcessPoolExecutor용)."""
+    import time as _time
+    import os as _os
+    import pandas as _pd
+    import duckdb as _duckdb
+    from pathlib import Path as _P
+
+    parquet_path, db_path, table_name, output_dir = args_tuple
+    file_name = _os.path.basename(parquet_path)
+    out_path = _os.path.join(output_dir, file_name)
+    done_marker = out_path + _MERGE_DONE_SUFFIX
+
+    if _os.path.exists(done_marker):
+        return ('skipped', parquet_path, 0)
+
+    t0 = _time.time()
+    try:
+        pq_df = _pd.read_parquet(parquet_path)
+        if pq_df.empty:
+            return ('empty', parquet_path, 0)
+
+        dates_str = ', '.join(f"'{d}'" for d in pq_df['date'].unique())
+        codes_str = ', '.join(f"'{c}'" for c in pq_df['code'].unique())
+
+        query = f"""
+            SELECT
+                날짜 AS date, 종목코드 AS code, 시간 AS time,
+                번호, 종목명, 종목명_scalar,
+                시간_sin, 시간_cos, 시간_scalar,
+                등락률, 누적거래대금, 거래회전율, 체결강도,
+                매도대기금액1, 매도대기금액2, 매도대기금액3, 매도대기금액4, 매도대기금액5,
+                매도대기금액6, 매도대기금액7, 매도대기금액8, 매도대기금액9, 매도대기금액10,
+                매수대기금액1, 매수대기금액2, 매수대기금액3, 매수대기금액4, 매수대기금액5,
+                매수대기금액6, 매수대기금액7, 매수대기금액8, 매수대기금액9, 매수대기금액10
+            FROM {table_name}
+            WHERE 날짜 IN ({dates_str}) AND 종목코드 IN ({codes_str})
+        """
+        conn = _duckdb.connect(database=db_path, read_only=True)
+        db_df = conn.execute(query).fetchdf()
+        conn.close()
+
+        if db_df.empty:
+            return ('no_db_data', parquet_path, 0)
+
+        merged = pq_df.merge(db_df, on=['date', 'code', 'time'], how='left')
+        matched = merged['등락률'].notna().sum()
+        total = len(merged)
+
+        _os.makedirs(output_dir, exist_ok=True)
+        merged.to_parquet(out_path, index=False, compression='snappy')
+        _P(done_marker).touch()
+
+        return ('ok', parquet_path, _time.time() - t0, matched, total)
+
+    except Exception as e:
+        return ('error', parquet_path, str(e))
+
+
+def merge_main(*, parquet_dir=None, db_path=None, table_name='datasets',
+               output_dir=None, workers=4, overwrite=False):
+    """
+    DuckDB 데이터를 Parquet 파일에 병합.
+    
+    직접 인자를 전달하거나, 인자 없이 호출하면 argparse로 CLI에서 읽음.
+    """
+    import time as _time, os as _os, sys as _sys
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S',
+        handlers=[
+            _logging.StreamHandler(_sys.stdout),
+            _logging.FileHandler('merge_embeddings.log', encoding='utf-8'),
+        ],
+        force=True,
+    )
+    log = _logging.getLogger('merge')
+
+    # CLI fallback: 인자가 주어지지 않은 경우 argparse 사용
+    if parquet_dir is None or db_path is None:
+        import argparse as _ap
+        parser = _ap.ArgumentParser(description='DuckDB → Parquet 병합')
+        parser.add_argument('--parquet_dir', required=True,  help='원본 parquet 폴더')
+        parser.add_argument('--db_path',     required=True,  help='DuckDB 파일 경로')
+        parser.add_argument('--table_name',  default='datasets')
+        parser.add_argument('--output_dir',  default=None,   help='출력 폴더 (기본=parquet_dir)')
+        parser.add_argument('--workers',     type=int, default=4)
+        parser.add_argument('--overwrite',   action='store_true')
+        parser.add_argument('--mode',        default='merge')
+        args = parser.parse_args()
+        parquet_dir = args.parquet_dir
+        db_path     = args.db_path
+        table_name  = args.table_name
+        output_dir  = args.output_dir
+        workers     = args.workers
+        overwrite   = args.overwrite
+
+    output_dir = output_dir or parquet_dir
+
+    if not _os.path.exists(db_path):
+        log.error(f"DuckDB not found: {db_path}"); return
+
+    pq_files = sorted(_glob.glob(_os.path.join(parquet_dir, '*.parquet')))
+    if not pq_files:
+        log.error(f"No parquet files in {parquet_dir}"); return
+
+    log.info(f"파일 수: {len(pq_files)}, 출력: {output_dir}, Workers: {workers}")
+
+    if not overwrite:
+        pending = [
+            f for f in pq_files
+            if not _os.path.exists(_os.path.join(output_dir, _os.path.basename(f)) + _MERGE_DONE_SUFFIX)
+        ]
+        log.info(f"완료: {len(pq_files)-len(pending)}개 (스킵), 처리 대상: {len(pending)}개")
+        pq_files = pending
+
+    if not pq_files:
+        log.info("처리할 파일 없음. 완료!"); return
+
+    tasks = [(f, db_path, table_name, output_dir) for f in pq_files]
+    ok_count = error_count = total_rows = 0
+    t_start = _time.time()
+
+    with _PPE(max_workers=workers) as executor:
+        futures = {executor.submit(_merge_one_file, t): t[0] for t in tasks}
+        for i, future in enumerate(_as_completed(futures), 1):
+            result = future.result()
+            status, path = result[0], result[1]
+            fname = _os.path.basename(path)
+
+            if status == 'ok':
+                _, _, elapsed, matched, total = result
+                ok_count += 1; total_rows += total
+                eta = (len(tasks) - i) * (_time.time() - t_start) / i
+                log.info(f"[{i}/{len(tasks)}] OK {fname} ({matched}/{total} matched, {elapsed:.1f}s) ETA:{eta/60:.1f}m")
+            elif status == 'skipped':
+                ok_count += 1
+            elif status == 'error':
+                error_count += 1
+                log.error(f"[{i}/{len(tasks)}] ERROR {fname}: {result[2]}")
+            else:
+                log.warning(f"[{i}/{len(tasks)}] {status.upper()} {fname}")
+
+    elapsed_total = _time.time() - t_start
+    log.info(f"완료: {ok_count}개 성공, {error_count}개 실패, 총 {total_rows:,}행, {elapsed_total/60:.1f}분")
