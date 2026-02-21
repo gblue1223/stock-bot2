@@ -153,6 +153,7 @@ class TrainingConfig:
         self.max_split_count = 1      # 최대 분할 매수 횟수 (1 = 단일 진입)
         self.min_holding_time = 2     # 최소 보유 시간 (초)
         self.max_holding_time = 100   # 최대 보유 시간 (초)
+        self.transaction_cost_rate = 0.00215  # 거래 수수료율
         
         # 디바이스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -208,18 +209,8 @@ class TrainingConfig:
             errors.append(f"Only 'grpo' policy is supported (got: {self.policy})")
         
         # V2: embedding_model OR parquet_path required
-        # If both are missing, try to see if we can infer parquet_path from db_path
         if self.embedding_model is None and self.parquet_path is None:
-             inferred = False
-             if self.db_path:
-                 base_dir = os.path.dirname(self.db_path)
-                 potential_path = os.path.join(base_dir, 'embeddings_v2')
-                 if os.path.isdir(potential_path):
-                     self.parquet_path = potential_path # Auto-set
-                     inferred = True
-             
-             if not inferred:
-                errors.append("embedding_model or parquet_path is required (and could not be inferred)")
+             errors.append("embedding_model or parquet_path is required")
         
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -244,18 +235,14 @@ def create_environment(config: TrainingConfig, device: str):
     try:
         # parquet_path는 config.validate()에서 이미 설정되었거나 검증됨
         if not hasattr(config, 'parquet_path') or config.parquet_path is None:
-             # 기본 추론: dataset 경로 기반
-             base_dir = os.path.dirname(config.db_path)
-             config.parquet_path = os.path.join(base_dir, 'embeddings_v2')
+             raise ValueError("parquet_path is required")
 
         logging.info(f"Using Embeddings from: {config.parquet_path}")
         
         env = GRPOScalpingEnvV2(
             parquet_path=config.parquet_path,
-            db_path=config.db_path,
-            table_name=config.table_name,
             embedding_dim=config.embedding_dim,
-            transaction_cost_rate=0.00215, # Fixed for now, can be made configurable
+            transaction_cost_rate=config.transaction_cost_rate,
             quick_exit_mode=config.quick_exit_mode,
             quick_exit_penalty=config.quick_exit_penalty,
             max_episode_steps=config.episode_steps,
@@ -335,6 +322,8 @@ def main():
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
     parser.add_argument('--embedding_model', type=str, default=None)
+    parser.add_argument('--parquet_path', type=str, default=None,
+                        help='Path to parquet embeddings directory (e.g. embeddings_v3)')
     parser.add_argument('--embedding_dim', type=int, default=None)
     parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')

@@ -75,8 +75,8 @@ class GRPOScalpingEnvV2(gym.Env):
         self.quick_exit_mode = quick_exit_mode
         self.max_episode_steps = max_episode_steps
         
-        # 관측 공간: 임베딩(128) + 포지션(3)
-        self.obs_dim = embedding_dim + 3
+        # 관측 공간: 임베딩(128) + 호가창(20) + 종목명/거래대금(2) + 포지션(3) = 153
+        self.obs_dim = embedding_dim + 20 + 2 + 3
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(self.obs_dim,), dtype=np.float32
         )
@@ -106,9 +106,15 @@ class GRPOScalpingEnvV2(gym.Env):
     # Shared across all instances
     _KEY_INDEX = None       # {(code, date): (file_path, row_count)}
     _LRU_CACHE = None       # OrderedDict for LRU: (code, date) -> DataFrame
-    _LRU_MAX_SIZE = 100
+    _LRU_MAX_SIZE = 50
     _INDEX_BUILT = False
-    _INDEX_LOCK = threading.Lock()  # 인덱스 구축 보호용 Lock (DuckDB 제거)
+    _INDEX_LOCK = threading.Lock()  # 인덱스 구축 보호용 Lock
+    _CACHE_LOCK = threading.Lock()  # LRU 캐시 + parquet I/O 보호용 Lock
+
+    # 학습에 실제로 필요한 컬럼만 로드 (메모리 절약 + 원본 호가창 및 시계열 피처 추가)
+    _REQUIRED_COLUMNS = ['date', 'time', 'code', 'embedding', '등락률', '종목명_scalar', '누적거래대금'] + \
+                        [f'매도대기금액{i}' for i in range(1, 11)] + \
+                        [f'매수대기금액{i}' for i in range(1, 11)]
 
     def _build_key_index_if_needed(self):
         """인덱스가 아직 구축되지 않은 경우에만 구축 (스레드 안전)"""
@@ -152,52 +158,56 @@ class GRPOScalpingEnvV2(gym.Env):
         logger.info(f"Key index built: {len(key_index)} (code, date) pairs from {len(pq_files)} files")
     
     def _get_embedding_data(self, code, date):
-        """LRU 캐시에서 (code, date) 데이터 가져오기. 없으면 parquet에서 로드."""
-        cache = GRPOScalpingEnvV2._LRU_CACHE
+        """LRU 캐시에서 (code, date) 데이터 가져오기. 없으면 parquet에서 로드.
+        
+        Thread-safe: _CACHE_LOCK으로 OrderedDict 접근과 pyarrow I/O를 직렬화.
+        pyarrow의 read_parquet은 동일 파일에 대한 동시 접근 시 segfault 유발 가능.
+        """
         key = (code, date)
         
-        if key in cache:
-            cache.move_to_end(key)
-            return cache[key]
-        
-        # 캐시 미스 → parquet에서 로드
-        index_entry = GRPOScalpingEnvV2._KEY_INDEX.get(key)
-        if index_entry is None:
-            return None
-        
-        # 파일 목록 구성
-        if isinstance(index_entry, list):
-            file_entries = index_entry
-        else:
-            file_entries = [index_entry]
-        
-        dfs = []
-        for file_path, _ in file_entries:
-            try:
-                # Log reading attempt for debugging Segfaults
-                logger.debug(f"Reading parquet: {file_path}")
-                df = pd.read_parquet(file_path)
-                filtered = df[(df['code'] == code) & (df['date'] == date)]
-                if len(filtered) > 0:
-                    dfs.append(filtered)
-            except Exception as e:
-                # Log error but don't crash. 
-                # In threading environment, this prevents taking down the thread/process if possible.
-                # If it's a hard segfault in C++, this might not help, but it catches Python-level issues.
-                logger.error(f"Failed to read parquet file {file_path} for {code}/{date}: {e}")
-                continue
-        
-        if not dfs:
-            return None
-        
-        result = pd.concat(dfs, ignore_index=True).sort_values('time').reset_index(drop=True)
-        
-        # LRU 캐시에 저장
-        cache[key] = result
-        if len(cache) > GRPOScalpingEnvV2._LRU_MAX_SIZE:
-            cache.popitem(last=False)  # 가장 오래된 항목 제거
-        
-        return result
+        with GRPOScalpingEnvV2._CACHE_LOCK:
+            cache = GRPOScalpingEnvV2._LRU_CACHE
+            
+            # 캐시 히트
+            if key in cache:
+                cache.move_to_end(key)
+                return cache[key]
+            
+            # 캐시 미스 → parquet에서 로드 (Lock 내부에서 I/O 수행)
+            index_entry = GRPOScalpingEnvV2._KEY_INDEX.get(key)
+            if index_entry is None:
+                return None
+            
+            # 파일 목록 구성
+            if isinstance(index_entry, list):
+                file_entries = index_entry
+            else:
+                file_entries = [index_entry]
+            
+            dfs = []
+            for file_path, _ in file_entries:
+                try:
+                    # 필요한 컬럼만 로드 (33개 → 5개, ~85% 메모리 절약)
+                    df = pd.read_parquet(file_path, columns=self._REQUIRED_COLUMNS)
+                    filtered = df[(df['code'] == code) & (df['date'] == date)]
+                    if len(filtered) > 0:
+                        dfs.append(filtered)
+                    del df  # 즉시 해제
+                except Exception as e:
+                    logger.error(f"Failed to read parquet file {file_path} for {code}/{date}: {e}")
+                    continue
+            
+            if not dfs:
+                return None
+            
+            result = pd.concat(dfs, ignore_index=True).sort_values('time').reset_index(drop=True)
+            
+            # LRU 캐시에 저장
+            cache[key] = result
+            if len(cache) > GRPOScalpingEnvV2._LRU_MAX_SIZE:
+                cache.popitem(last=False)  # 가장 오래된 항목 제거
+            
+            return result
 
     def _preload_valid_keys(self):
         """인덱스에서 유효한 종목/날짜 목록 로드"""
@@ -282,6 +292,19 @@ class GRPOScalpingEnvV2(gym.Env):
                 return_rates = df['등락률'].values.astype(np.float32) / 100.0
                 times = df['time'].values
                 
+                # 호가창 데이터 20개 추출 및 정규화 (1.0 기준 로그 스케일 등 활용 가능하지만 임시로 큰 값 클리핑 후 유지)
+                orderbook_cols = [f'매도대기금액{i}' for i in range(1, 11)] + [f'매수대기금액{i}' for i in range(1, 11)]
+                orderbooks = df[orderbook_cols].values.astype(np.float32)
+                
+                # 호가창 원본 데이터는 단위가 큼 (억원/천만원 단위). 모델 입력을 위해 약간 스케일링 (예: 1억 단위로 나누고 100 클리핑)
+                orderbooks = np.clip(orderbooks / 1e8, 0, 100.0) 
+                
+                # 추가 피처: 종목명_scalar 및 누적거래대금 추출
+                name_scalars = df['종목명_scalar'].values.astype(np.float32)
+                # 누적거래대금도 단위가 크므로 (보통 일별 수백억~조 단위) 100억 단위(1e10)로 스케일링하고 100 클리핑
+                volumes = np.clip(df['누적거래대금'].values.astype(np.float32) / 1e10, 0, 100.0)
+                extra_features = np.column_stack([name_scalars, volumes])
+                
                 # 에피소드 길이 제한 (랜덤 스타트)
                 total_len = len(df)
                 if self.max_episode_steps:
@@ -292,10 +315,14 @@ class GRPOScalpingEnvV2(gym.Env):
                         embeddings = embeddings[start_idx:end_idx]
                         return_rates = return_rates[start_idx:end_idx]
                         times = times[start_idx:end_idx]
+                        orderbooks = orderbooks[start_idx:end_idx]
+                        extra_features = extra_features[start_idx:end_idx]
                 
                 self.episode_embeddings = embeddings
                 self.episode_returns = return_rates
                 self.episode_times = times
+                self.episode_orderbooks = orderbooks
+                self.episode_extra_features = extra_features
                 self.episode_length = len(embeddings)
                 
                 self.prices = self.base_price * (1.0 + return_rates)
@@ -313,12 +340,16 @@ class GRPOScalpingEnvV2(gym.Env):
         raise RuntimeError("Failed to load episode data after retries")
 
     def _get_observation(self):
-        # 1. Embedding
+        # 1. Embedding & Orderbooks & Extra Features
         if self.current_step >= self.episode_length:
             # End of episode guard
             emb = np.zeros(self.embedding_dim, dtype=np.float32)
+            ob = np.zeros(20, dtype=np.float32)
+            xf = np.zeros(2, dtype=np.float32)
         else:
             emb = self.episode_embeddings[self.current_step]
+            ob = self.episode_orderbooks[self.current_step]
+            xf = self.episode_extra_features[self.current_step]
             
         # 2. Position Features
         if self.position == 1:
@@ -331,7 +362,7 @@ class GRPOScalpingEnvV2(gym.Env):
             
         extra = np.array([float(self.position), float(steps_norm), float(holding_time_norm)], dtype=np.float32)
         
-        return np.concatenate([emb, extra])
+        return np.concatenate([emb, ob, xf, extra])
 
     def step(self, action):
         reward = 0.0
