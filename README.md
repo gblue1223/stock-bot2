@@ -162,7 +162,7 @@ python ai_trader/grpo/train_scalping_v2.py \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v8_holding_rule_soft" \
     --load_policy "models/grpo_scalping_v8_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
-    --num_workers 4 \
+    --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
     --entropy_coef 0.01 \

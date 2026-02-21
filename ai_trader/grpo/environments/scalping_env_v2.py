@@ -214,9 +214,13 @@ class GRPOScalpingEnvV2(gym.Env):
             if index_entry is None:
                 return None
             
-            # 파일 목록 구성
+            # 파일 목록 구성 (JSON 캐시에서 로드 시 형태 정규화)
             if isinstance(index_entry, list):
-                file_entries = index_entry
+                # flat [path, count] vs nested [[path1, count1], [path2, count2]]
+                if len(index_entry) == 2 and isinstance(index_entry[0], str):
+                    file_entries = [index_entry]  # single entry
+                else:
+                    file_entries = index_entry  # multiple entries
             else:
                 file_entries = [index_entry]
             
@@ -276,7 +280,11 @@ class GRPOScalpingEnvV2(gym.Env):
             skipped_oom = 0
             for (code, date), entry in key_index.items():
                 if isinstance(entry, list):
-                    cnt = sum(c for _, c in entry)
+                    # flat [path, count] vs nested [[path1, count1], ...]
+                    if len(entry) == 2 and isinstance(entry[0], str):
+                        cnt = entry[1]
+                    else:
+                        cnt = sum(item[1] for item in entry)
                 else:
                     cnt = entry[1]
                 if cnt < min_len:
