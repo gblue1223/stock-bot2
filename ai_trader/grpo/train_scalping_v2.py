@@ -154,6 +154,7 @@ class TrainingConfig:
         self.min_holding_time = 2     # 최소 보유 시간 (초)
         self.max_holding_time = 100   # 최대 보유 시간 (초)
         self.transaction_cost_rate = 0.00215  # 거래 수수료율
+        self.no_trade_penalty = 5.0   # 거래 0회 시 패널티 (기본값: 5.0)
         
         # 디바이스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -260,6 +261,7 @@ def create_environment(config: TrainingConfig, device: str):
             max_split_count=config.max_split_count,
             min_holding_time=config.min_holding_time,
             max_holding_time=config.max_holding_time,
+            no_trade_penalty=getattr(config, 'no_trade_penalty', 5.0),
             device=device
         )
         return env
@@ -348,6 +350,8 @@ def main():
                         help='Max holding time in seconds (default: 100)')
     parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,
                         help='Target transaction cost rate (default: 0.00215)')
+    parser.add_argument('--no_trade_penalty', type=float, default=None,
+                        help='Penalty for making 0 trades in an episode (default: 5.0)')
     
     # ✅ 정규화 설정
     parser.add_argument('--use_raw_data', type=bool, default=None,

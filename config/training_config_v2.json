@@ -29,5 +29,6 @@
     "base_price": 100000.0,
     "stop_loss_pct": 2.0,
     "min_holding_time": 2,
-    "max_holding_time": 100
+    "max_holding_time": 100,
+    "no_trade_penalty": 5.0
 }
