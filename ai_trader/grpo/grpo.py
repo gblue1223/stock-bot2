@@ -117,145 +117,144 @@ class GRPOTrainer:
     
     def collect_rollouts(self, num_episodes: int) -> List[Dict[str, Any]]:
         """
-        현재 정책으로 롤아웃 수집 (병렬 처리 지원)
+        벡터화된 환경(SubprocVecEnv)을 이용한 배치 롤아웃 수집 (GIL 우회 및 GPU Batch Inference)
         """
-        if len(self.envs) > 1:
-            return self._collect_rollouts_parallel(num_episodes)
-        else:
-            return self._collect_rollouts_sequential(num_episodes)
-
-    def _collect_rollouts_parallel(self, num_episodes: int) -> List[Dict[str, Any]]:
-        """병렬 롤아웃 수집"""
-        logger.info(f"Collecting {num_episodes} rollouts using {len(self.envs)} workers...")
+        logger.info(f"Collecting {num_episodes} rollouts using Vectorized Environments...")
         
-        episodes = []
-        n_workers = len(self.envs)
+        # self.env가 VecEnv라고 가정 (SubprocVecEnv)
+        vec_env = self.env
+        num_envs = getattr(vec_env, 'num_envs', 1)
         
-        # 각 워커에 할당할 에피소드 수 계산
-        chunk_size = num_episodes // n_workers
-        remainder = num_episodes % n_workers
+        episodes_collected = []
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = []
+        # 각 환경별 임시 저장소
+        current_states = [[] for _ in range(num_envs)]
+        current_actions = [[] for _ in range(num_envs)]
+        current_rewards = [[] for _ in range(num_envs)]
+        current_next_states = [[] for _ in range(num_envs)]
+        current_dones = [[] for _ in range(num_envs)]
+        current_log_probs = [[] for _ in range(num_envs)]
+        
+        # 최초 Reset
+        obs, infos = vec_env.reset()
+        
+        episodes_done = 0
+        
+        while episodes_done < num_episodes:
+            # 1. 상태를 하나의 텐서로 배치화 (N, obs_dim)
+            if hasattr(obs, 'shape') and len(obs.shape) > 1:
+                obs_batch = np.array(obs, dtype=np.float32)
+            else:
+                obs_batch = np.stack(obs).astype(np.float32)
             
-            for i in range(n_workers):
-                count = chunk_size + (1 if i < remainder else 0)
-                if count > 0:
-                    futures.append(executor.submit(self._worker_task, i, count))
-            
-            for f in concurrent.futures.as_completed(futures):
-                try:
-                    res = f.result()
-                    episodes.extend(res)
-                except Exception as e:
-                    logger.error(f"Worker failed: {e}", exc_info=True)
-        
-        self.total_timesteps += sum(len(ep['rewards']) for ep in episodes)
-        logger.info(f"Collected {len(episodes)} rollouts (Parallel), total timesteps: {self.total_timesteps}")
-        return episodes
-
-    def _worker_task(self, worker_idx: int, count: int) -> List[Dict[str, Any]]:
-        """워커 스레드 작업"""
-        env = self.envs[worker_idx]
-        local_episodes = []
-        
-        for _ in range(count):
-            episode_data = self._run_episode(env)
-            local_episodes.append(episode_data)
-            
-        return local_episodes
-
-    def _collect_rollouts_sequential(self, num_episodes: int) -> List[Dict[str, Any]]:
-        """순차적 롤아웃 수집 (기존 로직)"""
-        logger.info(f"Collecting {num_episodes} rollouts (Sequential)...")
-        episodes = []
-        
-        for _ in range(num_episodes):
-            episode_data = self._run_episode(self.env)
-            self.total_timesteps += len(episode_data['rewards'])
-            episodes.append(episode_data)
-            
-        logger.info(f"Collected {len(episodes)} rollouts, total timesteps: {self.total_timesteps}")
-        return episodes
-
-    def _run_episode(self, env) -> Dict[str, Any]:
-        """단일 에피소드 실행"""
-        # 에피소드 데이터 초기화
-        states = []
-        actions = []
-        rewards = []
-        next_states = []
-        dones = []
-        log_probs = []
-        
-        # 환경 리셋
-        state, info = env.reset()
-        
-        episode_reward = 0.0
-        episode_steps = 0
-        
-        # 에피소드 실행
-        while True:
-            # 상태를 텐서로 변환
-            # 주의: ThreadPoolExecutor에서 실행 시, CUDA 텐서 생성은 thread-safe하지만
-            # 스트림 동기화 이슈가 있을 수 있음. 그러나 보통의 PyTorch 사용시 문제 없음.
             with torch.no_grad():
-                state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
+                states_tensor = torch.from_numpy(obs_batch).float().to(self.device)
                 
-                # 정책에서 행동 샘플링 (shared policy)
-                action, log_prob = self._sample_action(state_tensor)
+                # 2. पॉलिसी에서 행동 샘플링 (Batched Inference!)
+                # hasattr 대신 명시적 호출 (GRPOPolicy는 get_action 지원)
+                if hasattr(self.policy, 'get_action'):
+                    # get_action이 배치 단위로 동작하도록 수정 필요할 수 있음
+                    # 만약 get_action이 배치를 미지원하면 임시로 수동 처리
+                    try:
+                        actions, log_probs = self.policy.get_action(states_tensor, deterministic=False)
+                        if isinstance(actions, torch.Tensor):
+                            actions = actions.cpu().numpy()
+                        if isinstance(log_probs, torch.Tensor):
+                            log_probs = log_probs.cpu().numpy()
+                    except Exception as e:
+                        # Fallback: Loop if policy doesn't support batched get_action yet
+                        actions_list = []
+                        log_probs_list = []
+                        for i in range(num_envs):
+                            a, lp = self.policy.get_action(states_tensor[i:i+1], deterministic=False)
+                            actions_list.append(a.item() if isinstance(a, torch.Tensor) else a)
+                            log_probs_list.append(lp.item() if isinstance(lp, torch.Tensor) else lp)
+                        actions = np.array(actions_list)
+                        log_probs = np.array(log_probs_list)
+                else:
+                    logger.error("Policy missing get_action")
+                    actions = np.array([0]*num_envs)
+                    log_probs = np.array([0.0]*num_envs)
+                    
+            # 3. 환경 스텝 (멀티프로세스로 분산 전송 및 대기)
+            next_obs_raw, rewards, dones, step_infos = vec_env.step(actions)
             
-            # 환경에서 스텝 실행
-            next_state, reward, terminated, truncated, step_info = env.step(action)
-            done = terminated or truncated
+            # 여기서 넘어온 obs도 object 배열일 수 있으므로 변환
+            if hasattr(next_obs_raw, 'shape') and len(next_obs_raw.shape) > 1:
+                next_obs = np.array(next_obs_raw, dtype=np.float32)
+            else:
+                next_obs = np.stack(next_obs_raw).astype(np.float32)
             
-            # 데이터 저장
-            states.append(state)
-            actions.append(action)
-            rewards.append(reward)
-            next_states.append(next_state)
-            dones.append(done)
-            log_probs.append(log_prob)
+            # 4. 데이터 기록 및 에피소드 종료 처리
+            for i in range(num_envs):
+                if episodes_done >= num_episodes:
+                    break # 더 이상 수집 불필요
+                    
+                current_states[i].append(obs[i])
+                current_actions[i].append(actions[i])
+                current_rewards[i].append(rewards[i])
+                
+                # SubprocVecEnv는 done=True시 자동 reset하며 next_obs는 새 에피소드의 시작을 담습니다.
+                # 실제 터미널 상태는 info['terminal_observation']에 있을 수 있습니다.
+                if dones[i]:
+                    actual_next_obs = step_infos[i].get('terminal_observation', next_obs[i])
+                    
+                    # terminal_observation도 형변환
+                    if isinstance(actual_next_obs, (list, tuple)):
+                        actual_next_obs = np.array(actual_next_obs, dtype=np.float32)
+                    elif hasattr(actual_next_obs, 'astype'):
+                        actual_next_obs = actual_next_obs.astype(np.float32)
+                else:
+                    actual_next_obs = next_obs[i]
+                    
+                current_next_states[i].append(actual_next_obs)
+                current_dones[i].append(dones[i])
+                current_log_probs[i].append(log_probs[i])
+                
+                if dones[i]:
+                    # 에피소드 종료
+                    ep_rewards = current_rewards[i]
+                    ep_steps = len(ep_rewards)
+                    
+                    # 메타데이터 추출 (자동 리셋 시 이전 info는 reset_info나 단계 info에 있음)
+                    ep_info = step_infos[i].get('episode', {}).copy()
+                    for k in ['num_trades', 'win_rate', 'sharpe_ratio', 'avg_holding_time', 'quick_exit_violations']:
+                        if k in step_infos[i]:
+                            ep_info[k] = step_infos[i][k]
+                            
+                    ep_reward = sum(ep_rewards)
+                    if 'total_return' in ep_info:
+                        ep_reward = float(ep_info['total_return'])
+                        
+                    ep_info['episode_reward'] = ep_reward
+                    ep_info['episode_steps'] = ep_steps
+                    
+                    episode_data = {
+                        'states': np.array(current_states[i]),
+                        'actions': np.array(current_actions[i]),
+                        'rewards': np.array(current_rewards[i]),
+                        'next_states': np.array(current_next_states[i]),
+                        'dones': np.array(current_dones[i]),
+                        'log_probs': np.array(current_log_probs[i]),
+                        'metadata': ep_info
+                    }
+                    episodes_collected.append(episode_data)
+                    episodes_done += 1
+                    
+                    self.total_timesteps += ep_steps
+                    
+                    # 버퍼 비우기
+                    current_states[i] = []
+                    current_actions[i] = []
+                    current_rewards[i] = []
+                    current_next_states[i] = []
+                    current_dones[i] = []
+                    current_log_probs[i] = []
             
-            episode_reward += reward
-            episode_steps += 1
+            obs = next_obs
             
-            # 다음 상태로 이동
-            state = next_state
-            
-            if done:
-                break
-        
-        # 에피소드 메타데이터
-        episode_metadata = step_info.get('episode', {}).copy()
-        
-        # 커스텀 통계 키 병합
-        for k in ['num_trades', 'win_rate', 'sharpe_ratio', 'avg_holding_time', 'quick_exit_violations']:
-            if k in step_info:
-                episode_metadata[k] = step_info[k]
-        if 'total_return' in episode_metadata:
-            env_total = float(episode_metadata['total_return'])
-            sum_collected = float(np.sum(rewards))
-            if abs(env_total - sum_collected) > 1e-6:
-                # logger.warning(...) # 경합 줄이기 위해 로그 생략 또는 디버그
-                pass
-            episode_reward = env_total
-            
-        episode_metadata['episode_reward'] = episode_reward
-        episode_metadata['episode_steps'] = episode_steps
-        
-        # 에피소드 데이터 저장
-        episode_data = {
-            'states': np.array(states),
-            'actions': np.array(actions),
-            'rewards': np.array(rewards),
-            'next_states': np.array(next_states),
-            'dones': np.array(dones),
-            'log_probs': np.array(log_probs),
-            'metadata': episode_metadata
-        }
-        
-        return episode_data
+        logger.info(f"Collected {len(episodes_collected)} rollouts (Vectorized), total timesteps: {self.total_timesteps}")
+        return episodes_collected
     
     def _sample_action(self, state: torch.Tensor) -> Tuple[int, float]:
         """

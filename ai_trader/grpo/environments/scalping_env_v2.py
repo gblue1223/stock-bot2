@@ -128,22 +128,49 @@ class GRPOScalpingEnvV2(gym.Env):
     def _build_key_index(self):
         """parquet 파일에서 메타데이터만 스캔하여 (code, date) -> file 인덱스 구축"""
         import glob as _glob
+        import pyarrow.parquet as pq
+        import json
+        
+        index_cache_path = os.path.join(self.parquet_path, "key_index_v3.json")
+        
+        if os.path.exists(index_cache_path):
+            logger.info(f"Loading key index from cache: {index_cache_path}")
+            try:
+                with open(index_cache_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    # JSON keys are strings e.g. "('005930', '20240102')". Convert back to tuple.
+                    import ast
+                    key_index = {ast.literal_eval(k): v for k, v in data.items()}
+                    GRPOScalpingEnvV2._KEY_INDEX = key_index
+                    logger.info(f"Key index loaded: {len(key_index)} pairs from cache")
+                    return
+            except Exception as e:
+                logger.warning(f"Failed to load index cache: {e}. Rebuilding...")
+
         logger.info(f"Building key index from {self.parquet_path} (metadata only)...")
         
         pq_files = sorted(_glob.glob(os.path.join(self.parquet_path, "*.parquet")))
         if not pq_files:
             raise FileNotFoundError(f"No parquet files in {self.parquet_path}")
         
-        key_index = {}  # (code, date) -> (file_path, count)
+        key_index = {}  # (code, date) -> (file_path, count) or [(file_path, count)]
         
         for f in pq_files:
             try:
-                # embedding 컬럼 제외하고 code, date만 읽기 → 매우 가벼움
+                # pyarrow를 사용해 스키마만 로드 (메모리 절약)
+                try:
+                    parquet_file = pq.ParquetFile(f)
+                    if '등락률' not in parquet_file.schema.names:
+                        continue
+                except Exception as e:
+                    logger.debug(f"Skipping {f} (Schema error: {e})")
+                    continue
+                    
+                # 2. 인덱스 구축 진행 (컬럼이 있는 파일만, code와 date만 로드)
                 df = pd.read_parquet(f, columns=['code', 'date'])
                 for (code, date), group in df.groupby(['code', 'date']):
                     key = (code, date)
                     if key in key_index:
-                        # 여러 파일에 분산된 경우 → 리스트로 관리
                         existing = key_index[key]
                         if isinstance(existing, list):
                             existing.append((f, len(group)))
@@ -151,11 +178,20 @@ class GRPOScalpingEnvV2(gym.Env):
                             key_index[key] = [existing, (f, len(group))]
                     else:
                         key_index[key] = (f, len(group))
+                        
             except Exception as e:
                 logger.warning(f"Failed to read metadata from {f}: {e}")
         
         GRPOScalpingEnvV2._KEY_INDEX = key_index
         logger.info(f"Key index built: {len(key_index)} (code, date) pairs from {len(pq_files)} files")
+        
+        # 캐시에 저장
+        try:
+            with open(index_cache_path, 'w', encoding='utf-8') as f:
+                json.dump({str(k): v for k, v in key_index.items()}, f)
+            logger.info(f"Saved key index cache to {index_cache_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save index cache: {e}")
     
     def _get_embedding_data(self, code, date):
         """LRU 캐시에서 (code, date) 데이터 가져오기. 없으면 parquet에서 로드.
@@ -187,9 +223,26 @@ class GRPOScalpingEnvV2(gym.Env):
             dfs = []
             for file_path, _ in file_entries:
                 try:
-                    # 필요한 컬럼만 로드 (33개 → 5개, ~85% 메모리 절약)
-                    df = pd.read_parquet(file_path, columns=self._REQUIRED_COLUMNS)
-                    filtered = df[(df['code'] == code) & (df['date'] == date)]
+                    # PyArrow pushdown filters를 이용해 필요한 에피소드만 C++ 레벨에서 메모리에 로드
+                    df = pd.read_parquet(
+                        file_path, 
+                        columns=self._REQUIRED_COLUMNS,
+                        filters=[('code', '=', code), ('date', '=', str(date))]
+                    )
+                    
+                    # date가 숫자/문자열 형태로 섞여 있을 수 있으니 fallback 추가
+                    if len(df) == 0 and not isinstance(date, int):
+                        try:
+                            df = pd.read_parquet(
+                                file_path, 
+                                columns=self._REQUIRED_COLUMNS,
+                                filters=[('code', '=', code), ('date', '=', int(date))]
+                            )
+                        except Exception:
+                            pass
+
+                    # 혹시 필터가 완벽히 동작하지 않았을 경우를 대비한 2차 필터링
+                    filtered = df[(df['code'] == code) & (df['date'].astype(str) == str(date))]
                     if len(filtered) > 0:
                         dfs.append(filtered)
                     del df  # 즉시 해제
@@ -257,13 +310,14 @@ class GRPOScalpingEnvV2(gym.Env):
         self.episode_trades = []
         self.quick_exit_violations = 0
         
-        # 3. 초기 관측값
+        # 3. 초기 관측값 (float32 보장)
         obs = self._get_observation()
         
+        # info의 값이 string인 경우 numpy array 변환 시 string array가 되는 것을 방지하기 위해 타입 명시 필요
         info = {
-            'stock_code': self.episode_metadata['code'],
-            'date': self.episode_metadata['date'],
-            'time': self.episode_times[self.current_step]
+            'stock_code': str(self.episode_metadata['code']),
+            'date': str(self.episode_metadata['date']),
+            'time': float(self.episode_times[self.current_step])
         }
         return obs, info
 
@@ -287,23 +341,22 @@ class GRPOScalpingEnvV2(gym.Env):
                     logger.warning(f"'등락률' column missing in parquet for {code}/{date}. 재생성 필요.")
                     continue
                 
-                # 데이터 변환
-                embeddings = np.stack(df['embedding'].values)
+                # 데이터 변환 (명시적으로 float32 타입 보장)
+                embeddings = np.stack(df['embedding'].values).astype(np.float32)
                 return_rates = df['등락률'].values.astype(np.float32) / 100.0
                 times = df['time'].values
                 
-                # 호가창 데이터 20개 추출 및 정규화 (1.0 기준 로그 스케일 등 활용 가능하지만 임시로 큰 값 클리핑 후 유지)
+                # 호가창 데이터 20개 추출 및 정규화
                 orderbook_cols = [f'매도대기금액{i}' for i in range(1, 11)] + [f'매수대기금액{i}' for i in range(1, 11)]
                 orderbooks = df[orderbook_cols].values.astype(np.float32)
                 
-                # 호가창 원본 데이터는 단위가 큼 (억원/천만원 단위). 모델 입력을 위해 약간 스케일링 (예: 1억 단위로 나누고 100 클리핑)
+                # 호가창 원본 데이터는 단위가 큼 (억원/천만원 단위). 모델 입력을 위해 약간 스케일링
                 orderbooks = np.clip(orderbooks / 1e8, 0, 100.0) 
                 
                 # 추가 피처: 종목명_scalar 및 누적거래대금 추출
                 name_scalars = df['종목명_scalar'].values.astype(np.float32)
-                # 누적거래대금도 단위가 크므로 (보통 일별 수백억~조 단위) 100억 단위(1e10)로 스케일링하고 100 클리핑
                 volumes = np.clip(df['누적거래대금'].values.astype(np.float32) / 1e10, 0, 100.0)
-                extra_features = np.column_stack([name_scalars, volumes])
+                extra_features = np.column_stack([name_scalars, volumes]).astype(np.float32)
                 
                 # 에피소드 길이 제한 (랜덤 스타트)
                 total_len = len(df)
@@ -334,7 +387,9 @@ class GRPOScalpingEnvV2(gym.Env):
                 return
                 
             except Exception as e:
-                logger.warning(f"Data load failed for {code}/{date}: {e}")
+                c = code if 'code' in locals() else "Unknown"
+                d = date if 'date' in locals() else "Unknown"
+                logger.warning(f"Data load failed for {c}/{d}: {e}")
                 continue
                 
         raise RuntimeError("Failed to load episode data after retries")
@@ -362,7 +417,7 @@ class GRPOScalpingEnvV2(gym.Env):
             
         extra = np.array([float(self.position), float(steps_norm), float(holding_time_norm)], dtype=np.float32)
         
-        return np.concatenate([emb, ob, xf, extra])
+        return np.concatenate([emb, ob, xf, extra]).astype(np.float32)
 
     def step(self, action):
         reward = 0.0
@@ -530,19 +585,19 @@ class GRPOScalpingEnvV2(gym.Env):
             # Calculate episode statistics
             num_trades = len(self.episode_trades)
             if num_trades > 0:
-                profits = [t['profit'] for t in self.episode_trades]
+                profits = [float(t['profit']) for t in self.episode_trades]
                 win_count = sum(1 for p in profits if p > 0)
-                win_rate = win_count / num_trades
+                win_rate = float(win_count / num_trades)
                 
                 # Sharpe Ratio (using trade profits)
                 if len(profits) > 1:
-                    sharpe_ratio = np.mean(profits) / (np.std(profits) + 1e-8)
+                    sharpe_ratio = float(np.mean(profits) / (np.std(profits) + 1e-8))
                 else:
                     sharpe_ratio = 0.0
                     
                 # Holding Time
-                holding_times = [t.get('holding_time', 0.0) for t in self.episode_trades]
-                avg_holding_time = np.mean(holding_times)
+                holding_times = [float(t.get('holding_time', 0.0)) for t in self.episode_trades]
+                avg_holding_time = float(np.mean(holding_times))
                 
             else:
                 win_rate = 0.0
@@ -552,21 +607,21 @@ class GRPOScalpingEnvV2(gym.Env):
                 reward -= self.no_trade_penalty
                 
             info = {
-                'price': current_price,
-                'time': current_time,
-                'num_trades': num_trades,
-                'win_rate': win_rate,
-                'sharpe_ratio': sharpe_ratio,
-                'quick_exit_violations': self.quick_exit_violations,
-                'avg_holding_time': avg_holding_time
+                'price': float(current_price),
+                'time': float(current_time),
+                'num_trades': int(num_trades),
+                'win_rate': float(win_rate),
+                'sharpe_ratio': float(sharpe_ratio),
+                'quick_exit_violations': int(self.quick_exit_violations),
+                'avg_holding_time': float(avg_holding_time)
             }
         else:
             info = {
-                'price': current_price,
-                'time': current_time
+                'price': float(current_price),
+                'time': float(current_time)
             }
         
-        return obs, reward, terminated, truncated, info
+        return obs, float(reward), bool(terminated), bool(truncated), info
 
     def _calculate_reward(self, entry_price, exit_price, holding_time):
         """

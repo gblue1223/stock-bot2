@@ -115,7 +115,7 @@ class TrainingConfig:
         # 임베딩 설정 (scalping env용)
         self.embedding_model = None
         self.embedding_dim = 128
-        self.parquet_path = None # V2: Pre-computed embeddings path
+        self.parquet_path = 'datasets/parquet' # V2: Pre-computed embeddings path (default)
         self.quick_exit_mode = 'penalty_only'
         self.quick_exit_penalty = 0.01  # 기본값
         self.stagnation_exit_seconds = 180  # 기본값
@@ -168,6 +168,10 @@ class TrainingConfig:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
             
+            # 하위 호환성 (V1 config -> V2 config)
+            if 'embedding_model' in config and 'parquet_path' not in config:
+                config['parquet_path'] = config['embedding_model']
+                
             # 설정 업데이트
             for key, value in config.items():
                 if hasattr(self, key):
@@ -196,10 +200,8 @@ class TrainingConfig:
     def validate(self):
         """설정 검증"""
         errors = []
-        
-        if self.db_path is None:
-            errors.append("db_path is required")
-        elif not os.path.exists(self.db_path):
+        # V2 환경에서는 db_path가 더 이상 필수가 아님 (parquet_path 사용)
+        if self.db_path and not os.path.exists(self.db_path):
             errors.append(f"Database not found: {self.db_path}")
         
         if self.env != 'scalping':
@@ -209,8 +211,10 @@ class TrainingConfig:
             errors.append(f"Only 'grpo' policy is supported (got: {self.policy})")
         
         # V2: embedding_model OR parquet_path required
-        if self.embedding_model is None and self.parquet_path is None:
-             errors.append("embedding_model or parquet_path is required")
+        # CLI 인자로 들어오는 경우가 있어서 여기서 엄격하게 체크하면 실패할 수 있음
+        # 나중에 환경 생성 직전에 체크하도록 변경
+        # if self.embedding_model is None and getattr(self, 'parquet_path', None) is None:
+        #      errors.append("embedding_model or parquet_path is required")
         
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -233,14 +237,19 @@ def load_embedding_model(config: TrainingConfig, device: str):
 def create_environment(config: TrainingConfig, device: str):
     """환경 생성 (단일 인스턴스)"""
     try:
-        # parquet_path는 config.validate()에서 이미 설정되었거나 검증됨
-        if not hasattr(config, 'parquet_path') or config.parquet_path is None:
-             raise ValueError("parquet_path is required")
+        # V2 환경: parquet_path가 없으면 embedding_model을 parquet_path로 간주 (config.json 호환성)
+        logger.debug(f"Config keys inside create_environment: {config.__dict__}")
+        parquet_path = getattr(config, 'parquet_path', None)
+        if not parquet_path:
+            parquet_path = getattr(config, 'embedding_model', None)
+            
+        if not parquet_path:
+             raise ValueError(f"parquet_path or embedding_model is required for V2 env. Config dictionary: {config.__dict__}")
 
-        logging.info(f"Using Embeddings from: {config.parquet_path}")
+        logging.info(f"Using Embeddings from: {parquet_path}")
         
         env = GRPOScalpingEnvV2(
-            parquet_path=config.parquet_path,
+            parquet_path=parquet_path,
             embedding_dim=config.embedding_dim,
             transaction_cost_rate=config.transaction_cost_rate,
             quick_exit_mode=config.quick_exit_mode,
@@ -371,6 +380,7 @@ def main():
     logger.info("[START] GRPO Training System (Enhanced)")
     logger.info("=" * 80)
     
+    device = "cpu"
     try:
         # 1. 설정 로드
         logger.info("[STEP 1/6] Loading configuration...")
@@ -387,10 +397,18 @@ def main():
         
         # GPU 확인
         device = config.device
+        if device == 'cuda' and not torch.cuda.is_available():
+            logger.warning("CUDA requested but not available. Falling back to CPU")
+            device = 'cpu'
+            config.device = device
+            
         logger.info(f"[OK] Using device: {device}")
         if device == 'cuda':
-            logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
-            logger.info(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            try:
+                logger.info(f"  GPU: {torch.cuda.get_device_name(0)}")
+                logger.info(f"  Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            except Exception as e:
+                logger.warning(f"Could not retrieve CUDA info: {e}")
         
         # 2. 환경 생성
         # 2. 환경 생성 (병렬 처리 지원)
@@ -398,18 +416,24 @@ def main():
         
         # 임베딩 모델 로드 (한 번만 수행하여 공유)
         embedding_model = load_embedding_model(config, device)
+        # 데이터 병렬 처리를 위한 VecEnv 도입
+        from ai_trader.grpo.environments import SubprocVecEnv, DummyVecEnv
+        import functools
         
-        # 워커 수만큼 환경 생성
-        envs = []
-        for i in range(config.num_workers):
-            logger.debug(f"Creating env worker {i+1}/{config.num_workers}...")
-            env_instance = create_environment(config, device)
-            envs.append(env_instance)
+        # 워커 수만큼 환경 생성자 함수 리스트 생성
+        env_fns = [functools.partial(create_environment, config, device) for _ in range(config.num_workers)]
+            
+        if config.num_workers > 1:
+            logger.info(f"Initializing {config.num_workers} processes (SubprocVecEnv)...")
+            vec_env = SubprocVecEnv(env_fns)
+        else:
+            logger.info(f"Initializing 1 process (DummyVecEnv) to prevent Memory Limits...")
+            vec_env = DummyVecEnv(env_fns)
+            
+        logger.info(f"[OK] Environments created")
         
-        logger.info(f"[OK] Created {len(envs)} environments")
-        
-        # 로깅을 위해 첫 번째 환경 참조
-        ref_env = envs[0]
+        # 로깅을 위해 첫 번째 환경(생성하여 참조만 확인)
+        ref_env = create_environment(config, device)
         logger.info(f"  Observation space: {ref_env.observation_space.shape}")
         logger.info(f"  Action space: {ref_env.action_space.n}")
         logger.info(f"  Avg Transaction Cost: {ref_env.transaction_cost_rate}")
@@ -418,7 +442,7 @@ def main():
 
         # 3. 정책 생성
         logger.info("[STEP 3/6] Creating policy...")
-        policy = create_policy(config, envs, device) # 리스트 전달
+        policy = create_policy(config, ref_env, device) # 리스트 대신 ref_env 참조
         logger.info(f"[OK] Policy: {type(policy).__name__}")
         
         # 파라미터 수 계산
@@ -471,7 +495,7 @@ def main():
         # 6. 트레이너 생성
         trainer = GRPOTrainer(
             policy=policy,
-            env=envs,  # ✅ 환경 리스트 전달
+            env=vec_env,  # ✅ 환경 리스트가 아닌 VecEnv 인스턴스 전달
             episodes_per_group=config.episodes_per_group,
             num_groups=config.num_groups,
             learning_rate=config.lr,
@@ -499,7 +523,7 @@ def main():
              # Fix4: 0.0 대신 목표값의 30%로 초기화 (no-trade trivial solution 차단)
              initial_curriculum_cost = target_cost_rate * 0.30
              logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost (30% of target {target_cost_rate}), targeting {target_cost_rate}")
-             for e in envs: e.set_transaction_cost_rate(initial_curriculum_cost)
+             vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
              current_cost_rate = initial_curriculum_cost
         else:
              if initial_env_cost > 0:
@@ -507,7 +531,7 @@ def main():
                  # Fix4: 0.0 대신 목표값의 30%로 초기화 (no-trade trivial solution 차단)
                  initial_curriculum_cost = target_cost_rate * 0.30
                  logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost (30% of target {target_cost_rate}), targeting {target_cost_rate}")
-                 for e in envs: e.set_transaction_cost_rate(initial_curriculum_cost)
+                 vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
                  current_cost_rate = initial_curriculum_cost
              else:
                  current_cost_rate = initial_env_cost
@@ -523,6 +547,19 @@ def main():
 
             win_rate = metrics.get('mean_win_rate', 0.0)
             
+            if win_rate > 0.65:
+                # 30% 증가 설정
+                step_size = target_cost_rate * 0.30
+                
+                # 새로운 수수료율 계산 (목표값 초과 방지)
+                new_cost_rate = min(current_cost_rate + step_size, target_cost_rate)
+                
+                if new_cost_rate > current_cost_rate:
+                    logger.info(f"Curriculum Update: Win rate {win_rate:.1f}% > 65%. "
+                              f"Increasing transaction cost: {current_cost_rate:.5f} -> {new_cost_rate:.5f}")
+                    current_cost_rate = new_cost_rate
+                    vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
+                    
         logger.info("[OK] Trainer created")
         
         # 5. 훈련 설정 출력

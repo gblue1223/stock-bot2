@@ -3,7 +3,7 @@
     "policy": "grpo",
     "db_path": "C:\\Users\\user\\Workspace\\datasets@20260117\\datasets_raw_09_11.duckdb",
     "table_name": "datasets",
-    "parquet_path": "C:\\Users\\user\\Workspace\\datasets@20260117\\embeddings_v2",
+    "parquet_path": "C:\\Users\\user\\Workspace\\datasets@20260117\\embeddings_v3",
     "seq_len": 120,
     "features": 28,
     "embedding_dim": 128,

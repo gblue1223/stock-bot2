@@ -5,7 +5,9 @@ GRPO 환경 모듈
 """
 
 from .scalping_env import GRPOScalpingEnv
+from .vec_env import SubprocVecEnv, DummyVecEnv
 
 __all__ = [
     'GRPOScalpingEnv',
+    'SubprocVecEnv',
 ]
