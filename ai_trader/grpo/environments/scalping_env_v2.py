@@ -50,7 +50,7 @@ class GRPOScalpingEnvV2(gym.Env):
         max_holding_time: float = 100.0,
         seq_len: int = 120,
         device: str = 'cpu',
-        no_trade_penalty: float = 0.5,
+        no_trade_penalty: float = 10.0,
         max_rows_limit: int = 5_000_000,
     ):
         super().__init__()
@@ -461,9 +461,12 @@ class GRPOScalpingEnvV2(gym.Env):
                 
                 # Min holding check
                 if holding_time < self.min_holding_time:
-                    reward -= 0.2 # Penalty
+                    # Fix: 대폭 강화된 조기 청산 패널티 (-2.0점, 1초 단타 꼼수 원천 차단)
+                    reward -= 2.0
                 else:
-                    reward += 0.1 # Bonus
+                    # Fix: 강화된 보유 시간 보너스 (기본 보너스 0.5점 + 1초 유지할 때마다 0.05점 추가, 최대 1.0점 추가)
+                    time_bonus = min(holding_time * 0.05, 1.0)
+                    reward += (0.5 + time_bonus)
                     
                 # Sell execution
                 weight = self.position_steps / self.max_split_count

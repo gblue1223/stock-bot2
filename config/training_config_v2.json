@@ -30,5 +30,5 @@
     "stop_loss_pct": 2.0,
     "min_holding_time": 2,
     "max_holding_time": 100,
-    "no_trade_penalty": 5.0
+    "no_trade_penalty": 10.0
 }

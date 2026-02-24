@@ -145,12 +145,13 @@ python ai_trader/grpo/train_scalping_v2.py \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v8_holding_rule_soft" \
-    --num_workers 4 \
+    --output_dir "models/grpo_scalping_v9" \
+    --num_workers 1 \
     --min_holding 2 \
     --max_holding 300 \
     --entropy_coef 0.05 \
     --transaction_cost 0.0 \
+    --no_trade_penalty 50.0 \
     --lr 0.0001
 
 # Fine-tuning (기존 모델 로드)
@@ -160,13 +161,14 @@ python ai_trader/grpo/train_scalping_v2.py \
     --seq_len 120 \
     --features 28 \
     --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v8_holding_rule_soft" \
-    --load_policy "models/grpo_scalping_v8_holding_rule_soft/checkpoints/checkpoint_iter500.pt" \
+    --output_dir "models/grpo_scalping_v9" \
+    --load_policy "models/grpo_scalping_v9/checkpoints/checkpoint_iter500.pt" \
     --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
     --entropy_coef 0.01 \
     --transaction_cost 0.00215 \
+    --no_trade_penalty 50.0 \
     --lr 0.0001
 ```
 
