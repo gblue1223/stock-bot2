@@ -131,7 +131,7 @@ python scripts/data/generate_embeddings_parallel.py \
   --output_dir "C:\Users\user\Workspace\datasets@20260117\embeddings_v4" \
   --state_file "C:\Users\user\Workspace\datasets@20260117\embeddings_v4\processed_stocks.txt" \
   --table_name "datasets" \
-  --seq_len 120 \
+  --seq_len 3000 \
   --batch_size 4096 \
   --num_workers 2 \
   --device cuda
@@ -142,7 +142,7 @@ python scripts/data/generate_embeddings_parallel.py \
 python ai_trader/grpo/train_scalping_v2.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --parquet_path "C:\Users\user\Workspace\datasets@20260117\embeddings_v3" \
-    --seq_len 120 \
+    --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v9" \
@@ -158,7 +158,7 @@ python ai_trader/grpo/train_scalping_v2.py \
 python ai_trader/grpo/train_scalping_v2.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
     --parquet_path "C:\Users\user\Workspace\datasets@20260117\embeddings_v3" \
-    --seq_len 120 \
+    --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v9" \
@@ -214,7 +214,7 @@ from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
 model = MaskedAutoEncoder(
     input_dim=60,
     embedding_dim=128,
-    seq_len=120,
+    seq_len=3000,
     mask_ratio=0.15  # 15% 마스킹
 )
 
@@ -341,7 +341,7 @@ python -c "
 import torch, time
 from ai_trader.embedding.autoencoder_model import AutoEncoderEmbedding
 
-model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=120)
+model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=3000)
 model.eval()
 
 test_input = torch.randn(1, 60, 50)

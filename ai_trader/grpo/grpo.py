@@ -150,13 +150,13 @@ class GRPOTrainer:
             with torch.no_grad():
                 states_tensor = torch.from_numpy(obs_batch).float().to(self.device)
                 
-                # 2. पॉलिसी에서 행동 샘플링 (Batched Inference!)
-                # hasattr 대신 명시적 호출 (GRPOPolicy는 get_action 지원)
-                if hasattr(self.policy, 'get_action'):
-                    # get_action이 배치 단위로 동작하도록 수정 필요할 수 있음
-                    # 만약 get_action이 배치를 미지원하면 임시로 수동 처리
+                # 2. 정책에서 행동 샘플링 (Batched Inference)
+                # DataParallel 클래스 등으로 래핑된 경우 unwrap
+                base_policy = getattr(self.policy, 'module', self.policy)
+                
+                if hasattr(base_policy, 'get_action'):
                     try:
-                        actions, log_probs = self.policy.get_action(states_tensor, deterministic=False)
+                        actions, log_probs = base_policy.get_action(states_tensor, deterministic=False)
                         if isinstance(actions, torch.Tensor):
                             actions = actions.cpu().numpy()
                         if isinstance(log_probs, torch.Tensor):
@@ -172,12 +172,14 @@ class GRPOTrainer:
                         actions = np.array(actions_list)
                         log_probs = np.array(log_probs_list)
                 else:
-                    logger.error("Policy missing get_action")
-                    actions = np.array([0]*num_envs)
-                    log_probs = np.array([0.0]*num_envs)
+                    logger.error(f"Policy {type(base_policy)} missing get_action. Falling back to zeros.")
+                    actions = np.array([0]*num_envs, dtype=np.int64)
+                    log_probs = np.array([0.0]*num_envs, dtype=np.float32)
                     
             # 3. 환경 스텝 (멀티프로세스로 분산 전송 및 대기)
-            next_obs_raw, rewards, dones, step_infos = vec_env.step(actions)
+            # Ensure actions is a clean numpy int array before sending over pipes
+            actions_clean = np.array(actions, dtype=np.int32)
+            next_obs_raw, rewards, dones, step_infos = vec_env.step(actions_clean)
             
             # 여기서 넘어온 obs도 object 배열일 수 있으므로 변환
             if hasattr(next_obs_raw, 'shape') and len(next_obs_raw.shape) > 1:
