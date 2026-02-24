@@ -131,6 +131,8 @@ class TrainingConfig:
         self.entropy_coef = 0.15  # Fix3: 0.05 → 0.15 (정책 탐색 강화, no-trade collapse 방지)
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
+        self.batch_size = 64  # VRAM 최적화를 위한 미니배치 크기
+        
         
         # ✅ 정규화 설정 (live_trading.py와 일치)
         self.use_raw_data = True  # 원본 데이터 사용 (RollingNormalizer 적용)
@@ -360,6 +362,7 @@ def main():
     parser.add_argument('--value_coef', type=float, default=None)
     parser.add_argument('--max_grad_norm', type=float, default=None)
     parser.add_argument('--total_timesteps', type=int, default=None)
+    parser.add_argument('--batch_size', type=int, default=None, help='Mini-batch size for PPO updates (default: 64)')
     parser.add_argument('--checkpoint_interval', type=int, default=None)
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--load_policy', type=str, default=None)
@@ -496,6 +499,7 @@ def main():
             entropy_coef=config.entropy_coef,
             value_coef=config.value_coef,
             max_grad_norm=config.max_grad_norm,
+            batch_size=config.batch_size,
             device=device,
             tensorboard_log_dir=tensorboard_dir
         )

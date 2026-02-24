@@ -63,6 +63,7 @@ class GRPOTrainer:
         entropy_coef: float = 0.01,
         value_coef: float = 0.5,
         max_grad_norm: float = 0.5,
+        batch_size: int = 64,
         device: str = 'cpu',
         tensorboard_log_dir: Optional[str] = None,
         use_gae: bool = True
@@ -93,6 +94,7 @@ class GRPOTrainer:
         self.entropy_coef = entropy_coef
         self.value_coef = value_coef
         self.max_grad_norm = max_grad_norm
+        self.batch_size = batch_size
         self.use_gae = use_gae
         
         # Optimizer 초기화
@@ -602,12 +604,12 @@ class GRPOTrainer:
         # 어드밴티지 정규화
         all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
         
-        # 텐서로 변환
-        states_tensor = torch.from_numpy(all_states).float().to(self.device)
-        actions_tensor = torch.from_numpy(all_actions).long().to(self.device)
-        old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float().to(self.device)
-        advantages_tensor = torch.from_numpy(all_advantages).float().to(self.device)
-        returns_tensor = torch.from_numpy(all_returns).float().to(self.device)
+        # VRAM 보호를 위해 전체 버퍼는 CPU 메모리에 유지합니다.
+        states_tensor = torch.from_numpy(all_states).float()
+        actions_tensor = torch.from_numpy(all_actions).long()
+        old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float()
+        advantages_tensor = torch.from_numpy(all_advantages).float()
+        returns_tensor = torch.from_numpy(all_returns).float()
         
         # 2. 참조 정책 저장 (KL 발산 계산용)
         if self.reference_policy is None:
@@ -635,7 +637,7 @@ class GRPOTrainer:
         
         # 3. 여러 에포크 동안 정책 업데이트 (PPO의 multiple epochs)
         num_epochs = 4  # PPO 표준 설정
-        batch_size = 64
+        batch_size = self.batch_size
         num_samples = len(all_states)
         
         total_policy_loss = 0.0
@@ -653,12 +655,12 @@ class GRPOTrainer:
                 end_idx = min(start_idx + batch_size, num_samples)
                 batch_indices = indices[start_idx:end_idx]
                 
-                # 배치 데이터
-                batch_states = states_tensor[batch_indices]
-                batch_actions = actions_tensor[batch_indices]
-                batch_old_log_probs = old_log_probs_tensor[batch_indices]
-                batch_advantages = advantages_tensor[batch_indices]
-                batch_returns = returns_tensor[batch_indices]
+                # 미니 배치 데이터 슬라이싱 후 GPU 메모리로 이동 (VRAM 폭발 방지)
+                batch_states = states_tensor[batch_indices].to(self.device)
+                batch_actions = actions_tensor[batch_indices].to(self.device)
+                batch_old_log_probs = old_log_probs_tensor[batch_indices].to(self.device)
+                batch_advantages = advantages_tensor[batch_indices].to(self.device)
+                batch_returns = returns_tensor[batch_indices].to(self.device)
                 
                 # 4. 정책 평가
                 log_probs, entropy, values = self.policy.evaluate_actions(
