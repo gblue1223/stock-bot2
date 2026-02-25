@@ -15,9 +15,10 @@ def worker(remote, parent_remote, env_fn_wrapper):
                 done = terminated or truncated
                 if done:
                     # Automatically reset
+                    terminal_ob = ob
                     ob, info_reset = env.reset()
                     info['reset_info'] = info_reset
-                    info['terminal_observation'] = ob # Save for reference if needed
+                    info['terminal_observation'] = terminal_ob # Save for reference if needed
                 remote.send((ob, reward, done, info))
             elif cmd == 'reset':
                 ob, info = env.reset()
@@ -148,9 +149,10 @@ class DummyVecEnv:
         for i, env in enumerate(self.envs):
             o, r, d, tr, info = env.step(actions[i])
             if d or tr:
-                info['terminal_observation'] = o
+                terminal_ob = o
                 o, reset_info = env.reset()
-                info['episode'] = reset_info
+                info['reset_info'] = reset_info
+                info['terminal_observation'] = terminal_ob
             obs.append(o)
             rews.append(r)
             dones.append(d or tr)
