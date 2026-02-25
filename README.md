@@ -139,25 +139,23 @@ python scripts/data/generate_embeddings_parallel.py \
 
 ```bash
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
-python ai_trader/grpo/train_scalping_v2.py \
+python ai_trader/grpo/train_e2e.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --parquet_path "C:\Users\user\Workspace\datasets@20260117\embeddings_v3" \
     --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v9" \
-    --num_workers 1 \
+    --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
-    --entropy_coef 0.05 \
+    --entropy_coef 0.15 \
     --transaction_cost 0.0 \
     --no_trade_penalty 50.0 \
     --lr 0.0001
 
 # Fine-tuning (기존 모델 로드)
-python ai_trader/grpo/train_scalping_v2.py \
+python ai_trader/grpo/train_e2e.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --parquet_path "C:\Users\user\Workspace\datasets@20260117\embeddings_v3" \
     --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
@@ -255,7 +253,7 @@ finetuned_model = FineTunedEmbedding(
 
 ```bash
 # 원본 데이터 + RollingNormalizer 사용 (권장)
-python ai_trader/grpo/train_scalping_v2.py \
+python ai_trader/grpo/train_e2e.py \
     --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
     --embedding_model models/autoencoder/best_model.pt \
     --total_timesteps 100000 \
@@ -263,8 +261,7 @@ python ai_trader/grpo/train_scalping_v2.py \
     --rolling_window_size 1000 \
     --output_dir models/grpo_scalping
 
-# JSON 설정 파일 사용
-python ai_trader/grpo/train_scalping_v2.py --config config/training_config.json
+# JSON 설정thon ai_trader/grpo/train_scalping_e2e.py --config config/training_config.json
 ```
 
 ### 실시간 추론 파이프라인
@@ -393,7 +390,7 @@ ai_trader/
 │   ├── policies/
 │   │   └── scalping_policy.py  # GRPO 정책 네트워크
 │   ├── grpo.py                 # GRPO 알고리즘
-│   ├── train_scalping_v2.py       # 훈련 스크립트 (Enhanced)
+│   ├──alping_e2e.py       # 훈련 스크립트 (Enhanced)
 │   └── inference/
 │       ├── grpo_infer.py       # 기본 추론 엔진
 │       └── enhanced_grpo_infer.py  # 향상된 추론 엔진

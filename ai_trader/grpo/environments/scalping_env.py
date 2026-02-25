@@ -1030,8 +1030,8 @@ class GRPOScalpingEnv(gym.Env):
         if self.current_step >= self.episode_length - 1:
             terminated = True
         
-        # 최대 스텝 수 체크
-        if self.max_episode_steps is not None and self.current_step >= self.max_episode_steps:
+        # 최대 스텝 수 체크 (상대 스텝으로 계산)
+        if self.max_episode_steps is not None and (self.current_step - (self.seq_len - 1)) >= self.max_episode_steps:
             truncated = True
         
         # 에피소드 종료 시 강제 청산 (통계용)
