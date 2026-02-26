@@ -141,6 +141,7 @@ python scripts/data/generate_embeddings_parallel.py \
 # GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
 python ai_trader/grpo/train_e2e.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
+    --load_policy "models/grpo_scalping_v9/checkpoints/checkpoint_iter500.pt" \
     --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
@@ -156,11 +157,11 @@ python ai_trader/grpo/train_e2e.py \
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_e2e.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
+    --load_policy "models/grpo_scalping_v9/checkpoints/checkpoint_iter500.pt" \
     --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v9" \
-    --load_policy "models/grpo_scalping_v9/checkpoints/checkpoint_iter500.pt" \
     --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \

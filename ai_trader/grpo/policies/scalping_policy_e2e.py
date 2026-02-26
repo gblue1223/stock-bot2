@@ -112,6 +112,7 @@ class GRPOPolicyE2E(nn.Module):
         x = x.transpose(1, 2)
         
         # GRU Layer
+        self.gru.flatten_parameters()  # PyTorch contiguous memory warning 방지
         _, hidden = self.gru(x)
         # hidden의 형태: (num_layers, batch_size, rnn_hidden_dim)
         # 마지막 레이어의 은닉 상태를 사용
