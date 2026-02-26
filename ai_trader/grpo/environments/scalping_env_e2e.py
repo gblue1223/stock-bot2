@@ -452,12 +452,12 @@ class GRPOScalpingEnv(gym.Env):
         """
         # ✅ Rolling normalization 적용
         if self.use_raw_data and self.normalizer is not None:
-            normalized_seq = np.zeros_like(sequence, dtype=np.float32)
-            for t in range(len(sequence)):
-                normalized_seq[t] = self.normalizer.normalize(
-                    sequence[t],
-                    update=True  # 훈련 중이므로 통계 업데이트
-                )
+            # RollingNormalizer supports 2D arrays natively.
+            # Passing the entire sequence at once is magnitudes faster than a for-loop.
+            normalized_seq = self.normalizer.normalize(
+                sequence,
+                update=True  # 훈련 중이므로 통계 업데이트
+            )
             return normalized_seq
         return sequence
     
