@@ -118,7 +118,9 @@ class TrainingConfig:
         self.stagnation_exit_seconds = 180  # 기본값
         
         # 정책 설정
-        self.hidden_dim = 128  # 64 -> 128 (네트워크 용량 증가)
+        self.hidden_dim = 128       # FC hidden dim
+        self.cnn_channels = 64      # CNN 필터 수 (VRAM 조절: 64/128/256/512)
+        self.rnn_hidden_dim = 128   # GRU 은닉 크기 (VRAM 조절: 128/256/512/1024)
         self.action_dim = 3
         
         # 훈련 설정
@@ -270,10 +272,13 @@ def create_policy(config: TrainingConfig, env, device: str):
         
         policy = GRPOPolicyE2E(
             obs_dim=ref_env.observation_space.shape[-1],
+            cnn_channels=config.cnn_channels,
+            rnn_hidden_dim=config.rnn_hidden_dim,
             fc_hidden_dim=config.hidden_dim,
             action_dim=config.action_dim
         )
-        logger.info(f"[OK] GRPOPolicyE2E created (obs_dim={ref_env.observation_space.shape[-1]})")
+        logger.info(f"[OK] GRPOPolicyE2E created: obs_dim={ref_env.observation_space.shape[-1]}, "
+                   f"cnn={config.cnn_channels}, rnn={config.rnn_hidden_dim}, fc={config.hidden_dim}")
         
         policy.to(device)
         return policy
@@ -350,7 +355,20 @@ def main():
                         help='Minimum samples for normalization (default: 100)')
     
     # 정책 설정
-    parser.add_argument('--hidden_dim', type=int, default=None)
+    parser.add_argument('--hidden_dim', type=int, default=None,
+                        help='FC hidden layer dim (default: 128)')
+    parser.add_argument('--cnn_channels', type=int, default=None,
+                        help='CNN filter count (default:64, large:128, xlarge:256)')
+    parser.add_argument('--rnn_hidden_dim', type=int, default=None,
+                        help='GRU hidden size (default:128, large:256, xlarge:512)')
+    parser.add_argument('--vram_preset', choices=['small', 'medium', 'large', 'xlarge'], default=None,
+                        help=(
+                            'VRAM 사용량 프리셋 (개별 옵션보다 우선 적용).\n'
+                            '  small  : cnn=64,  rnn=128, fc=128, batch=64   (~4GB)\n'
+                            '  medium : cnn=128, rnn=256, fc=256, batch=128  (~8GB)\n'
+                            '  large  : cnn=256, rnn=512, fc=512, batch=256  (~16GB)\n'
+                            '  xlarge : cnn=512, rnn=1024,fc=1024,batch=512  (~24GB+)'
+                        ))
     parser.add_argument('--action_dim', type=int, default=None)
     parser.add_argument('--episodes_per_group', type=int, default=None)
     parser.add_argument('--num_groups', type=int, default=None)
@@ -381,9 +399,24 @@ def main():
         
         # CLI 인자로 오버라이드
         for key, value in vars(args).items():
-            if value is not None and key != 'config' and hasattr(config, key):
+            if value is not None and key not in ('config', 'vram_preset') and hasattr(config, key):
                 setattr(config, key, value)
                 logger.debug(f"  Override: {key} = {value}")
+        
+        # vram_preset 적용 (개별 CLI보다 나중에 적용하여 최종 우선권 부여)
+        VRAM_PRESETS = {
+            'small':  dict(cnn_channels=64,  rnn_hidden_dim=128,  hidden_dim=128,  batch_size=64),
+            'medium': dict(cnn_channels=128, rnn_hidden_dim=256,  hidden_dim=256,  batch_size=128),
+            'large':  dict(cnn_channels=256, rnn_hidden_dim=512,  hidden_dim=512,  batch_size=256),
+            'xlarge': dict(cnn_channels=512, rnn_hidden_dim=1024, hidden_dim=1024, batch_size=512),
+        }
+        if args.vram_preset:
+            preset = VRAM_PRESETS[args.vram_preset]
+            for k, v in preset.items():
+                setattr(config, k, v)
+            logger.info(f"[VRAM Preset '{args.vram_preset}'] cnn={config.cnn_channels}, "
+                       f"rnn={config.rnn_hidden_dim}, fc={config.hidden_dim}, "
+                       f"batch={config.batch_size}")
         
         # 설정 검증
         config.validate()
