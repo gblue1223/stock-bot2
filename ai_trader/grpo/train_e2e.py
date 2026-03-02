@@ -494,6 +494,34 @@ def main():
                 else:
                     state_dict = checkpoint
                 
+                # ✅ 체크포인트 아키텍처 자동 감지 (shape 불일치 방지)
+                # conv1.weight: (out_channels, in_channels, kernel) -> cnn_channels
+                # gru.weight_hh_l0: (3*hidden, hidden)             -> rnn_hidden_dim
+                # fc1.weight: (hidden_out, hidden_in)              -> hidden_dim
+                ckpt_cnn = state_dict['conv1.weight'].shape[0]     if 'conv1.weight'     in state_dict else None
+                ckpt_rnn = state_dict['gru.weight_hh_l0'].shape[1] if 'gru.weight_hh_l0' in state_dict else None
+                ckpt_fc  = state_dict['fc1.weight'].shape[0]       if 'fc1.weight'       in state_dict else None
+                
+                needs_rebuild = (
+                    (ckpt_cnn is not None and ckpt_cnn != config.cnn_channels) or
+                    (ckpt_rnn is not None and ckpt_rnn != config.rnn_hidden_dim) or
+                    (ckpt_fc  is not None and ckpt_fc  != config.hidden_dim)
+                )
+                
+                if needs_rebuild:
+                    logger.warning(
+                        f"[ARCH MISMATCH] 체크포인트 아키텍처 "
+                        f"(cnn={ckpt_cnn}, rnn={ckpt_rnn}, fc={ckpt_fc}) != "
+                        f"현재 config (cnn={config.cnn_channels}, rnn={config.rnn_hidden_dim}, fc={config.hidden_dim}) "
+                        f"-> 체크포인트에 맞게 정책을 재생성합니다."
+                    )
+                    if ckpt_cnn is not None: config.cnn_channels   = ckpt_cnn
+                    if ckpt_rnn is not None: config.rnn_hidden_dim = ckpt_rnn
+                    if ckpt_fc  is not None: config.hidden_dim      = ckpt_fc
+                    policy = create_policy(config, ref_env, device)
+                    total_params = sum(p.numel() for p in policy.parameters())
+                    logger.info(f"  Rebuilt policy: cnn={config.cnn_channels}, rnn={config.rnn_hidden_dim}, fc={config.hidden_dim} ({total_params:,} params)")
+                
                 missing, unexpected = policy.load_state_dict(state_dict, strict=False)
                 if missing:
                     logger.warning(f"  Missing keys: {len(missing)}")
