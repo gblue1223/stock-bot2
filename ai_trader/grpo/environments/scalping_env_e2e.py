@@ -964,7 +964,10 @@ class GRPOScalpingEnv(gym.Env):
                 # 1단계만 보유 시 보상 10%, 10단계(풀매수) 보유 시 보상 100%
                 weight = self.position_steps / self.max_split_count
                 
-                step_reward = step_return * 100 * weight
+                # Fix A: step reward 스케일 축소 (100 → 10)
+                # 거래 결과(profit_rate*100) 대비 step noise 비중을 1/10로 줄여
+                # 에이전트가 매매 타이밍 학습에 집중하도록 유도
+                step_reward = step_return * 10 * weight
                 reward += step_reward
                 
                 # --- 리스크 관리 (손절 & 본전청산) ---

@@ -110,7 +110,7 @@ class TrainingConfig:
         self.table_name = 'datasets'
         self.seq_len = 3000
         self.features = 28
-        self.episode_steps = 150
+        self.episode_steps = 600   # Fix C: 150 → 600 (더 긴 관찰 시간으로 타이밍 학습 유도)
         
         # 임베딩 사용 안함
         self.quick_exit_mode = 'penalty_only'
@@ -122,8 +122,8 @@ class TrainingConfig:
         self.action_dim = 3
         
         # 훈련 설정
-        self.episodes_per_group = 6
-        self.num_groups = 3
+        self.episodes_per_group = 16  # Fix B: 6 → 16 (GRPO 그래디언트 품질 향상)
+        self.num_groups = 4            # Fix B: 3 → 4 (총 64개 에피소드/iteration)
         self.lr = 5e-4
         self.gamma = 0.99
         self.clip = 0.1  # 0.2 -> 0.1 (안정성 강화)
@@ -534,26 +534,32 @@ def main():
                  logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
 
         def curriculum_callback(iteration: int, metrics: dict):
+            """Fix D: 시간 기반 Curriculum Learning (win_rate 조건 제거)"""
             nonlocal current_cost_rate
             nonlocal target_cost_rate
             
             if current_cost_rate >= target_cost_rate:
                 return
 
-            win_rate = metrics.get('mean_win_rate', 0.0)
+            total_iterations = metrics.get('total_iterations', 8000)
+            progress = iteration / total_iterations
             
-            if win_rate > 0.65:
-                # 30% 증가 설정
-                step_size = target_cost_rate * 0.30
-                
-                # 새로운 수수료율 계산 (목표값 초과 방지)
-                new_cost_rate = min(current_cost_rate + step_size, target_cost_rate)
-                
-                if new_cost_rate > current_cost_rate:
-                    logger.info(f"Curriculum Update: Win rate {win_rate:.1f}% > 65%. "
-                              f"Increasing transaction cost: {current_cost_rate:.5f} -> {new_cost_rate:.5f}")
-                    current_cost_rate = new_cost_rate
-                    vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
+            # 0~10%: 수수료 0 (기본 탐색)
+            # 10~50%: 선형 증가 → 목표 수수료 100%
+            # 50%~: 목표 수수료 유지
+            if progress < 0.1:
+                new_cost_rate = 0.0
+            elif progress < 0.5:
+                ratio = (progress - 0.1) / 0.4
+                new_cost_rate = target_cost_rate * ratio
+            else:
+                new_cost_rate = target_cost_rate
+            
+            if abs(new_cost_rate - current_cost_rate) > 1e-7:
+                logger.info(f"Curriculum Update (progress={progress:.1%}): "
+                          f"Transaction cost {current_cost_rate:.6f} → {new_cost_rate:.6f}")
+                current_cost_rate = new_cost_rate
+                vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
                     
         logger.info("[OK] Trainer created")
         
