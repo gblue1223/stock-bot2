@@ -154,6 +154,7 @@ class TrainingConfig:
         self.max_split_count = 1      # 최대 분할 매수 횟수 (1 = 단일 진입)
         self.min_holding_time = 2     # 최소 보유 시간 (초)
         self.max_holding_time = 100   # 최대 보유 시간 (초)
+        self.early_exit_penalty = 0.2 # 최소 보유 시간 위반 페널티
         self.no_trade_penalty = 10.0  # 거래 안할 시 패널티 (기본값: 10.0)
         self.transaction_cost_rate = 0.00215  # 거래 수수료율
         
@@ -254,6 +255,7 @@ def create_environment(config: TrainingConfig, device: str):
             max_split_count=config.max_split_count,
             min_holding_time=config.min_holding_time,
             max_holding_time=config.max_holding_time,
+            early_exit_penalty=config.early_exit_penalty,
             no_trade_penalty=config.no_trade_penalty
         )
         return env
@@ -341,6 +343,8 @@ def main():
                         help='Min holding time in seconds (default: 2)')
     parser.add_argument('--max_holding', dest='max_holding_time', type=float, default=None,
                         help='Max holding time in seconds (default: 100)')
+    parser.add_argument('--early_exit_penalty', type=float, default=None,
+                        help='Penalty for early exit before min_holding (default: 0.2)')
     parser.add_argument('--no_trade_penalty', type=float, default=None,
                         help='Penalty for making 0 trades in an episode (default: 10.0)')
     parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,

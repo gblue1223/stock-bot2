@@ -72,6 +72,7 @@ class GRPOScalpingEnv(gym.Env):
         max_split_count: int = 1,       # ✅ 최대 분할 매수 횟수
         min_holding_time: float = 2.0,  # ✅ 최소 보유 시간
         max_holding_time: float = 100.0,# ✅ 최대 보유 시간
+        early_exit_penalty: float = 0.2,# ✅ 조기 매도 페널티
     ):
         super().__init__()
         
@@ -80,6 +81,7 @@ class GRPOScalpingEnv(gym.Env):
         self.max_split_count = max_split_count
         self.min_holding_time = min_holding_time
         self.max_holding_time = max_holding_time
+        self.early_exit_penalty = early_exit_penalty
         self.no_trade_penalty = no_trade_penalty
         
         self.db_path = db_path
@@ -877,9 +879,9 @@ class GRPOScalpingEnv(gym.Env):
                 
                 # ✅ 최소 보유 시간 체크 (Dense Reward로 가이드)
                 if holding_time < self.min_holding_time:
-                    # 너무 빨리 파는 경우: 약한 페널티 부여 (-0.2점)
+                    # 너무 빨리 파는 경우: 약한 페널티 부여
                     # 거래를 아예 포기하지 않도록 페널티 완화
-                    early_exit_penalty = 0.2
+                    early_exit_penalty = self.early_exit_penalty
                     reward -= early_exit_penalty
                     logger.debug(f"Early Exit Penalty applied: -{early_exit_penalty} (holding_time {holding_time:.2f}s < {self.min_holding_time}s)")
                 else:
