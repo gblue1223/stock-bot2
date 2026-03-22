@@ -451,15 +451,19 @@ def main():
         import functools
         
         # E2E 환경은 IPC 파이프 크기 한계로 인해 Windows에서 SubprocVecEnv가 자주 터짐 (BrokenPipeError)
-        # DummyVecEnv를 강제로 사용하여 OOM 및 Pickle 이슈 우회
-        if config.num_workers > 1:
+        # Linux(Colab)에서는 정상 작동하므로 OS 체크 후 적용
+        if config.num_workers > 1 and sys.platform == 'win32':
              logger.warning(f"Overriding num_workers={config.num_workers} to 1. SubprocVecEnv IPC crashes with seq_len=3000 in E2E on Windows.")
              config.num_workers = 1
              
         env_fns = [functools.partial(create_environment, config, device) for _ in range(config.num_workers)]
         
-        logger.info(f"Initializing {config.num_workers} processes (DummyVecEnv) to prevent Memory Limits...")
-        vec_env = DummyVecEnv(env_fns)
+        if config.num_workers > 1:
+            logger.info(f"Initializing {config.num_workers} processes (SubprocVecEnv) for parallel processing...")
+            vec_env = SubprocVecEnv(env_fns)
+        else:
+            logger.info(f"Initializing 1 processes (DummyVecEnv)...")
+            vec_env = DummyVecEnv(env_fns)
         
         logger.info(f"[OK] Environments created")
         
