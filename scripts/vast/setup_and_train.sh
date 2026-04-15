@@ -81,6 +81,15 @@ log_info "🚀 훈련 시작..."
 ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     "cd $REMOTE_WORKSPACE && chmod +x train_e2e.sh && ./train_e2e.sh $REMOTE_WORKSPACE/datasets_raw_09_11.duckdb"
 
+# 5. 새로 생성된 체크포인트 로컬로 복사
+LOCAL_CHECKPOINT_DIR="$PROJECT_ROOT/models/grpo_scalping_v10/checkpoints"
+mkdir -p "$LOCAL_CHECKPOINT_DIR"
+log_info "📥 원격 체크포인트 → 로컬 복사 중..."
+scp -r "${SCP_OPTS[@]}" \
+    "$SSH_TARGET:$REMOTE_WORKSPACE/models/grpo_scalping_v10/checkpoints/." \
+    "$LOCAL_CHECKPOINT_DIR/"
+log_success "체크포인트 복사 완료: $LOCAL_CHECKPOINT_DIR"
+
 log_success "🎉 완료!"
 log_info "SSH 접속:    ssh -p $SSH_PORT $SSH_TARGET"
 log_info "TensorBoard: ssh -p $SSH_PORT -L 6006:localhost:6006 $SSH_TARGET"
