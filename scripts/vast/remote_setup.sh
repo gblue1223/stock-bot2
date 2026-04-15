@@ -43,14 +43,22 @@ download_from_gdrive() {
     fi
 }
 
-download_from_gdrive "$CHECKPOINT_ID" "checkpoint_iter770.pt"       "체크포인트"
-download_from_gdrive "$DATASET_ID"    "datasets_raw_09_11.duckdb"   "데이터셋"
-
-# 디렉토리 구조 생성 및 파일 배치
-log_info "📁 프로젝트 구조 생성 중..."
 mkdir -p models/grpo_scalping_v10/checkpoints logs runs
-mv checkpoint_iter770.pt models/grpo_scalping_v10/checkpoints/
-log_success "체크포인트 이동 완료"
+
+CHECKPOINT_DEST="models/grpo_scalping_v10/checkpoints/checkpoint_iter770.pt"
+DATASET_DEST="datasets_raw_09_11.duckdb"
+
+if [ -f "$CHECKPOINT_DEST" ]; then
+    log_warning "체크포인트 이미 존재 - 스킵: $CHECKPOINT_DEST"
+else
+    download_from_gdrive "$CHECKPOINT_ID" "$CHECKPOINT_DEST" "체크포인트"
+fi
+
+if [ -f "$DATASET_DEST" ]; then
+    log_warning "데이터셋 이미 존재 - 스킵: $DATASET_DEST"
+else
+    download_from_gdrive "$DATASET_ID" "$DATASET_DEST" "데이터셋"
+fi
 
 # 환경 변수
 cat > .env << 'ENVEOF'
