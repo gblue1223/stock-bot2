@@ -25,8 +25,7 @@ apt-get install -y -qq wget curl unzip python3-pip git
 
 # Python 의존성
 log_info "🐍 Python 의존성 설치 중..."
-pip install -q --upgrade pip
-pip install -q gdown duckdb pandas pyarrow python-dotenv stable-baselines3 tensorboard torch torchvision gymnasium
+pip install -q --break-system-packages gdown duckdb pandas pyarrow python-dotenv stable-baselines3 tensorboard torch torchvision gymnasium
 
 # Google Drive 다운로드 함수
 download_from_gdrive() {
