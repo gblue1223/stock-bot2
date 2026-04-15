@@ -156,18 +156,19 @@ python ai_trader/grpo/train_e2e.py \
 # Fine-tuning (기존 모델 로드)
 python ai_trader/grpo/train_e2e.py \
     --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --load_policy "models/grpo_scalping_v10/checkpoints/checkpoint_iter500.pt" \
+    --load_policy "models/grpo_scalping_v10/checkpoints/checkpoint_iter770.pt" \
     --seq_len 3000 \
     --features 28 \
     --total_timesteps 200000 \
     --output_dir "models/grpo_scalping_v10" \
+    --early_exit_penalty 1.2 \
     --num_workers 2 \
     --min_holding 2 \
     --max_holding 300 \
-    --entropy_coef 0.01 \
+    --entropy_coef 0.15 \
     --transaction_cost 0.00215 \
-    --no_trade_penalty 50.0 \
-    --lr 0.0001
+    --no_trade_penalty 30.0 \
+    --lr 0.00001
 ```
 
 ### 3단계: 실시간 추론 (2.87ms)
