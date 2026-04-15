@@ -16,11 +16,9 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 # Google Drive URL 또는 ID에서 파일 ID 추출
 extract_gdrive_id() {
     local input="$1"
-    # URL 형식: https://drive.google.com/file/d/FILE_ID/view...
     if [[ "$input" =~ /file/d/([a-zA-Z0-9_-]+) ]]; then
         echo "${BASH_REMATCH[1]}"
     else
-        # 이미 ID만 입력된 경우
         echo "$input"
     fi
 }
@@ -36,11 +34,14 @@ if [ $# -lt 4 ]; then
 fi
 
 SSH_PORT="$1"
-SSH_TARGET="$2"   # user@ip 형식
+SSH_TARGET="$2"
 CHECKPOINT_ID="$(extract_gdrive_id "$3")"
 DATASET_ID="$(extract_gdrive_id "$4")"
 REMOTE_WORKSPACE="/workspace"
-SSH_OPTS="-p $SSH_PORT -o StrictHostKeyChecking=no"
+
+# ssh와 scp는 포트 옵션 플래그가 다름 (ssh: -p, scp: -P)
+SSH_OPTS=(-p "$SSH_PORT" -o StrictHostKeyChecking=no)
+SCP_OPTS=(-P "$SSH_PORT" -o StrictHostKeyChecking=no)
 
 log_info "======================================"
 log_info "🚀 Vast.ai 자동화 스크립트 시작"
@@ -51,35 +52,35 @@ log_info "======================================"
 
 # 1. SSH 연결 테스트
 log_info "📡 SSH 연결 테스트 중..."
-if ! ssh $SSH_OPTS "$SSH_TARGET" "echo ok" &>/dev/null; then
+if ! ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "echo ok" &>/dev/null; then
     log_error "SSH 연결 실패. 포트, 대상 주소, SSH 키를 확인해주세요."
-    log_info "수동 연결 시도: ssh $SSH_OPTS $SSH_TARGET"
+    log_info "수동 연결 시도: ssh -p $SSH_PORT $SSH_TARGET"
     exit 1
 fi
 log_success "SSH 연결 성공"
 
 # 2. 원격 설정 스크립트 업로드 및 실행
 log_info "📤 설정 스크립트 업로드 중..."
-scp $SSH_OPTS "$SCRIPT_DIR/remote_setup.sh" "$SSH_TARGET:/tmp/"
+scp "${SCP_OPTS[@]}" "$SCRIPT_DIR/remote_setup.sh" "$SSH_TARGET:/tmp/"
 
-log_info "� 원격 환경 설정 및 GDrive 파일 다운로드 중..."
-ssh $SSH_OPTS "$SSH_TARGET" "chmod +x /tmp/remote_setup.sh && /tmp/remote_setup.sh '$CHECKPOINT_ID' '$DATASET_ID'"
+log_info "🔧 원격 환경 설정 및 GDrive 파일 다운로드 중..."
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" "chmod +x /tmp/remote_setup.sh && /tmp/remote_setup.sh '$CHECKPOINT_ID' '$DATASET_ID'"
 
 # 3. 프로젝트 코드 업로드
 log_info "📤 프로젝트 코드 업로드 중..."
 for dir in ai_trader config lib; do
     log_info "  → $dir/"
-    scp -r $SSH_OPTS "$PROJECT_ROOT/$dir" "$SSH_TARGET:$REMOTE_WORKSPACE/"
+    scp -r "${SCP_OPTS[@]}" "$PROJECT_ROOT/$dir" "$SSH_TARGET:$REMOTE_WORKSPACE/"
 done
 
 # 4. 훈련 스크립트 업로드 및 실행
 log_info "📤 훈련 스크립트 업로드 중..."
-scp $SSH_OPTS "$SCRIPT_DIR/train_e2e.sh" "$SSH_TARGET:$REMOTE_WORKSPACE/"
+scp "${SCP_OPTS[@]}" "$SCRIPT_DIR/train_e2e.sh" "$SSH_TARGET:$REMOTE_WORKSPACE/"
 
 log_info "🚀 훈련 시작..."
-ssh $SSH_OPTS "$SSH_TARGET" \
+ssh "${SSH_OPTS[@]}" "$SSH_TARGET" \
     "cd $REMOTE_WORKSPACE && chmod +x train_e2e.sh && ./train_e2e.sh $REMOTE_WORKSPACE/datasets_raw_09_11.duckdb"
 
 log_success "🎉 완료!"
-log_info "SSH 접속:    ssh $SSH_OPTS $SSH_TARGET"
-log_info "TensorBoard: ssh $SSH_OPTS -L 6006:localhost:6006 $SSH_TARGET"
+log_info "SSH 접속:    ssh -p $SSH_PORT $SSH_TARGET"
+log_info "TensorBoard: ssh -p $SSH_PORT -L 6006:localhost:6006 $SSH_TARGET"
