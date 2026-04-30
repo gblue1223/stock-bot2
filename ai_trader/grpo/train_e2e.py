@@ -603,7 +603,7 @@ def main():
                  logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
 
         def curriculum_callback(iteration: int, metrics: dict):
-            """Fix D: 시간 기반 Curriculum Learning (win_rate 조건 제거)"""
+            """Fix D: 시간 기반 Curriculum Learning (3x 가속 스케줄)"""
             nonlocal current_cost_rate
             nonlocal target_cost_rate
             
@@ -613,13 +613,14 @@ def main():
             total_iterations = metrics.get('total_iterations', 8000)
             progress = iteration / total_iterations
             
-            # 0~10%: 수수료 0 (기본 탐색)
-            # 10~50%: 선형 증가 → 목표 수수료 100%
-            # 50%~: 목표 수수료 유지
-            if progress < 0.1:
+            # 3x 가속 스케줄:
+            # 0~5%: 수수료 0 (기본 탐색, 빠르게 통과)
+            # 5~20%: 선형 증가 → 목표 수수료 100%
+            # 20%~: 목표 수수료 유지
+            if progress < 0.05:
                 new_cost_rate = 0.0
-            elif progress < 0.5:
-                ratio = (progress - 0.1) / 0.4
+            elif progress < 0.20:
+                ratio = (progress - 0.05) / 0.15
                 new_cost_rate = target_cost_rate * ratio
             else:
                 new_cost_rate = target_cost_rate

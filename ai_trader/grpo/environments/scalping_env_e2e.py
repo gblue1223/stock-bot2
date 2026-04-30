@@ -787,8 +787,13 @@ class GRPOScalpingEnv(gym.Env):
         두 시간 값의 차이를 초 단위로 계산
         입력 포맷: HHMMSSmmm (9자리) + 선택적 소수점 (.0)
         예: 90000000.0 (09:00:00.000)
+        
+        안전장치: 반환값은 항상 max_holding_time 이하로 클램핑됩니다.
         """
         if str(start_time_val).startswith('0') or start_time_val == 0: return 0.0
+        
+        # 안전 상한선: max_holding_time (기본 300s 등)
+        safe_max = self.max_holding_time
         
         try:
             # 1. 문자열 변환 및 소수점 제거 (100000030.0 -> "100000030")
@@ -811,17 +816,19 @@ class GRPOScalpingEnv(gym.Env):
             s_seconds = parse_time(s_str)
             e_seconds = parse_time(e_str)
             
-            # 4. 날짜 경계 처리 (밤 11시 -> 새벽 1시 인 경우 등을 대비)
-            # 여기선 단순 차이만 계산하되, 음수면 하루(86400초) 더함
+            # 4. 시간 차이 계산
             diff = e_seconds - s_seconds
             if diff < 0:
-                diff += 86400.0
-                
-            return diff
+                # 음수 diff는 파싱 에러이거나 날짜 경계 문제
+                # 스캘핑 환경에서 날짜를 넘기는 경우는 없으므로 max_holding_time으로 클램핑
+                diff = safe_max
+            
+            # 5. 안전 클램핑: max_holding_time 초과 방지
+            return min(diff, safe_max)
             
         except Exception as e:
             # 파싱 실패 시 안전장치
-            # logger.warning(f"Time parsing failed: {start_time_val} -> {end_time_val} ({e})")
+            logger.warning(f"Time parsing failed: {start_time_val} -> {end_time_val} ({e})")
             return 1.0  # 기본값 1초 반환하여 에러 방지
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
