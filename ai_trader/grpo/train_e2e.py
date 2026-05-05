@@ -604,31 +604,53 @@ def main():
                  logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
 
         if target_cost_rate > 0:
-             # 재시작 시 체크포인트 iteration에 맞는 수수료로 초기화 (순간 충격 방지)
-             # start_iteration은 체크포인트 파일명에서 이미 추출된 값 (기본값 0)
-             resume_iter = start_iteration  # e.g. 1320
+             # 재시작 시: 항상 cost=0에서 시작하고 warmup 동안 점진적으로 올림
+             # (이전 학습이 cost=0으로 진행됐을 수 있으므로 갑작스러운 충격 방지)
+             WARMUP_ITERS = 200  # 재시작 후 200 iter 동안 0 → resume_target 선형 증가
+             resume_iter = start_iteration  # e.g. 1320 (체크포인트 파일명에서 파싱)
              total_iter_for_calc = getattr(config, 'total_iterations', 8000)
-             initial_curriculum_cost = _calc_curriculum_cost(resume_iter, total_iter_for_calc, target_cost_rate)
-             logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost "
-                         f"(Target {target_cost_rate}, Resume iter={resume_iter})")
+             resume_target_cost = _calc_curriculum_cost(resume_iter, total_iter_for_calc, target_cost_rate)
+
+             # warmup 시작: cost=0
+             initial_curriculum_cost = 0.0
+             logger.info(
+                 f"Curriculum Learning: Warmup start cost=0.0 → {resume_target_cost:.5f} "
+                 f"over {WARMUP_ITERS} iters (then resume normal schedule from iter {resume_iter}). "
+                 f"Target={target_cost_rate}"
+             )
              vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
              current_cost_rate = initial_curriculum_cost
 
         def curriculum_callback(iteration: int, metrics: dict):
-            """Fix D: 시간 기반 Curriculum Learning (3x 가속 스케줄)"""
+            """Curriculum Learning: resume warmup 후 정상 스케줄"""
             nonlocal current_cost_rate
             nonlocal target_cost_rate
-            
+
             if current_cost_rate >= target_cost_rate:
                 return
 
             total_iterations = metrics.get('total_iterations', 8000)
+
+            # ── Phase 1: Resume Warmup ─────────────────────────────────────────
+            # 재시작이 있는 경우(start_iteration > 0):
+            # cost=0 → resume_target으로 WARMUP_ITERS 동안 선형 증가
+            if start_iteration > 0:
+                iters_since_resume = iteration - start_iteration
+                if iters_since_resume <= WARMUP_ITERS:
+                    warmup_ratio = iters_since_resume / WARMUP_ITERS
+                    new_cost_rate = resume_target_cost * warmup_ratio
+                    if abs(new_cost_rate - current_cost_rate) > 1e-7:
+                        logger.info(
+                            f"Curriculum Warmup ({iters_since_resume}/{WARMUP_ITERS}): "
+                            f"Transaction cost {current_cost_rate:.6f} → {new_cost_rate:.6f}"
+                        )
+                        current_cost_rate = new_cost_rate
+                        vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
+                    return  # warmup 중에는 일반 스케줄 skip
+
+            # ── Phase 2: 정상 Curriculum 스케줄 ───────────────────────────────
+            # 0~5%: cost=0  /  5~20%: 선형 증가  /  20%+: 목표 유지
             progress = iteration / total_iterations
-            
-            # 3x 가속 스케줄:
-            # 0~5%: 수수료 0 (기본 탐색, 빠르게 통과)
-            # 5~20%: 선형 증가 → 목표 수수료 100%
-            # 20%~: 목표 수수료 유지
             if progress < 0.05:
                 new_cost_rate = 0.0
             elif progress < 0.20:
@@ -636,13 +658,16 @@ def main():
                 new_cost_rate = target_cost_rate * ratio
             else:
                 new_cost_rate = target_cost_rate
-            
+
             if abs(new_cost_rate - current_cost_rate) > 1e-7:
-                logger.info(f"Curriculum Update (progress={progress:.1%}): "
-                          f"Transaction cost {current_cost_rate:.6f} → {new_cost_rate:.6f}")
+                logger.info(
+                    f"Curriculum Update (progress={progress:.1%}): "
+                    f"Transaction cost {current_cost_rate:.6f} → {new_cost_rate:.6f}"
+                )
                 current_cost_rate = new_cost_rate
                 vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
-                    
+
+
         logger.info("[OK] Trainer created")
         
         # 5. 훈련 설정 출력
