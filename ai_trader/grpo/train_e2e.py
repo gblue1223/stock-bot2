@@ -582,25 +582,37 @@ def main():
         # Use first env to determine initial settings if not overridden
         initial_env_cost = ref_env.transaction_cost_rate
         
+        def _calc_curriculum_cost(iter_num: int, total_iter: int, t_rate: float) -> float:
+             """주어진 iteration 번호에 맞는 curriculum 수수료 계산"""
+             progress = iter_num / total_iter
+             if progress < 0.05:
+                 return 0.0
+             elif progress < 0.20:
+                 ratio = (progress - 0.05) / 0.15
+                 return t_rate * ratio
+             else:
+                 return t_rate
+
         if hasattr(args, 'transaction_cost_rate') and args.transaction_cost_rate is not None and args.transaction_cost_rate > 0:
              target_cost_rate = args.transaction_cost_rate
-             # Fix4: 0.0으로 초기화하여 초기에 무조건 진입 성공을 유도 (no-trade collapse 완벽 차단)
-             initial_curriculum_cost = 0.0
-             logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost (Target {target_cost_rate})")
-             vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
-             current_cost_rate = initial_curriculum_cost
         else:
              if initial_env_cost > 0:
                  target_cost_rate = initial_env_cost
-                 # Fix4: 0.0으로 초기화하여 초기에 무조건 진입 성공을 유도 (no-trade collapse 완벽 차단)
-                 initial_curriculum_cost = 0.0
-                 logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost (Target {target_cost_rate})")
-                 vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
-                 current_cost_rate = initial_curriculum_cost
              else:
                  current_cost_rate = initial_env_cost
                  target_cost_rate = initial_env_cost
                  logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
+
+        if target_cost_rate > 0:
+             # 재시작 시 체크포인트 iteration에 맞는 수수료로 초기화 (순간 충격 방지)
+             # start_iteration은 체크포인트 파일명에서 이미 추출된 값 (기본값 0)
+             resume_iter = start_iteration  # e.g. 1320
+             total_iter_for_calc = getattr(config, 'total_iterations', 8000)
+             initial_curriculum_cost = _calc_curriculum_cost(resume_iter, total_iter_for_calc, target_cost_rate)
+             logger.info(f"Curriculum Learning: Starting with {initial_curriculum_cost:.5f} transaction cost "
+                         f"(Target {target_cost_rate}, Resume iter={resume_iter})")
+             vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
+             current_cost_rate = initial_curriculum_cost
 
         def curriculum_callback(iteration: int, metrics: dict):
             """Fix D: 시간 기반 Curriculum Learning (3x 가속 스케줄)"""
