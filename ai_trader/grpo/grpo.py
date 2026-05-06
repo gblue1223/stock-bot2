@@ -110,6 +110,9 @@ class GRPOTrainer:
         self.total_timesteps = 0
         self.num_updates = 0
         
+        # 외부 상태 (체크포인트에 함께 저장됨, 예: curriculum cost rate)
+        self.extra_checkpoint_state = {}
+        
         # 참조 정책 (KL 발산 계산용)
         self.reference_policy = None
         
@@ -879,7 +882,10 @@ class GRPOTrainer:
             if checkpoint_path and (iteration + 1) % checkpoint_interval == 0:
                 # Format checkpoint path with iteration number
                 formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
-                self.save_checkpoint(formatted_checkpoint_path, iteration + 1)
+                self.save_checkpoint(
+                    formatted_checkpoint_path, iteration + 1,
+                    extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
+                )
             
             # 7. 진행률 및 예상 시간 계산
             iteration_elapsed = time.time() - iteration_start_time
@@ -1122,13 +1128,14 @@ class GRPOTrainer:
                     f"violations={total_violations}, entropy={update_metrics.get('entropy', 0.0):.4f}, "
                     f"kl_div={update_metrics.get('kl_divergence', 0.0):.6f}")
     
-    def save_checkpoint(self, checkpoint_path: str, iteration: int):
+    def save_checkpoint(self, checkpoint_path: str, iteration: int, extra_state: Optional[Dict[str, Any]] = None):
         """
         체크포인트 저장
         
         Args:
             checkpoint_path: 체크포인트 저장 경로
             iteration: 현재 반복 횟수
+            extra_state: 추가 상태 (예: curriculum cost rate 등)
         """
         # 정책 타입 및 설정 정보 추출
         policy_class_name = self.policy.__class__.__name__
@@ -1162,15 +1169,24 @@ class GRPOTrainer:
             }
         }
         
+        # 추가 상태 저장 (curriculum cost rate 등)
+        if extra_state:
+            checkpoint['extra_state'] = extra_state
+        
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved to {checkpoint_path}")
+        if extra_state:
+            logger.info(f"  Extra state saved: {extra_state}")
     
-    def load_checkpoint(self, checkpoint_path: str):
+    def load_checkpoint(self, checkpoint_path: str) -> Optional[Dict[str, Any]]:
         """
         체크포인트 로드
         
         Args:
             checkpoint_path: 체크포인트 경로
+            
+        Returns:
+            extra_state: 체크포인트에 저장된 추가 상태 (없으면 None)
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         
@@ -1179,8 +1195,14 @@ class GRPOTrainer:
         self.total_timesteps = checkpoint['total_timesteps']
         self.num_updates = checkpoint['num_updates']
         
+        extra_state = checkpoint.get('extra_state', None)
+        
         logger.info(f"Checkpoint loaded from {checkpoint_path}, "
                    f"timesteps={self.total_timesteps}, updates={self.num_updates}")
+        if extra_state:
+            logger.info(f"  Extra state restored: {extra_state}")
+        
+        return extra_state
     
     def _format_time(self, seconds: float) -> str:
         """

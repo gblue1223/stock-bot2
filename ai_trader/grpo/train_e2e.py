@@ -537,6 +537,13 @@ def main():
                     logger.warning(f"  Unexpected keys: {len(unexpected)}")
                 logger.info("[OK] Policy loaded successfully")
                 
+                # 체크포인트에서 extra_state 복원 (curriculum cost rate 등)
+                restored_cost_rate = None
+                if isinstance(checkpoint, dict) and 'extra_state' in checkpoint:
+                    extra = checkpoint['extra_state']
+                    restored_cost_rate = extra.get('current_cost_rate', None)
+                    logger.info(f"[RESTORE] Extra state found: {extra}")
+                
                 # 체크포인트 파일명에서 시작 반복 횟수 추출 (load_policy가 설정된 경우)
                 try:
                     import re
@@ -604,51 +611,52 @@ def main():
                  logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
 
         if target_cost_rate > 0:
-             # 재시작 시: 항상 cost=0에서 시작하고 warmup 동안 점진적으로 올림
-             # (이전 학습이 cost=0으로 진행됐을 수 있으므로 갑작스러운 충격 방지)
-             WARMUP_ITERS = 200  # 재시작 후 200 iter 동안 0 → resume_target 선형 증가
-             resume_iter = start_iteration  # e.g. 1320 (체크포인트 파일명에서 파싱)
-             total_iter_for_calc = getattr(config, 'total_iterations', 8000)
-             resume_target_cost = _calc_curriculum_cost(resume_iter, total_iter_for_calc, target_cost_rate)
-
-             # warmup 시작: cost=0
-             initial_curriculum_cost = 0.0
-             logger.info(
-                 f"Curriculum Learning: Warmup start cost=0.0 → {resume_target_cost:.5f} "
-                 f"over {WARMUP_ITERS} iters (then resume normal schedule from iter {resume_iter}). "
-                 f"Target={target_cost_rate}"
-             )
-             vec_env.env_method('set_transaction_cost_rate', initial_curriculum_cost)
-             current_cost_rate = initial_curriculum_cost
+            # ── 체크포인트에서 cost 복원 (보수적 방식) ───────────────────────
+            # 체크포인트에 저장된 current_cost_rate가 있으면 그 값에서 바로 시작
+            # 없으면(구 체크포인트) curriculum 스케줄에서 현재 iteration에 해당하는 cost 계산
+            if config.load_policy and 'restored_cost_rate' in dir():
+                if restored_cost_rate is not None:
+                    # 체크포인트에 저장된 cost를 그대로 복원
+                    current_cost_rate = restored_cost_rate
+                    logger.info(
+                        f"Curriculum Learning: Restored cost={current_cost_rate:.6f} from checkpoint. "
+                        f"Target={target_cost_rate}"
+                    )
+                else:
+                    # 구 체크포인트: extra_state 없음 → iteration 기반으로 cost 계산
+                    total_iter_for_calc = getattr(config, 'total_iterations', 8000)
+                    current_cost_rate = _calc_curriculum_cost(start_iteration, total_iter_for_calc, target_cost_rate)
+                    logger.info(
+                        f"Curriculum Learning: No saved cost in checkpoint. "
+                        f"Computed cost={current_cost_rate:.6f} for iter={start_iteration}. "
+                        f"Target={target_cost_rate}"
+                    )
+            else:
+                # 처음부터 훈련 시작
+                current_cost_rate = 0.0
+                logger.info(
+                    f"Curriculum Learning: Starting fresh. cost=0.0. "
+                    f"Target={target_cost_rate}"
+                )
+            
+            vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
 
         def curriculum_callback(iteration: int, metrics: dict):
-            """Curriculum Learning: resume warmup 후 정상 스케줄"""
+            """Curriculum Learning: 정상 스케줄 (warmup 없음, 체크포인트 cost에서 이어서 진행)"""
             nonlocal current_cost_rate
             nonlocal target_cost_rate
+
+            # 매 iteration마다 체크포인트용 상태 업데이트
+            trainer.extra_checkpoint_state = {
+                'current_cost_rate': current_cost_rate
+            }
 
             if current_cost_rate >= target_cost_rate:
                 return
 
             total_iterations = metrics.get('total_iterations', 8000)
 
-            # ── Phase 1: Resume Warmup ─────────────────────────────────────────
-            # 재시작이 있는 경우(start_iteration > 0):
-            # cost=0 → resume_target으로 WARMUP_ITERS 동안 선형 증가
-            if start_iteration > 0:
-                iters_since_resume = iteration - start_iteration
-                if iters_since_resume <= WARMUP_ITERS:
-                    warmup_ratio = iters_since_resume / WARMUP_ITERS
-                    new_cost_rate = resume_target_cost * warmup_ratio
-                    if abs(new_cost_rate - current_cost_rate) > 1e-7:
-                        logger.info(
-                            f"Curriculum Warmup ({iters_since_resume}/{WARMUP_ITERS}): "
-                            f"Transaction cost {current_cost_rate:.6f} → {new_cost_rate:.6f}"
-                        )
-                        current_cost_rate = new_cost_rate
-                        vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
-                    return  # warmup 중에는 일반 스케줄 skip
-
-            # ── Phase 2: 정상 Curriculum 스케줄 ───────────────────────────────
+            # ── 정상 Curriculum 스케줄 ───────────────────────────────────
             # 0~5%: cost=0  /  5~20%: 선형 증가  /  20%+: 목표 유지
             progress = iteration / total_iterations
             if progress < 0.05:
@@ -666,6 +674,11 @@ def main():
                 )
                 current_cost_rate = new_cost_rate
                 vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
+            
+            # 변경 후에도 체크포인트 상태 갱신
+            trainer.extra_checkpoint_state = {
+                'current_cost_rate': current_cost_rate
+            }
 
 
         logger.info("[OK] Trainer created")
@@ -723,7 +736,10 @@ def main():
         
         # 최종 모델 저장
         final_model_path = os.path.join(config.output_dir, f'{config.env}_{config.policy}_model.pt')
-        trainer.save_checkpoint(final_model_path, final_metrics['num_updates'])
+        trainer.save_checkpoint(
+            final_model_path, final_metrics['num_updates'],
+            extra_state=trainer.extra_checkpoint_state if trainer.extra_checkpoint_state else None
+        )
         logger.info(f"  Final Model: {final_model_path}")
         
         # 정규화 통계 저장 (첫 번째 환경 기준)
