@@ -95,6 +95,10 @@ class GRPOPolicyE2E(nn.Module):
             - action_logits: 행동 로짓 (batch_size, action_dim)
             - state_value: 상태 가치 (batch_size, 1)
         """
+        # 안정성을 위한 NaN/Inf 처리 (데이터나 정규화에서 발생할 수 있는 이상값이 CUDA 에러를 유발하는 것 방지)
+        if torch.isnan(state).any() or torch.isinf(state).any():
+            state = torch.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
+            
         # (seq_len, obs_dim) 입력인 경우 배치 차원 추가
         if state.dim() == 2:
             state = state.unsqueeze(0)
@@ -102,14 +106,14 @@ class GRPOPolicyE2E(nn.Module):
         batch_size = state.size(0)
         
         # CNN 입력 형태 맞추기: (batch_size, channels, seq_len)
-        x = state.transpose(1, 2)
+        x = state.transpose(1, 2).contiguous()
         
         # CNN Layers
         x = F.relu(self.bn1(self.conv1(x)))
         x = F.relu(self.bn2(self.conv2(x)))
         
         # RNN 입력 형태 맞추기: (batch_size, seq_len, channels)
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2).contiguous()
         
         # GRU Layer
         self.gru.flatten_parameters()  # PyTorch contiguous memory warning 방지
@@ -180,11 +184,20 @@ class GRPOPolicyE2E(nn.Module):
         # Forward pass
         action_logits, state_values = self.forward(states)
         
+        # 네트워크 폭발로 인한 NaN 방지 (NaN일 경우 균등 분포 및 0 가치로 초기화)
+        if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
+            action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=1.0, neginf=-1.0)
+        if torch.isnan(state_values).any() or torch.isinf(state_values).any():
+            state_values = torch.nan_to_num(state_values, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         # 행동 확률 분포 생성
         dist = Categorical(logits=action_logits)
         
+        # 행동 범위 제한 (Out of bounds 인덱스로 인한 CUDA 메모리 에러 방지)
+        actions_safe = torch.clamp(actions, 0, self.action_dim - 1)
+        
         # 로그 확률 계산
-        log_probs = dist.log_prob(actions)
+        log_probs = dist.log_prob(actions_safe)
         
         # 엔트로피 계산
         entropy = dist.entropy()
