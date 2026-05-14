@@ -531,6 +531,8 @@ def main():
                     logger.info(f"  Rebuilt policy: cnn={config.cnn_channels}, rnn={config.rnn_hidden_dim}, fc={config.hidden_dim} ({total_params:,} params)")
                 
                 missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+                # MUST flatten parameters after loading state_dict for cuDNN
+                policy.gru.flatten_parameters()
                 if missing:
                     logger.warning(f"  Missing keys: {len(missing)}")
                 if unexpected:
