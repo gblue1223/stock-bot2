@@ -196,7 +196,8 @@ class GRPOPolicyE2E(nn.Module):
         dist = Categorical(logits=action_logits)
         
         # 행동 범위 제한 (Out of bounds 인덱스로 인한 CUDA 메모리 에러 방지)
-        actions_safe = torch.clamp(actions, 0, self.action_dim - 1)
+        # Categorical.log_prob은 내부적으로 gather()를 사용하므로 반드시 long 타입이어야 함
+        actions_safe = torch.clamp(actions.long(), 0, self.action_dim - 1)
         
         # 로그 확률 계산
         log_probs = dist.log_prob(actions_safe)

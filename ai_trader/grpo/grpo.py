@@ -644,6 +644,9 @@ class GRPOTrainer:
         
         # 현재 정책을 참조 정책으로 복사
         self.reference_policy.load_state_dict(self.policy.state_dict())
+        # GRU 가중치를 연속 메모리 블록으로 재정렬 (cuDNN 역전파 안정성)
+        if hasattr(self.reference_policy, 'gru'):
+            self.reference_policy.gru.flatten_parameters()
         self.reference_policy.eval()
         
         # 3. 여러 에포크 동안 정책 업데이트 (PPO의 multiple epochs)
@@ -668,7 +671,7 @@ class GRPOTrainer:
                 
                 # 미니 배치 데이터 슬라이싱 후 GPU 메모리로 이동 (VRAM 폭발 방지)
                 batch_states = states_tensor[batch_indices].to(self.device)
-                batch_actions = actions_tensor[batch_indices].to(self.device)
+                batch_actions = actions_tensor[batch_indices].long().to(self.device)
                 batch_old_log_probs = old_log_probs_tensor[batch_indices].to(self.device)
                 batch_advantages = advantages_tensor[batch_indices].to(self.device)
                 batch_returns = returns_tensor[batch_indices].to(self.device)
@@ -720,6 +723,10 @@ class GRPOTrainer:
                 )
                 
                 self.optimizer.step()
+                
+                # GRU 가중치 연속 메모리 보장 (optimizer.step이 가중치를 비연속적으로 만들 수 있음)
+                if hasattr(self.policy, 'gru'):
+                    self.policy.gru.flatten_parameters()
                 
                 # 10. KL 발산 계산 (조기 종료 체크)
                 with torch.no_grad():
