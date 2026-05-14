@@ -568,7 +568,15 @@ class GRPOTrainer:
                 
                 with torch.no_grad():
                     # 현재 정책에서 값 함수 추정 (evaluate_actions가 values 반환)
-                    _, _, values_ep = self.policy.evaluate_actions(states_tensor_ep, actions_tensor_ep)
+                    # 메모리 부족(CUDA illegal memory access) 방지를 위해 미니 배치 단위로 평가
+                    values_ep_list = []
+                    for start_i in range(0, len(states_tensor_ep), self.batch_size):
+                        end_i = min(start_i + self.batch_size, len(states_tensor_ep))
+                        batch_s = states_tensor_ep[start_i:end_i]
+                        batch_a = actions_tensor_ep[start_i:end_i]
+                        _, _, v = self.policy.evaluate_actions(batch_s, batch_a)
+                        values_ep_list.append(v)
+                    values_ep = torch.cat(values_ep_list, dim=0)
                     values_ep = values_ep.squeeze(-1).cpu().numpy() if values_ep.dim() > 1 else values_ep.cpu().numpy()
                 
                 # GAE 계산
