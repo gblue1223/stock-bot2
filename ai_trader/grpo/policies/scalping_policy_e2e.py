@@ -79,6 +79,9 @@ class GRPOPolicyE2E(nn.Module):
         logger.info(f"GRPOPolicyE2E initialized: obs_dim={obs_dim}, "
                    f"cnn_channels={cnn_channels}, rnn_hidden_dim={rnn_hidden_dim}, "
                    f"action_dim={action_dim}")
+                   
+        # Initialize GRU weights as contiguous
+        self.gru.flatten_parameters()
     
     def forward(
         self,
@@ -116,7 +119,6 @@ class GRPOPolicyE2E(nn.Module):
         x = x.transpose(1, 2).contiguous()
         
         # GRU Layer
-        self.gru.flatten_parameters()  # PyTorch contiguous memory warning 방지
         _, hidden = self.gru(x)
         # hidden의 형태: (num_layers, batch_size, rnn_hidden_dim)
         # 마지막 레이어의 은닉 상태를 사용
