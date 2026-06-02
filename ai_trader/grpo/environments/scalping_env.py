@@ -1035,43 +1035,45 @@ class GRPOScalpingEnv(gym.Env):
             truncated = True
         
         # 에피소드 종료 시 강제 청산 (통계용)
-        if (terminated or truncated) and self.position == 1:
-            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+        # 에피소드 종료 시 강제 청산 (통계용) 및 no_trade_penalty 적용
+        if terminated or truncated:
+            if self.position == 1:
+                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
+                weight = self.position_steps / self.max_split_count if self.max_split_count > 0 else 1.0
+                
+                # 가중치 적용된 실제 매도 및 수익 정산
+                profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
+                weighted_profit_reward = profit_rate * 100 * weight
+                exit_cost = self.transaction_cost_rate * 100 * weight
+                
+                final_trade_reward = weighted_profit_reward - exit_cost
+                
+                reward += final_trade_reward
+                if len(self.episode_rewards) > 0:
+                    self.episode_rewards[-1] += final_trade_reward
+                
+                _, reward_components = self._calculate_reward(
+                    self.avg_entry_price, self.current_price, holding_time
+                )
+                
+                self.episode_trades.append({
+                    'entry_price': self.avg_entry_price,
+                    'exit_price': self.current_price,
+                    'holding_time': holding_time,
+                    'profit_rate': profit_rate,
+                    'reward': final_trade_reward,
+                    'reward_components': reward_components,
+                    'weight': weight,
+                    'forced_liquidation': True
+                })
+                logger.debug(f"Forced liquidation on episode end: profit={profit_rate*100:.2f}%, reward={final_trade_reward:.4f}")
             
-            # 매도 비용 지불 (Dense Reward 관점)
-            final_step_penalty = -self.transaction_cost_rate * 100
-            
-            reward += final_step_penalty
-            if len(self.episode_rewards) > 0:
-                self.episode_rewards[-1] += final_step_penalty
-            
-            # 매도 비용 지불 (가중치 적용)
-            weight = self.position_steps / self.max_split_count
-            final_step_penalty = -self.transaction_cost_rate * 100 * weight
-            
-            reward += final_step_penalty
-            if len(self.episode_rewards) > 0:
-                self.episode_rewards[-1] += final_step_penalty
-            
-            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-            
-            # 통계용 기록 (가중치 반영된 최종 보상 근사치)
-            # 여기서는 편의상 단순 기록
-            _, reward_components = self._calculate_reward(
-                self.avg_entry_price, self.current_price, holding_time
-            )
-            
-            self.episode_trades.append({
-                'entry_price': self.avg_entry_price,
-                'exit_price': self.current_price,
-                'holding_time': holding_time,
-                'profit_rate': reward_components['profit_rate'],
-                'reward': reward,
-                'reward_components': reward_components,
-                'forced_liquidation': True
-            })
-            
-            logger.debug(f"Forced liquidation")
+            # 거래를 한 번도 안 한 경우 패널티 부여 (no-trade collapse 방지)
+            if len(self.episode_trades) == 0:
+                reward -= self.no_trade_penalty
+                if len(self.episode_rewards) > 0:
+                    self.episode_rewards[-1] -= self.no_trade_penalty
+                logger.debug(f"No trade penalty applied: -{self.no_trade_penalty}")
         
         # 현재 가격 및 시간 업데이트
         if not (terminated or truncated):
@@ -1115,9 +1117,12 @@ class GRPOScalpingEnv(gym.Env):
         Returns:
             에피소드 메타데이터 딕셔너리
         """
-        # 총 수익
-        total_return = sum(self.episode_rewards)
-        
+        # 총 수익 (거래별 net return의 합)
+        if self.episode_trades:
+            total_return = sum((t['profit_rate'] - self.round_trip_cost) * 100 * t.get('weight', 1.0) for t in self.episode_trades)
+        else:
+            total_return = -self.no_trade_penalty if self.no_trade_penalty > 0 else 0.0
+            
         # 거래 횟수
         num_trades = len(self.episode_trades)
         
@@ -1132,9 +1137,12 @@ class GRPOScalpingEnv(gym.Env):
         sharpe_ratio = 0.0
         epsilon = 1e-6  # near-zero 분모 방지 임계값
         if self.episode_trades and len(self.episode_trades) > 1:
-            trade_rewards = np.asarray([t['reward'] for t in self.episode_trades], dtype=np.float64)
-            mean_reward = float(np.mean(trade_rewards))
-            std_reward = float(np.std(trade_rewards))
+            trade_net_profits = np.asarray([
+                (t['profit_rate'] - self.round_trip_cost) * 100 * t.get('weight', 1.0)
+                for t in self.episode_trades
+            ], dtype=np.float64)
+            mean_reward = float(np.mean(trade_net_profits))
+            std_reward = float(np.std(trade_net_profits))
             if np.isfinite(std_reward) and std_reward >= epsilon:
                 sharpe_ratio = mean_reward / std_reward
         elif len(self.episode_rewards) > 1:
@@ -1144,17 +1152,23 @@ class GRPOScalpingEnv(gym.Env):
             if np.isfinite(std_reward) and std_reward >= epsilon:
                 sharpe_ratio = mean_reward / std_reward
         
-        # 승률 계산 (추가 메트릭)
+        # 승률 계산 (수익률이 왕복 거래비용을 초과하는 거래 비율)
         if self.episode_trades:
-            win_rate = np.mean([1 if t['reward'] > 0 else 0 for t in self.episode_trades])
+            win_rate = np.mean([1 if t['profit_rate'] > self.round_trip_cost else 0 for t in self.episode_trades])
         else:
             win_rate = 0.0
         
-        # 평균 거래당 수익 (추가 메트릭)
+        # 평균 거래당 수익 (가중치를 반영한 net profit의 평균)
         if self.episode_trades:
-            avg_profit_per_trade = np.mean([t['reward'] for t in self.episode_trades])
+            avg_profit_per_trade = np.mean([
+                (t['profit_rate'] - self.round_trip_cost) * 100 * t.get('weight', 1.0)
+                for t in self.episode_trades
+            ])
         else:
             avg_profit_per_trade = 0.0
+            
+        # 10.0 ~ 10.0 클리핑 적용 (Sharpe Ratio 안정화)
+        sharpe_ratio = float(np.clip(sharpe_ratio, -10.0, 10.0))
         
         metadata = {
             'total_return': float(total_return),
