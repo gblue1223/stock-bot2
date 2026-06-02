@@ -157,6 +157,7 @@ class TrainingConfig:
         self.early_exit_penalty = 0.2 # 최소 보유 시간 위반 페널티
         self.no_trade_penalty = 10.0  # 거래 안할 시 패널티 (기본값: 10.0)
         self.transaction_cost_rate = 0.00215  # 거래 수수료율
+        self.max_trades_per_episode = None  # 에피소드당 최대 거래 횟수
         
         # 디바이스
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -255,7 +256,8 @@ def create_environment(config: TrainingConfig, device: str):
             min_holding_time=config.min_holding_time,
             max_holding_time=config.max_holding_time,
             early_exit_penalty=config.early_exit_penalty,
-            no_trade_penalty=config.no_trade_penalty
+            no_trade_penalty=config.no_trade_penalty,
+            max_trades_per_episode=config.max_trades_per_episode
         )
         return env
     except Exception as e:
@@ -345,6 +347,8 @@ def main():
                         help='Penalty for making 0 trades in an episode (default: 10.0)')
     parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,
                         help='Target transaction cost rate (default: 0.00215)')
+    parser.add_argument('--max_trades_per_episode', type=int, default=None,
+                        help='Max trades allowed per episode (default: None/unlimited)')
     
     # ✅ 정규화 설정
     parser.add_argument('--use_raw_data',

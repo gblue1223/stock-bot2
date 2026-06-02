@@ -75,6 +75,8 @@ class GRPOScalpingEnv(gym.Env):
         max_split_count: int = 1,       # ✅ 최대 분할 매수 횟수
         min_holding_time: float = 2.0,  # ✅ 최소 보유 시간
         max_holding_time: float = 100.0,# ✅ 최대 보유 시간
+        no_trade_penalty: float = 10.0, # ✅ 거래 안할 시 패널티 (기본값: 10.0)
+        max_trades_per_episode: Optional[int] = None, # ✅ 최대 거래 횟수 제한
         device: str = 'cpu'
     ):
         super().__init__()
@@ -84,6 +86,8 @@ class GRPOScalpingEnv(gym.Env):
         self.max_split_count = max_split_count
         self.min_holding_time = min_holding_time
         self.max_holding_time = max_holding_time
+        self.no_trade_penalty = no_trade_penalty
+        self.max_trades_per_episode = max_trades_per_episode
         
         self.embedding_model = embedding_model
         self.embedding_model.eval()  # 추론 모드
@@ -838,9 +842,11 @@ class GRPOScalpingEnv(gym.Env):
         truncated = False
         quick_exit_triggered = False
         
-        # 1. 행동 실행
         if action == 1:  # 매수
-            if self.position_steps < self.max_split_count:
+            if self.position == 0 and self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode:
+                # 최대 거래 횟수 초과로 신규 진입 차단
+                pass
+            elif self.position_steps < self.max_split_count:
                 # 분할 매수 (또는 신규 진입)
                 old_steps = self.position_steps
                 new_steps = old_steps + 1
@@ -1030,6 +1036,10 @@ class GRPOScalpingEnv(gym.Env):
         if self.current_step >= self.episode_length - 1:
             terminated = True
         
+        # 에피소드 최대 거래 횟수 달성 체크 (포지션이 없을 때 조기 종료)
+        if self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode and self.position == 0:
+            terminated = True
+            
         # 최대 스텝 수 체크 (상대 스텝으로 계산)
         if self.max_episode_steps is not None and (self.current_step - (self.seq_len - 1)) >= self.max_episode_steps:
             truncated = True
