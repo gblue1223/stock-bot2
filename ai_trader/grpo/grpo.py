@@ -902,24 +902,6 @@ class GRPOTrainer:
                     extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
                 )
             
-            # 7. 진행률 및 예상 시간 계산
-            iteration_elapsed = time.time() - iteration_start_time
-            iteration_times.append(iteration_elapsed)
-            
-            # 최근 10개 iteration의 평균 시간으로 예상 시간 계산
-            recent_times = iteration_times[-10:]
-            avg_iteration_time = np.mean(recent_times)
-            remaining_iterations = num_iterations - (iteration + 1)
-            estimated_remaining_time = avg_iteration_time * remaining_iterations
-            
-            # 진행률 계산
-            progress_pct = (iteration + 1) / num_iterations * 100
-            
-            # 시간 포맷팅
-            elapsed_time = time.time() - start_time
-            elapsed_str = self._format_time(elapsed_time)
-            remaining_str = self._format_time(estimated_remaining_time)
-            
             # 평균 보상 및 추가 메트릭 계산
             mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
             

@@ -203,8 +203,11 @@ class TrainingConfig:
     def validate(self):
         """설정 검증"""
         errors = []
-        # V2 환경에서는 db_path가 더 이상 필수가 아님 (parquet_path 사용)
-        if self.db_path and not os.path.exists(self.db_path):
+        
+        # E2E: db_path 필수 체크를 먼저 수행
+        if not self.db_path:
+            errors.append("db_path is required for E2E training")
+        elif not os.path.exists(self.db_path):
             errors.append(f"Database not found: {self.db_path}")
         
         if self.env != 'scalping':
@@ -212,10 +215,6 @@ class TrainingConfig:
         
         if self.policy != 'grpo':
             errors.append(f"Only 'grpo' policy is supported (got: {self.policy})")
-        
-        # E2E: db_path required
-        if not self.db_path:
-             errors.append("db_path is required for E2E validation")
         
         if errors:
             error_msg = "Configuration validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
@@ -327,10 +326,7 @@ def main():
     parser.add_argument('--seq_len', type=int, default=None)
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
-    parser.add_argument('--embedding_model', type=str, default=None)
-    parser.add_argument('--parquet_path', type=str, default=None,
-                        help='Path to parquet embeddings directory (e.g. embeddings_v3)')
-    parser.add_argument('--embedding_dim', type=int, default=None)
+    # (E2E에서는 embedding 관련 인자 미사용 - 제거됨)
     parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
     
@@ -351,7 +347,9 @@ def main():
                         help='Target transaction cost rate (default: 0.00215)')
     
     # ✅ 정규화 설정
-    parser.add_argument('--use_raw_data', type=bool, default=None,
+    parser.add_argument('--use_raw_data',
+                        type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=None,
                         help='Use raw data with RollingNormalizer (default: True)')
     parser.add_argument('--rolling_window_size', type=int, default=None,
                         help='Rolling window size for normalization (default: 1000)')
@@ -401,13 +399,7 @@ def main():
         logger.info("[STEP 1/6] Loading configuration...")
         config = TrainingConfig(args.config)
         
-        # CLI 인자로 오버라이드
-        for key, value in vars(args).items():
-            if value is not None and key not in ('config', 'vram_preset') and hasattr(config, key):
-                setattr(config, key, value)
-                logger.debug(f"  Override: {key} = {value}")
-        
-        # vram_preset 적용 (개별 CLI보다 나중에 적용하여 최종 우선권 부여)
+        # vram_preset 적용 (기본값 역할, 개별 CLI 인자가 최종 우선)
         VRAM_PRESETS = {
             'small':  dict(cnn_channels=64,  rnn_hidden_dim=128,  hidden_dim=128,  batch_size=64),
             'medium': dict(cnn_channels=128, rnn_hidden_dim=256,  hidden_dim=256,  batch_size=128),
@@ -421,6 +413,12 @@ def main():
             logger.info(f"[VRAM Preset '{args.vram_preset}'] cnn={config.cnn_channels}, "
                        f"rnn={config.rnn_hidden_dim}, fc={config.hidden_dim}, "
                        f"batch={config.batch_size}")
+        
+        # CLI 인자로 최종 오버라이드 (개별 인자가 프리셋보다 우선)
+        for key, value in vars(args).items():
+            if value is not None and key not in ('config', 'vram_preset') and hasattr(config, key):
+                setattr(config, key, value)
+                logger.debug(f"  Override: {key} = {value}")
         
         # 설정 검증
         config.validate()
@@ -467,8 +465,11 @@ def main():
         
         logger.info(f"[OK] Environments created")
         
-        # 로깅을 위해 첫 번째 환경(생성하여 참조만 확인)
-        ref_env = create_environment(config, device)
+        # 로깅 참조용 환경 (DummyVecEnv는 내부 환경 직접 참조, SubprocVecEnv는 별도 생성)
+        if config.num_workers <= 1:
+            ref_env = vec_env.envs[0]
+        else:
+            ref_env = create_environment(config, device)
         logger.info(f"  Observation space: {ref_env.observation_space.shape}")
         logger.info(f"  Action space: {ref_env.action_space.n}")
         logger.info(f"  Avg Transaction Cost: {ref_env.transaction_cost_rate}")
@@ -582,6 +583,15 @@ def main():
             tensorboard_log_dir=tensorboard_dir
         )
         
+        # Optimizer 상태 복원 (체크포인트에서 재개 시)
+        if config.load_policy and 'checkpoint' in locals():
+            if isinstance(checkpoint, dict) and 'optimizer_state_dict' in checkpoint:
+                try:
+                    trainer.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    logger.info("[OK] Optimizer state restored from checkpoint")
+                except Exception as e:
+                    logger.warning(f"Could not restore optimizer state: {e}")
+        
         # 7. 커리큘럼 러닝 콜백 정의
         
         # Set transaction cost for all environments
@@ -616,7 +626,7 @@ def main():
             # ── 체크포인트에서 cost 복원 (보수적 방식) ───────────────────────
             # 체크포인트에 저장된 current_cost_rate가 있으면 그 값에서 바로 시작
             # 없으면(구 체크포인트) curriculum 스케줄에서 현재 iteration에 해당하는 cost 계산
-            if config.load_policy and 'restored_cost_rate' in dir():
+            if config.load_policy and 'restored_cost_rate' in locals():
                 if restored_cost_rate is not None:
                     # 체크포인트에 저장된 cost를 그대로 복원
                     current_cost_rate = restored_cost_rate
@@ -626,7 +636,7 @@ def main():
                     )
                 else:
                     # 구 체크포인트: extra_state 없음 → iteration 기반으로 cost 계산
-                    total_iter_for_calc = getattr(config, 'total_iterations', 8000)
+                    total_iter_for_calc = config.total_timesteps // 25  # total_timesteps / TIMESTEP_TO_ITERATION_RATIO
                     current_cost_rate = _calc_curriculum_cost(start_iteration, total_iter_for_calc, target_cost_rate)
                     logger.info(
                         f"Curriculum Learning: No saved cost in checkpoint. "
@@ -687,7 +697,8 @@ def main():
         
         # 5. 훈련 설정 출력
         episodes_per_iteration = config.episodes_per_group * config.num_groups
-        total_episodes = (config.total_timesteps // 25) * episodes_per_iteration
+        TIMESTEP_TO_ITERATION_RATIO = 25  # 1 iteration ≈ 25 timesteps
+        total_episodes = (config.total_timesteps // TIMESTEP_TO_ITERATION_RATIO) * episodes_per_iteration
         
         logger.info("=" * 80)
         logger.info("[STEP 5/6] Training Configuration:")
@@ -776,13 +787,12 @@ def main():
     
     finally:
         # 정리
-        if 'envs' in locals():
-            for i, e in enumerate(envs):
-                try:
-                    e.close()
-                except:
-                    pass
-            logger.debug(f"Closed {len(envs)} environments")
+        if 'vec_env' in locals():
+            try:
+                vec_env.close()
+                logger.debug("VecEnv closed")
+            except Exception:
+                pass
         
         if device == 'cuda':
             torch.cuda.empty_cache()
