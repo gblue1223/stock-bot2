@@ -11,8 +11,13 @@
 - Position: 포지션 정보 클래스
 """
 
-from ai_trader.grpo.inference.grpo_infer import GRPOInference
-from ai_trader.grpo.inference.enhanced_grpo_infer import EnhancedGRPOInference, Position, Action
-from ai_trader.grpo.inference.trade_logger import TradeLogger
+from .enhanced_grpo_infer_xlstm import GRPOInferenceE2EXLSTM, EnhancedGRPOInferenceXLSTM, Position, Action
+from .trade_logger import TradeLogger
 
-__all__ = ['GRPOInference', 'EnhancedGRPOInference', 'Position', 'Action', 'TradeLogger']
+__all__ = [
+    'GRPOInferenceE2EXLSTM',
+    'EnhancedGRPOInferenceXLSTM',
+    'Position',
+    'Action',
+    'TradeLogger'
+]
