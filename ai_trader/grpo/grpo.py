@@ -153,34 +153,33 @@ class GRPOTrainer:
                 obs_batch = np.stack(obs).astype(np.float32)
             
             with torch.no_grad():
-                states_tensor = torch.from_numpy(obs_batch).float().to(self.device, non_blocking=True)
+                states_tensor = torch.from_numpy(obs_batch).float().to(self.device)
                 
-                # 2. 정책에서 행동 샘플링 (Batched Inference under BF16 autocast)
+                # 2. 정책에서 행동 샘플링 (Batched Inference)
                 # DataParallel 클래스 등으로 래핑된 경우 unwrap
                 base_policy = getattr(self.policy, 'module', self.policy)
                 
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    if hasattr(base_policy, 'get_action'):
-                        try:
-                            actions, log_probs = base_policy.get_action(states_tensor, deterministic=False)
-                            if isinstance(actions, torch.Tensor):
-                                actions = actions.cpu().numpy()
-                            if isinstance(log_probs, torch.Tensor):
-                                log_probs = log_probs.float().cpu().numpy()
-                        except Exception as e:
-                            # Fallback: Loop if policy doesn't support batched get_action yet
-                            actions_list = []
-                            log_probs_list = []
-                            for i in range(num_envs):
-                                a, lp = self.policy.get_action(states_tensor[i:i+1], deterministic=False)
-                                actions_list.append(a.item() if isinstance(a, torch.Tensor) else a)
-                                log_probs_list.append(lp.item() if isinstance(lp, torch.Tensor) else lp)
-                            actions = np.array(actions_list)
-                            log_probs = np.array(log_probs_list)
-                    else:
-                        logger.error(f"Policy {type(base_policy)} missing get_action. Falling back to zeros.")
-                        actions = np.array([0]*num_envs, dtype=np.int64)
-                        log_probs = np.array([0.0]*num_envs, dtype=np.float32)
+                if hasattr(base_policy, 'get_action'):
+                    try:
+                        actions, log_probs = base_policy.get_action(states_tensor, deterministic=False)
+                        if isinstance(actions, torch.Tensor):
+                            actions = actions.cpu().numpy()
+                        if isinstance(log_probs, torch.Tensor):
+                            log_probs = log_probs.cpu().numpy()
+                    except Exception as e:
+                        # Fallback: Loop if policy doesn't support batched get_action yet
+                        actions_list = []
+                        log_probs_list = []
+                        for i in range(num_envs):
+                            a, lp = self.policy.get_action(states_tensor[i:i+1], deterministic=False)
+                            actions_list.append(a.item() if isinstance(a, torch.Tensor) else a)
+                            log_probs_list.append(lp.item() if isinstance(lp, torch.Tensor) else lp)
+                        actions = np.array(actions_list)
+                        log_probs = np.array(log_probs_list)
+                else:
+                    logger.error(f"Policy {type(base_policy)} missing get_action. Falling back to zeros.")
+                    actions = np.array([0]*num_envs, dtype=np.int64)
+                    log_probs = np.array([0.0]*num_envs, dtype=np.float32)
                     
             # 3. 환경 스텝 (멀티프로세스로 분산 전송 및 대기)
             # Ensure actions is a clean numpy int array before sending over pipes
@@ -671,54 +670,47 @@ class GRPOTrainer:
                 batch_indices = indices[start_idx:end_idx]
                 
                 # 미니 배치 데이터 슬라이싱 후 GPU 메모리로 이동 (VRAM 폭발 방지)
-                batch_states = states_tensor[batch_indices].to(self.device, non_blocking=True)
-                batch_actions = actions_tensor[batch_indices].long().to(self.device, non_blocking=True)
-                batch_old_log_probs = old_log_probs_tensor[batch_indices].to(self.device, non_blocking=True)
-                batch_advantages = advantages_tensor[batch_indices].to(self.device, non_blocking=True)
-                batch_returns = returns_tensor[batch_indices].to(self.device, non_blocking=True)
+                batch_states = states_tensor[batch_indices].to(self.device)
+                batch_actions = actions_tensor[batch_indices].long().to(self.device)
+                batch_old_log_probs = old_log_probs_tensor[batch_indices].to(self.device)
+                batch_advantages = advantages_tensor[batch_indices].to(self.device)
+                batch_returns = returns_tensor[batch_indices].to(self.device)
                 
-                # Autocast policy evaluation and loss computation to BF16 for speed/memory efficiency
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    # 4. 정책 평가
-                    log_probs, entropy, values = self.policy.evaluate_actions(
-                        batch_states, batch_actions
-                    )
-                    
-                    # 수치적 안정성을 위해 실수형 변환
-                    log_probs = log_probs.float()
-                    entropy = entropy.float()
-                    values = values.float()
-                    
-                    # 5. PPO 클리핑 목적 함수 계산
-                    # 확률 비율: r_t = π_θ(a|s) / π_θ_old(a|s)
-                    ratio = torch.exp(log_probs - batch_old_log_probs)
-                    
-                    # 클리핑되지 않은 목적 함수
-                    surr1 = ratio * batch_advantages
-                    
-                    # 클리핑된 목적 함수
-                    ratio_clipped = torch.clamp(
-                        ratio,
-                        1.0 - self.clip_epsilon,
-                        1.0 + self.clip_epsilon
-                    )
-                    surr2 = ratio_clipped * batch_advantages
-                    
-                    # 최소값 선택 (보수적 정책 업데이트)
-                    policy_loss = -torch.min(surr1, surr2).mean()
-                    
-                    # 6. 가치 손실 계산 (MSE)
-                    value_loss = F.mse_loss(values, batch_returns)
-                    
-                    # 7. 엔트로피 보너스 (탐험 장려)
-                    entropy_loss = -entropy.mean()
-                    
-                    # 8. 총 손실 계산
-                    loss = (
-                        policy_loss +
-                        self.value_coef * value_loss +
-                        self.entropy_coef * entropy_loss
-                    )
+                # 4. 정책 평가
+                log_probs, entropy, values = self.policy.evaluate_actions(
+                    batch_states, batch_actions
+                )
+                
+                # 5. PPO 클리핑 목적 함수 계산
+                # 확률 비율: r_t = π_θ(a|s) / π_θ_old(a|s)
+                ratio = torch.exp(log_probs - batch_old_log_probs)
+                
+                # 클리핑되지 않은 목적 함수
+                surr1 = ratio * batch_advantages
+                
+                # 클리핑된 목적 함수
+                ratio_clipped = torch.clamp(
+                    ratio,
+                    1.0 - self.clip_epsilon,
+                    1.0 + self.clip_epsilon
+                )
+                surr2 = ratio_clipped * batch_advantages
+                
+                # 최소값 선택 (보수적 정책 업데이트)
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # 6. 가치 손실 계산 (MSE)
+                value_loss = F.mse_loss(values, batch_returns)
+                
+                # 7. 엔트로피 보너스 (탐험 장려)
+                entropy_loss = -entropy.mean()
+                
+                # 8. 총 손실 계산
+                loss = (
+                    policy_loss +
+                    self.value_coef * value_loss +
+                    self.entropy_coef * entropy_loss
+                )
                 
                 # 9. 그래디언트 업데이트
                 self.optimizer.zero_grad()
@@ -738,12 +730,10 @@ class GRPOTrainer:
                 
                 # 10. KL 발산 계산 (조기 종료 체크)
                 with torch.no_grad():
-                    # Autocast reference policy evaluation
-                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                        ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
-                            batch_states, batch_actions
-                        )
-                        ref_log_probs = ref_log_probs.float()
+                    # 참조 정책의 로그 확률
+                    ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
+                        batch_states, batch_actions
+                    )
                     
                     # KL 발산: KL(π_old || π_new)
                     kl_divergence = (batch_old_log_probs - log_probs).mean()
@@ -1144,26 +1134,23 @@ class GRPOTrainer:
             iteration: 현재 반복 횟수
             extra_state: 추가 상태 (예: curriculum cost rate 등)
         """
-        # 만약 모델이 컴파일된 상태라면 실제 원본 모델 추출
-        actual_policy = self.policy._orig_mod if hasattr(self.policy, '_orig_mod') else self.policy
-        
         # 정책 타입 및 설정 정보 추출
-        policy_class_name = actual_policy.__class__.__name__
+        policy_class_name = self.policy.__class__.__name__
         policy_config = {
             'policy_type': policy_class_name,
-            'action_dim': actual_policy.action_dim if hasattr(actual_policy, 'action_dim') else 3,
-            'hidden_dim': actual_policy.hidden_dim if hasattr(actual_policy, 'hidden_dim') else 128,
+            'action_dim': self.policy.action_dim if hasattr(self.policy, 'action_dim') else 3,
+            'hidden_dim': self.policy.hidden_dim if hasattr(self.policy, 'hidden_dim') else 128,
         }
         
         # GRPOPolicy의 경우 embedding_dim 저장
-        if hasattr(actual_policy, 'embedding_dim'):
-            policy_config['embedding_dim'] = actual_policy.embedding_dim
+        if hasattr(self.policy, 'embedding_dim'):
+            policy_config['embedding_dim'] = self.policy.embedding_dim
         
         checkpoint = {
             'iteration': iteration,
             'total_timesteps': self.total_timesteps,
             'num_updates': self.num_updates,
-            'policy_state_dict': actual_policy.state_dict(),
+            'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': {
                 'episodes_per_group': self.episodes_per_group,

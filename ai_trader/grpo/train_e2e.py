@@ -34,15 +34,6 @@ from ai_trader.grpo.grpo import GRPOTrainer
 from ai_trader.grpo.inference.trade_logger import TradeLogger
 from ai_trader.grpo.policies.scalping_policy_e2e import GRPOPolicyE2E
 
-# GPU Acceleration Configs (Tensor Core TF32 & cuDNN Auto-tuner)
-if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision('high')
-    logging.getLogger(__name__).info("🚀 CUDA & Tensor Core optimizations enabled (TF32, cuDNN Benchmark)")
-
-
 # ========================================
 # 로깅 설정 (live_trading.py 패턴)
 # ========================================
@@ -574,13 +565,6 @@ def main():
                 logger.error(f"Failed to load policy: {e}", exc_info=True)
                 raise
         
-        # Compile model for PyTorch 2.x acceleration (fuses CNN & GRU operations)
-        try:
-            policy = torch.compile(policy)
-            logger.info("🚀 Policy model JIT-compiled with torch.compile")
-        except Exception as e:
-            logger.warning(f"Failed to compile policy model (using standard PyTorch): {e}")
-
         # 4. 훈련기 설정
         logger.info("[STEP 4/6] Creating trainer...")
         os.makedirs(config.output_dir, exist_ok=True)
