@@ -17,7 +17,30 @@ from datetime import datetime, timedelta  # ✅ 시간 계산용 추가
 # ✅ RollingNormalizer import
 from lib.rolling_normalization import RollingNormalizer
 
-logger = logging.getLogger(__name__)
+import inspect
+
+class ContextLogger:
+    def __init__(self, default_logger):
+        self.default_logger = default_logger
+
+    def _get_logger(self):
+        try:
+            frame = inspect.currentframe()
+            if frame and frame.f_back and frame.f_back.f_back:
+                caller_self = frame.f_back.f_back.f_locals.get('self', None)
+                if caller_self is not None:
+                    return logging.getLogger(caller_self.__class__.__module__)
+        except Exception:
+            pass
+        return self.default_logger
+
+    def info(self, msg, *args, **kwargs): self._get_logger().info(msg, *args, **kwargs)
+    def debug(self, msg, *args, **kwargs): self._get_logger().debug(msg, *args, **kwargs)
+    def warning(self, msg, *args, **kwargs): self._get_logger().warning(msg, *args, **kwargs)
+    def error(self, msg, *args, **kwargs): self._get_logger().error(msg, *args, **kwargs)
+    def critical(self, msg, *args, **kwargs): self._get_logger().critical(msg, *args, **kwargs)
+
+logger = ContextLogger(logging.getLogger(__name__))
 
 
 class GRPOScalpingEnv(gym.Env):
