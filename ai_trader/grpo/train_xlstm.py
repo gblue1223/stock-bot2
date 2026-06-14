@@ -204,14 +204,78 @@ def create_policy(config: TrainingConfig, env, device: str):
 def main():
     parser = argparse.ArgumentParser(description='xLSTM 기반 GRPO E2E 훈련')
     parser.add_argument('--config', type=str, default=None, help='JSON 설정 파일')
-    parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--db', dest='db_path', type=str, default=None)
+    parser.add_argument('--debug', action='store_true', help='Enable DEBUG logging')
+    
+    # 데이터
+    parser.add_argument('--db', dest='db_path', type=str, default=None, help='Database path')
+    parser.add_argument('--table', dest='table_name', type=str, default=None, help='Table name')
     parser.add_argument('--extracted_dir', type=str, default=None, help='추출 데이터 디렉토리 경로')
-    parser.add_argument('--num_workers', type=int, default=None)
+    
+    # 기타 인자들
+    parser.add_argument('--seq_len', type=int, default=None)
+    parser.add_argument('--features', type=int, default=None)
+    parser.add_argument('--episode_steps', type=int, default=None)
+    parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
+    parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
+    
+    # 손절 및 분할 매수 설정
+    parser.add_argument('--stop_loss', dest='stop_loss_pct', type=float, default=None,
+                        help='Stop loss percentage (default: 2.0)')
+    parser.add_argument('--max_split', dest='max_split_count', type=int, default=None,
+                        help='Max split buy count (default: 1)')
+    parser.add_argument('--min_holding', dest='min_holding_time', type=float, default=None,
+                        help='Min holding time in seconds (default: 2)')
+    parser.add_argument('--max_holding', dest='max_holding_time', type=float, default=None,
+                        help='Max holding time in seconds (default: 100)')
+    parser.add_argument('--early_exit_penalty', type=float, default=None,
+                        help='Penalty for early exit before min_holding (default: 0.2)')
+    parser.add_argument('--no_trade_penalty', type=float, default=None,
+                        help='Penalty for making 0 trades in an episode (default: 10.0)')
+    parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,
+                        help='Target transaction cost rate (default: 0.00215)')
+    parser.add_argument('--max_trades_per_episode', type=int, default=None,
+                        help='Max trades allowed per episode (default: None/unlimited)')
+    
+    # 정규화 설정
+    parser.add_argument('--use_raw_data',
+                        type=lambda x: x.lower() in ('true', '1', 'yes'),
+                        default=None,
+                        help='Use raw data with RollingNormalizer (default: True)')
+    parser.add_argument('--rolling_window_size', type=int, default=None,
+                        help='Rolling window size for normalization (default: 1000)')
+    parser.add_argument('--rolling_min_samples', type=int, default=None,
+                        help='Minimum samples for normalization (default: 100)')
+    
+    # 정책 설정
+    parser.add_argument('--hidden_dim', type=int, default=None,
+                        help='FC hidden layer dim (default: 128)')
+    parser.add_argument('--cnn_channels', type=int, default=None,
+                        help='CNN filter count (default:64, large:128, xlarge:256)')
+    parser.add_argument('--rnn_hidden_dim', type=int, default=None,
+                        help='xLSTM hidden size (default:128, large:256, xlarge:512)')
+    parser.add_argument('--vram_preset', choices=['small', 'medium', 'large', 'xlarge'], default=None,
+                        help=(
+                            'VRAM 사용량 프리셋 (개별 옵션보다 우선 적용).\n'
+                            '  small  : cnn=64,  rnn=128, fc=128, batch=64   (~4GB)\n'
+                            '  medium : cnn=128, rnn=256, fc=256, batch=128  (~8GB)\n'
+                            '  large  : cnn=256, rnn=512, fc=512, batch=256  (~16GB)\n'
+                            '  xlarge : cnn=512, rnn=1024,fc=1024,batch=512  (~24GB+)'
+                        ))
+    parser.add_argument('--action_dim', type=int, default=None)
+    parser.add_argument('--episodes_per_group', type=int, default=None)
+    parser.add_argument('--num_groups', type=int, default=None)
+    parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--gamma', type=float, default=None)
+    parser.add_argument('--clip', type=float, default=None)
+    parser.add_argument('--kl_target', type=float, default=None)
+    parser.add_argument('--entropy_coef', type=float, default=None)
+    parser.add_argument('--value_coef', type=float, default=None)
+    parser.add_argument('--max_grad_norm', type=float, default=None)
     parser.add_argument('--total_timesteps', type=int, default=None)
-    parser.add_argument('--vram_preset', choices=['small', 'medium', 'large', 'xlarge'], default=None)
+    parser.add_argument('--batch_size', type=int, default=None, help='Mini-batch size for PPO updates (default: 64)')
+    parser.add_argument('--checkpoint_interval', type=int, default=None)
     parser.add_argument('--output_dir', type=str, default=None)
-    parser.add_argument('--load_policy', type=str, default=None, help='체크포인트 pt 파일')
+    parser.add_argument('--load_policy', type=str, default=None)
     
     args = parser.parse_args()
     
