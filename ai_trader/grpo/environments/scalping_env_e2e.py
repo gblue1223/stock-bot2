@@ -82,6 +82,8 @@ class GRPOScalpingEnv(gym.Env):
         seq_len: int = 3000,
         expected_features: int = 28,
         transaction_cost_rate: float = 0.00215,
+        buy_tax_rate: float = 0.0,
+        sell_tax_rate: float = 0.0018,
         no_trade_penalty: float = 10.0,
         quick_exit_penalty: float = 0.01,
         quick_exit_threshold: float = 1.5,
@@ -116,7 +118,15 @@ class GRPOScalpingEnv(gym.Env):
         
         # 거래 비용 설정
         self.transaction_cost_rate = transaction_cost_rate
-        self.round_trip_cost = transaction_cost_rate * 2  # 왕복 거래비용: 0.43%
+        self.buy_tax_rate = buy_tax_rate
+        self.sell_tax_rate = sell_tax_rate
+        
+        # 커리큘럼 러닝 스케일링용 타겟 값 저장
+        self.target_transaction_cost_rate = transaction_cost_rate
+        self.target_buy_tax_rate = buy_tax_rate
+        self.target_sell_tax_rate = sell_tax_rate
+        
+        self.round_trip_cost = (transaction_cost_rate + buy_tax_rate) + (transaction_cost_rate + sell_tax_rate)
         
         # 빠른 손절 룰 설정
         self.quick_exit_threshold = quick_exit_threshold
@@ -711,12 +721,17 @@ class GRPOScalpingEnv(gym.Env):
         Args:
            rate: 새로운 거래 비용율 (예: 0.00215)
         """
+        if self.target_transaction_cost_rate > 0:
+            ratio = rate / self.target_transaction_cost_rate
+            self.buy_tax_rate = self.target_buy_tax_rate * ratio
+            self.sell_tax_rate = self.target_sell_tax_rate * ratio
         self.transaction_cost_rate = rate
-        # 왕복 비용(매수/매도 각각 적용된다고 가정하면 2배, or 이미 구현된 로직에 맞춤)
-        # _calculate_reward logic: 수수료+세금 = 0.215%, 왕복 0.43%
-        # self.round_trip_cost는 calculate_reward에서 쓰임
-        self.round_trip_cost = rate * 2
-        logger.info(f"Transaction cost rate updated to {rate:.6f} (Round trip: {self.round_trip_cost:.6f})")
+        self.round_trip_cost = (self.transaction_cost_rate + self.buy_tax_rate) + (self.transaction_cost_rate + self.sell_tax_rate)
+        logger.info(
+            f"Transaction cost updated: rate={self.transaction_cost_rate:.6f}, "
+            f"buy_tax={self.buy_tax_rate:.6f}, sell_tax={self.sell_tax_rate:.6f} "
+            f"(Round trip: {self.round_trip_cost:.6f})"
+        )
 
     def _check_quick_exit_penalty_only(self, holding_time: float) -> Tuple[float, bool]:
         """
@@ -763,7 +778,7 @@ class GRPOScalpingEnv(gym.Env):
         weight = self.position_steps / self.max_split_count if self.max_split_count > 0 else 1.0
         
         # 매도 비용 지불
-        exit_cost = self.transaction_cost_rate * 100 * weight
+        exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100 * weight
         
         # 거래 통계용 계산
         realized_reward, reward_components = self._calculate_reward(
@@ -905,7 +920,7 @@ class GRPOScalpingEnv(gym.Env):
                 # 매수 비용 차감 (1회분 = 1/max_split)
                 # 예: 10분할이면 전체 자산의 10%만 매수했으므로 비용도 10%만 발생
                 buy_weight = 1.0 / self.max_split_count
-                reward -= self.transaction_cost_rate * 100 * buy_weight
+                reward -= (self.transaction_cost_rate + self.buy_tax_rate) * 100 * buy_weight
                 
                 logger.debug(f"Buy (Step {new_steps}/{self.max_split_count}): "
                            f"price={self.current_price:.1f}, "
@@ -939,7 +954,7 @@ class GRPOScalpingEnv(gym.Env):
                     weight = self.position_steps / self.max_split_count
                     
                     # 매도 비용 차감 (보유 수량만큼)
-                    reward -= self.transaction_cost_rate * 100 * weight
+                    reward -= (self.transaction_cost_rate + self.sell_tax_rate) * 100 * weight
                     
                     # 수익률 계산 (평단가 기준)
                     profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
@@ -1095,7 +1110,7 @@ class GRPOScalpingEnv(gym.Env):
                 # 가중치 적용된 실제 매도 및 수익 정산
                 profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
                 weighted_profit_reward = profit_rate * 100 * weight
-                exit_cost = self.transaction_cost_rate * 100 * weight
+                exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100 * weight
                 
                 final_trade_reward = weighted_profit_reward - exit_cost
                 
