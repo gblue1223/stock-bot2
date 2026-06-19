@@ -149,6 +149,7 @@ class TrainingConfig:
             errors.append("Either db_path or extracted_dir is required")
         elif self.extracted_dir and not os.path.exists(self.extracted_dir):
             logger.warning(f"extracted_dir ({self.extracted_dir}) not found. Falling back to DB checking.")
+            self.extracted_dir = None
             if not self.db_path:
                 errors.append("extracted_dir not found and no db_path specified")
             elif not os.path.exists(self.db_path):
@@ -421,69 +422,10 @@ def main():
             tensorboard_log_dir=tensorboard_dir
         )
         
-        # 커리큘럼 콜백 설정 (train_e2e와 동일)
-        current_cost_rate = 0.0
-        target_cost_rate = config.transaction_cost_rate
-        
-        if target_cost_rate > 0:
-            if config.load_policy and 'restored_cost_rate' in locals():
-                if restored_cost_rate is not None:
-                    # 체크포인트에 저장된 cost를 복원하되, 새 타겟 비용보다 크면 타겟 비용으로 제한
-                    current_cost_rate = min(restored_cost_rate, target_cost_rate)
-                    logger.info(
-                        f"Curriculum Learning: Restored cost={restored_cost_rate:.6f} from checkpoint. "
-                        f"Applied cost (capped at target)={current_cost_rate:.6f}. "
-                        f"Target={target_cost_rate}"
-                    )
-                else:
-                    # 구 체크포인트: iteration 기반으로 cost 계산
-                    total_iter_for_calc = config.total_timesteps // 25
-                    progress_approx = start_iteration / total_iter_for_calc
-                    if progress_approx < 0.05:
-                        current_cost_rate = 0.0
-                    elif progress_approx < 0.20:
-                        current_cost_rate = target_cost_rate * ((progress_approx - 0.05) / 0.15)
-                    else:
-                        current_cost_rate = target_cost_rate
-                    logger.info(
-                        f"Curriculum Learning: No saved cost in checkpoint. "
-                        f"Computed cost={current_cost_rate:.6f} for iter={start_iteration}. "
-                        f"Target={target_cost_rate}"
-                    )
-            else:
-                current_cost_rate = 0.0
-                logger.info(
-                    f"Curriculum Learning: Starting fresh. cost=0.0. "
-                    f"Target={target_cost_rate}"
-                )
-                
+        # 7. 고정 거래 비용 적용 (커리큘럼 미사용)
+        current_cost_rate = config.transaction_cost_rate
         vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
-        
-        def curriculum_callback(iteration: int, metrics: dict):
-            nonlocal current_cost_rate
-            nonlocal target_cost_rate
-            
-            trainer.extra_checkpoint_state = {'current_cost_rate': current_cost_rate}
-            if current_cost_rate >= target_cost_rate:
-                return
-                
-            total_iterations = metrics.get('total_iterations', 8000)
-            progress = iteration / total_iterations
-            
-            if progress < 0.05:
-                new_cost_rate = 0.0
-            elif progress < 0.20:
-                ratio = (progress - 0.05) / 0.15
-                new_cost_rate = target_cost_rate * ratio
-            else:
-                new_cost_rate = target_cost_rate
-                
-            if abs(new_cost_rate - current_cost_rate) > 1e-7:
-                logger.info(f"Curriculum Update: {current_cost_rate:.6f} -> {new_cost_rate:.6f}")
-                current_cost_rate = new_cost_rate
-                vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
-                
-            trainer.extra_checkpoint_state = {'current_cost_rate': current_cost_rate}
+        logger.info(f"[OK] Fixed transaction cost rate applied: {current_cost_rate:.6f}")
 
         # 훈련 관련 메트릭스 출력
         episodes_per_iteration = config.episodes_per_group * config.num_groups
@@ -508,7 +450,7 @@ def main():
             total_episodes=total_episodes,
             checkpoint_interval=config.checkpoint_interval,
             checkpoint_path=checkpoint_path,
-            on_iteration_end=curriculum_callback,
+            on_iteration_end=None,
             start_iteration=start_iteration
         )
         

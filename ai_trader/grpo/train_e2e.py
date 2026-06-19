@@ -616,107 +616,10 @@ def main():
                 except Exception as e:
                     logger.warning(f"Could not restore optimizer state: {e}")
         
-        # 7. 커리큘럼 러닝 콜백 정의
-        
-        # Set transaction cost for all environments
-        current_cost_rate = 0.0
-        target_cost_rate = config.transaction_cost_rate
-        
-        # Use first env to determine initial settings if not overridden
-        initial_env_cost = ref_env.transaction_cost_rate
-        
-        def _calc_curriculum_cost(iter_num: int, total_iter: int, t_rate: float) -> float:
-             """주어진 iteration 번호에 맞는 curriculum 수수료 계산"""
-             progress = iter_num / total_iter
-             if progress < 0.05:
-                 return 0.0
-             elif progress < 0.20:
-                 ratio = (progress - 0.05) / 0.15
-                 return t_rate * ratio
-             else:
-                 return t_rate
-
-        if hasattr(args, 'transaction_cost_rate') and args.transaction_cost_rate is not None and args.transaction_cost_rate > 0:
-             target_cost_rate = args.transaction_cost_rate
-        else:
-             if initial_env_cost > 0:
-                 target_cost_rate = initial_env_cost
-             else:
-                 current_cost_rate = initial_env_cost
-                 target_cost_rate = initial_env_cost
-                 logger.info(f"Curriculum Learning: Transaction cost already {current_cost_rate}. No curriculum applied.")
-
-        if target_cost_rate > 0:
-            # ── 체크포인트에서 cost 복원 (보수적 방식) ───────────────────────
-            # 체크포인트에 저장된 current_cost_rate가 있으면 그 값에서 바로 시작
-            # 없으면(구 체크포인트) curriculum 스케줄에서 현재 iteration에 해당하는 cost 계산
-            if config.load_policy and 'restored_cost_rate' in locals():
-                if restored_cost_rate is not None:
-                    # 체크포인트에 저장된 cost를 복원하되, 새 타겟 비용보다 크면 타겟 비용으로 제한
-                    current_cost_rate = min(restored_cost_rate, target_cost_rate)
-                    logger.info(
-                        f"Curriculum Learning: Restored cost={restored_cost_rate:.6f} from checkpoint. "
-                        f"Applied cost (capped at target)={current_cost_rate:.6f}. "
-                        f"Target={target_cost_rate}"
-                    )
-                else:
-                    # 구 체크포인트: extra_state 없음 → iteration 기반으로 cost 계산
-                    total_iter_for_calc = config.total_timesteps // 25  # total_timesteps / TIMESTEP_TO_ITERATION_RATIO
-                    current_cost_rate = _calc_curriculum_cost(start_iteration, total_iter_for_calc, target_cost_rate)
-                    logger.info(
-                        f"Curriculum Learning: No saved cost in checkpoint. "
-                        f"Computed cost={current_cost_rate:.6f} for iter={start_iteration}. "
-                        f"Target={target_cost_rate}"
-                    )
-            else:
-                # 처음부터 훈련 시작
-                current_cost_rate = 0.0
-                logger.info(
-                    f"Curriculum Learning: Starting fresh. cost=0.0. "
-                    f"Target={target_cost_rate}"
-                )
-            
-            vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
-
-        def curriculum_callback(iteration: int, metrics: dict):
-            """Curriculum Learning: 정상 스케줄 (warmup 없음, 체크포인트 cost에서 이어서 진행)"""
-            nonlocal current_cost_rate
-            nonlocal target_cost_rate
-
-            # 매 iteration마다 체크포인트용 상태 업데이트
-            trainer.extra_checkpoint_state = {
-                'current_cost_rate': current_cost_rate
-            }
-
-            if current_cost_rate >= target_cost_rate:
-                return
-
-            total_iterations = metrics.get('total_iterations', 8000)
-
-            # ── 정상 Curriculum 스케줄 ───────────────────────────────────
-            # 0~5%: cost=0  /  5~20%: 선형 증가  /  20%+: 목표 유지
-            progress = iteration / total_iterations
-            if progress < 0.05:
-                new_cost_rate = 0.0
-            elif progress < 0.20:
-                ratio = (progress - 0.05) / 0.15
-                new_cost_rate = target_cost_rate * ratio
-            else:
-                new_cost_rate = target_cost_rate
-
-            if abs(new_cost_rate - current_cost_rate) > 1e-7:
-                logger.info(
-                    f"Curriculum Update (progress={progress:.1%}): "
-                    f"Transaction cost {current_cost_rate:.6f} → {new_cost_rate:.6f}"
-                )
-                current_cost_rate = new_cost_rate
-                vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
-            
-            # 변경 후에도 체크포인트 상태 갱신
-            trainer.extra_checkpoint_state = {
-                'current_cost_rate': current_cost_rate
-            }
-
+        # 7. 고정 거래 비용 적용 (커리큘럼 미사용)
+        current_cost_rate = config.transaction_cost_rate
+        vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
+        logger.info(f"[OK] Fixed transaction cost rate applied: {current_cost_rate:.6f}")
 
         logger.info("[OK] Trainer created")
         
@@ -757,7 +660,7 @@ def main():
             total_episodes=total_episodes,
             checkpoint_interval=config.checkpoint_interval,
             checkpoint_path=checkpoint_path,
-            on_iteration_end=curriculum_callback,
+            on_iteration_end=None,
             start_iteration=start_iteration
         )
         

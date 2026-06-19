@@ -53,7 +53,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
         extracted_dir: Optional[str] = None  # ✅ 추가: 사전 추출 데이터 디렉토리
     ):
-        self.extracted_dir = Path(extracted_dir) if extracted_dir else None
+        self.extracted_dir = Path(extracted_dir) if (extracted_dir and os.path.exists(extracted_dir)) else None
         self.manifest_data = None
         
         # extracted_dir가 있는 경우 db_path를 더미로 전달하여 초기 통과
