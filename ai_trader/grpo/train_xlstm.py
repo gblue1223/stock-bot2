@@ -377,6 +377,13 @@ def main():
                     missing, unexpected = policy.load_state_dict(state_dict, strict=False)
                     logger.info("  Checkpoint loaded successfully.")
                     
+                # 체크포인트에서 extra_state 복원 (curriculum cost rate 등)
+                restored_cost_rate = None
+                if isinstance(checkpoint, dict) and 'extra_state' in checkpoint:
+                    extra = checkpoint['extra_state']
+                    restored_cost_rate = extra.get('current_cost_rate', None)
+                    logger.info(f"[RESTORE] Extra state found: {extra}")
+                    
                 # Iteration 정보 복원
                 try:
                     import re
@@ -418,6 +425,38 @@ def main():
         current_cost_rate = 0.0
         target_cost_rate = config.transaction_cost_rate
         
+        if target_cost_rate > 0:
+            if config.load_policy and 'restored_cost_rate' in locals():
+                if restored_cost_rate is not None:
+                    # 체크포인트에 저장된 cost를 복원하되, 새 타겟 비용보다 크면 타겟 비용으로 제한
+                    current_cost_rate = min(restored_cost_rate, target_cost_rate)
+                    logger.info(
+                        f"Curriculum Learning: Restored cost={restored_cost_rate:.6f} from checkpoint. "
+                        f"Applied cost (capped at target)={current_cost_rate:.6f}. "
+                        f"Target={target_cost_rate}"
+                    )
+                else:
+                    # 구 체크포인트: iteration 기반으로 cost 계산
+                    total_iter_for_calc = config.total_timesteps // 25
+                    progress_approx = start_iteration / total_iter_for_calc
+                    if progress_approx < 0.05:
+                        current_cost_rate = 0.0
+                    elif progress_approx < 0.20:
+                        current_cost_rate = target_cost_rate * ((progress_approx - 0.05) / 0.15)
+                    else:
+                        current_cost_rate = target_cost_rate
+                    logger.info(
+                        f"Curriculum Learning: No saved cost in checkpoint. "
+                        f"Computed cost={current_cost_rate:.6f} for iter={start_iteration}. "
+                        f"Target={target_cost_rate}"
+                    )
+            else:
+                current_cost_rate = 0.0
+                logger.info(
+                    f"Curriculum Learning: Starting fresh. cost=0.0. "
+                    f"Target={target_cost_rate}"
+                )
+                
         vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
         
         def curriculum_callback(iteration: int, metrics: dict):

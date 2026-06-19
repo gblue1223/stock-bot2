@@ -652,10 +652,11 @@ def main():
             # 없으면(구 체크포인트) curriculum 스케줄에서 현재 iteration에 해당하는 cost 계산
             if config.load_policy and 'restored_cost_rate' in locals():
                 if restored_cost_rate is not None:
-                    # 체크포인트에 저장된 cost를 그대로 복원
-                    current_cost_rate = restored_cost_rate
+                    # 체크포인트에 저장된 cost를 복원하되, 새 타겟 비용보다 크면 타겟 비용으로 제한
+                    current_cost_rate = min(restored_cost_rate, target_cost_rate)
                     logger.info(
-                        f"Curriculum Learning: Restored cost={current_cost_rate:.6f} from checkpoint. "
+                        f"Curriculum Learning: Restored cost={restored_cost_rate:.6f} from checkpoint. "
+                        f"Applied cost (capped at target)={current_cost_rate:.6f}. "
                         f"Target={target_cost_rate}"
                     )
                 else:

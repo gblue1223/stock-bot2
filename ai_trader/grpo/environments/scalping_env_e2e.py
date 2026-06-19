@@ -728,7 +728,7 @@ class GRPOScalpingEnv(gym.Env):
            rate: 새로운 거래 비용율 (예: 0.00215)
         """
         if self.target_transaction_cost_rate > 0:
-            ratio = rate / self.target_transaction_cost_rate
+            ratio = min(1.0, rate / self.target_transaction_cost_rate)
             self.buy_tax_rate = self.target_buy_tax_rate * ratio
             self.sell_tax_rate = self.target_sell_tax_rate * ratio
         self.transaction_cost_rate = rate
