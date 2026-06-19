@@ -33,7 +33,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         transaction_cost_rate: float = 0.00215,
         buy_tax_rate: float = 0.0,
         sell_tax_rate: float = 0.0018,
-        no_trade_penalty: float = 10.0,
+        no_trade_penalty: float = 0.0,
         quick_exit_penalty: float = 0.01,
         quick_exit_threshold: float = 1.5,
         quick_exit_mode: str = 'penalty_only',
@@ -48,6 +48,9 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         max_holding_time: float = 100.0,
         early_exit_penalty: float = 0.2,
         max_trades_per_episode: Optional[int] = None,
+        step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
+        win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
+        loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
         extracted_dir: Optional[str] = None  # ✅ 추가: 사전 추출 데이터 디렉토리
     ):
         self.extracted_dir = Path(extracted_dir) if extracted_dir else None
@@ -78,7 +81,10 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             min_holding_time=min_holding_time,
             max_holding_time=max_holding_time,
             early_exit_penalty=early_exit_penalty,
-            max_trades_per_episode=max_trades_per_episode
+            max_trades_per_episode=max_trades_per_episode,
+            step_reward_scale=step_reward_scale,
+            win_bonus=win_bonus,
+            loss_penalty=loss_penalty
         )
         
         if self.extracted_dir:

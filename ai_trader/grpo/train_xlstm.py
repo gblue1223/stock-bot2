@@ -107,11 +107,14 @@ class TrainingConfig:
         self.min_holding_time = 2
         self.max_holding_time = 100
         self.early_exit_penalty = 0.2
-        self.no_trade_penalty = 10.0
+        self.no_trade_penalty = 0.0
         self.transaction_cost_rate = 0.00015  # 기본 거래 수수료율 (0.015%)
         self.buy_tax_rate = 0.0                # 매수 세금 (0%)
         self.sell_tax_rate = 0.0018            # 매도 세금 (0.18%)
         self.max_trades_per_episode = None
+        self.step_reward_scale = 1.0  # Dense step reward 스케일 비율
+        self.win_bonus = 5.0          # 승리 보너스
+        self.loss_penalty = 0.3       # 손실 페널티
         
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
@@ -180,6 +183,9 @@ def create_environment(config: TrainingConfig, device: str):
             early_exit_penalty=config.early_exit_penalty,
             no_trade_penalty=config.no_trade_penalty,
             max_trades_per_episode=config.max_trades_per_episode,
+            step_reward_scale=config.step_reward_scale,
+            win_bonus=config.win_bonus,
+            loss_penalty=config.loss_penalty,
             extracted_dir=config.extracted_dir
         )
     except Exception as e:
@@ -234,7 +240,7 @@ def main():
     parser.add_argument('--early_exit_penalty', type=float, default=None,
                         help='Penalty for early exit before min_holding (default: 0.2)')
     parser.add_argument('--no_trade_penalty', type=float, default=None,
-                        help='Penalty for making 0 trades in an episode (default: 10.0)')
+                        help='Penalty for making 0 trades in an episode (default: 0.0)')
     parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,
                         help='Target transaction cost rate (default: 0.00015)')
     parser.add_argument('--buy_tax', dest='buy_tax_rate', type=float, default=None,
@@ -243,6 +249,12 @@ def main():
                         help='Sell tax rate (default: 0.0018)')
     parser.add_argument('--max_trades_per_episode', type=int, default=None,
                         help='Max trades allowed per episode (default: None/unlimited)')
+    parser.add_argument('--step_reward_scale', type=float, default=None,
+                        help='Scale for dense step reward (default: 1.0)')
+    parser.add_argument('--win_bonus', type=float, default=None,
+                        help='Bonus for winning trades (default: 5.0)')
+    parser.add_argument('--loss_penalty', type=float, default=None,
+                        help='Penalty for losing trades (default: 0.3)')
     
     # 정규화 설정
     parser.add_argument('--use_raw_data',

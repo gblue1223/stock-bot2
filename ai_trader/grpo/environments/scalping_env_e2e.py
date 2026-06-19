@@ -84,7 +84,7 @@ class GRPOScalpingEnv(gym.Env):
         transaction_cost_rate: float = 0.00215,
         buy_tax_rate: float = 0.0,
         sell_tax_rate: float = 0.0018,
-        no_trade_penalty: float = 10.0,
+        no_trade_penalty: float = 0.0,
         quick_exit_penalty: float = 0.01,
         quick_exit_threshold: float = 1.5,
         quick_exit_mode: str = 'penalty_only',
@@ -99,6 +99,9 @@ class GRPOScalpingEnv(gym.Env):
         max_holding_time: float = 100.0,# ✅ 최대 보유 시간
         early_exit_penalty: float = 0.2,# ✅ 조기 매도 페널티
         max_trades_per_episode: Optional[int] = None, # ✅ 최대 거래 횟수 제한
+        step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
+        win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
+        loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
     ):
         super().__init__()
         
@@ -110,6 +113,9 @@ class GRPOScalpingEnv(gym.Env):
         self.early_exit_penalty = early_exit_penalty
         self.no_trade_penalty = no_trade_penalty
         self.max_trades_per_episode = max_trades_per_episode
+        self.step_reward_scale = step_reward_scale
+        self.win_bonus = win_bonus
+        self.loss_penalty = loss_penalty
         
         self.db_path = db_path
         self.table_name = table_name
@@ -967,11 +973,11 @@ class GRPOScalpingEnv(gym.Env):
                     # 승리/손실 보너스에도 가중치 적용
                     # 풀매수 성공 시 보너스 큼, 짤짤이 성공 시 보너스 작음
                     if profit_rate > self.round_trip_cost:
-                        bonus = 1.5 * weight
+                        bonus = self.win_bonus * weight
                         reward += bonus
                         logger.debug(f"Win bonus applied: +{bonus:.2f} (weight={weight:.2f})")
                     elif profit_rate < 0:
-                        penalty = 0.5 * weight
+                        penalty = self.loss_penalty * weight
                         reward -= penalty
                         logger.debug(f"Loss penalty applied: -{penalty:.2f} (weight={weight:.2f})")
                     
@@ -1024,10 +1030,9 @@ class GRPOScalpingEnv(gym.Env):
                 # 1단계만 보유 시 보상 10%, 10단계(풀매수) 보유 시 보상 100%
                 weight = self.position_steps / self.max_split_count
                 
-                # Fix A: step reward 스케일 축소 (100 → 10)
-                # 거래 결과(profit_rate*100) 대비 step noise 비중을 1/10로 줄여
-                # 에이전트가 매매 타이밍 학습에 집중하도록 유도
-                step_reward = step_return * 10 * weight
+                # Fix A: step reward 스케일 조정 (기본값: 1.0)
+                # 거래 결과 대비 step noise 비중을 줄여 에이전트가 매매 타이밍 학습에 집중하도록 유도
+                step_reward = step_return * self.step_reward_scale * weight
                 reward += step_reward
                 
                 # --- 리스크 관리 (손절 & 본전청산) ---
@@ -1187,7 +1192,7 @@ class GRPOScalpingEnv(gym.Env):
         if self.episode_trades:
             total_return = sum((t['profit_rate'] - self.round_trip_cost) * 100 * t.get('weight', 1.0) for t in self.episode_trades)
         else:
-            total_return = -self.no_trade_penalty if self.no_trade_penalty > 0 else 0.0
+            total_return = 0.0
             
         # 거래 횟수
         num_trades = len(self.episode_trades)
