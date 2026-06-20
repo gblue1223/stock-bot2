@@ -64,10 +64,10 @@ class GRPOScalpingEnv(gym.Env):
         seq_len: 시퀀스 길이 (기본값: 3000)
         expected_features: 예상 특징 수 (기본값: 28, 딥러닝 모델과 일치해야 함)
         transaction_cost_rate: 거래 비용 비율 (기본값: 0.00215 = 0.215%)
-        quick_exit_threshold: 빠른 손절 시간 임계값 (초, 기본값: 1.5)
-        quick_exit_penalty: 빠른 손절 룰 위반 페널티 (기본값: 0.01)
+        loss_holding_threshold: 손실 보유 허용 시간 (초, 기본값: 1.5)
+        loss_holding_penalty: 손실 보유 누적 페널티 (기본값: 0.01)
         max_episode_steps: 에피소드당 최대 스텝 수 (기본값: None, 제한 없음)
-        quick_exit_mode: 빠른 손절 룰 동작 모드 (기본값: 'penalty_only')
+        loss_holding_mode: 손실 보유 위반 시 동작 모드 (기본값: 'penalty_only')
             - 'penalty_only': 페널티만 부여, 정책이 학습
             - 'force_close': 강제 청산 (이전 동작)
         device: 디바이스 ('cpu' 또는 'cuda')
@@ -85,9 +85,9 @@ class GRPOScalpingEnv(gym.Env):
         buy_tax_rate: float = 0.0,
         sell_tax_rate: float = 0.0018,
         no_trade_penalty: float = 0.0,
-        quick_exit_penalty: float = 0.01,
-        quick_exit_threshold: float = 1.5,
-        quick_exit_mode: str = 'penalty_only',
+        loss_holding_penalty: float = 0.01,
+        loss_holding_threshold: float = 1.5,
+        loss_holding_mode: str = 'penalty_only',
         max_episode_steps: Optional[int] = None,
         use_raw_data: bool = True,  # ✅ 원본 데이터 사용 여부
         rolling_window_size: int = 1000,  # ✅ Rolling window 크기
@@ -97,7 +97,7 @@ class GRPOScalpingEnv(gym.Env):
         max_split_count: int = 1,       # ✅ 최대 분할 매수 횟수
         min_holding_time: float = 2.0,  # ✅ 최소 보유 시간
         max_holding_time: float = 100.0,# ✅ 최대 보유 시간
-        early_exit_penalty: float = 0.2,# ✅ 조기 매도 페널티
+        min_holding_penalty: float = 0.2,# ✅ 조기 매도 페널티
         max_trades_per_episode: Optional[int] = None, # ✅ 최대 거래 횟수 제한
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
@@ -110,7 +110,7 @@ class GRPOScalpingEnv(gym.Env):
         self.max_split_count = max_split_count
         self.min_holding_time = min_holding_time
         self.max_holding_time = max_holding_time
-        self.early_exit_penalty = early_exit_penalty
+        self.min_holding_penalty = min_holding_penalty
         self.no_trade_penalty = no_trade_penalty
         self.max_trades_per_episode = max_trades_per_episode
         self.step_reward_scale = step_reward_scale
@@ -134,14 +134,14 @@ class GRPOScalpingEnv(gym.Env):
         
         self.round_trip_cost = (transaction_cost_rate + buy_tax_rate) + (transaction_cost_rate + sell_tax_rate)
         
-        # 빠른 손절 룰 설정
-        self.quick_exit_threshold = quick_exit_threshold
-        self.quick_exit_penalty = quick_exit_penalty
-        self.quick_exit_mode = quick_exit_mode
+        # 손실 방치 룰 설정
+        self.loss_holding_threshold = loss_holding_threshold
+        self.loss_holding_penalty = loss_holding_penalty
+        self.loss_holding_mode = loss_holding_mode
         
         # 동작 모드 검증
-        if quick_exit_mode not in ['penalty_only', 'force_close']:
-            raise ValueError(f"Invalid quick_exit_mode: {quick_exit_mode}. "
+        if loss_holding_mode not in ['penalty_only', 'force_close']:
+            raise ValueError(f"Invalid loss_holding_mode: {loss_holding_mode}. "
                            f"Must be 'penalty_only' or 'force_close'")
         
 
@@ -242,7 +242,7 @@ class GRPOScalpingEnv(gym.Env):
         # 에피소드 메타데이터
         self.episode_trades = []
         self.episode_rewards = []
-        self.quick_exit_violations = 0
+        self.loss_holding_violations = 0
         
         # 현재 에피소드 데이터
         self.episode_data = None
@@ -604,7 +604,7 @@ class GRPOScalpingEnv(gym.Env):
         # 에피소드 메타데이터 초기화
         self.episode_trades = []
         self.episode_rewards = []
-        self.quick_exit_violations = 0
+        self.loss_holding_violations = 0
         
         # 초기 관측값
         observation = self._get_current_observation()
@@ -739,9 +739,9 @@ class GRPOScalpingEnv(gym.Env):
             f"(Round trip: {self.round_trip_cost:.6f})"
         )
 
-    def _check_quick_exit_penalty_only(self, holding_time: float) -> Tuple[float, bool]:
+    def _check_loss_holding_penalty_only(self, holding_time: float) -> Tuple[float, bool]:
         """
-        빠른 손절 룰 체크 (penalty_only 모드)
+        손실 보유 허용 시간 초과 체크 (penalty_only 모드)
         
         임계값을 초과하고 손실 중이면 페널티만 부여.
         강제 청산하지 않고 정책이 학습하도록 유도.
@@ -750,23 +750,23 @@ class GRPOScalpingEnv(gym.Env):
             holding_time: 보유 시간 (초)
             
         Returns:
-            (reward, quick_exit_triggered) 튜플
+            (reward, loss_holding_triggered) 튜플
         """
         reward = 0.0
-        quick_exit_triggered = False
+        loss_holding_triggered = False
         
         # 임계값을 초과하고 손실 중이면 페널티
-        if holding_time > self.quick_exit_threshold and self.current_price < self.avg_entry_price:
-            quick_exit_triggered = True
-            self.quick_exit_violations += 1
-            reward = -self.quick_exit_penalty
+        if holding_time > self.loss_holding_threshold and self.current_price < self.avg_entry_price:
+            loss_holding_triggered = True
+            self.loss_holding_violations += 1
+            reward = -self.loss_holding_penalty
             
-            logger.debug(f"Quick exit penalty: price={self.current_price:.4f}, "
+            logger.debug(f"Loss holding penalty: price={self.current_price:.4f}, "
                        f"avg_entry_price={self.avg_entry_price:.4f}, "
                        f"holding_time={holding_time:.2f}s, "
-                       f"penalty={self.quick_exit_penalty:.4f}")
+                       f"penalty={self.loss_holding_penalty:.4f}")
         
-        return reward, quick_exit_triggered
+        return reward, loss_holding_triggered
     
     def _force_close_position(self, reason: str, penalty: float = 0.0) -> float:
         """
@@ -899,7 +899,7 @@ class GRPOScalpingEnv(gym.Env):
         reward = 0.0
         terminated = False
         truncated = False
-        quick_exit_triggered = False
+        loss_holding_triggered = False
         
         if action == 1:  # 매수
             if self.position == 0 and self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode:
@@ -945,9 +945,9 @@ class GRPOScalpingEnv(gym.Env):
                 if holding_time < self.min_holding_time:
                     # 너무 빨리 파는 경우: 약한 페널티 부여
                     # 거래를 아예 포기하지 않도록 페널티 완화
-                    early_exit_penalty = self.early_exit_penalty
-                    reward -= early_exit_penalty
-                    logger.debug(f"Early Exit Penalty applied: -{early_exit_penalty} (holding_time {holding_time:.2f}s < {self.min_holding_time}s). Sell aborted (Action Masking).")
+                    min_holding_penalty = self.min_holding_penalty
+                    reward -= min_holding_penalty
+                    logger.debug(f"Min Holding Penalty applied: -{min_holding_penalty} (holding_time {holding_time:.2f}s < {self.min_holding_time}s). Sell aborted (Action Masking).")
                 else:
                     # 충분히 기다렸다가 파는 경우: 인내 보너스 (+0.1점)
                     patience_bonus = 0.1
@@ -1081,10 +1081,10 @@ class GRPOScalpingEnv(gym.Env):
                     # 빠른 손절 체크 로직은 해제 (이 로직이 대체)
                     pass
                 else:
-                    # 기존의 '시간 경과에 따른 빠른 손절' 로직 유지 (Only if not forced closed)
+                    # 기존의 '시간 경과에 따른 손실 방치' 로직 유지 (Only if not forced closed)
                     # holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time) # 위에서 계산함
-                    if self.quick_exit_mode == 'penalty_only':
-                         penalty, quick_exit_triggered = self._check_quick_exit_penalty_only(holding_time)
+                    if self.loss_holding_mode == 'penalty_only':
+                         penalty, loss_holding_triggered = self._check_loss_holding_penalty_only(holding_time)
                          reward += penalty
         
         # 보상 기록
@@ -1163,8 +1163,8 @@ class GRPOScalpingEnv(gym.Env):
             'position': self.position,
             'current_price': self.current_price,
             'current_time': self.current_time,
-            'quick_exit_violations': self.quick_exit_violations,
-            'quick_exit_triggered': quick_exit_triggered
+            'loss_holding_violations': self.loss_holding_violations,
+            'loss_holding_triggered': loss_holding_triggered
         }
         
         if terminated or truncated:
@@ -1183,7 +1183,7 @@ class GRPOScalpingEnv(gym.Env):
         - 거래 횟수 (num_trades)
         - 평균 보유 시간 (avg_holding_time)
         - 샤프 비율 (sharpe_ratio)
-        - 빠른 손절 룰 위반 횟수 (quick_exit_violations)
+        - 손실 보유 위반 횟수 (loss_holding_violations)
         
         Returns:
             에피소드 메타데이터 딕셔너리
@@ -1246,7 +1246,7 @@ class GRPOScalpingEnv(gym.Env):
             'num_trades': int(num_trades),
             'avg_holding_time': float(avg_holding_time),
             'sharpe_ratio': float(sharpe_ratio),
-            'quick_exit_violations': int(self.quick_exit_violations),
+            'loss_holding_violations': int(self.loss_holding_violations),
             'win_rate': float(win_rate),
             'avg_profit_per_trade': float(avg_profit_per_trade),
             'episode_length': int(self.episode_length),
@@ -1259,7 +1259,7 @@ class GRPOScalpingEnv(gym.Env):
                    f"num_trades={num_trades}, "
                    f"avg_holding_time={avg_holding_time:.2f}s, "
                    f"sharpe_ratio={sharpe_ratio:.4f}, "
-                   f"quick_exit_violations={self.quick_exit_violations}, "
+                   f"loss_holding_violations={self.loss_holding_violations}, "
                    f"win_rate={win_rate:.2%}")
         
         return metadata

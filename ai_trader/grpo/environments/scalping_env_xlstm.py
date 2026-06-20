@@ -34,9 +34,9 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         buy_tax_rate: float = 0.0,
         sell_tax_rate: float = 0.0018,
         no_trade_penalty: float = 0.0,
-        quick_exit_penalty: float = 0.01,
-        quick_exit_threshold: float = 1.5,
-        quick_exit_mode: str = 'penalty_only',
+        loss_holding_penalty: float = 0.01,
+        loss_holding_threshold: float = 1.5,
+        loss_holding_mode: str = 'penalty_only',
         max_episode_steps: Optional[int] = None,
         use_raw_data: bool = True,
         rolling_window_size: int = 1000,
@@ -46,7 +46,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         max_split_count: int = 1,
         min_holding_time: float = 2.0,
         max_holding_time: float = 100.0,
-        early_exit_penalty: float = 0.2,
+        min_holding_penalty: float = 0.2,
         max_trades_per_episode: Optional[int] = None,
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
@@ -68,9 +68,9 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             buy_tax_rate=buy_tax_rate,
             sell_tax_rate=sell_tax_rate,
             no_trade_penalty=no_trade_penalty,
-            quick_exit_penalty=quick_exit_penalty,
-            quick_exit_threshold=quick_exit_threshold,
-            quick_exit_mode=quick_exit_mode,
+            loss_holding_penalty=loss_holding_penalty,
+            loss_holding_threshold=loss_holding_threshold,
+            loss_holding_mode=loss_holding_mode,
             max_episode_steps=max_episode_steps,
             use_raw_data=use_raw_data,
             rolling_window_size=rolling_window_size,
@@ -80,7 +80,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             max_split_count=max_split_count,
             min_holding_time=min_holding_time,
             max_holding_time=max_holding_time,
-            early_exit_penalty=early_exit_penalty,
+            min_holding_penalty=min_holding_penalty,
             max_trades_per_episode=max_trades_per_episode,
             step_reward_scale=step_reward_scale,
             win_bonus=win_bonus,
@@ -131,7 +131,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             self.max_price_since_entry = 0.0
             self.episode_trades = []
             self.episode_rewards = []
-            self.quick_exit_violations = 0
+            self.loss_holding_violations = 0
             self.episode_data = None
             self.episode_metadata = None
             self.episode_length = 0

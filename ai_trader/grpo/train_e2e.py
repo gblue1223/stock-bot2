@@ -113,9 +113,9 @@ class TrainingConfig:
         self.episode_steps = 600   # Fix C: 150 → 600 (더 긴 관찰 시간으로 타이밍 학습 유도)
         
         # 임베딩 사용 안함
-        self.quick_exit_mode = 'penalty_only'
-        self.quick_exit_penalty = 0.01  # 기본값
-        self.quick_exit_threshold = 2.5 # 빠른 손절 임계값 (MIN_HOLDING=2보다 길어야 모순이 없음)
+        self.loss_holding_mode = 'penalty_only'
+        self.loss_holding_penalty = 0.01  # 기본값
+        self.loss_holding_threshold = 2.5 # 손실 보유 허용 시간 (MIN_HOLDING=2보다 길어야 모순이 없음)
         self.stagnation_exit_seconds = 180  # 기본값
         
         # 정책 설정
@@ -155,7 +155,7 @@ class TrainingConfig:
         self.max_split_count = 1      # 최대 분할 매수 횟수 (1 = 단일 진입)
         self.min_holding_time = 2     # 최소 보유 시간 (초)
         self.max_holding_time = 100   # 최대 보유 시간 (초)
-        self.early_exit_penalty = 0.2 # 최소 보유 시간 위반 페널티
+        self.min_holding_penalty = 0.2 # 최소 보유 시간 위반 페널티
         self.no_trade_penalty = 0.0   # 거래 안할 시 패널티 (기본값: 0.0)
         self.transaction_cost_rate = 0.00015  # 기본 거래 수수료율 (0.015%)
         self.buy_tax_rate = 0.0                # 매수 세금 (0%)
@@ -255,16 +255,16 @@ def create_environment(config: TrainingConfig, device: str):
             transaction_cost_rate=config.transaction_cost_rate,
             buy_tax_rate=config.buy_tax_rate,
             sell_tax_rate=config.sell_tax_rate,
-            quick_exit_mode=config.quick_exit_mode,
-            quick_exit_penalty=config.quick_exit_penalty,
-            quick_exit_threshold=config.quick_exit_threshold,
+            loss_holding_mode=config.loss_holding_mode,
+            loss_holding_penalty=config.loss_holding_penalty,
+            loss_holding_threshold=config.loss_holding_threshold,
             max_episode_steps=config.episode_steps,
             base_price=config.base_price,
             stop_loss_pct=config.stop_loss_pct,
             max_split_count=config.max_split_count,
             min_holding_time=config.min_holding_time,
             max_holding_time=config.max_holding_time,
-            early_exit_penalty=config.early_exit_penalty,
+            min_holding_penalty=config.min_holding_penalty,
             no_trade_penalty=config.no_trade_penalty,
             max_trades_per_episode=config.max_trades_per_episode,
             step_reward_scale=config.step_reward_scale,
@@ -340,11 +340,11 @@ def main():
     parser.add_argument('--seq_len', type=int, default=None)
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
-    parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
-    parser.add_argument('--quick_exit_penalty', type=float, default=None,
-                        help='Penalty for quick exit (default: 0.01)')
-    parser.add_argument('--quick_exit_threshold', type=float, default=None,
-                        help='Time threshold in seconds for quick exit penalty (default: 2.5)')
+    parser.add_argument('--loss_holding_mode', choices=['penalty_only', 'force_close'], default=None)
+    parser.add_argument('--loss_holding_penalty', type=float, default=None,
+                        help='Penalty for loss holding (default: 0.01)')
+    parser.add_argument('--loss_holding_threshold', type=float, default=None,
+                        help='Time threshold in seconds for loss holding penalty (default: 2.5)')
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
     
     # ✅ 손절 및 분할 매수 설정
@@ -356,7 +356,7 @@ def main():
                         help='Min holding time in seconds (default: 2)')
     parser.add_argument('--max_holding', dest='max_holding_time', type=float, default=None,
                         help='Max holding time in seconds (default: 100)')
-    parser.add_argument('--early_exit_penalty', type=float, default=None,
+    parser.add_argument('--min_holding_penalty', type=float, default=None,
                         help='Penalty for early exit before min_holding (default: 0.2)')
     parser.add_argument('--no_trade_penalty', type=float, default=None,
                         help='Penalty for making 0 trades in an episode (default: 0.0)')
