@@ -73,6 +73,7 @@ class TrainingConfig:
         
         self.quick_exit_mode = 'penalty_only'
         self.quick_exit_penalty = 0.01
+        self.quick_exit_threshold = 2.5 # 빠른 손절 임계값 (MIN_HOLDING=2보다 길어야 모순이 없음)
         self.stagnation_exit_seconds = 180
         
         self.hidden_dim = 128
@@ -149,7 +150,6 @@ class TrainingConfig:
             errors.append("Either db_path or extracted_dir is required")
         elif self.extracted_dir and not os.path.exists(self.extracted_dir):
             logger.warning(f"extracted_dir ({self.extracted_dir}) not found. Falling back to DB checking.")
-            self.extracted_dir = None
             if not self.db_path:
                 errors.append("extracted_dir not found and no db_path specified")
             elif not os.path.exists(self.db_path):
@@ -175,6 +175,7 @@ def create_environment(config: TrainingConfig, device: str):
             sell_tax_rate=config.sell_tax_rate,
             quick_exit_mode=config.quick_exit_mode,
             quick_exit_penalty=config.quick_exit_penalty,
+            quick_exit_threshold=config.quick_exit_threshold,
             max_episode_steps=config.episode_steps,
             base_price=config.base_price,
             stop_loss_pct=config.stop_loss_pct,
@@ -227,6 +228,10 @@ def main():
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
     parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
+    parser.add_argument('--quick_exit_penalty', type=float, default=None,
+                        help='Penalty for quick exit (default: 0.01)')
+    parser.add_argument('--quick_exit_threshold', type=float, default=None,
+                        help='Time threshold in seconds for quick exit penalty (default: 2.5)')
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
     
     # 손절 및 분할 매수 설정

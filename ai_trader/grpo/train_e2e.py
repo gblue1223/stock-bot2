@@ -115,6 +115,7 @@ class TrainingConfig:
         # 임베딩 사용 안함
         self.quick_exit_mode = 'penalty_only'
         self.quick_exit_penalty = 0.01  # 기본값
+        self.quick_exit_threshold = 2.5 # 빠른 손절 임계값 (MIN_HOLDING=2보다 길어야 모순이 없음)
         self.stagnation_exit_seconds = 180  # 기본값
         
         # 정책 설정
@@ -256,6 +257,7 @@ def create_environment(config: TrainingConfig, device: str):
             sell_tax_rate=config.sell_tax_rate,
             quick_exit_mode=config.quick_exit_mode,
             quick_exit_penalty=config.quick_exit_penalty,
+            quick_exit_threshold=config.quick_exit_threshold,
             max_episode_steps=config.episode_steps,
             base_price=config.base_price,
             stop_loss_pct=config.stop_loss_pct,
@@ -338,8 +340,11 @@ def main():
     parser.add_argument('--seq_len', type=int, default=None)
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
-    # (E2E에서는 embedding 관련 인자 미사용 - 제거됨)
     parser.add_argument('--quick_exit_mode', choices=['penalty_only', 'force_close'], default=None)
+    parser.add_argument('--quick_exit_penalty', type=float, default=None,
+                        help='Penalty for quick exit (default: 0.01)')
+    parser.add_argument('--quick_exit_threshold', type=float, default=None,
+                        help='Time threshold in seconds for quick exit penalty (default: 2.5)')
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
     
     # ✅ 손절 및 분할 매수 설정
