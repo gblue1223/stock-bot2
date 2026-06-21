@@ -331,6 +331,41 @@ def main():
             if value is not None and key not in ('config', 'vram_preset') and hasattr(config, key):
                 setattr(config, key, value)
                 
+        # 체크포인트 파일로부터 모델 아키텍처 자동 감지 및 설정 조정
+        if config.load_policy and os.path.exists(config.load_policy):
+            logger.info(f"[CHECKPOINT DETECT] Loading checkpoint {config.load_policy} to verify/auto-adjust model dimensions...")
+            try:
+                # GPU OOM을 방지하기 위해 CPU에서 임시로 로드하여 검사
+                checkpoint = torch.load(config.load_policy, map_location='cpu')
+                state_dict = checkpoint.get('policy_state_dict', checkpoint.get('state_dict', checkpoint))
+                
+                has_gru = any('gru' in k for k in state_dict.keys())
+                
+                # CNN 채널 감지 및 자동 조정
+                if 'conv1.weight' in state_dict:
+                    chk_cnn = state_dict['conv1.weight'].shape[0]
+                    if config.cnn_channels != chk_cnn:
+                        logger.warning(f"[AUTO-CONFIG] Overriding cnn_channels from {config.cnn_channels} to {chk_cnn} to match checkpoint.")
+                        config.cnn_channels = chk_cnn
+                
+                if not has_gru:
+                    # xLSTM Hidden Dimension 감지 및 자동 조정
+                    if 'xlstm.cells.0.w_q.weight' in state_dict:
+                        chk_rnn = state_dict['xlstm.cells.0.w_q.weight'].shape[0]
+                        if config.rnn_hidden_dim != chk_rnn:
+                            logger.warning(f"[AUTO-CONFIG] Overriding rnn_hidden_dim from {config.rnn_hidden_dim} to {chk_rnn} to match checkpoint.")
+                            config.rnn_hidden_dim = chk_rnn
+                    # FC Hidden Dimension 감지 및 자동 조정
+                    if 'fc1.weight' in state_dict:
+                        chk_fc = state_dict['fc1.weight'].shape[0]
+                        if config.hidden_dim != chk_fc:
+                            logger.warning(f"[AUTO-CONFIG] Overriding hidden_dim (FC) from {config.hidden_dim} to {chk_fc} to match checkpoint.")
+                            config.hidden_dim = chk_fc
+                else:
+                    logger.info("[CHECKPOINT DETECT] GRU checkpoint detected. Only CNN shapes will be auto-matched. RNN/FC will use config settings.")
+            except Exception as e:
+                logger.warning(f"Failed to auto-detect/adjust config from load_policy: {e}. Proceeding with manual config.")
+
         config.validate()
         device = config.device
         if device == 'cuda' and not torch.cuda.is_available():
