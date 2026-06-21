@@ -150,6 +150,7 @@ class TrainingConfig:
             errors.append("Either db_path or extracted_dir is required")
         elif self.extracted_dir and not os.path.exists(self.extracted_dir):
             logger.warning(f"extracted_dir ({self.extracted_dir}) not found. Falling back to DB checking.")
+            self.extracted_dir = None
             if not self.db_path:
                 errors.append("extracted_dir not found and no db_path specified")
             elif not os.path.exists(self.db_path):

@@ -115,19 +115,23 @@ class mLSTMLayer(nn.Module):
         self, 
         x: torch.Tensor, 
         prev_states: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, List[Optional[Tuple[torch.Tensor, torch.Tensor]]]]:
         # x: (batch_size, seq_len, input_size)
         batch_size, seq_len, _ = x.size()
         
+        states: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
         if prev_states is None:
-            prev_states = [None] * self.num_layers
+            for _ in range(self.num_layers):
+                states.append(None)
+        else:
+            states = prev_states
             
-        next_states = []
+        next_states: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
         current_input = x
         
         for layer_idx, cell in enumerate(self.cells):
             layer_output = []
-            state = prev_states[layer_idx]
+            state = states[layer_idx]
             
             for t in range(seq_len):
                 x_t = current_input[:, t, :]
