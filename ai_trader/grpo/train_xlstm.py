@@ -101,6 +101,7 @@ class TrainingConfig:
         self.output_dir = 'models/grpo_xlstm'
         self.load_policy = None
         self.num_workers = 4
+        self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
         
         self.base_price = 100000.0
         self.stop_loss_pct = 2.0
@@ -205,7 +206,8 @@ def create_policy(config: TrainingConfig, env, device: str):
             cnn_channels=config.cnn_channels,
             rnn_hidden_dim=config.rnn_hidden_dim,
             fc_hidden_dim=config.hidden_dim,
-            action_dim=config.action_dim
+            action_dim=config.action_dim,
+            checkpoint_segments=config.checkpoint_segments
         )
         policy.to(device)
         return policy
@@ -280,6 +282,9 @@ def main():
                         help='CNN filter count (default:64, large:128, xlarge:256)')
     parser.add_argument('--rnn_hidden_dim', type=int, default=None,
                         help='xLSTM hidden size (default:128, large:256, xlarge:512)')
+    parser.add_argument('--checkpoint_segments', type=int, default=None,
+                        help='Gradient checkpointing: number of segments to split the RNN sequence into. '
+                             'Higher = less VRAM but slower (default: 16)')
     parser.add_argument('--vram_preset', choices=['small', 'medium', 'large', 'xlarge'], default=None,
                         help=(
                             'VRAM 사용량 프리셋 (개별 옵션보다 우선 적용).\n'

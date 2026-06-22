@@ -10,6 +10,7 @@ from typing import Tuple, Optional, Any, Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as cp
 from torch.distributions import Categorical
 
 logger = logging.getLogger(__name__)
@@ -98,18 +99,47 @@ class mLSTMCell(nn.Module):
 class mLSTMLayer(nn.Module):
     """
     nn.GRU를 대체하는 다층 mLSTM 레이어
+    
+    Gradient Checkpointing:
+    시퀀스를 checkpoint_segments 개의 세그먼트로 나누어,
+    세그먼트 경계의 state(C, n)만 보관하고 내부 중간결과는
+    backward 시 재계산합니다. 이를 통해 VRAM 사용량을
+    O(seq_len)에서 O(seq_len / checkpoint_segments)로 줄입니다.
     """
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, dropout: float = 0.0):
+    def __init__(
+        self, input_size: int, hidden_size: int,
+        num_layers: int = 1, dropout: float = 0.0,
+        checkpoint_segments: int = 16
+    ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.checkpoint_segments = checkpoint_segments
         
         self.cells = nn.ModuleList([
             mLSTMCell(input_size if l == 0 else hidden_size, hidden_size) 
             for l in range(num_layers)
         ])
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
+
+    @staticmethod
+    def _run_segment(cell: 'mLSTMCell', segment_input: torch.Tensor,
+                     C: torch.Tensor, n: torch.Tensor
+                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        세그먼트 내 타임스텝을 순차 실행 (checkpoint 내부 함수).
+        checkpoint 에 전달되려면 입출력이 모두 Tensor여야 하므로
+        state tuple을 풀어서 받고 풀어서 반환합니다.
+        """
+        state = (C, n)
+        outputs = []
+        for t in range(segment_input.size(1)):
+            x_t = segment_input[:, t, :]
+            h_t, state = cell(x_t, state)
+            outputs.append(h_t)
+        seg_out = torch.stack(outputs, dim=1)  # (batch, seg_len, hidden)
+        return seg_out, state[0], state[1]
 
     def forward(
         self, 
@@ -124,25 +154,64 @@ class mLSTMLayer(nn.Module):
             for _ in range(self.num_layers):
                 states.append(None)
         else:
-            states = prev_states
+            states = list(prev_states)
             
         next_states: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
         current_input = x
         
         for layer_idx, cell in enumerate(self.cells):
-            layer_output = []
-            state = states[layer_idx]
-            
-            for t in range(seq_len):
-                x_t = current_input[:, t, :]
-                h_t, state = cell(x_t, state)
-                layer_output.append(h_t)
+            # --- State 초기화 (checkpoint에 Tensor가 필요) ---
+            raw_state = states[layer_idx]
+            if raw_state is None:
+                C = torch.zeros(batch_size, cell.hidden_size, cell.hidden_size,
+                                device=x.device, dtype=x.dtype)
+                n = torch.zeros(batch_size, cell.hidden_size, 1,
+                                device=x.device, dtype=x.dtype)
+            else:
+                C, n = raw_state
+
+            if self.training and seq_len > 1:
+                # --- Gradient Checkpointing 모드 ---
+                num_segs = min(self.checkpoint_segments, seq_len)
+                seg_size = max(1, (seq_len + num_segs - 1) // num_segs)
                 
-            layer_output = torch.stack(layer_output, dim=1)  # (batch_size, seq_len, hidden_size)
+                all_outputs: List[torch.Tensor] = []
+                for seg_start in range(0, seq_len, seg_size):
+                    seg_end = min(seg_start + seg_size, seq_len)
+                    seg_input = current_input[:, seg_start:seg_end, :]
+
+                    # _run_segment을 cell에 대해 바인딩한 래퍼
+                    # cell 참조를 closure로 캡처하면 loop variable 문제가 있으므로
+                    # 즉시 바인딩합니다.
+                    def _make_fn(_cell):
+                        def _fn(seg_in, _C, _n):
+                            return mLSTMLayer._run_segment(_cell, seg_in, _C, _n)
+                        return _fn
+
+                    seg_out, C, n = cp.checkpoint(
+                        _make_fn(cell),
+                        seg_input, C, n,
+                        use_reentrant=False
+                    )
+                    all_outputs.append(seg_out)
+                
+                layer_output = torch.cat(all_outputs, dim=1)
+            else:
+                # --- 추론 모드: checkpointing 불필요 ---
+                layer_output_list = []
+                state = (C, n)
+                for t in range(seq_len):
+                    x_t = current_input[:, t, :]
+                    h_t, state = cell(x_t, state)
+                    layer_output_list.append(h_t)
+                layer_output = torch.stack(layer_output_list, dim=1)
+                C, n = state
+
+            # (batch_size, seq_len, hidden_size)
             if layer_idx < self.num_layers - 1:
                 layer_output = self.dropout(layer_output)
             current_input = layer_output
-            next_states.append(state)
+            next_states.append((C, n))
             
         return current_input, next_states
 
@@ -167,7 +236,8 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         cnn_channels: int = 64,
         rnn_hidden_dim: int = 128,
         fc_hidden_dim: int = 256,
-        action_dim: int = 3
+        action_dim: int = 3,
+        checkpoint_segments: int = 16
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -182,12 +252,13 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         self.conv2 = nn.Conv1d(in_channels=cnn_channels, out_channels=cnn_channels, kernel_size=5, stride=2, padding=2)
         self.bn2 = nn.BatchNorm1d(cnn_channels)
         
-        # 2. Sequence Modeling with mLSTM
+        # 2. Sequence Modeling with mLSTM (with gradient checkpointing)
         self.xlstm = mLSTMLayer(
             input_size=cnn_channels,
             hidden_size=rnn_hidden_dim,
             num_layers=2,
-            dropout=0.2
+            dropout=0.2,
+            checkpoint_segments=checkpoint_segments
         )
         
         # 3. 공유 Dense 레이어
