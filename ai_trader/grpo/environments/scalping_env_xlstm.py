@@ -24,6 +24,9 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
     데이터 디렉토리(extracted_dir)가 지정되면 사전 추출된 npz 파일을 고속 로드하고,
     그렇지 않으면 기존 DuckDB 환경으로 폴백하여 호환성을 유지합니다.
     """
+    # Class-level cache to share loaded episodes across resets within a worker process
+    _episode_cache = {}
+    
     def __init__(
         self,
         db_path: Optional[str] = None,
@@ -152,10 +155,19 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                     file_path_rel, stock_code, date, length = self.valid_keys[idx]
                     
                     full_path = self.extracted_dir / file_path_rel
-                    data = np.load(full_path, allow_pickle=True)
                     
-                    features = data['features']
-                    metadata = data['metadata']
+                    if full_path not in GRPOScalpingEnvXLSTM._episode_cache:
+                        data = np.load(full_path, allow_pickle=True)
+                        GRPOScalpingEnvXLSTM._episode_cache[full_path] = (
+                            data['features'].astype(np.float32),
+                            data['metadata']
+                        )
+                        
+                    features, metadata = GRPOScalpingEnvXLSTM._episode_cache[full_path]
+                    
+                    # 메모리 오염 방지를 위해 얕은 복사본 반환
+                    features = features.copy()
+                    metadata = metadata.copy()
                     
                     # 에피소드 스텝만큼 슬라이싱
                     if self.max_episode_steps is not None:

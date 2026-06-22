@@ -1254,7 +1254,7 @@ class GRPOScalpingEnv(gym.Env):
             'trades': self.episode_trades  # 개별 거래 데이터 포함 (평가용)
         }
         
-        logger.info(f"Episode finished: "
+        logger.debug(f"Episode finished: "
                    f"total_return={total_return:.4f}, "
                    f"num_trades={num_trades}, "
                    f"avg_holding_time={avg_holding_time:.2f}s, "
