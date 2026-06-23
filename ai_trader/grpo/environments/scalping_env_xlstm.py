@@ -91,7 +91,8 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         )
         
         if self.extracted_dir:
-            logger.info(f"Loaded environment using pre-extracted data from: {self.extracted_dir}")
+            self.normalizer = None
+            logger.info(f"Loaded environment using pre-extracted data from: {self.extracted_dir} (RollingNormalizer disabled, Z-score applied pre-cache)")
         else:
             logger.info("Loaded environment using live DuckDB queries")
 
@@ -158,8 +159,16 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                     
                     if full_path not in GRPOScalpingEnvXLSTM._episode_cache:
                         data = np.load(full_path, allow_pickle=True)
+                        raw_features = data['features'].astype(np.float32)
+                        
+                        # Z-score normalize features along time axis (axis 0) to avoid step-by-step overhead
+                        mean = raw_features.mean(axis=0)
+                        std = raw_features.std(axis=0)
+                        std = np.where(std < 1e-6, 1.0, std)
+                        normalized_features = (raw_features - mean) / std
+                        
                         GRPOScalpingEnvXLSTM._episode_cache[full_path] = (
-                            data['features'].astype(np.float32),
+                            normalized_features,
                             data['metadata']
                         )
                         
