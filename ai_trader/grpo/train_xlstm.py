@@ -101,6 +101,7 @@ class TrainingConfig:
         self.output_dir = 'models/grpo_xlstm'
         self.load_policy = None
         self.revert_patience = 0
+        self.initial_best_reward = None
         self.num_workers = 4
         self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
         
@@ -310,6 +311,7 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--load_policy', type=str, default=None)
     parser.add_argument('--revert_patience', type=int, default=None)
+    parser.add_argument('--initial_best_reward', type=float, default=None)
     
     args = parser.parse_args()
     
@@ -409,6 +411,8 @@ def main():
         logger.info(f"  Total parameters: {total_params:,}")
         
         start_iteration = 0
+        best_mean_reward_val = config.initial_best_reward if config.initial_best_reward is not None else float('-inf')
+        
         if config.load_policy:
             logger.info(f"[LOAD POLICY] Loading from {config.load_policy}...")
             try:
@@ -432,6 +436,11 @@ def main():
                     extra = checkpoint['extra_state']
                     restored_cost_rate = extra.get('current_cost_rate', None)
                     logger.info(f"[RESTORE] Extra state found: {extra}")
+                
+                # best_mean_reward 복원
+                if isinstance(checkpoint, dict) and 'best_mean_reward' in checkpoint and config.initial_best_reward is None:
+                    best_mean_reward_val = checkpoint['best_mean_reward']
+                    logger.info(f"[RESTORE] Loaded best_mean_reward from checkpoint: {best_mean_reward_val:.4f}")
                     
                 # Iteration 정보 복원
                 try:
@@ -473,6 +482,10 @@ def main():
             device=device,
             tensorboard_log_dir=tensorboard_dir
         )
+        
+        if best_mean_reward_val != float('-inf'):
+            trainer.best_mean_reward = best_mean_reward_val
+            logger.info(f"[RESTORE] GRPOTrainer.best_mean_reward initialized to: {best_mean_reward_val:.4f}")
         
         # 7. 고정 거래 비용 적용 (커리큘럼 미사용)
         current_cost_rate = config.transaction_cost_rate

@@ -110,6 +110,7 @@ class GRPOTrainer:
         # 훈련 상태
         self.total_timesteps = 0
         self.num_updates = 0
+        self.best_mean_reward = float('-inf')
         
         # 외부 상태 (체크포인트에 함께 저장됨, 예: curriculum cost rate)
         self.extra_checkpoint_state = {}
@@ -872,7 +873,6 @@ class GRPOTrainer:
         iteration_times = []
         
         # Best checkpoint 추적: 역대 최고 성능 가중치 자동 저장
-        best_mean_reward = float('-inf')
         recent_rewards = []  # EMA 계산용 최근 보상 기록
         no_improve_count = 0  # 연속 미개선 횟수
         revert_count = 0  # 리버트 횟수
@@ -931,8 +931,8 @@ class GRPOTrainer:
                 else:
                     ema_reward = np.mean(recent_rewards)
                 
-                if ema_reward > best_mean_reward:
-                    best_mean_reward = ema_reward
+                if ema_reward > self.best_mean_reward:
+                    self.best_mean_reward = ema_reward
                     # checkpoint_path 형식: .../checkpoints/checkpoint_iter{}.pt
 
                     best_checkpoint_path = os.path.join(
@@ -1220,6 +1220,7 @@ class GRPOTrainer:
             'iteration': iteration,
             'total_timesteps': self.total_timesteps,
             'num_updates': self.num_updates,
+            'best_mean_reward': self.best_mean_reward,
             'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': {
@@ -1261,6 +1262,7 @@ class GRPOTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.total_timesteps = checkpoint['total_timesteps']
         self.num_updates = checkpoint['num_updates']
+        self.best_mean_reward = checkpoint.get('best_mean_reward', float('-inf'))
         
         extra_state = checkpoint.get('extra_state', None)
         
