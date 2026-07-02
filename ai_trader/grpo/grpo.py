@@ -844,7 +844,8 @@ class GRPOTrainer:
         checkpoint_path: Optional[str] = None,
         on_iteration_end: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         start_iteration: int = 0,
-        max_timesteps: Optional[int] = None
+        max_timesteps: Optional[int] = None,
+        revert_to_best_patience: int = 0
     ) -> Dict[str, Any]:
         """
         GRPO 훈련 실행
@@ -873,6 +874,9 @@ class GRPOTrainer:
         # Best checkpoint 추적: 역대 최고 성능 가중치 자동 저장
         best_mean_reward = float('-inf')
         recent_rewards = []  # EMA 계산용 최근 보상 기록
+        no_improve_count = 0  # 연속 미개선 횟수
+        revert_count = 0  # 리버트 횟수
+        max_reverts = 20  # 최대 리버트 허용 횟수
         
         for iteration in range(start_iteration, num_iterations):
             iteration_start_time = time.time()
@@ -940,6 +944,31 @@ class GRPOTrainer:
                         extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
                     )
                     logger.info(f"🏆 New best EMA reward: {ema_reward:.4f} (raw: {mean_reward:.4f}) at iteration {iteration + 1}")
+                    no_improve_count = 0
+                else:
+                    no_improve_count += 1
+                
+                # Revert-to-Best 체크
+                best_checkpoint_path = os.path.join(
+                    os.path.dirname(checkpoint_path.format(0)),
+                    'checkpoint_best.pt'
+                )
+                if (revert_to_best_patience > 0 and 
+                    no_improve_count >= revert_to_best_patience and 
+                    revert_count < max_reverts and 
+                    os.path.exists(best_checkpoint_path)):
+                    
+                    logger.info(f"🔄 Reverting to best checkpoint (no improvement for {no_improve_count} iterations, "
+                                f"revert #{revert_count + 1}/{max_reverts})")
+                    self.load_checkpoint(best_checkpoint_path)
+                    
+                    # Reset optimizer to clear momentum and force the correct learning rate
+                    self.optimizer = optim.Adam(self.policy.parameters(), lr=self.learning_rate)
+                    
+                    # Reset patience and recent rewards
+                    no_improve_count = 0
+                    recent_rewards = []
+                    revert_count += 1
             
             # 콜백 호출 (Curriculum Learning 등)
             if on_iteration_end:

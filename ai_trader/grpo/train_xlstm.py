@@ -100,6 +100,7 @@ class TrainingConfig:
         self.checkpoint_interval = 10
         self.output_dir = 'models/grpo_xlstm'
         self.load_policy = None
+        self.revert_patience = 0
         self.num_workers = 4
         self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
         
@@ -308,6 +309,7 @@ def main():
     parser.add_argument('--checkpoint_interval', type=int, default=None)
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--load_policy', type=str, default=None)
+    parser.add_argument('--revert_patience', type=int, default=None)
     
     args = parser.parse_args()
     
@@ -497,7 +499,9 @@ def main():
             checkpoint_interval=config.checkpoint_interval,
             checkpoint_path=checkpoint_path,
             on_iteration_end=None,
-            start_iteration=start_iteration
+            start_iteration=start_iteration,
+            max_timesteps=config.total_timesteps,
+            revert_to_best_patience=config.revert_patience
         )
         
         training_time = time.time() - start_time
