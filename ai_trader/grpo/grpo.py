@@ -6,6 +6,7 @@ GRPO (Group Relative Policy Optimization) 알고리즘 구현
 
 import logging
 from typing import Dict, List, Optional, Tuple, Any, Callable
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -842,7 +843,8 @@ class GRPOTrainer:
         checkpoint_interval: int = 100,
         checkpoint_path: Optional[str] = None,
         on_iteration_end: Optional[Callable[[int, Dict[str, Any]], None]] = None,
-        start_iteration: int = 0
+        start_iteration: int = 0,
+        max_timesteps: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         GRPO 훈련 실행
@@ -853,6 +855,7 @@ class GRPOTrainer:
             checkpoint_path: 체크포인트 저장 경로 (format string with {} for iteration)
             on_iteration_end: 매 반복 종료 시 호출될 콜백 함수 (iteration, metrics) -> None
             start_iteration: 시작 반복 횟수 (재개 시 사용)
+            max_timesteps: 최대 훈련 타임스텝 수 (실제 누적 타임스텝 기준 조기 종료)
             
         Returns:
             훈련 메트릭 딕셔너리
@@ -866,6 +869,10 @@ class GRPOTrainer:
         
         start_time = time.time()
         iteration_times = []
+        
+        # Best checkpoint 추적: 역대 최고 성능 가중치 자동 저장
+        best_mean_reward = float('-inf')
+        recent_rewards = []  # EMA 계산용 최근 보상 기록
         
         for iteration in range(start_iteration, num_iterations):
             iteration_start_time = time.time()
@@ -911,6 +918,29 @@ class GRPOTrainer:
             mean_sharpe = np.mean([ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes])
             mean_holding_time = np.mean([ep['metadata'].get('avg_holding_time', 0.0) for ep in episodes])
             
+            # Best checkpoint 저장: 3-iteration EMA 기반 역대 최고 Mean Reward 갱신 시
+            if checkpoint_path:
+                recent_rewards.append(mean_reward)
+                # 최소 3개 이터레이션이 쌓인 후부터 EMA 기반으로 판단
+                if len(recent_rewards) >= 3:
+                    ema_reward = np.mean(recent_rewards[-3:])
+                else:
+                    ema_reward = np.mean(recent_rewards)
+                
+                if ema_reward > best_mean_reward:
+                    best_mean_reward = ema_reward
+                    # checkpoint_path 형식: .../checkpoints/checkpoint_iter{}.pt
+
+                    best_checkpoint_path = os.path.join(
+                        os.path.dirname(checkpoint_path.format(0)),
+                        'checkpoint_best.pt'
+                    )
+                    self.save_checkpoint(
+                        best_checkpoint_path, iteration + 1,
+                        extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
+                    )
+                    logger.info(f"🏆 New best EMA reward: {ema_reward:.4f} (raw: {mean_reward:.4f}) at iteration {iteration + 1}")
+            
             # 콜백 호출 (Curriculum Learning 등)
             if on_iteration_end:
                 metrics_summary = {
@@ -952,6 +982,17 @@ class GRPOTrainer:
                        f"Policy Loss: {update_metrics['policy_loss']:.4f} | "
                        f"Elapsed: {elapsed_str} | "
                        f"ETA: {remaining_str}")
+            
+            # 조기 종료 체크: 실제 경과 타임스텝 수 기준
+            if max_timesteps and self.total_timesteps >= max_timesteps:
+                logger.info(f"[EARLY STOP] Stopped because total_timesteps ({self.total_timesteps:,}) >= max_timesteps ({max_timesteps:,})")
+                if checkpoint_path:
+                    formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
+                    self.save_checkpoint(
+                        formatted_checkpoint_path, iteration + 1,
+                        extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
+                    )
+                break
         
         logger.info("GRPO training completed!")
         
