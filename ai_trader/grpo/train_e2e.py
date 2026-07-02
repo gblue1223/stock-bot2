@@ -576,15 +576,21 @@ def main():
                     restored_cost_rate = extra.get('current_cost_rate', None)
                     logger.info(f"[RESTORE] Extra state found: {extra}")
                 
-                # 체크포인트 파일명에서 시작 반복 횟수 추출 (load_policy가 설정된 경우)
+                # 체크포인트 파일에서 시작 반복 횟수 추출
                 try:
-                    import re
-                    match = re.search(r'checkpoint_iter(\d+)\.pt', config.load_policy)
-                    if match:
-                        start_iteration = int(match.group(1))
-                        logger.info(f"Resuming from iteration: {start_iteration}")
+                    if isinstance(checkpoint, dict) and 'iteration' in checkpoint:
+                        start_iteration = checkpoint['iteration']
+                        logger.info(f"Resuming from iteration: {start_iteration} (loaded from checkpoint metadata)")
+                    else:
+                        import re
+                        match = re.search(r'checkpoint_iter(\d+)\.pt', config.load_policy)
+                        if match:
+                            start_iteration = int(match.group(1))
+                            logger.info(f"Resuming from iteration: {start_iteration} (extracted from filename)")
+                        else:
+                            start_iteration = 0
                 except Exception as e:
-                    logger.warning(f"Could not extract iteration number from checkpoint path: {e}")
+                    logger.warning(f"Could not extract iteration number from checkpoint: {e}")
                     start_iteration = 0
             except Exception as e:
                 logger.error(f"Failed to load policy: {e}", exc_info=True)
@@ -666,7 +672,8 @@ def main():
             checkpoint_interval=config.checkpoint_interval,
             checkpoint_path=checkpoint_path,
             on_iteration_end=None,
-            start_iteration=start_iteration
+            start_iteration=start_iteration,
+            max_timesteps=config.total_timesteps
         )
         
         training_time = time.time() - start_time

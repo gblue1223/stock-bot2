@@ -435,13 +435,17 @@ def main():
                     
                 # Iteration 정보 복원
                 try:
-                    import re
-                    match = re.search(r'checkpoint_iter(\d+)\.pt', config.load_policy)
-                    if match:
-                        start_iteration = int(match.group(1))
-                        logger.info(f"Resuming from iteration: {start_iteration}")
-                except Exception:
-                    pass
+                    if isinstance(checkpoint, dict) and 'iteration' in checkpoint:
+                        start_iteration = checkpoint['iteration']
+                        logger.info(f"Resuming from iteration: {start_iteration} (loaded from checkpoint metadata)")
+                    else:
+                        import re
+                        match = re.search(r'checkpoint_iter(\d+)\.pt', config.load_policy)
+                        if match:
+                            start_iteration = int(match.group(1))
+                            logger.info(f"Resuming from iteration: {start_iteration} (extracted from filename)")
+                except Exception as e:
+                    logger.warning(f"Failed to restore iteration info: {e}. Defaulting to 0.")
             except Exception as e:
                 logger.error(f"Failed to load policy: {e}", exc_info=True)
                 raise
