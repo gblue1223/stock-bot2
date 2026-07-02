@@ -110,7 +110,6 @@ class GRPOTrainer:
         # 훈련 상태
         self.total_timesteps = 0
         self.num_updates = 0
-        self.best_mean_reward = float('-inf')
         
         # 외부 상태 (체크포인트에 함께 저장됨, 예: curriculum cost rate)
         self.extra_checkpoint_state = {}
@@ -873,10 +872,32 @@ class GRPOTrainer:
         iteration_times = []
         
         # Best checkpoint 추적: 역대 최고 성능 가중치 자동 저장
+        best_mean_reward = float('-inf')
         recent_rewards = []  # EMA 계산용 최근 보상 기록
         no_improve_count = 0  # 연속 미개선 횟수
         revert_count = 0  # 리버트 횟수
         max_reverts = 20  # 최대 리버트 허용 횟수
+        
+        # 기존 checkpoint_best.pt에서 이전 세션의 best_ema_reward 복원
+        if checkpoint_path:
+            _best_ckpt_path = os.path.join(
+                os.path.dirname(checkpoint_path.format(0)),
+                'checkpoint_best.pt'
+            )
+            if os.path.exists(_best_ckpt_path):
+                try:
+                    _best_meta = torch.load(_best_ckpt_path, map_location='cpu')
+                    _saved_reward = None
+                    if isinstance(_best_meta.get('extra_state'), dict):
+                        _saved_reward = _best_meta['extra_state'].get('best_ema_reward')
+                    if _saved_reward is not None:
+                        best_mean_reward = _saved_reward
+                        logger.info(f"📊 Loaded previous best EMA reward: {best_mean_reward:.4f} from checkpoint_best.pt")
+                    else:
+                        logger.info("📊 checkpoint_best.pt exists but has no best_ema_reward metadata. Starting fresh.")
+                    del _best_meta  # GPU 메모리 절약
+                except Exception as e:
+                    logger.warning(f"Could not load best EMA reward from checkpoint_best.pt: {e}")
         
         for iteration in range(start_iteration, num_iterations):
             iteration_start_time = time.time()
@@ -931,17 +952,20 @@ class GRPOTrainer:
                 else:
                     ema_reward = np.mean(recent_rewards)
                 
-                if ema_reward > self.best_mean_reward:
-                    self.best_mean_reward = ema_reward
+                if ema_reward > best_mean_reward:
+                    best_mean_reward = ema_reward
                     # checkpoint_path 형식: .../checkpoints/checkpoint_iter{}.pt
 
                     best_checkpoint_path = os.path.join(
                         os.path.dirname(checkpoint_path.format(0)),
                         'checkpoint_best.pt'
                     )
+                    # best_ema_reward를 extra_state에 포함하여 세션 간 보존
+                    _extra = dict(self.extra_checkpoint_state) if self.extra_checkpoint_state else {}
+                    _extra['best_ema_reward'] = best_mean_reward
                     self.save_checkpoint(
                         best_checkpoint_path, iteration + 1,
-                        extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
+                        extra_state=_extra
                     )
                     logger.info(f"🏆 New best EMA reward: {ema_reward:.4f} (raw: {mean_reward:.4f}) at iteration {iteration + 1}")
                     no_improve_count = 0
@@ -1220,7 +1244,6 @@ class GRPOTrainer:
             'iteration': iteration,
             'total_timesteps': self.total_timesteps,
             'num_updates': self.num_updates,
-            'best_mean_reward': self.best_mean_reward,
             'policy_state_dict': self.policy.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': {
@@ -1262,7 +1285,6 @@ class GRPOTrainer:
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.total_timesteps = checkpoint['total_timesteps']
         self.num_updates = checkpoint['num_updates']
-        self.best_mean_reward = checkpoint.get('best_mean_reward', float('-inf'))
         
         extra_state = checkpoint.get('extra_state', None)
         
