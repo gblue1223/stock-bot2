@@ -886,7 +886,7 @@ class GRPOTrainer:
             )
             if os.path.exists(_best_ckpt_path):
                 try:
-                    _best_meta = torch.load(_best_ckpt_path, map_location='cpu')
+                    _best_meta = torch.load(_best_ckpt_path, map_location='cpu', weights_only=False)
                     _saved_reward = None
                     if isinstance(_best_meta.get('extra_state'), dict):
                         _saved_reward = _best_meta['extra_state'].get('best_ema_reward')
@@ -1279,7 +1279,7 @@ class GRPOTrainer:
         Returns:
             extra_state: 체크포인트에 저장된 추가 상태 (없으면 None)
         """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
