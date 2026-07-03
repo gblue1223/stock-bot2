@@ -977,13 +977,29 @@ class GRPOTrainer:
                     os.path.dirname(checkpoint_path.format(0)),
                     'checkpoint_best.pt'
                 )
+                
+                # 현재 EMA vs best 로깅 (디버깅용)
+                if len(recent_rewards) >= 3:
+                    _current_ema = np.mean(recent_rewards[-3:])
+                    _gap = best_mean_reward - _current_ema
+                    logger.info(f"📈 EMA-3: {_current_ema:.4f} | Best: {best_mean_reward:.4f} | Gap: {_gap:.4f} | No-improve: {no_improve_count}/{revert_to_best_patience}")
+                
                 if (revert_to_best_patience > 0 and 
                     no_improve_count >= revert_to_best_patience and 
                     revert_count < max_reverts and 
                     os.path.exists(best_checkpoint_path)):
                     
+                    revert_count += 1
+                    
+                    # 3회 연속 Revert마다 patience를 2배로 증가 (무한 루프 방지)
+                    if revert_count > 0 and revert_count % 3 == 0:
+                        old_patience = revert_to_best_patience
+                        revert_to_best_patience = min(revert_to_best_patience * 2, 30)
+                        logger.info(f"⚠️ {revert_count} consecutive reverts detected. "
+                                    f"Increasing patience: {old_patience} → {revert_to_best_patience}")
+                    
                     logger.info(f"🔄 Reverting to best checkpoint (no improvement for {no_improve_count} iterations, "
-                                f"revert #{revert_count + 1}/{max_reverts})")
+                                f"revert #{revert_count}/{max_reverts})")
                     self.load_checkpoint(best_checkpoint_path)
                     
                     # Reset optimizer to clear momentum and force the correct learning rate
@@ -992,7 +1008,6 @@ class GRPOTrainer:
                     # Reset patience and recent rewards
                     no_improve_count = 0
                     recent_rewards = []
-                    revert_count += 1
             
             # 콜백 호출 (Curriculum Learning 등)
             if on_iteration_end:
