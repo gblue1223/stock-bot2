@@ -561,8 +561,8 @@ class GRPOTrainer:
         all_returns = []
         
         if self.use_gae:
-            # 에피소드별로 값 함수 추정 후 GAE 계산
-            for episode in episodes:
+            # 에피소드별로 값 함수 추정 후 GAE 계산 및 그룹 상대 어드밴티지 결합
+            for episode, group_adv in zip(episodes, advantages):
                 states = episode['states']
                 actions = episode['actions']
                 old_log_probs = episode['log_probs']
@@ -586,15 +586,26 @@ class GRPOTrainer:
                     values_ep = torch.cat(values_ep_list, dim=0)
                     values_ep = values_ep.squeeze(-1).cpu().numpy() if values_ep.dim() > 1 else values_ep.cpu().numpy()
                 
-                # GAE 계산
+                # GAE 계산 (타임스텝별 세부 기여도 평가)
                 adv_ep, ret_ep = self._compute_gae(rewards, dones, values_ep)
+                
+                # 하이브리드 어드밴티지 적용: GAE + 그룹 상대 어드밴티지 (A안)
+                # GAE 어드밴티지와 스케일을 맞추기 위해 그룹 상대 어드밴티지를 step 수로 나누어 per-step 스케일로 만듭니다.
+                # A_hybrid(t) = A_gae(t) + alpha * (relative_advantage / num_steps)
+                alpha = 1.0  # 기여도 조정 계수
+                num_steps = len(rewards)
+                relative_adv_step = group_adv / num_steps
+                adv_hybrid = adv_ep + alpha * relative_adv_step
+                
+                # 리턴 값도 하이브리드 어드밴티지에 맞춰 업데이트 (Q = A + V)
+                ret_hybrid = adv_hybrid + values_ep
                 
                 # 축적
                 all_states.append(states)
                 all_actions.append(actions)
                 all_old_log_probs.append(old_log_probs)
-                all_advantages.append(adv_ep)
-                all_returns.append(ret_ep)
+                all_advantages.append(adv_hybrid)
+                all_returns.append(ret_hybrid)
         else:
             for episode, advantage in zip(episodes, advantages):
                 states = episode['states']
