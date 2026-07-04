@@ -103,6 +103,8 @@ class TrainingConfig:
         self.revert_patience = 0
         self.num_workers = 4
         self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
+        self.num_epochs = 4            # Number of epochs per policy update
+        self.use_gae = False           # Whether to use GAE (default False for GRPO mode)
         
         self.base_price = 100000.0
         self.stop_loss_pct = 2.0
@@ -310,6 +312,9 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--load_policy', type=str, default=None)
     parser.add_argument('--revert_patience', type=int, default=None)
+    parser.add_argument('--num_epochs', type=int, default=None, help='Number of epochs per policy update')
+    parser.add_argument('--use_gae', type=lambda x: x.lower() in ('true', '1', 'yes'), default=None,
+                        help='Whether to use GAE (default: False for GRPO mode)')
     
     args = parser.parse_args()
     
@@ -471,7 +476,9 @@ def main():
             max_grad_norm=config.max_grad_norm,
             batch_size=config.batch_size,
             device=device,
-            tensorboard_log_dir=tensorboard_dir
+            tensorboard_log_dir=tensorboard_dir,
+            use_gae=config.use_gae,
+            num_epochs=config.num_epochs
         )
         
         # 7. 고정 거래 비용 적용 (커리큘럼 미사용)

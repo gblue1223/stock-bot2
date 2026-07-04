@@ -67,7 +67,8 @@ class GRPOTrainer:
         batch_size: int = 64,
         device: str = 'cpu',
         tensorboard_log_dir: Optional[str] = None,
-        use_gae: bool = True
+        use_gae: bool = True,
+        num_epochs: int = 4
     ):
         self.policy = policy
         
@@ -97,6 +98,8 @@ class GRPOTrainer:
         self.max_grad_norm = max_grad_norm
         self.batch_size = batch_size
         self.use_gae = use_gae
+        self.num_epochs = num_epochs
+        logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}")
         
         # Optimizer 초기화
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
@@ -494,10 +497,13 @@ class GRPOTrainer:
                 # 그룹 상대 어드밴티지: A_i = R_i - mean(R_group)
                 relative_advantage = episode_return - mean_group_return
                 
-                # 에피소드의 각 타임스텝에 동일한 어드밴티지 할당
-                # 이는 에피소드 전체의 성과를 각 행동에 귀속시키는 방식입니다
+                # 에피소드의 각 타임스텝에 어드밴티지 할당 (시간 할인 적용)
+                # 에피소드 마지막(결과 결정 시점)에 가까울수록 더 큰 어드밴티지를 할당합니다.
                 num_steps = len(episode['rewards'])
-                advantage_array = np.full(num_steps, relative_advantage, dtype=np.float32)
+                advantage_array = np.zeros(num_steps, dtype=np.float32)
+                for t in range(num_steps):
+                    # t가 마지막 스텝에 가까울수록 (num_steps - 1 - t가 0에 가까울수록) 할인율이 1에 수렴
+                    advantage_array[t] = relative_advantage * (self.gamma ** (num_steps - 1 - t))
                 
                 advantages.append(advantage_array)
                 
@@ -651,7 +657,7 @@ class GRPOTrainer:
         self.reference_policy.eval()
         
         # 3. 여러 에포크 동안 정책 업데이트 (PPO의 multiple epochs)
-        num_epochs = 4  # PPO 표준 설정
+        num_epochs = self.num_epochs
         batch_size = self.batch_size
         num_samples = len(all_states)
         
@@ -701,17 +707,27 @@ class GRPOTrainer:
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # 6. 가치 손실 계산 (MSE)
-                value_loss = F.mse_loss(values, batch_returns)
+                if self.use_gae:
+                    value_loss = F.mse_loss(values, batch_returns)
+                else:
+                    value_loss = torch.tensor(0.0, device=self.device)
                 
                 # 7. 엔트로피 보너스 (탐험 장려)
                 entropy_loss = -entropy.mean()
                 
                 # 8. 총 손실 계산
-                loss = (
-                    policy_loss +
-                    self.value_coef * value_loss +
-                    self.entropy_coef * entropy_loss
-                )
+                if self.use_gae:
+                    loss = (
+                        policy_loss +
+                        self.value_coef * value_loss +
+                        self.entropy_coef * entropy_loss
+                    )
+                else:
+                    # GRPO 모드에서는 value loss를 제외합니다.
+                    loss = (
+                        policy_loss +
+                        self.entropy_coef * entropy_loss
+                    )
                 
                 # 9. 그래디언트 업데이트
                 self.optimizer.zero_grad()
@@ -731,11 +747,6 @@ class GRPOTrainer:
                 
                 # 10. KL 발산 계산 (조기 종료 체크)
                 with torch.no_grad():
-                    # 참조 정책의 로그 확률
-                    ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
-                        batch_states, batch_actions
-                    )
-                    
                     # KL 발산: KL(π_old || π_new)
                     kl_divergence = (batch_old_log_probs - log_probs).mean()
                     
