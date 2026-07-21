@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-삼성전자 1주 매수 후 즉시 매도 테스트 스크립트 (`scripts/test_order.py`)
+주식 1주 매수 후 즉시 매도 테스트 스크립트 (`scripts/test_order.py`)
 
 사용법:
-    .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1
+    1. 일반 KRX 거래:
+       .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1
+
+    2. SOR (Smart Order Routing / 최유리 스마트 라우팅) 거래:
+       .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1 --exchange sor
 """
 
 import sys
@@ -28,8 +32,24 @@ logging.basicConfig(
 logger = logging.getLogger("TestOrder")
 
 
-def run_order_test(stock_code: str = "005930", quantity: int = 1):
-    logger.info("키움 REST API 클라이언트 초기화 중...")
+def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str = "krx"):
+    exchange_upper = exchange.upper()
+    
+    # 키움 API 거래소 구분 코드 (1: KRX, 2: NXT, 3: SOR/통합)
+    if exchange_upper in ["SOR", "AL", "SOL", "INTEGRATED"]:
+        stex_type = "3"
+        exchange_name = "SOR / SOL (최유리 통합 스마트 주문, stex_tp=3)"
+    elif exchange_upper in ["NXT", "NX"]:
+        stex_type = "2"
+        exchange_name = "NXT (Nextrade 대체거래소, stex_tp=2)"
+    else:
+        stex_type = "1"
+        exchange_name = "KRX (한국거래소, stex_tp=1)"
+
+    # 종목코드에 접미사가 붙어있다면 원본 6자리 추출
+    clean_code = stock_code.split("_")[0]
+
+    logger.info(f"키움 REST API 클라이언트 초기화 중... (거래 방식: {exchange_name})")
     client = KoapyRestSimple(simulation=False)
     
     try:
@@ -45,13 +65,13 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1):
     logger.info(f"사용 계좌번호: {account_no}")
 
     # 1. 1주 매수 주문 송신
-    logger.info(f"🚀 [{stock_code}] {quantity}주 시장가 매수 주문 송신 중...")
+    logger.info(f"🚀 [{clean_code}] {quantity}주 시장가 매수 주문 송신 중... ({exchange_name})")
     try:
         buy_res = client.send_order(
-            rqname="TEST_BUY_1",
+            rqname=f"TEST_BUY_{exchange_upper}",
             account_no=account_no,
             order_type=OrderType.BUY,
-            code=stock_code,
+            code=clean_code,
             quantity=quantity,
             price=0,
             hoga=OrderBookType.MARKET
@@ -66,27 +86,28 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1):
     time.sleep(3)
 
     # 2. 1주 매도 주문 송신
-    logger.info(f"🔥 [{stock_code}] {quantity}주 시장가 매도 주문 송신 중...")
+    logger.info(f"🔥 [{clean_code}] {quantity}주 시장가 매도 주문 송신 중... ({exchange_name})")
     try:
         sell_res = client.send_order(
-            rqname="TEST_SELL_1",
+            rqname=f"TEST_SELL_{exchange_upper}",
             account_no=account_no,
             order_type=OrderType.SELL,
-            code=stock_code,
+            code=clean_code,
             quantity=quantity,
             price=0,
             hoga=OrderBookType.MARKET
         )
         logger.info(f"✅ 매도 주문 응답: {sell_res}")
-        logger.info("🎉 1주 매수 후 매도 테스트 프로세스가 완료되었습니다!")
+        logger.info(f"🎉 [{clean_code}] 1주 매수 후 매도 테스트 프로세스가 완료되었습니다! ({exchange_name})")
     except Exception as e:
         logger.error(f"❌ 매도 주문 실패: {e}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="1주 매수 후 매도 테스트 스크립트")
+    parser = argparse.ArgumentParser(description="1주 매수 후 매도 테스트 스크립트 (KRX / SOR 지원)")
     parser.add_argument("--code", type=str, default="005930", help="종목코드 (기본: 005930)")
     parser.add_argument("--qty", type=int, default=1, help="주문 수량 (기본: 1주)")
+    parser.add_argument("--exchange", "-e", type=str, default="krx", help="거래 방식 (krx, sor/sol, nxt)")
     args = parser.parse_args()
 
-    run_order_test(stock_code=args.code, quantity=args.qty)
+    run_order_test(stock_code=args.code, quantity=args.qty, exchange=args.exchange)
