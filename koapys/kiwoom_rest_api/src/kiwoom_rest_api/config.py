@@ -39,11 +39,11 @@ def get_ws_url() -> str:
 
 def get_api_key() -> str:
     """Return the API key"""
-    return API_KEY
+    return os.environ.get("KIWOOM_API_KEY") or API_KEY
 
 def get_api_secret() -> str:
     """Return the API secret"""
-    return API_SECRET
+    return os.environ.get("KIWOOM_API_SECRET") or API_SECRET
 
 def get_headers(access_token: Optional[str] = None) -> dict:
     """Return common headers for API requests"""

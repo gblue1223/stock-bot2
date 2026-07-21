@@ -42,7 +42,9 @@ class RealtimeProgramTrader:
         except Exception as e:
             self.logger.error(f"❌ Failed to connect KoapyRestSimple: {e}")
             if not config.dry_run:
-                raise
+                raise ConnectionError(f"API Connection Failed in Live Mode: {e}")
+            else:
+                self.logger.warning("⚠️ Dry-Run 모드로 계속 실행합니다 (API 연결 없이 시뮬레이션).")
 
         # API 토큰 및 컴포넌트
         base_url = "https://api.kiwoom.com"
@@ -57,12 +59,18 @@ class RealtimeProgramTrader:
             stock_info_api=self.stock_info
         )
 
-        # 계좌 선택
+        # 계좌 선택 (API 연결 안되어있으면 모의 계좌 사용)
         if self.config.account_no:
             self.account_no = self.config.account_no
         else:
-            accounts = self.koapys.get_account_list()
-            self.account_no = accounts[0] if accounts else "0000000000"
+            if self.koapys.is_connected:
+                try:
+                    accounts = self.koapys.get_account_list()
+                    self.account_no = accounts[0] if accounts else "0000000000"
+                except Exception:
+                    self.account_no = "0000000000"
+            else:
+                self.account_no = "0000000000"
         self.logger.info(f"Using account number: {self.account_no}")
 
         # 종목별 포지션 트래커 초기화
@@ -103,7 +111,7 @@ class RealtimeProgramTrader:
             f"| 수량: {qty:,}주 | 단가: {current_price:,.0f}원 | 금액: {order_amount:,.0f}원"
         )
 
-        if not self.config.dry_run:
+        if not self.config.dry_run and self.koapys.is_connected:
             try:
                 res = self.koapys.send_order(
                     rqname=f"PGM_SPLIT_BUY_{step_num}",
@@ -118,6 +126,8 @@ class RealtimeProgramTrader:
             except Exception as e:
                 self.logger.error(f"[{pos.stock_code}] 주문 체결 에러: {e}")
                 return False
+        else:
+            self.logger.info(f"💡 [DRY-RUN] 실제 주문은 송신되지 않았습니다. (가상 매수 수량: {qty}주)")
 
         # 포지션 관리 갱신
         pos.executed_steps += 1
@@ -146,7 +156,7 @@ class RealtimeProgramTrader:
             f"청산단가: {current_price:,.0f}원 | 손익: {pnl_amount:+,.0f}원 ({pnl_pct:+.2f}%)"
         )
 
-        if not self.config.dry_run:
+        if not self.config.dry_run and self.koapys.is_connected:
             try:
                 res = self.koapys.send_order(
                     rqname=f"PGM_LIQUIDATE_{reason}",
@@ -160,6 +170,8 @@ class RealtimeProgramTrader:
                 self.logger.info(f"[{pos.stock_code}] 청산 주문 응답: {res}")
             except Exception as e:
                 self.logger.error(f"[{pos.stock_code}] 청산 주문 에러: {e}")
+        else:
+            self.logger.info(f"💡 [DRY-RUN] 실제 청산 주문은 송신되지 않았습니다. (가상 청산 수량: {pos.holding_qty}주)")
 
         # 포지션 초기화 및 당일 매매 중단 설정
         pos.holding_qty = 0
@@ -203,6 +215,14 @@ class RealtimeProgramTrader:
             prog_data = self.strategy.fetch_program_data(code, date_str)
             current_price = prog_data.get("current_price", 0.0)
 
+            # Dry-Run 모드이면서 API 접속이 불가할 때 시뮬레이션 더미가 설정
+            if current_price <= 0 and self.config.dry_run:
+                mock_prices = {"005930": 55000.0, "000660": 180000.0}
+                current_price = mock_prices.get(code, 70000.0)
+                prog_data["current_price"] = current_price
+                prog_data["net_buy_amt"] = 1500.0  # +15억 양수 수급 예시
+                prog_data["net_buy_irds"] = 300.0  # +3억 수급 확대 예시
+
             if current_price <= 0:
                 self.logger.warning(f"[{code}] 현재가를 취득하지 못했습니다.")
                 continue
@@ -234,7 +254,7 @@ class RealtimeProgramTrader:
         if is_close_time:
             self.logger.info("⏰ 장 마감 시각에 도달하여 당일 매매 모니터링을 종료합니다.")
 
-    def start_loop(self):
+    def start_loop(self, max_iterations: Optional[int] = None):
         """실시간 트레이딩 모니터링 루프를 실행합니다."""
         self.logger.info("=" * 60)
         self.logger.info(f"⚡ 실시간 프로그램 매매 10분할 트레이더 시작")
@@ -245,6 +265,7 @@ class RealtimeProgramTrader:
         self.logger.info(f" 드라이런 모드: {self.config.dry_run}")
         self.logger.info("=" * 60)
 
+        iterations = 0
         while True:
             try:
                 if self.check_market_close_time():
@@ -252,7 +273,13 @@ class RealtimeProgramTrader:
                     break
 
                 self.run_cycle()
-                time.sleep(10)  # 10초 주기로 모니터링 폴링
+                iterations += 1
+
+                if max_iterations and iterations >= max_iterations:
+                    self.logger.info(f"최대 테스트 횟수({max_iterations}회)에 도달하여 루프를 종료합니다.")
+                    break
+
+                time.sleep(5)  # 5초 주기로 모니터링 폴링
 
             except KeyboardInterrupt:
                 self.logger.info("사용자에 의해 트레이딩이 중단되었습니다.")

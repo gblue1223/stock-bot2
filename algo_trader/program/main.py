@@ -10,18 +10,21 @@
        python -m algo_trader.program.main --stocks "005930,000660" --budget 2000000 --splits 10
 """
 
+import os
 import sys
 import argparse
 import logging
 from pathlib import Path
+from dotenv import load_dotenv
 
-# 프로젝트 루트 경로 추가
+# 프로젝트 루트 경로 추가 및 .env 우선 로드
 project_root = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "koapys" / "kiwoom_rest_api" / "src"))
 
-from dotenv import load_dotenv
-load_dotenv(project_root / ".env")
+env_path = project_root / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
 
 from algo_trader.program.config import ProgramTradingConfig
 from algo_trader.program.trader import RealtimeProgramTrader
@@ -89,6 +92,12 @@ def main():
         action="store_true",
         help="드라이런 모드 (실제 주문을 내지 않고 로그로만 확인)"
     )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=None,
+        help="최대 사이클 실행 횟수 (테스트용, 기본값: 무한)"
+    )
 
     args = parser.parse_args()
 
@@ -110,7 +119,7 @@ def main():
     )
 
     trader = RealtimeProgramTrader(config=config)
-    trader.start_loop()
+    trader.start_loop(max_iterations=args.max_iterations)
 
 
 if __name__ == "__main__":
