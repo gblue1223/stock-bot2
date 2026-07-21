@@ -28,7 +28,7 @@ class ProgramTradingConfig:
     account_no: Optional[str] = None  # 계좌번호 (None일 경우 첫번째 계좌 자동 선택)
     dry_run: bool = False  # 드라이런 모드 (True일 경우 실제 주문을 내지 않고 로그만 출력)
     amount_quantity_type: str = "1"  # 키움 API 금액수량구분 (1: 금액 백만원, 2: 수량 천주)
-    stock_exchange_type: str = "1"  # 거래소 구분 (1: KRX, 2: NXT, 3: 통합)
+    stock_exchange_type: str = "KRX"  # 거래소 구분 ("KRX": 한국거래소, "NXT": Nextrade 대체거래소, "SOR": 최유리 통합 주문)
 
     def get_budget_per_split(self) -> float:
         """1회 분할당 주문 예산 산출"""

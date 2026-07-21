@@ -108,8 +108,13 @@ class RealtimeProgramTrader:
 
         self.logger.info(
             f"🚀 [{pos.stock_code}] 10분할 매수 집행 #{step_num}/{pos.target_steps} "
-            f"| 수량: {qty:,}주 | 단가: {current_price:,.0f}원 | 금액: {order_amount:,.0f}원"
+            f"| 수량: {qty:,}주 | 단가: {current_price:,.0f}원 | 금액: {order_amount:,.0f}원 | 거래소: {self.config.stock_exchange_type}"
         )
+
+        # NXT 모드에서는 지정가(LIMIT) 주문, KRX/SOR 모드에서는 시장가(MARKET) 주문 적용
+        is_nxt = (self.config.stock_exchange_type.upper() == "NXT")
+        hoga_type = OrderBookType.LIMIT if is_nxt else OrderBookType.MARKET
+        order_price = int(current_price) if is_nxt else 0
 
         if not self.config.dry_run and self.koapys.is_connected:
             try:
@@ -119,8 +124,9 @@ class RealtimeProgramTrader:
                     order_type=OrderType.BUY,
                     code=pos.stock_code,
                     quantity=qty,
-                    price=0,  # 시장가 주문 시 price는 0
-                    hoga=OrderBookType.MARKET
+                    price=order_price,
+                    hoga=hoga_type,
+                    dmst_stex_tp=self.config.stock_exchange_type
                 )
                 self.logger.info(f"[{pos.stock_code}] 주문 응답: {res}")
             except Exception as e:
@@ -143,7 +149,7 @@ class RealtimeProgramTrader:
         return True
 
     def liquidate_position(self, pos: PositionState, current_price: float, reason: str):
-        """보유 포지션을 시장가로 전량 매도(청산)합니다."""
+        """보유 포지션을 전량 매도(청산)합니다."""
         if pos.holding_qty <= 0:
             return
 
@@ -156,6 +162,10 @@ class RealtimeProgramTrader:
             f"청산단가: {current_price:,.0f}원 | 손익: {pnl_amount:+,.0f}원 ({pnl_pct:+.2f}%)"
         )
 
+        is_nxt = (self.config.stock_exchange_type.upper() == "NXT")
+        hoga_type = OrderBookType.LIMIT if is_nxt else OrderBookType.MARKET
+        order_price = int(current_price) if is_nxt else 0
+
         if not self.config.dry_run and self.koapys.is_connected:
             try:
                 res = self.koapys.send_order(
@@ -164,8 +174,9 @@ class RealtimeProgramTrader:
                     order_type=OrderType.SELL,
                     code=pos.stock_code,
                     quantity=pos.holding_qty,
-                    price=0,
-                    hoga=OrderBookType.MARKET
+                    price=order_price,
+                    hoga=hoga_type,
+                    dmst_stex_tp=self.config.stock_exchange_type
                 )
                 self.logger.info(f"[{pos.stock_code}] 청산 주문 응답: {res}")
             except Exception as e:
@@ -259,6 +270,7 @@ class RealtimeProgramTrader:
         self.logger.info("=" * 60)
         self.logger.info(f"⚡ 실시간 프로그램 매매 10분할 트레이더 시작")
         self.logger.info(f" 대상 종목: {self.config.target_stocks}")
+        self.logger.info(f" 거래소 구분: {self.config.stock_exchange_type}")
         self.logger.info(f" 분할 횟수: {self.config.split_count}회 | 분할 주기: {self.config.interval_seconds}초")
         self.logger.info(f" 종목당 예산: {self.config.total_budget_per_stock:,.0f}원 (1회당: {self.config.get_budget_per_split():,.0f}원)")
         self.logger.info(f" 손절: -{self.config.stop_loss_pct}% | 익절: +{self.config.take_profit_pct}% | 청산시각: {self.config.market_close_time}")

@@ -6,8 +6,11 @@
     1. 드라이런 (모의 실행):
        python -m algo_trader.program.main --stocks "005930,000660" --dry-run
        
-    2. 실전 트레이딩:
-       python -m algo_trader.program.main --stocks "005930,000660" --budget 2000000 --splits 10
+    2. NXT (Nextrade 대체거래소) 10분할 트레이딩:
+       python -m algo_trader.program.main --stocks "005930,000660" --exchange nxt --budget 2000000
+
+    3. SOR (최유리 스마트 라우팅) 10분할 트레이딩:
+       python -m algo_trader.program.main --stocks "005930,000660" --exchange sor --budget 2000000
 """
 
 import os
@@ -45,6 +48,12 @@ def main():
         type=str,
         default="005930,000660",
         help="대상 종목코드 목록 (쉼표로 구분, 예: 005930,000660)"
+    )
+    parser.add_argument(
+        "--exchange", "-e",
+        type=str,
+        default="krx",
+        help="거래소 구분 (krx: 한국거래소, nxt: Nextrade 대체거래소, sor/al: 최유리 스마트 라우팅)"
     )
     parser.add_argument(
         "--budget", "-b",
@@ -106,6 +115,15 @@ def main():
         logger.error("대상 종목 코드가 지정되지 않았습니다.")
         sys.exit(1)
 
+    # 거래소 코드 맵핑 (krx -> KRX, nxt -> NXT, sor -> SOR)
+    ex_upper = args.exchange.upper()
+    if ex_upper in ["NXT", "NX"]:
+        stex_code = "NXT"
+    elif ex_upper in ["SOR", "AL", "SOL", "INTEGRATED"]:
+        stex_code = "SOR"
+    else:
+        stex_code = "KRX"
+
     config = ProgramTradingConfig(
         target_stocks=stock_list,
         split_count=args.splits,
@@ -115,7 +133,8 @@ def main():
         take_profit_pct=args.take_profit,
         market_close_time=args.close_time,
         account_no=args.account,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        stock_exchange_type=stex_code
     )
 
     trader = RealtimeProgramTrader(config=config)
