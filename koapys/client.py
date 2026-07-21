@@ -609,6 +609,7 @@ class KoapyRestSimple:
         price: int,
         hoga: OrderBookType,
         origin_order_no: str = "",
+        dmst_stex_tp: str = "KRX",
     ) -> Dict[str, Any]:
         if self._simulation:
             return {"status": "접수", "rqname": rqname, "order_no": "SIM-ORDER-0001", "code": code}
@@ -637,7 +638,7 @@ class KoapyRestSimple:
             # Determine if buy or sell
             if order_type == OrderType.BUY:
                 result = self._order.stock_buy_order_request_kt10000(
-                    dmst_stex_tp="KRX",
+                    dmst_stex_tp=dmst_stex_tp,
                     stk_cd=code,
                     ord_qty=str(quantity),
                     trde_tp=trde_tp,
@@ -645,7 +646,7 @@ class KoapyRestSimple:
                 )
             elif order_type == OrderType.SELL:
                 result = self._order.stock_sell_order_request_kt10001(
-                    dmst_stex_tp="KRX",
+                    dmst_stex_tp=dmst_stex_tp,
                     stk_cd=code,
                     ord_qty=str(quantity),
                     trde_tp=trde_tp,

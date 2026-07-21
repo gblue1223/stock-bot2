@@ -7,7 +7,7 @@
        .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1
 
     2. NXT (Nextrade 대체거래소 애프터마켓 15:30~20:00 - 지정가 필수):
-       .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1 --exchange nxt --price 55000
+       .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1 --exchange nxt --price 263000
 
     3. SOR (Smart Order Routing 최유리 주문):
        .venv64/Scripts/python scripts/test_order.py --code 005930 --qty 1 --exchange sor
@@ -39,18 +39,18 @@ logger = logging.getLogger("TestOrder")
 def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str = "krx", price: int = 0):
     exchange_upper = exchange.upper()
     
-    # 키움 API 거래소 구분 코드 (1: KRX, 2: NXT, 3: SOR/통합)
+    # 키움 API 거래소 구분 코드 (KRX, NXT, SOR)
     if exchange_upper in ["NXT", "NX"]:
-        stex_type = "2"
-        exchange_name = "NXT (Nextrade 대체거래소 애프터마켓, stex_tp=2)"
+        stex_code = "NXT"
+        exchange_name = "NXT (Nextrade 대체거래소 애프터마켓, dmst_stex_tp='NXT')"
         is_nxt = True
     elif exchange_upper in ["SOR", "AL", "SOL", "INTEGRATED"]:
-        stex_type = "3"
-        exchange_name = "SOR / SOL (최유리 통합 스마트 주문, stex_tp=3)"
+        stex_code = "SOR"
+        exchange_name = "SOR / SOL (최유리 통합 스마트 주문, dmst_stex_tp='SOR')"
         is_nxt = False
     else:
-        stex_type = "1"
-        exchange_name = "KRX (한국거래소, stex_tp=1)"
+        stex_code = "KRX"
+        exchange_name = "KRX (한국거래소, dmst_stex_tp='KRX')"
         is_nxt = False
 
     clean_code = stock_code.split("_")[0]
@@ -71,14 +71,12 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str 
     logger.info(f"사용 계좌번호: {account_no}")
 
     # 호가 및 가격 설정
-    # NXT 거래소 애프터마켓(15:30~20:00)은 시장가(MARKET) 주문이 불가능하고 지정가(LIMIT) 주문만 가능합니다.
     target_price = price
     if price > 0:
         hoga_type = OrderBookType.LIMIT
         order_desc = f"지정가 {target_price:,.0f}원"
     else:
         if is_nxt:
-            # NXT 애프터마켓에 가격이 지정되지 않은 경우 현재가 조회 시도
             try:
                 stock_info_api = StockInfo(base_url=client._base_url, token_manager=client._token_manager)
                 info_res = stock_info_api.basic_stock_information_request_ka10001(clean_code)
@@ -96,7 +94,7 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str 
             target_price = 0
             order_desc = "시장가"
 
-    # 1. 1주 매수 주문 송신
+    # 1. 1주 매수 주문 송신 (dmst_stex_tp 파라미터 전달)
     logger.info(f"🚀 [{clean_code}] {quantity}주 {order_desc} 매수 주문 송신 중... ({exchange_name})")
     try:
         buy_res = client.send_order(
@@ -106,7 +104,8 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str 
             code=clean_code,
             quantity=quantity,
             price=target_price,
-            hoga=hoga_type
+            hoga=hoga_type,
+            dmst_stex_tp=stex_code
         )
         logger.info(f"✅ 매수 주문 응답: {buy_res}")
     except Exception as e:
@@ -117,7 +116,7 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str 
     logger.info("3초간 체결 대기 중...")
     time.sleep(3)
 
-    # 2. 1주 매도 주문 송신
+    # 2. 1주 매도 주문 송신 (dmst_stex_tp 파라미터 전달)
     logger.info(f"🔥 [{clean_code}] {quantity}주 {order_desc} 매도 주문 송신 중... ({exchange_name})")
     try:
         sell_res = client.send_order(
@@ -127,7 +126,8 @@ def run_order_test(stock_code: str = "005930", quantity: int = 1, exchange: str 
             code=clean_code,
             quantity=quantity,
             price=target_price,
-            hoga=hoga_type
+            hoga=hoga_type,
+            dmst_stex_tp=stex_code
         )
         logger.info(f"✅ 매도 주문 응답: {sell_res}")
         logger.info(f"🎉 [{clean_code}] 1주 매수 후 매도 테스트 프로세스가 완료되었습니다! ({exchange_name})")
