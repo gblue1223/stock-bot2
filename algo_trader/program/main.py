@@ -95,7 +95,25 @@ def main():
         "--sell-threshold",
         type=float,
         default=100000.0,
-        help="프로그램 매도 시그널 이탈 감도 기준 (백만원 단위, 기본값: 100,000백만원 = -1,000억원)"
+        help="프로그램 급격한 매도 시그널 이탈 감도 기준 (백만원 단위, 기본값: 100,000백만원 = -1,000억원)"
+    )
+    parser.add_argument(
+        "--trend-window",
+        type=int,
+        default=10,
+        help="완만한 하락 추세 감지 분 창 (기본값: 10분)"
+    )
+    parser.add_argument(
+        "--gentle-down-threshold",
+        type=float,
+        default=10000.0,
+        help="10분 완만한 하락 청산 감도 기준 (백만원 단위, 기본값: 10,000백만원 = -100억원)"
+    )
+    parser.add_argument(
+        "--decrease-ratio",
+        type=float,
+        default=0.6,
+        help="10분 중 하락 분 비율 기준 (기본값: 0.6 = 60%%)"
     )
     parser.add_argument(
         "--account", "-a",
@@ -141,7 +159,10 @@ def main():
         account_no=args.account,
         dry_run=args.dry_run,
         stock_exchange_type=stex_code,
-        sell_net_buy_trend_threshold=args.sell_threshold
+        sell_net_buy_trend_threshold=args.sell_threshold,
+        trend_window_minutes=args.trend_window,
+        gentle_downward_threshold=args.gentle_down_threshold,
+        consecutive_decrease_ratio=args.decrease_ratio
     )
 
     trader = RealtimeProgramTrader(config=config)

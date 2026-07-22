@@ -18,7 +18,12 @@ class ProgramTradingConfig:
     # 수급 시그널 설정
     min_net_buy_amount: float = 0.0  # 진입에 필요한 최소 프로그램 순매수 금액 (백만원 단위)
     min_net_buy_trend_irds: float = 0.0  # 매수 진입 시 필요한 순매수 증감 기준 (백만원 단위, >0 시 매수)
-    sell_net_buy_trend_threshold: float = 100_000.0  # 프로그램 매도 시그널 이탈 기준 (백만원 단위, 100,000 = -1,000억원)
+    sell_net_buy_trend_threshold: float = 100_000.0  # 프로그램 급격한 매도 시그널 이탈 기준 (백만원 단위, 100,000 = -1,000억원)
+
+    # 10분 완만한 하락 추세 청산 설정
+    trend_window_minutes: int = 10  # 추세 감지 분 창 (기본 10분)
+    gentle_downward_threshold: float = 10_000.0  # 10분간 완만 하락 청산 감도 기준 (백만원 단위, 10,000 = -100억원)
+    consecutive_decrease_ratio: float = 0.6  # 10분 중 하락 분 비율 기준 (기본 60% 이상)
 
     # 리스크 관리 설정
     stop_loss_pct: float = 2.0  # 손절 비율 (%) -> -2% 손실 시 전량 매도

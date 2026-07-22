@@ -54,7 +54,8 @@ class ProgramTradingStrategy:
             "buy_amt": 0.0,
             "current_price": 0.0,
             "time_str": "",
-            "raw_time_data": None
+            "raw_time_data": None,
+            "time_series_items": []
         }
 
         # 1. 시간대별 프로그램 매매 추이 요청 (ka90008)
@@ -77,6 +78,7 @@ class ProgramTradingStrategy:
                     result_data["buy_amt"] = parse_amount(latest.get("prm_buy_amt"))
                     result_data["net_buy_qty"] = parse_amount(latest.get("prm_netprps_qty"))
                     result_data["raw_time_data"] = latest
+                    result_data["time_series_items"] = valid_items
         except Exception as e:
             self.logger.warning(f"[{stock_code}] ka90008 시간대별 프로그램 매매 조회 실패: {e}")
 
@@ -98,18 +100,45 @@ class ProgramTradingStrategy:
         net_buy_irds = prog_data.get("net_buy_irds", 0.0)
 
         # BUY 신호 조건:
-        # 1) 프로그램 누적 순매수 금액이 설정한 최소 임계값(min_net_buy_amount) 이상이고
-        # 2) 최근 시간대별 순매수 증감(net_buy_irds)이 양수(+)인 경우 (매수세 확대)
+        # 1) 프로그램 누적 순매수 금액이 최소 임계값(min_net_buy_amount) 이상이고
+        # 2) 최근 시간대별 순매수 증감(net_buy_irds)이 지정한 양수(+) 기준 이상인 경우 (기본 0 초과)
         if net_buy_amt >= self.config.min_net_buy_amount and net_buy_irds > self.config.min_net_buy_trend_irds:
             self.logger.info(f"[{stock_code}] 🟢 BUY 시그널 감지 - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
             return ProgramSignal.BUY
 
-        # SELL 신호 조건:
-        # 1) 최근 순매수 증감(net_buy_irds)이 설정된 이탈 기준(-1,000억원 = -100,000백만원) 이하로 급감하거나
-        # 2) 누적 순매수 금액이 설정된 이탈 기준 이하인 경우
+        # SELL 신호 조건 1: 최근 1분간 프로그램 순매수 급감(-1,000억원 이상) 또는 누적 순매수 대량 이탈 시
         sell_limit = -abs(self.config.sell_net_buy_trend_threshold)
         if net_buy_irds <= sell_limit or net_buy_amt <= sell_limit:
-            self.logger.info(f"[{stock_code}] 🔴 SELL 시그널 감지 - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
+            self.logger.info(f"[{stock_code}] 🔴 SELL 시그널 감지 (급격한 이탈) - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
             return ProgramSignal.SELL
+
+        # SELL 신호 조건 2: 10분간 완만한 하락 추세 감지
+        trend_items = prog_data.get("time_series_items", [])
+        window_size = self.config.trend_window_minutes
+        if len(trend_items) >= 5:  # 최소 5분 이상 시계열 데이터 누적 시
+            idx_past = min(window_size, len(trend_items) - 1)
+            net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
+            net_buy_past = parse_amount(trend_items[idx_past].get("prm_netprps_amt"))
+            diff_trend = net_buy_now - net_buy_past
+
+            # 시계열 내 감소 발생 구간 수 카운트
+            check_count = min(window_size, len(trend_items) - 1)
+            decreases = 0
+            for k in range(check_count):
+                irds = parse_amount(trend_items[k].get("prm_netprps_amt_irds"))
+                if irds < 0:
+                    decreases += 1
+
+            decrease_ratio = decreases / check_count if check_count > 0 else 0.0
+            gentle_threshold = -abs(self.config.gentle_downward_threshold)
+
+            # 10분간 누적 순매수액 감소량이 완만 하락 감도 기준 이하이고, 하락 구간 비율이 60% 이상인 경우
+            if diff_trend <= gentle_threshold and decrease_ratio >= self.config.consecutive_decrease_ratio:
+                self.logger.info(
+                    f"[{stock_code}] 🔴 SELL 시그널 감지 ({window_size}분 완만 하락 추세) - "
+                    f"{window_size}분간 순매수 변동: {diff_trend:,.0f}백만원, "
+                    f"하락비율: {decrease_ratio*100:.0f}% ({decreases}/{check_count}분)"
+                )
+                return ProgramSignal.SELL
 
         return ProgramSignal.HOLD
