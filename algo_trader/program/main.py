@@ -130,8 +130,8 @@ def main():
     parser.add_argument(
         "--decrease-ratio",
         type=float,
-        default=0.5,
-        help="1분 단위 중 하락 분 비율 기준 (기본값: 0.5 = 50%%)"
+        default=0.1,
+        help="1분 단위 중 하락 분 비율 기준 (기본값: 0.1 = 10%%)"
     )
     parser.add_argument(
         "--account", "-a",
