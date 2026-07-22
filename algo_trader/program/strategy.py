@@ -1,6 +1,6 @@
 import logging
 from enum import Enum
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple, List
 from datetime import datetime
 
 from .config import ProgramTradingConfig
@@ -28,6 +28,40 @@ def parse_amount(val: Any) -> float:
         return float(val_str)
     except ValueError:
         return 0.0
+
+
+def parse_hhmmss_to_seconds(tm_str: str) -> int:
+    """HHMMSS 포맷 시각 문자열을 하루 기준 초(seconds) 단위로 변환합니다."""
+    tm_str = str(tm_str).zfill(6)
+    try:
+        h = int(tm_str[:2])
+        m = int(tm_str[2:4])
+        s = int(tm_str[4:6])
+        return h * 3600 + m * 60 + s
+    except Exception:
+        return 0
+
+
+def get_past_item_by_minutes(valid_items: List[Dict[str, Any]], minutes: int) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """현재 시각 대비 정확히 N분 전 시점의 아이템 및 해당 구간 시계열 목록을 추출합니다."""
+    if not valid_items:
+        return None, []
+    
+    now_sec = parse_hhmmss_to_seconds(valid_items[0].get("tm"))
+    target_sec = now_sec - minutes * 60
+
+    past_item = valid_items[-1]
+    window_items = []
+    
+    for item in valid_items:
+        sec = parse_hhmmss_to_seconds(item.get("tm"))
+        if sec >= target_sec:
+            window_items.append(item)
+        if sec <= target_sec:
+            past_item = item
+            break
+
+    return past_item, window_items
 
 
 class ProgramTradingStrategy:
@@ -103,22 +137,23 @@ class ProgramTradingStrategy:
         # BUY 신호 조건:
         # 1) 프로그램 누적 순매수 금액이 최소 임계값(min_net_buy_amount) 이상이고
         # 2) 최근 시간대별 순매수 증감(net_buy_irds)이 지정한 양수(+) 기준 이상이며
-        # 3) 이전 10분 간의 상승세(10분 전 대비 순매수 누적액 증가: net_buy_now > net_buy_10m_ago)가 확인된 경우
+        # 3) 실제 이전 10분 전 시점 대비 현재 프로그램 순매수 누적액이 상승(net_buy_now > net_buy_10m_ago)한 경우
         if net_buy_amt >= self.config.min_net_buy_amount and net_buy_irds > self.config.min_net_buy_trend_irds:
             buy_trend_ok = True
             diff_buy_trend = 0.0
             if len(trend_items) >= 5:
-                idx_past = min(self.config.buy_trend_window_minutes, len(trend_items) - 1)
-                net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
-                net_buy_past = parse_amount(trend_items[idx_past].get("prm_netprps_amt"))
-                diff_buy_trend = net_buy_now - net_buy_past
+                past_item, _ = get_past_item_by_minutes(trend_items, self.config.buy_trend_window_minutes)
+                if past_item:
+                    net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
+                    net_buy_past = parse_amount(past_item.get("prm_netprps_amt"))
+                    diff_buy_trend = net_buy_now - net_buy_past
 
-                if diff_buy_trend <= self.config.min_buy_trend_increase:
-                    buy_trend_ok = False
+                    if diff_buy_trend <= self.config.min_buy_trend_increase:
+                        buy_trend_ok = False
 
             if buy_trend_ok:
                 self.logger.info(
-                    f"[{stock_code}] 🟢 BUY 시그널 감지 (10분간 상승세 확인: {diff_buy_trend:+,.0f}백만원) - "
+                    f"[{stock_code}] 🟢 BUY 시그널 감지 (실제 {self.config.buy_trend_window_minutes}분간 상승세 확인: {diff_buy_trend:+,.0f}백만원) - "
                     f"순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})"
                 )
                 return ProgramSignal.BUY
@@ -129,32 +164,26 @@ class ProgramTradingStrategy:
             self.logger.info(f"[{stock_code}] 🔴 SELL 시그널 감지 (급격한 이탈) - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
             return ProgramSignal.SELL
 
-        # SELL 신호 조건 2: 10분간 완만한 하락 추세 감지
+        # SELL 신호 조건 2: 실제 10분간 완만한 하락 추세 감지
         window_size = self.config.trend_window_minutes
-        if len(trend_items) >= 5:  # 최소 5분 이상 시계열 데이터 누적 시
-            idx_past = min(window_size, len(trend_items) - 1)
-            net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
-            net_buy_past = parse_amount(trend_items[idx_past].get("prm_netprps_amt"))
-            diff_trend = net_buy_now - net_buy_past
+        if len(trend_items) >= 5:
+            past_item, window_items = get_past_item_by_minutes(trend_items, window_size)
+            if past_item and len(window_items) >= 5:
+                net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
+                net_buy_past = parse_amount(past_item.get("prm_netprps_amt"))
+                diff_trend = net_buy_now - net_buy_past
 
-            # 시계열 내 감소 발생 구간 수 카운트
-            check_count = min(window_size, len(trend_items) - 1)
-            decreases = 0
-            for k in range(check_count):
-                irds = parse_amount(trend_items[k].get("prm_netprps_amt_irds"))
-                if irds < 0:
-                    decreases += 1
+                decreases = sum(1 for it in window_items if parse_amount(it.get("prm_netprps_amt_irds")) < 0)
+                check_count = len(window_items)
+                decrease_ratio = decreases / check_count if check_count > 0 else 0.0
+                gentle_threshold = -abs(self.config.gentle_downward_threshold)
 
-            decrease_ratio = decreases / check_count if check_count > 0 else 0.0
-            gentle_threshold = -abs(self.config.gentle_downward_threshold)
-
-            # 10분간 누적 순매수액 감소량이 완만 하락 감도 기준 이하이고, 하락 구간 비율이 60% 이상인 경우
-            if diff_trend <= gentle_threshold and decrease_ratio >= self.config.consecutive_decrease_ratio:
-                self.logger.info(
-                    f"[{stock_code}] 🔴 SELL 시그널 감지 ({window_size}분 완만 하락 추세) - "
-                    f"{window_size}분간 순매수 변동: {diff_trend:,.0f}백만원, "
-                    f"하락비율: {decrease_ratio*100:.0f}% ({decreases}/{check_count}분)"
-                )
-                return ProgramSignal.SELL
+                if diff_trend <= gentle_threshold and decrease_ratio >= self.config.consecutive_decrease_ratio:
+                    self.logger.info(
+                        f"[{stock_code}] 🔴 SELL 시그널 감지 (실제 {window_size}분 완만 하락 추세) - "
+                        f"{window_size}분간 순매수 변동: {diff_trend:,.0f}백만원, "
+                        f"하락비율: {decrease_ratio*100:.0f}% ({decreases}/{check_count}개 틱)"
+                    )
+                    return ProgramSignal.SELL
 
         return ProgramSignal.HOLD
