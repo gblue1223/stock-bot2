@@ -92,6 +92,12 @@ def main():
         help="장 마감 전 자동 청산 시각 (HH:MM:SS, 기본값: 15:15:00)"
     )
     parser.add_argument(
+        "--sell-threshold",
+        type=float,
+        default=100000.0,
+        help="프로그램 매도 시그널 이탈 감도 기준 (백만원 단위, 기본값: 100,000백만원 = -1,000억원)"
+    )
+    parser.add_argument(
         "--account", "-a",
         type=str,
         help="계좌번호 (선택사항, 입력하지 않으면 첫번째 계좌 자동 선택)"
@@ -134,7 +140,8 @@ def main():
         market_close_time=args.close_time,
         account_no=args.account,
         dry_run=args.dry_run,
-        stock_exchange_type=stex_code
+        stock_exchange_type=stex_code,
+        sell_net_buy_trend_threshold=args.sell_threshold
     )
 
     trader = RealtimeProgramTrader(config=config)

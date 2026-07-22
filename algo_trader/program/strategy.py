@@ -105,9 +105,10 @@ class ProgramTradingStrategy:
             return ProgramSignal.BUY
 
         # SELL 신호 조건:
-        # 1) 프로그램 순매수가 음수(-)이거나 (순매도 전환)
-        # 2) 순매수 증감이 큰 폭의 음수(-)로 이탈하는 경우
-        elif net_buy_amt < 0 or net_buy_irds < -abs(self.config.min_net_buy_trend_irds):
+        # 1) 최근 순매수 증감(net_buy_irds)이 설정된 이탈 기준(-1,000억원 = -100,000백만원) 이하로 급감하거나
+        # 2) 누적 순매수 금액이 설정된 이탈 기준 이하인 경우
+        sell_limit = -abs(self.config.sell_net_buy_trend_threshold)
+        if net_buy_irds <= sell_limit or net_buy_amt <= sell_limit:
             self.logger.info(f"[{stock_code}] 🔴 SELL 시그널 감지 - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
             return ProgramSignal.SELL
 

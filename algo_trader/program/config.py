@@ -16,8 +16,9 @@ class ProgramTradingConfig:
     interval_seconds: int = 300  # 분할 주문 실행 체크 주기 (초 단위, 기본 5분)
 
     # 수급 시그널 설정
-    min_net_buy_amount: float = 0.0  # 진입에 필요한 최소 프로그램 순매수 금액 (백만원 단위, 0 이상)
-    min_net_buy_trend_irds: float = 0.0  # 순매수 금액 증감 기준 (0 초과 시 수급 유입으로 판단)
+    min_net_buy_amount: float = 0.0  # 진입에 필요한 최소 프로그램 순매수 금액 (백만원 단위)
+    min_net_buy_trend_irds: float = 0.0  # 매수 진입 시 필요한 순매수 증감 기준 (백만원 단위, >0 시 매수)
+    sell_net_buy_trend_threshold: float = 100_000.0  # 프로그램 매도 시그널 이탈 기준 (백만원 단위, 100,000 = -1,000억원)
 
     # 리스크 관리 설정
     stop_loss_pct: float = 2.0  # 손절 비율 (%) -> -2% 손실 시 전량 매도
