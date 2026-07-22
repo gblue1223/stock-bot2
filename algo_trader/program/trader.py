@@ -10,6 +10,7 @@ from kiwoom_rest_api.koreanstock.stockinfo import StockInfo
 
 from .config import ProgramTradingConfig
 from .strategy import ProgramTradingStrategy, ProgramSignal
+from .recorder import ProgramTradeRecorder
 
 
 @dataclass
@@ -31,6 +32,9 @@ class RealtimeProgramTrader:
     def __init__(self, config: ProgramTradingConfig):
         self.config = config
         self.logger = logging.getLogger("RealtimeProgramTrader")
+        
+        # 데이터 레코더 초기화 (수급 틱 및 주문 내역 CSV 기록)
+        self.recorder = ProgramTradeRecorder()
         
         # Koapys REST 클라이언트 초기화
         self.logger.info("Initializing KoapyRestSimple client...")
@@ -116,6 +120,10 @@ class RealtimeProgramTrader:
         hoga_type = OrderBookType.LIMIT if is_nxt else OrderBookType.MARKET
         order_price = int(current_price) if is_nxt else 0
 
+        order_no = ""
+        return_code = ""
+        return_msg = ""
+
         if not self.config.dry_run and self.koapys.is_connected:
             try:
                 res = self.koapys.send_order(
@@ -128,11 +136,15 @@ class RealtimeProgramTrader:
                     hoga=hoga_type,
                     dmst_stex_tp=self.config.stock_exchange_type
                 )
+                order_no = str(res.get("order_no") or res.get("ord_no") or "")
+                return_code = res.get("return_code", "")
+                return_msg = str(res.get("return_msg", ""))
                 self.logger.info(f"[{pos.stock_code}] 주문 응답: {res}")
             except Exception as e:
                 self.logger.error(f"[{pos.stock_code}] 주문 체결 에러: {e}")
                 return False
         else:
+            return_msg = "DRY-RUN SIMULATION"
             self.logger.info(f"💡 [DRY-RUN] 실제 주문은 송신되지 않았습니다. (가상 매수 수량: {qty}주)")
 
         # 포지션 관리 갱신
@@ -141,6 +153,20 @@ class RealtimeProgramTrader:
         pos.total_cost += order_amount
         pos.avg_price = pos.total_cost / pos.holding_qty if pos.holding_qty > 0 else 0.0
         pos.last_order_time = datetime.now()
+
+        # 주문 내역 파일에 기록
+        self.recorder.log_order(
+            stock_code=pos.stock_code,
+            action="BUY",
+            reason=f"PGM_SPLIT_BUY_{step_num}",
+            quantity=qty,
+            price=current_price,
+            order_no=order_no,
+            return_code=return_code,
+            return_msg=return_msg,
+            holding_qty_after=pos.holding_qty,
+            avg_price_after=pos.avg_price
+        )
 
         self.logger.info(
             f"✅ [{pos.stock_code}] 보유 현황 | 총 수량: {pos.holding_qty:,}주 | "
@@ -166,6 +192,10 @@ class RealtimeProgramTrader:
         hoga_type = OrderBookType.LIMIT if is_nxt else OrderBookType.MARKET
         order_price = int(current_price) if is_nxt else 0
 
+        order_no = ""
+        return_code = ""
+        return_msg = ""
+
         if not self.config.dry_run and self.koapys.is_connected:
             try:
                 res = self.koapys.send_order(
@@ -178,11 +208,31 @@ class RealtimeProgramTrader:
                     hoga=hoga_type,
                     dmst_stex_tp=self.config.stock_exchange_type
                 )
+                order_no = str(res.get("order_no") or res.get("ord_no") or "")
+                return_code = res.get("return_code", "")
+                return_msg = str(res.get("return_msg", ""))
                 self.logger.info(f"[{pos.stock_code}] 청산 주문 응답: {res}")
             except Exception as e:
                 self.logger.error(f"[{pos.stock_code}] 청산 주문 에러: {e}")
         else:
+            return_msg = "DRY-RUN SIMULATION"
             self.logger.info(f"💡 [DRY-RUN] 실제 청산 주문은 송신되지 않았습니다. (가상 청산 수량: {pos.holding_qty}주)")
+
+        # 청산 주문 내역 파일에 기록
+        self.recorder.log_order(
+            stock_code=pos.stock_code,
+            action="SELL",
+            reason=f"PGM_LIQUIDATE_{reason}",
+            quantity=pos.holding_qty,
+            price=current_price,
+            order_no=order_no,
+            return_code=return_code,
+            return_msg=return_msg,
+            holding_qty_after=0,
+            avg_price_after=0.0,
+            pnl_amount=pnl_amount,
+            pnl_pct=pnl_pct
+        )
 
         # 포지션 및 분할 횟수 초기화 (수급 재유입 시 1회차부터 다시 분할 매수 진입 가능)
         pos.holding_qty = 0
@@ -253,7 +303,17 @@ class RealtimeProgramTrader:
             # 2. 수급 시그널 분석
             signal = self.strategy.analyze_signal(code, prog_data)
 
-            # 3. 신호에 따른 분할 주문 제어
+            # 3. 매 모니터링 틱 수급 데이터 파일 저장
+            self.recorder.log_tick(
+                stock_code=code,
+                current_price=current_price,
+                prog_data=prog_data,
+                signal_str=signal.value,
+                holding_qty=pos.holding_qty,
+                executed_steps=pos.executed_steps
+            )
+
+            # 4. 신호에 따른 분할 주문 제어
             if signal == ProgramSignal.BUY:
                 # 주문 주기 간격(interval_seconds) 체크
                 can_order = True
@@ -281,6 +341,7 @@ class RealtimeProgramTrader:
         self.logger.info(f" 분할 횟수: {self.config.split_count}회 | 분할 주기: {self.config.interval_seconds}초")
         self.logger.info(f" 종목당 예산: {self.config.total_budget_per_stock:,.0f}원 (1회당: {self.config.get_budget_per_split():,.0f}원)")
         self.logger.info(f" 손절: -{self.config.stop_loss_pct}% | 익절: +{self.config.take_profit_pct}% | 청산시각: {self.config.market_close_time}")
+        self.logger.info(f" 기록 파일 저장 경로: {self.recorder.log_dir}")
         self.logger.info(f" 드라이런 모드: {self.config.dry_run}")
         self.logger.info("=" * 60)
 

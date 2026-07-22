@@ -18,10 +18,12 @@ if _env_path.exists():
 from .config import ProgramTradingConfig
 from .strategy import ProgramTradingStrategy, ProgramSignal
 from .trader import RealtimeProgramTrader
+from .recorder import ProgramTradeRecorder
 
 __all__ = [
     "ProgramTradingConfig",
     "ProgramTradingStrategy",
     "ProgramSignal",
     "RealtimeProgramTrader",
+    "ProgramTradeRecorder",
 ]
