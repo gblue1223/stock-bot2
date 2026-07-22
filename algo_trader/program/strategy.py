@@ -135,10 +135,9 @@ class ProgramTradingStrategy:
         trend_items = prog_data.get("time_series_items", [])
 
         # BUY 신호 조건:
-        # 1) 프로그램 누적 순매수 금액이 최소 임계값(min_net_buy_amount) 이상이고
-        # 2) 최근 시간대별 순매수 증감(net_buy_irds)이 지정한 양수(+) 기준 이상이며
-        # 3) 실제 이전 10분 전 시점 대비 현재 프로그램 순매수 누적액이 상승(net_buy_now > net_buy_10m_ago)한 경우
-        if net_buy_amt >= self.config.min_net_buy_amount and net_buy_irds > self.config.min_net_buy_trend_irds:
+        # 1) 최근 시간대별 순매수 증감(net_buy_irds)이 지정한 양수(+) 기준 이상이며 (기본: 0 초과)
+        # 2) 실제 이전 10분 전 시점 대비 현재 프로그램 순매수 누적액이 상승(net_buy_now > net_buy_10m_ago)한 경우
+        if net_buy_irds > self.config.min_net_buy_trend_irds:
             buy_trend_ok = True
             diff_buy_trend = 0.0
             if len(trend_items) >= 5:
