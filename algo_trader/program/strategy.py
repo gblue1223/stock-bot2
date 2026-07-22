@@ -64,6 +64,20 @@ def get_past_item_by_minutes(valid_items: List[Dict[str, Any]], minutes: int) ->
     return past_item, window_items
 
 
+def get_1min_binned_items(valid_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """5초 단위 틱 데이터를 1분 단위(HHMM) 최신 틱으로 그룹화하여 1분별 스냅샷 리스트를 반환합니다."""
+    binned = []
+    seen_minutes = set()
+    for item in valid_items:
+        tm = str(item.get("tm", "")).zfill(6)
+        if len(tm) >= 4:
+            hhmm = tm[:4]
+            if hhmm not in seen_minutes:
+                seen_minutes.add(hhmm)
+                binned.append(item)
+    return binned
+
+
 class ProgramTradingStrategy:
     """실시간 프로그램 매매 동향 기반 시그널 생성기"""
 
@@ -163,26 +177,43 @@ class ProgramTradingStrategy:
             self.logger.info(f"[{stock_code}] 🔴 SELL 시그널 감지 (급격한 이탈) - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
             return ProgramSignal.SELL
 
-        # SELL 신호 조건 2: 실제 10분간 완만한 하락 추세 감지
+        # SELL 신호 조건 2: 10분간 완만한 하락 추세 감지 (1분 단위 스냅샷 기준 이전 대비 10% 이상 낮아지는 경우)
         window_size = self.config.trend_window_minutes
-        if len(trend_items) >= 5:
-            past_item, window_items = get_past_item_by_minutes(trend_items, window_size)
-            if past_item and len(window_items) >= 5:
-                net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
-                net_buy_past = parse_amount(past_item.get("prm_netprps_amt"))
-                diff_trend = net_buy_now - net_buy_past
+        binned_1min = get_1min_binned_items(trend_items)
 
-                decreases = sum(1 for it in window_items if parse_amount(it.get("prm_netprps_amt_irds")) < 0)
-                check_count = len(window_items)
-                decrease_ratio = decreases / check_count if check_count > 0 else 0.0
-                gentle_threshold = -abs(self.config.gentle_downward_threshold)
+        if len(binned_1min) >= 5:
+            idx_10m = min(window_size, len(binned_1min) - 1)
+            net_buy_now = parse_amount(binned_1min[0].get("prm_netprps_amt"))
+            net_buy_10m_ago = parse_amount(binned_1min[idx_10m].get("prm_netprps_amt"))
+            diff_trend = net_buy_now - net_buy_10m_ago
 
-                if diff_trend <= gentle_threshold and decrease_ratio >= self.config.consecutive_decrease_ratio:
-                    self.logger.info(
-                        f"[{stock_code}] 🔴 SELL 시그널 감지 (실제 {window_size}분 완만 하락 추세) - "
-                        f"{window_size}분간 순매수 변동: {diff_trend:,.0f}백만원, "
-                        f"하락비율: {decrease_ratio*100:.0f}% ({decreases}/{check_count}개 틱)"
-                    )
-                    return ProgramSignal.SELL
+            # 1분 단위 연속 변동 비교 (binned[k] vs binned[k+1])
+            check_count = idx_10m
+            decreases_1min = 0
+            for k in range(check_count):
+                amt_k = parse_amount(binned_1min[k].get("prm_netprps_amt"))
+                amt_prev = parse_amount(binned_1min[k + 1].get("prm_netprps_amt"))
+                if amt_k < amt_prev:
+                    decreases_1min += 1
+
+            decrease_ratio_1min = decreases_1min / check_count if check_count > 0 else 0.0
+
+            # 10분 전 대비 순매수 하락 비율(%) 계산
+            pct_drop = 0.0
+            if abs(net_buy_10m_ago) > 0:
+                pct_drop = ((net_buy_10m_ago - net_buy_now) / abs(net_buy_10m_ago)) * 100.0
+
+            gentle_threshold = -abs(self.config.gentle_downward_threshold)
+
+            # 완만한 하락 판정 조건:
+            # (1) 1분 단위 스냅샷 기준 10분 전 대비 순매수가 설정 비율(기본 10.0%) 이상 낮아진 경우
+            # (2) 또는 1분 단위 하락 비율이 50% 이상이면서 10분간 누적 순매수 감소액이 설정 임계값 이하인 경우
+            if pct_drop >= self.config.gentle_downward_pct or (diff_trend <= gentle_threshold and decrease_ratio_1min >= self.config.consecutive_decrease_ratio):
+                self.logger.info(
+                    f"[{stock_code}] 🔴 SELL 시그널 감지 ({window_size}분 완만 하락 추세) - "
+                    f"1분 스냅샷 10분전 대비 변동: {diff_trend:,.0f}백만원 ({pct_drop:.1f}% 하락), "
+                    f"1분단위 하락비율: {decrease_ratio_1min*100:.0f}% ({decreases_1min}/{check_count}분)"
+                )
+                return ProgramSignal.SELL
 
         return ProgramSignal.HOLD

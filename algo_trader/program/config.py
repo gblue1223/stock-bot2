@@ -27,7 +27,8 @@ class ProgramTradingConfig:
     # 10분 완만한 하락 추세 청산 설정
     trend_window_minutes: int = 10  # 추세 감지 분 창 (기본 10분)
     gentle_downward_threshold: float = 10_000.0  # 10분간 완만 하락 청산 감도 기준 (백만원 단위, 10,000 = -100억원)
-    consecutive_decrease_ratio: float = 0.6  # 10분 중 하락 분 비율 기준 (기본 60% 이상)
+    gentle_downward_pct: float = 10.0  # 1분 단위 스냅샷 기준 이전 10분 대비 완만 하락 비율 (기본 10.0%)
+    consecutive_decrease_ratio: float = 0.5  # 1분 단위 하락 분 비율 기준 (기본 50% 이상)
 
     # 리스크 관리 설정
     stop_loss_pct: float = 2.0  # 손절 비율 (%) -> -2% 손실 시 전량 매도

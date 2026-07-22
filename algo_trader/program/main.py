@@ -122,10 +122,16 @@ def main():
         help="10분 완만한 하락 청산 감도 기준 (백만원 단위, 기본값: 10,000백만원 = -100억원)"
     )
     parser.add_argument(
+        "--gentle-down-pct",
+        type=float,
+        default=10.0,
+        help="1분 스냅샷 기준 이전 10분 대비 완만 하락 비율 (%%, 기본값: 10.0%%)"
+    )
+    parser.add_argument(
         "--decrease-ratio",
         type=float,
-        default=0.6,
-        help="10분 중 하락 분 비율 기준 (기본값: 0.6 = 60%%)"
+        default=0.5,
+        help="1분 단위 중 하락 분 비율 기준 (기본값: 0.5 = 50%%)"
     )
     parser.add_argument(
         "--account", "-a",
@@ -176,6 +182,7 @@ def main():
         min_buy_trend_increase=args.min_buy_trend_increase,
         trend_window_minutes=args.trend_window,
         gentle_downward_threshold=args.gentle_down_threshold,
+        gentle_downward_pct=args.gentle_down_pct,
         consecutive_decrease_ratio=args.decrease_ratio
     )
 
