@@ -98,13 +98,30 @@ class ProgramTradingStrategy:
         """프로그램 매매 동향 수치를 분석하여 매수/매도/관망 시그널을 판정합니다."""
         net_buy_amt = prog_data.get("net_buy_amt", 0.0)
         net_buy_irds = prog_data.get("net_buy_irds", 0.0)
+        trend_items = prog_data.get("time_series_items", [])
 
         # BUY 신호 조건:
         # 1) 프로그램 누적 순매수 금액이 최소 임계값(min_net_buy_amount) 이상이고
-        # 2) 최근 시간대별 순매수 증감(net_buy_irds)이 지정한 양수(+) 기준 이상인 경우 (기본 0 초과)
+        # 2) 최근 시간대별 순매수 증감(net_buy_irds)이 지정한 양수(+) 기준 이상이며
+        # 3) 이전 10분 간의 상승세(10분 전 대비 순매수 누적액 증가: net_buy_now > net_buy_10m_ago)가 확인된 경우
         if net_buy_amt >= self.config.min_net_buy_amount and net_buy_irds > self.config.min_net_buy_trend_irds:
-            self.logger.info(f"[{stock_code}] 🟢 BUY 시그널 감지 - 순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})")
-            return ProgramSignal.BUY
+            buy_trend_ok = True
+            diff_buy_trend = 0.0
+            if len(trend_items) >= 5:
+                idx_past = min(self.config.buy_trend_window_minutes, len(trend_items) - 1)
+                net_buy_now = parse_amount(trend_items[0].get("prm_netprps_amt"))
+                net_buy_past = parse_amount(trend_items[idx_past].get("prm_netprps_amt"))
+                diff_buy_trend = net_buy_now - net_buy_past
+
+                if diff_buy_trend <= self.config.min_buy_trend_increase:
+                    buy_trend_ok = False
+
+            if buy_trend_ok:
+                self.logger.info(
+                    f"[{stock_code}] 🟢 BUY 시그널 감지 (10분간 상승세 확인: {diff_buy_trend:+,.0f}백만원) - "
+                    f"순매수: {net_buy_amt:,.0f}백만원 (증감: {net_buy_irds:,.0f})"
+                )
+                return ProgramSignal.BUY
 
         # SELL 신호 조건 1: 최근 1분간 프로그램 순매수 급감(-1,000억원 이상) 또는 누적 순매수 대량 이탈 시
         sell_limit = -abs(self.config.sell_net_buy_trend_threshold)
@@ -113,7 +130,6 @@ class ProgramTradingStrategy:
             return ProgramSignal.SELL
 
         # SELL 신호 조건 2: 10분간 완만한 하락 추세 감지
-        trend_items = prog_data.get("time_series_items", [])
         window_size = self.config.trend_window_minutes
         if len(trend_items) >= 5:  # 최소 5분 이상 시계열 데이터 누적 시
             idx_past = min(window_size, len(trend_items) - 1)

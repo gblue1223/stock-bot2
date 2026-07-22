@@ -20,6 +20,10 @@ class ProgramTradingConfig:
     min_net_buy_trend_irds: float = 0.0  # 매수 진입 시 필요한 순매수 증감 기준 (백만원 단위, >0 시 매수)
     sell_net_buy_trend_threshold: float = 100_000.0  # 프로그램 급격한 매도 시그널 이탈 기준 (백만원 단위, 100,000 = -1,000억원)
 
+    # 10분 상승세 확인 매수 설정
+    buy_trend_window_minutes: int = 10  # 매수 시 상승세 감지 분 창 (기본 10분)
+    min_buy_trend_increase: float = 0.0  # 10분간 최소 순매수 상승 증가액 (백만원 단위, >0 시 10분간 상승으로 판단)
+
     # 10분 완만한 하락 추세 청산 설정
     trend_window_minutes: int = 10  # 추세 감지 분 창 (기본 10분)
     gentle_downward_threshold: float = 10_000.0  # 10분간 완만 하락 청산 감도 기준 (백만원 단위, 10,000 = -100억원)

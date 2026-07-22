@@ -98,6 +98,18 @@ def main():
         help="프로그램 급격한 매도 시그널 이탈 감도 기준 (백만원 단위, 기본값: 100,000백만원 = -1,000억원)"
     )
     parser.add_argument(
+        "--buy-trend-window",
+        type=int,
+        default=10,
+        help="매수 진입 시 상승세 확인 분 창 (기본값: 10분)"
+    )
+    parser.add_argument(
+        "--min-buy-trend-increase",
+        type=float,
+        default=0.0,
+        help="10분간 최소 순매수 상승 증가액 (백만원 단위, 기본값: 0.0백만원)"
+    )
+    parser.add_argument(
         "--trend-window",
         type=int,
         default=10,
@@ -160,6 +172,8 @@ def main():
         dry_run=args.dry_run,
         stock_exchange_type=stex_code,
         sell_net_buy_trend_threshold=args.sell_threshold,
+        buy_trend_window_minutes=args.buy_trend_window,
+        min_buy_trend_increase=args.min_buy_trend_increase,
         trend_window_minutes=args.trend_window,
         gentle_downward_threshold=args.gentle_down_threshold,
         consecutive_decrease_ratio=args.decrease_ratio
