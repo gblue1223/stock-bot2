@@ -148,7 +148,7 @@ class RealtimeProgramTrader:
         )
         return True
 
-    def liquidate_position(self, pos: PositionState, current_price: float, reason: str):
+    def liquidate_position(self, pos: PositionState, current_price: float, reason: str, stop_today: bool = False):
         """보유 포지션을 전량 매도(청산)합니다."""
         if pos.holding_qty <= 0:
             return
@@ -184,11 +184,18 @@ class RealtimeProgramTrader:
         else:
             self.logger.info(f"💡 [DRY-RUN] 실제 청산 주문은 송신되지 않았습니다. (가상 청산 수량: {pos.holding_qty}주)")
 
-        # 포지션 초기화 및 당일 매매 중단 설정
+        # 포지션 및 분할 횟수 초기화 (수급 재유입 시 1회차부터 다시 분할 매수 진입 가능)
         pos.holding_qty = 0
         pos.total_cost = 0.0
         pos.avg_price = 0.0
-        pos.is_stopped_today = True
+        pos.executed_steps = 0
+
+        # 손절/익절/장마감 청산의 경우에만 당일 매매 중단
+        if stop_today:
+            pos.is_stopped_today = True
+            self.logger.info(f"🛑 [{pos.stock_code}] 리스크 관리 규칙에 따라 당일 매매를 종료합니다.")
+        else:
+            self.logger.info(f"🔄 [{pos.stock_code}] 포지션 청산 완료. 추후 수급(BUY) 재유입 시 재진입 대기 중...")
 
     def check_risk_and_liquidation(self, pos: PositionState, current_price: float):
         """손절(-2%), 익절(+3%) 및 장마감 청산 조건을 검사합니다."""
@@ -199,17 +206,17 @@ class RealtimeProgramTrader:
 
         # 1. 손절 조건 검사
         if pnl_pct <= -abs(self.config.stop_loss_pct):
-            self.liquidate_position(pos, current_price, reason=f"손절 기준 도달 ({pnl_pct:.2f}%)")
+            self.liquidate_position(pos, current_price, reason=f"손절 기준 도달 ({pnl_pct:.2f}%)", stop_today=True)
             return
 
         # 2. 익절 조건 검사
         if pnl_pct >= abs(self.config.take_profit_pct):
-            self.liquidate_position(pos, current_price, reason=f"익절 기준 도달 ({pnl_pct:.2f}%)")
+            self.liquidate_position(pos, current_price, reason=f"익절 기준 도달 ({pnl_pct:.2f}%)", stop_today=True)
             return
 
         # 3. 장 마감 전 강제 청산 검사
         if self.check_market_close_time():
-            self.liquidate_position(pos, current_price, reason="장 마감 전 자동 청산")
+            self.liquidate_position(pos, current_price, reason="장 마감 전 자동 청산", stop_today=True)
             return
 
     def run_cycle(self):
