@@ -134,6 +134,12 @@ def main():
         help="1분 단위 중 하락 분 비율 기준 (기본값: 0.1 = 10%%)"
     )
     parser.add_argument(
+        "--rebuy-cooldown",
+        type=int,
+        default=10,
+        help="매도 청산 완료 후 신규 재매수 방지 쿨다운 시간 (분 단위, 기본값: 10분)"
+    )
+    parser.add_argument(
         "--account", "-a",
         type=str,
         help="계좌번호 (선택사항, 입력하지 않으면 첫번째 계좌 자동 선택)"
@@ -174,6 +180,7 @@ def main():
         stop_loss_pct=args.stop_loss,
         take_profit_pct=args.take_profit,
         market_close_time=args.close_time,
+        rebuy_cooldown_minutes=args.rebuy_cooldown,
         account_no=args.account,
         dry_run=args.dry_run,
         stock_exchange_type=stex_code,

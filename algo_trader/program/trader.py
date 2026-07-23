@@ -28,6 +28,7 @@ class PositionState:
     sell_target_steps: int = 10  # 목표 분할 매도 횟수 (10분할 또는 3분할)
     executed_sell_steps: int = 0  # 현재 집행된 분할 매도 횟수
     last_sell_order_time: Optional[datetime] = None  # 마지막 매도 주문 시간
+    last_liquidation_time: Optional[datetime] = None  # 포지션 전량 매도 청산 완료 시각
 
 
 class RealtimeProgramTrader:
@@ -251,6 +252,7 @@ class RealtimeProgramTrader:
             pos.avg_price = 0.0
             pos.executed_steps = 0
             pos.executed_sell_steps = 0
+            pos.last_liquidation_time = datetime.now()
 
         # 청산 주문 내역 파일에 기록
         self.recorder.log_order(
@@ -270,9 +272,12 @@ class RealtimeProgramTrader:
 
         if stop_today and pos.holding_qty <= 0:
             pos.is_stopped_today = True
-            self.logger.info(f"🛑 [{pos.stock_code}] 3분할 매도 청산 완료. 리스크 관리 규칙에 따라 당일 매매를 종료합니다.")
+            self.logger.info(f"🛑 [{pos.stock_code}] 장 마감 3분할 매도 청산 완료. 당일 매매를 종료합니다.")
         elif pos.holding_qty <= 0:
-            self.logger.info(f"🔄 [{pos.stock_code}] 포지션 전량 분할 매도 완료. 수급(BUY) 재유입 시 재진입 대기 중...")
+            self.logger.info(
+                f"🔄 [{pos.stock_code}] 포지션 전량 분할 매도 완료. "
+                f"{self.config.rebuy_cooldown_minutes}분간 재매수 방지 쿨다운 적용 후 수급(BUY) 재유입 시 재진입 대기 중..."
+            )
         else:
             self.logger.info(f"✅ [{pos.stock_code}] 분할 매도 후 잔여 보유: {pos.holding_qty:,}주")
 
@@ -287,12 +292,12 @@ class RealtimeProgramTrader:
 
         # 1. 손절 조건 검사 (3분할 매도)
         if pnl_pct <= -abs(self.config.stop_loss_pct):
-            self.execute_split_sell(pos, current_price, reason=f"손절 기준 도달 ({pnl_pct:.2f}%)", target_splits=3, stop_today=True, min_interval=0)
+            self.execute_split_sell(pos, current_price, reason=f"손절 기준 도달 ({pnl_pct:.2f}%)", target_splits=3, stop_today=False, min_interval=0)
             return
 
         # 2. 익절 조건 검사 (3분할 매도)
         if pnl_pct >= abs(self.config.take_profit_pct):
-            self.execute_split_sell(pos, current_price, reason=f"익절 기준 도달 ({pnl_pct:.2f}%)", target_splits=3, stop_today=True, min_interval=0)
+            self.execute_split_sell(pos, current_price, reason=f"익절 기준 도달 ({pnl_pct:.2f}%)", target_splits=3, stop_today=False, min_interval=0)
             return
 
         # 3. 장 마감 전 강제 청산 검사 (3분할 매도)
@@ -346,7 +351,17 @@ class RealtimeProgramTrader:
 
             # 4. 신호에 따른 분할 주문 제어
             if signal == ProgramSignal.BUY:
-                # 주문 주기 간격(interval_seconds) 체크
+                # 0. 매도 청산 후 재매수 방지 쿨다운 시간 체크 (기본 10분)
+                if pos.last_liquidation_time and self.config.rebuy_cooldown_minutes > 0:
+                    elapsed_min = (datetime.now() - pos.last_liquidation_time).total_seconds() / 60.0
+                    if elapsed_min < self.config.rebuy_cooldown_minutes:
+                        self.logger.info(
+                            f"⏳ [{code}] 매도 청산 후 재매수 방지 쿨다운 유지 중 "
+                            f"({elapsed_min:.1f}분 경과 / {self.config.rebuy_cooldown_minutes}분 대기). 신규 매수를 대기합니다."
+                        )
+                        continue
+
+                # 1. 주문 주기 간격(interval_seconds) 체크
                 can_order = True
                 if pos.last_order_time:
                     elapsed = (datetime.now() - pos.last_order_time).total_seconds()
@@ -379,7 +394,7 @@ class RealtimeProgramTrader:
         self.logger.info(f" 거래소 구분: {self.config.stock_exchange_type}")
         self.logger.info(f" 분할 횟수: {self.config.split_count}회 | 분할 주기: {self.config.interval_seconds}초")
         self.logger.info(f" 종목당 예산: {self.config.total_budget_per_stock:,.0f}원 (1회당: {self.config.get_budget_per_split():,.0f}원)")
-        self.logger.info(f" 손절: -{self.config.stop_loss_pct}% | 익절: +{self.config.take_profit_pct}% | 청산시각: {self.config.market_close_time}")
+        self.logger.info(f" 손절: -{self.config.stop_loss_pct}% | 익절: +{self.config.take_profit_pct}% | 청산시각: {self.config.market_close_time} | 재매수 쿨다운: {self.config.rebuy_cooldown_minutes}분")
         self.logger.info(f" 기록 파일 저장 경로: {self.recorder.log_dir}")
         self.logger.info(f" 드라이런 모드: {self.config.dry_run}")
         self.logger.info("=" * 60)

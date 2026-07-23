@@ -30,10 +30,11 @@ class ProgramTradingConfig:
     gentle_downward_pct: float = 10.0  # 1분 단위 스냅샷 기준 이전 10분 대비 완만 하락 비율 (기본 10.0%)
     consecutive_decrease_ratio: float = 0.1  # 1분 단위 하락 분 비율 기준 (기본 10% 이상)
 
-    # 리스크 관리 설정
+    # 리스크 관리 및 재매수 설정
     stop_loss_pct: float = 2.0  # 손절 비율 (%) -> -2% 손실 시 전량 매도
     take_profit_pct: float = 3.0  # 익절 비율 (%) -> +3% 수익 시 전량 매도
     market_close_time: str = "15:15:00"  # 장 마감 전 강제 청산 시각 (HH:MM:SS)
+    rebuy_cooldown_minutes: int = 10  # 매도 청산 완료 후 신규 재매수 금지 쿨다운 시간 (분 단위, 기본 10분)
 
     # 거래 모드 및 계좌 설정
     account_no: Optional[str] = None  # 계좌번호 (None일 경우 첫번째 계좌 자동 선택)
