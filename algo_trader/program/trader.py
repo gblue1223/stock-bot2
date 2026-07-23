@@ -15,15 +15,19 @@ from .recorder import ProgramTradeRecorder
 
 @dataclass
 class PositionState:
-    """종목별 10분할 매매 포지션 관리 데이터클래스"""
+    """종목별 분할 매매 포지션 관리 데이터클래스"""
     stock_code: str
-    target_steps: int = 10  # 목표 분할 수 (10회)
-    executed_steps: int = 0  # 현재 집행된 분할 횟수
+    target_steps: int = 10  # 목표 분할 매수 횟수
+    executed_steps: int = 0  # 현재 집행된 분할 매수 횟수
     holding_qty: int = 0  # 현재 보유 수량
     total_cost: float = 0.0  # 총 매수 금액
     avg_price: float = 0.0  # 평균 매수가
-    is_stopped_today: bool = False  # 손절/익절로 당일 매매가 종료되었는지 여부
-    last_order_time: Optional[datetime] = None  # 마지막 주문 시간
+    is_stopped_today: bool = False  # 손절/익절/장마감으로 당일 매매 종료 여부
+    last_order_time: Optional[datetime] = None  # 마지막 매수 주문 시간
+
+    sell_target_steps: int = 10  # 목표 분할 매도 횟수 (10분할 또는 3분할)
+    executed_sell_steps: int = 0  # 현재 집행된 분할 매도 횟수
+    last_sell_order_time: Optional[datetime] = None  # 마지막 매도 주문 시간
 
 
 class RealtimeProgramTrader:
@@ -99,7 +103,7 @@ class RealtimeProgramTrader:
     def execute_split_buy(self, pos: PositionState, current_price: float) -> bool:
         """1회 분할 매수를 집행합니다."""
         if pos.executed_steps >= pos.target_steps:
-            self.logger.info(f"[{pos.stock_code}] 10분할 매수가 이미 완료되었습니다 ({pos.executed_steps}/{pos.target_steps}).")
+            self.logger.info(f"[{pos.stock_code}] 분할 매수가 이미 완료되었습니다 ({pos.executed_steps}/{pos.target_steps}).")
             return False
 
         qty = self.calculate_order_quantity(current_price)
@@ -111,7 +115,7 @@ class RealtimeProgramTrader:
         step_num = pos.executed_steps + 1
 
         self.logger.info(
-            f"🚀 [{pos.stock_code}] 10분할 매수 집행 #{step_num}/{pos.target_steps} "
+            f"🚀 [{pos.stock_code}] 분할 매수 집행 #{step_num}/{pos.target_steps} "
             f"| 수량: {qty:,}주 | 단가: {current_price:,.0f}원 | 금액: {order_amount:,.0f}원 | 거래소: {self.config.stock_exchange_type}"
         )
 
@@ -149,6 +153,7 @@ class RealtimeProgramTrader:
 
         # 포지션 관리 갱신
         pos.executed_steps += 1
+        pos.executed_sell_steps = 0  # 매수 시 분할 매도 회차 초기화
         pos.holding_qty += qty
         pos.total_cost += order_amount
         pos.avg_price = pos.total_cost / pos.holding_qty if pos.holding_qty > 0 else 0.0
@@ -174,18 +179,33 @@ class RealtimeProgramTrader:
         )
         return True
 
-    def liquidate_position(self, pos: PositionState, current_price: float, reason: str, stop_today: bool = False):
-        """보유 포지션을 전량 매도(청산)합니다."""
+    def execute_split_sell(self, pos: PositionState, current_price: float, reason: str, target_splits: int, stop_today: bool = False, min_interval: int = 0) -> bool:
+        """분할 매도를 집행합니다 (target_splits: 프로그램 SELL 시그널 시 설정 분할수, 리스크관리/장마감 시 3분할)."""
         if pos.holding_qty <= 0:
-            return
+            return False
 
-        pnl_amount = (current_price - pos.avg_price) * pos.holding_qty
+        # 최소 매도 주문 간격 체크 (프로그램 SELL 시 interval_seconds 적용, 3분할 청산 시 0초)
+        if pos.last_sell_order_time and min_interval > 0:
+            elapsed = (datetime.now() - pos.last_sell_order_time).total_seconds()
+            if elapsed < min_interval:
+                return False
+
+        pos.sell_target_steps = target_splits
+        remaining_steps = max(1, pos.sell_target_steps - pos.executed_sell_steps)
+        
+        if remaining_steps <= 1:
+            qty = pos.holding_qty  # 마지막 분할 회차는 잔여 수량 전량 매도
+        else:
+            qty = max(1, pos.holding_qty // remaining_steps)
+
+        step_num = pos.executed_sell_steps + 1
+        pnl_amount = (current_price - pos.avg_price) * qty
         pnl_pct = ((current_price / pos.avg_price) - 1.0) * 100.0 if pos.avg_price > 0 else 0.0
 
         self.logger.info(
-            f"🔥 [{pos.stock_code}] 포지션 전량 청산 [{reason}] | "
-            f"수량: {pos.holding_qty:,}주 | 평단가: {pos.avg_price:,.0f}원 | "
-            f"청산단가: {current_price:,.0f}원 | 손익: {pnl_amount:+,.0f}원 ({pnl_pct:+.2f}%)"
+            f"🔥 [{pos.stock_code}] 분할 매도 집행 #{step_num}/{pos.sell_target_steps} [{reason}] | "
+            f"수량: {qty:,}주 (잔여보유: {pos.holding_qty:,}주) | 평단가: {pos.avg_price:,.0f}원 | "
+            f"매도가: {current_price:,.0f}원 | 예상손익: {pnl_amount:+,.0f}원 ({pnl_pct:+.2f}%)"
         )
 
         is_nxt = (self.config.stock_exchange_type.upper() == "NXT")
@@ -199,11 +219,11 @@ class RealtimeProgramTrader:
         if not self.config.dry_run and self.koapys.is_connected:
             try:
                 res = self.koapys.send_order(
-                    rqname=f"PGM_LIQUIDATE_{reason}",
+                    rqname=f"PGM_SPLIT_SELL_{step_num}_{reason}",
                     account_no=self.account_no,
                     order_type=OrderType.SELL,
                     code=pos.stock_code,
-                    quantity=pos.holding_qty,
+                    quantity=qty,
                     price=order_price,
                     hoga=hoga_type,
                     dmst_stex_tp=self.config.stock_exchange_type
@@ -211,62 +231,73 @@ class RealtimeProgramTrader:
                 order_no = str(res.get("order_no") or res.get("ord_no") or "")
                 return_code = res.get("return_code", "")
                 return_msg = str(res.get("return_msg", ""))
-                self.logger.info(f"[{pos.stock_code}] 청산 주문 응답: {res}")
+                self.logger.info(f"[{pos.stock_code}] 분할 매도 주문 응답: {res}")
             except Exception as e:
-                self.logger.error(f"[{pos.stock_code}] 청산 주문 에러: {e}")
+                self.logger.error(f"[{pos.stock_code}] 분할 매도 주문 에러: {e}")
+                return False
         else:
             return_msg = "DRY-RUN SIMULATION"
-            self.logger.info(f"💡 [DRY-RUN] 실제 청산 주문은 송신되지 않았습니다. (가상 청산 수량: {pos.holding_qty}주)")
+            self.logger.info(f"💡 [DRY-RUN] 실제 매도 주문은 송신되지 않았습니다. (가상 분할 매도 수량: {qty}주)")
+
+        # 포지션 관리 갱신
+        pos.executed_sell_steps += 1
+        pos.holding_qty -= qty
+        pos.total_cost -= (qty * pos.avg_price)
+        pos.last_sell_order_time = datetime.now()
+
+        if pos.holding_qty <= 0:
+            pos.holding_qty = 0
+            pos.total_cost = 0.0
+            pos.avg_price = 0.0
+            pos.executed_steps = 0
+            pos.executed_sell_steps = 0
 
         # 청산 주문 내역 파일에 기록
         self.recorder.log_order(
             stock_code=pos.stock_code,
             action="SELL",
-            reason=f"PGM_LIQUIDATE_{reason}",
-            quantity=pos.holding_qty,
+            reason=f"PGM_SPLIT_SELL_{step_num}_{reason}",
+            quantity=qty,
             price=current_price,
             order_no=order_no,
             return_code=return_code,
             return_msg=return_msg,
-            holding_qty_after=0,
-            avg_price_after=0.0,
+            holding_qty_after=pos.holding_qty,
+            avg_price_after=pos.avg_price,
             pnl_amount=pnl_amount,
             pnl_pct=pnl_pct
         )
 
-        # 포지션 및 분할 횟수 초기화 (수급 재유입 시 1회차부터 다시 분할 매수 진입 가능)
-        pos.holding_qty = 0
-        pos.total_cost = 0.0
-        pos.avg_price = 0.0
-        pos.executed_steps = 0
-
-        # 손절/익절/장마감 청산의 경우에만 당일 매매 중단
-        if stop_today:
+        if stop_today and pos.holding_qty <= 0:
             pos.is_stopped_today = True
-            self.logger.info(f"🛑 [{pos.stock_code}] 리스크 관리 규칙에 따라 당일 매매를 종료합니다.")
+            self.logger.info(f"🛑 [{pos.stock_code}] 3분할 매도 청산 완료. 리스크 관리 규칙에 따라 당일 매매를 종료합니다.")
+        elif pos.holding_qty <= 0:
+            self.logger.info(f"🔄 [{pos.stock_code}] 포지션 전량 분할 매도 완료. 수급(BUY) 재유입 시 재진입 대기 중...")
         else:
-            self.logger.info(f"🔄 [{pos.stock_code}] 포지션 청산 완료. 추후 수급(BUY) 재유입 시 재진입 대기 중...")
+            self.logger.info(f"✅ [{pos.stock_code}] 분할 매도 후 잔여 보유: {pos.holding_qty:,}주")
+
+        return True
 
     def check_risk_and_liquidation(self, pos: PositionState, current_price: float):
-        """손절(-2%), 익절(+3%) 및 장마감 청산 조건을 검사합니다."""
+        """손절(-2%), 익절(+3%) 및 장마감 청산 조건 시 3분할 매도를 수행합니다."""
         if pos.holding_qty <= 0 or current_price <= 0:
             return
 
         pnl_pct = ((current_price / pos.avg_price) - 1.0) * 100.0 if pos.avg_price > 0 else 0.0
 
-        # 1. 손절 조건 검사
+        # 1. 손절 조건 검사 (3분할 매도)
         if pnl_pct <= -abs(self.config.stop_loss_pct):
-            self.liquidate_position(pos, current_price, reason=f"손절 기준 도달 ({pnl_pct:.2f}%)", stop_today=True)
+            self.execute_split_sell(pos, current_price, reason=f"손절 기준 도달 ({pnl_pct:.2f}%)", target_splits=3, stop_today=True, min_interval=0)
             return
 
-        # 2. 익절 조건 검사
+        # 2. 익절 조건 검사 (3분할 매도)
         if pnl_pct >= abs(self.config.take_profit_pct):
-            self.liquidate_position(pos, current_price, reason=f"익절 기준 도달 ({pnl_pct:.2f}%)", stop_today=True)
+            self.execute_split_sell(pos, current_price, reason=f"익절 기준 도달 ({pnl_pct:.2f}%)", target_splits=3, stop_today=True, min_interval=0)
             return
 
-        # 3. 장 마감 전 강제 청산 검사
+        # 3. 장 마감 전 강제 청산 검사 (3분할 매도)
         if self.check_market_close_time():
-            self.liquidate_position(pos, current_price, reason="장 마감 전 자동 청산", stop_today=True)
+            self.execute_split_sell(pos, current_price, reason="장 마감 전 자동 3분할 청산", target_splits=3, stop_today=True, min_interval=0)
             return
 
     def run_cycle(self):
@@ -295,7 +326,7 @@ class RealtimeProgramTrader:
                 self.logger.warning(f"[{code}] 현재가를 취득하지 못했습니다.")
                 continue
 
-            # 1. 손절/익절/장마감 청산 체크
+            # 1. 손절/익절/장마감 청산 체크 (3분할 매도)
             self.check_risk_and_liquidation(pos, current_price)
             if pos.is_stopped_today:
                 continue
@@ -326,7 +357,15 @@ class RealtimeProgramTrader:
                     self.execute_split_buy(pos, current_price)
 
             elif signal == ProgramSignal.SELL and pos.holding_qty > 0:
-                self.liquidate_position(pos, current_price, reason="프로그램 매도 시그널 청산")
+                # 프로그램 SELL 시그널 감지 시 설정한 분할 수(--splits)대로 분할 매도
+                self.execute_split_sell(
+                    pos,
+                    current_price,
+                    reason="프로그램 매도 시그널 분할 청산",
+                    target_splits=self.config.split_count,
+                    stop_today=False,
+                    min_interval=self.config.interval_seconds
+                )
 
         # 장마감 시간이 지나면 전체 트레이더 중지 처리
         if is_close_time:
