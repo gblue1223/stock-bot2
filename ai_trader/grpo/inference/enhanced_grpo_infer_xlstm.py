@@ -76,7 +76,7 @@ class GRPOInferenceE2EXLSTM:
         
         # state_dict로부터 차원 감지
         # conv1.weight: (out_channels, in_channels, kernel_size)
-        obs_dim = state_dict['conv1.weight'].shape[1] if 'conv1.weight' in state_dict else 31
+        obs_dim = state_dict['conv1.weight'].shape[1] if 'conv1.weight' in state_dict else 43
         cnn_channels = state_dict['conv1.weight'].shape[0] if 'conv1.weight' in state_dict else 64
         
         # xlstm.cells.0.w_q.weight: (hidden_size, hidden_size)

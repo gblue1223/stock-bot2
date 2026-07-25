@@ -2,7 +2,8 @@
 GRPO 스캘핑 환경
 
 초단위 스캘핑을 위한 Gymnasium 환경을 정의합니다.
-임베딩 모델을 사용하여 관측값을 생성하고, 스캘핑 특화 보상 구조를 제공합니다.
+시계열 특징 데이터와 5단계 분할 포지션 메타데이터를 사용하여 관측값을 생성하며,
+1~5초 급등 패턴 탐지 보상 및 1~5초 미상승 자동 손절 구조를 제공합니다.
 """
 
 import logging
@@ -12,9 +13,8 @@ import torch
 import gymnasium as gym
 from gymnasium import spaces
 import duckdb
-from datetime import datetime, timedelta  # ✅ 시간 계산용 추가
+from datetime import datetime, timedelta
 
-# ✅ RollingNormalizer import
 from lib.rolling_normalization import RollingNormalizer
 
 import inspect
@@ -47,30 +47,22 @@ class GRPOScalpingEnv(gym.Env):
     """
     스캘핑을 위한 GRPO 훈련 환경
     
-    관측 공간: 임베딩 벡터 (embedding_dim,)
-    행동 공간: Discrete(3) - 0: 보유, 1: 매수, 2: 매도
+    관측 공간: (seq_len, 43) [특징 28차원 + 5단계 메타데이터 15차원]
+    행동 공간: Discrete(3) - 0: 보유, 1: 매수 (+1단계), 2: 매도 (1단계 FIFO 청산)
     
     보상 구조:
-    - 수익: (청산가 - 진입가) / 진입가 - 거래비용
-    - 거래비용: 수수료(0.015%) + 세금(0.2%) = 0.215% (매수/매도 각각 적용)
-    - 총 거래비용: 0.43% (왕복)
-    - 양의 보상 조건: 수익률 > 0.43%
-    - 빠른 손절 룰 위반: -0.01 페널티 (시간 임계값 설정 가능, 기본값 1.5초)
-    - 빠른 손절 룰 위반: -0.01 페널티 (시간 임계값 설정 가능, 기본값 1.5초)
+    - 5단계 분할 매수/매도 (단계별 독립 진입가 기준 수익률 정산)
+    - 1~5초 내 미상승 시 즉시 자동 손절 (-1.0 페널티)
+    - 1~5초 내 가격 상승 포착 시 패턴 탐지 보너스 (+0.5)
+    - 거래비용: 수수료(0.015%) + 세금(0.18%) (매수/매도 적용)
     
     Args:
         db_path: DuckDB 데이터베이스 경로
         table_name: 테이블명 (기본값: 'datasets')
         seq_len: 시퀀스 길이 (기본값: 3000)
-        expected_features: 예상 특징 수 (기본값: 28, 딥러닝 모델과 일치해야 함)
+        expected_features: 예상 특징 수 (기본값: 28)
         transaction_cost_rate: 거래 비용 비율 (기본값: 0.00215 = 0.215%)
-        loss_holding_threshold: 손실 보유 허용 시간 (초, 기본값: 1.5)
-        loss_holding_penalty: 손실 보유 누적 페널티 (기본값: 0.01)
         max_episode_steps: 에피소드당 최대 스텝 수 (기본값: None, 제한 없음)
-        loss_holding_mode: 손실 보유 위반 시 동작 모드 (기본값: 'penalty_only')
-            - 'penalty_only': 페널티만 부여, 정책이 학습
-            - 'force_close': 강제 청산 (이전 동작)
-        device: 디바이스 ('cpu' 또는 'cuda')
     """
     
     metadata = {'render_modes': []}
@@ -85,19 +77,11 @@ class GRPOScalpingEnv(gym.Env):
         buy_tax_rate: float = 0.0,
         sell_tax_rate: float = 0.0018,
         no_trade_penalty: float = 0.0,
-        loss_holding_penalty: float = 0.01,
-        loss_holding_threshold: float = 1.5,
-        loss_holding_mode: str = 'penalty_only',
         max_episode_steps: Optional[int] = None,
         use_raw_data: bool = True,  # ✅ 원본 데이터 사용 여부
         rolling_window_size: int = 1000,  # ✅ Rolling window 크기
         rolling_min_samples: int = 100,  # ✅ 최소 샘플 수
         base_price: float = 100000.0,  # ✅ 기준 가격 (기본값: 10만원)
-        stop_loss_pct: float = 2.0,     # ✅ 손절 기준 (%)
-        max_split_count: int = 1,       # ✅ 최대 분할 매수 횟수
-        min_holding_time: float = 2.0,  # ✅ 최소 보유 시간
-        max_holding_time: float = 100.0,# ✅ 최대 보유 시간
-        min_holding_penalty: float = 0.2,# ✅ 조기 매도 페널티
         max_trades_per_episode: Optional[int] = None, # ✅ 최대 거래 횟수 제한
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
@@ -106,11 +90,6 @@ class GRPOScalpingEnv(gym.Env):
         super().__init__()
         
         self.base_price = base_price
-        self.stop_loss_pct = stop_loss_pct
-        self.max_split_count = max_split_count
-        self.min_holding_time = min_holding_time
-        self.max_holding_time = max_holding_time
-        self.min_holding_penalty = min_holding_penalty
         self.no_trade_penalty = no_trade_penalty
         self.max_trades_per_episode = max_trades_per_episode
         self.step_reward_scale = step_reward_scale
@@ -134,18 +113,6 @@ class GRPOScalpingEnv(gym.Env):
         
         self.round_trip_cost = (transaction_cost_rate + buy_tax_rate) + (transaction_cost_rate + sell_tax_rate)
         
-        # 손실 방치 룰 설정
-        self.loss_holding_threshold = loss_holding_threshold
-        self.loss_holding_penalty = loss_holding_penalty
-        self.loss_holding_mode = loss_holding_mode
-        
-        # 동작 모드 검증
-        if loss_holding_mode not in ['penalty_only', 'force_close']:
-            raise ValueError(f"Invalid loss_holding_mode: {loss_holding_mode}. "
-                           f"Must be 'penalty_only' or 'force_close'")
-        
-
-        
         # 에피소드 길이 제한
         self.max_episode_steps = max_episode_steps
         
@@ -156,7 +123,6 @@ class GRPOScalpingEnv(gym.Env):
         
         # ✅ RollingNormalizer 초기화 (원본 데이터 사용 시)
         if use_raw_data:
-            # FEATURE_NAMES는 live_trading.py와 동일한 순서여야 함
             from lib.normalization import FEATURE_NAMES
             self.normalizer = RollingNormalizer(
                 window_size=rolling_window_size,
@@ -168,12 +134,10 @@ class GRPOScalpingEnv(gym.Env):
             self.normalizer = None
             logger.info("Using pre-normalized data from database")
         
-        # 관측 공간: 시퀀스 길이 x (특징 차원 + 포지션 정보 3)
-        # 1. Feature (expected_features)
-        # 2. Position (0 or 1)
-        # 3. Position Steps (Normalized)
-        # 4. Holding Time (Normalized)
-        self.obs_dim = expected_features + 3
+        # 관측 공간: 시퀀스 길이 x (특징 차원 28 + 5단계 메타데이터 15) = (seq_len, 43)
+        # 5개 단계 각각의: [is_active, profit_rate, holding_time_norm]
+        self.MAX_STAGES = 5
+        self.obs_dim = expected_features + (self.MAX_STAGES * 3)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
@@ -210,6 +174,18 @@ class GRPOScalpingEnv(gym.Env):
         self.conn.close()
         self.conn = None
 
+    @property
+    def position(self) -> int:
+        return 1 if len(getattr(self, 'stages', [])) > 0 else 0
+
+    @property
+    def position_steps(self) -> int:
+        return len(getattr(self, 'stages', []))
+
+    @property
+    def max_split_count(self) -> int:
+        return 5
+
     def __getstate__(self):
         """직렬화 시 DB 연결 제외"""
         state = self.__dict__.copy()
@@ -228,16 +204,9 @@ class GRPOScalpingEnv(gym.Env):
              
         # 에피소드 상태
         self.current_step = 0
-        self.position = 0  # 0: 포지션 없음, 1: 보유 중 (호환성 유지)
-        self.position_steps = 0  # 현재 분할 매수 단계 (0 ~ max_split_count)
-        self.avg_entry_price = 0.0  # 평단가
-
-        self.entry_time = 0
+        self.stages = []  # List[dict]: {'entry_price': float, 'entry_time': float, 'pattern_rewarded': bool}
         self.current_price = 0.0
-        self.current_time = 0
-        
-        # 리스크 관리용 상태
-        self.max_price_since_entry = 0.0  # 진입 후 최고가 (본전 청산용)
+        self.current_time = 0.0
         
         # 에피소드 메타데이터
         self.episode_trades = []
@@ -534,25 +503,25 @@ class GRPOScalpingEnv(gym.Env):
         else:
             normalized_sequence = sequence
         
-        # ✅ 포지션 상태 정보 추가 (중요: 에이전트가 자신의 상태를 알아야 함)
-        if self.position == 1:
-            holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-            holding_time_norm = min(holding_time / (self.max_holding_time + 1e-6), 1.0)
-            steps_norm = self.position_steps / (self.max_split_count or 1)
-        else:
-            holding_time_norm = 0.0
-            steps_norm = 0.0
-            
-        extra_features = np.array([
-            float(self.position),
-            float(steps_norm),
-            float(holding_time_norm)
-        ], dtype=np.float32)
+        # ✅ 5단계 포지션 정보 메타데이터 추가 (is_active, profit_rate, holding_norm) x 5 = 15
+        extra_features_list = []
+        for i in range(5):
+            if i < len(self.stages):
+                st = self.stages[i]
+                p_rate = (self.current_price - st['entry_price']) / st['entry_price']
+                p_rate = float(np.clip(p_rate, -1.0, 1.0))
+                h_sec = self._calculate_seconds_diff(st['entry_time'], self.current_time)
+                h_norm = float(min(h_sec / 10.0, 1.0))
+                extra_features_list.extend([1.0, p_rate, h_norm])
+            else:
+                extra_features_list.extend([0.0, 0.0, 0.0])
+                
+        extra_features = np.array(extra_features_list, dtype=np.float32)
         
         # 각 timestep 마다 동일한 메타데이터 추가 (Broadcasting)
         extra_features_expanded = np.tile(extra_features, (self.seq_len, 1))
         
-        # 특징 벡터 (seq_len, 28) + 상태 벡터 (seq_len, 3) = (seq_len, 31)
+        # 특징 벡터 (seq_len, 28) + 상태 벡터 (seq_len, 15) = (seq_len, 43)
         observation = np.concatenate([normalized_sequence, extra_features_expanded], axis=-1)
         
         return observation.astype(np.float32)
@@ -564,20 +533,13 @@ class GRPOScalpingEnv(gym.Env):
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         환경 리셋
-        
-        Args:
-            seed: 랜덤 시드
-            options: 추가 옵션
-            
-        Returns:
-            (observation, info) 튜플
         """
         super().reset(seed=seed)
         
         # ✅ DB 연결 지연 초기화 (Multiprocessing Safe)
         self._ensure_db_connection()
         
-        # ✅ 에피소드마다 normalizer 리셋 (각 에피소드가 독립적인 종목/날짜)
+        # ✅ 에피소드마다 normalizer 리셋
         if self.use_raw_data and self.normalizer is not None:
             self.normalizer.reset()
             logger.debug("Normalizer reset for new episode")
@@ -591,13 +553,9 @@ class GRPOScalpingEnv(gym.Env):
         
         # 에피소드 상태 초기화
         self.current_step = self.seq_len - 1  # 최소 seq_len만큼의 히스토리 필요
-        self.position = 0
-        self.position_steps = 0
-        self.avg_entry_price = 0.0
-        self.entry_time = 0.0
-        self.max_price_since_entry = 0.0
+        self.stages = []
         
-        # 현재 가격 및 시간 (메타데이터의 시간 컬럼 사용)
+        # 현재 가격 및 시간
         self.current_price = self._get_current_price()
         self.current_time = float(self.episode_metadata[self.current_step, 2])
         
@@ -847,8 +805,8 @@ class GRPOScalpingEnv(gym.Env):
         """
         if str(start_time_val).startswith('0') or start_time_val == 0: return 0.0
         
-        # 안전 상한선: max_holding_time (기본 300s 등)
-        safe_max = self.max_holding_time
+        # 안전 상한선 (기본 300초)
+        safe_max = getattr(self, 'max_holding_time', 300.0)
         
         try:
             # 1. 문자열 변환 및 소수점 제거 (100000030.0 -> "100000030")
@@ -899,279 +857,171 @@ class GRPOScalpingEnv(gym.Env):
         reward = 0.0
         terminated = False
         truncated = False
-        loss_holding_triggered = False
-        
-        if action == 1:  # 매수
-            if self.position == 0 and self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode:
-                # 최대 거래 횟수 초과로 신규 진입 차단
-                pass
-            elif self.position_steps < self.max_split_count:
-                # 분할 매수 (또는 신규 진입)
-                old_steps = self.position_steps
-                new_steps = old_steps + 1
-                
-                # 평단가 갱신 (가중 평균)
-                # 이전 총액 + 현재 매수액 / 총 수량
-                prev_total_value = self.avg_entry_price * old_steps
-                new_total_value = prev_total_value + self.current_price
-                self.avg_entry_price = new_total_value / new_steps
-                
-                self.position_steps = new_steps
-                self.position = 1  # 1개라도 있으면 포지션 ON
-                
-                if old_steps == 0:
-                    self.entry_time = self.current_time
-                    self.max_price_since_entry = self.current_price
-                
-                # 매수 비용 차감 (1회분 = 1/max_split)
-                # 예: 10분할이면 전체 자산의 10%만 매수했으므로 비용도 10%만 발생
-                buy_weight = 1.0 / self.max_split_count
-                reward -= (self.transaction_cost_rate + self.buy_tax_rate) * 100 * buy_weight
-                
-                logger.debug(f"Buy (Step {new_steps}/{self.max_split_count}): "
-                           f"price={self.current_price:.1f}, "
-                           f"new_avg={self.avg_entry_price:.1f}, "
-                           f"cost_weight={buy_weight:.2f}")
-            else:
-                # 이미 풀매수 상태: 과도한 매수 시도 페널티 (선택사항)
-                pass
-        
-        elif action == 2:  # 매도
-            if self.position == 1:
-                # 보유 시간 계산
-                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-                
-                # ✅ 최소 보유 시간 체크 (Dense Reward로 가이드 및 Soft Action Masking)
-                if holding_time < self.min_holding_time:
-                    # 너무 빨리 파는 경우: 약한 페널티 부여
-                    # 거래를 아예 포기하지 않도록 페널티 완화
-                    min_holding_penalty = self.min_holding_penalty
-                    reward -= min_holding_penalty
-                    logger.debug(f"Min Holding Penalty applied: -{min_holding_penalty} (holding_time {holding_time:.2f}s < {self.min_holding_time}s). Sell aborted (Action Masking).")
-                else:
-                    # 충분히 기다렸다가 파는 경우: 인내 보너스 (+0.1점)
-                    patience_bonus = 0.1
-                    reward += patience_bonus
-                    # logger.debug(f"Patience Bonus applied: +{patience_bonus}")
+        MAX_STAGES = 5
 
-                    # 전량 매도 진행
+        # 1. 행동 실행
+        if action == 1:  # 매수 (5단계 분할)
+            if len(self.stages) < MAX_STAGES:
+                if self.max_trades_per_episode is None or len(self.episode_trades) < self.max_trades_per_episode:
+                    self.stages.append({
+                        'entry_price': self.current_price,
+                        'entry_time': self.current_time,
+                        'pattern_rewarded': False
+                    })
+                    buy_weight = 1.0 / MAX_STAGES
+                    reward -= (self.transaction_cost_rate + self.buy_tax_rate) * 100.0 * buy_weight
+                    logger.debug(f"Buy (Stage {len(self.stages)}/{MAX_STAGES}): price={self.current_price:.1f}")
+
+        elif action == 2:  # 매도 (1단계씩 FIFO 청산)
+            if len(self.stages) > 0:
+                stage = self.stages.pop(0)
+                holding_time = self._calculate_seconds_diff(stage['entry_time'], self.current_time)
+                sell_weight = 1.0 / MAX_STAGES
+                profit_rate = (self.current_price - stage['entry_price']) / stage['entry_price']
+                
+                weighted_profit_reward = profit_rate * 100.0 * sell_weight
+                exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100.0 * sell_weight
+                trade_reward = weighted_profit_reward - exit_cost
+                
+                if profit_rate > self.round_trip_cost:
+                    bonus = self.win_bonus * sell_weight
+                    trade_reward += bonus
+                elif profit_rate < 0:
+                    penalty = self.loss_penalty * sell_weight
+                    trade_reward -= penalty
                     
-                    # 매도 가중치 (전량 매도이므로 현재 보유 비중)
-                    weight = self.position_steps / self.max_split_count
-                    
-                    # 매도 비용 차감 (보유 수량만큼)
-                    reward -= (self.transaction_cost_rate + self.sell_tax_rate) * 100 * weight
-                    
-                    # 수익률 계산 (평단가 기준)
-                    profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
-                    
-                    # 가중치가 적용된 수익 보상 시뮬레이션
-                    # (단순 수익률이 아니라, '내 돈이 얼마나 들어갔나'에 비례한 수익금 개념)
-                    weighted_profit_reward = profit_rate * 100 * weight
-                    reward += weighted_profit_reward
-                    
-                    # 승리/손실 보너스에도 가중치 적용
-                    # 풀매수 성공 시 보너스 큼, 짤짤이 성공 시 보너스 작음
-                    if profit_rate > self.round_trip_cost:
-                        bonus = self.win_bonus * weight
-                        reward += bonus
-                        logger.debug(f"Win bonus applied: +{bonus:.2f} (weight={weight:.2f})")
-                    elif profit_rate < 0:
-                        penalty = self.loss_penalty * weight
-                        reward -= penalty
-                        logger.debug(f"Loss penalty applied: -{penalty:.2f} (weight={weight:.2f})")
-                    
-                    # 기록용 (호환성 유지)
-                    _, reward_components = self._calculate_reward(
-                        self.avg_entry_price, self.current_price, holding_time
-                    )
+                reward += trade_reward
+                
+                trade_info = {
+                    'entry_price': stage['entry_price'],
+                    'exit_price': self.current_price,
+                    'holding_time': holding_time,
+                    'profit_rate': profit_rate,
+                    'reward': trade_reward,
+                    'exit_reason': 'Signal Sell',
+                    'weight': sell_weight
+                }
+                self.episode_trades.append(trade_info)
+                logger.debug(f"Sell Stage (FIFO): entry={stage['entry_price']:.1f}, exit={self.current_price:.1f}, profit={profit_rate*100:.2f}%")
+
+        # 2. 매수 후 1~5초 내 미상승 손절 & 상승 패턴 탐지 보너스 체크
+        stages_to_remove = []
+        for i, stage in enumerate(self.stages):
+            holding_sec = self._calculate_seconds_diff(stage['entry_time'], self.current_time)
+            profit_rate = (self.current_price - stage['entry_price']) / stage['entry_price']
+            sell_weight = 1.0 / MAX_STAGES
+            
+            if 1.0 <= holding_sec <= 5.0:
+                if profit_rate <= 0:
+                    # 1~5초 내 가격 미상승 → 즉시 손절
+                    weighted_profit_reward = profit_rate * 100.0 * sell_weight
+                    exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100.0 * sell_weight
+                    sl_reward = weighted_profit_reward - exit_cost - 1.0  # 손절 페널티 -1.0
+                    reward += sl_reward
                     
                     trade_info = {
-                        'entry_price': self.avg_entry_price,
+                        'entry_price': stage['entry_price'],
                         'exit_price': self.current_price,
-                        'holding_time': holding_time,
+                        'holding_time': holding_sec,
                         'profit_rate': profit_rate,
-                        'reward': reward,
-                        'reward_components': reward_components,
-                        'position_steps': self.position_steps,
-                        'weight': weight
+                        'reward': sl_reward,
+                        'exit_reason': '1-5s Non-Rising StopLoss',
+                        'weight': sell_weight
                     }
                     self.episode_trades.append(trade_info)
-                    
-                    logger.debug(f"Sell at price={self.current_price:.1f}, "
-                               f"avg={self.avg_entry_price:.1f}, "
-                               f"steps={self.position_steps}, "
-                               f"profit={profit_rate*100:.2f}%, "
-                               f"weighted_reward={weighted_profit_reward:.4f}")
-                    
-                    # 상태 초기화
-                    self.position = 0
-                    self.position_steps = 0
-                    self.avg_entry_price = 0.0
-                    self.entry_time = 0.0
-                    self.max_price_since_entry = 0.0
-        
-        elif action == 0:  # 보유
-            pass
-        
-        # 2. 포지션 보유에 따른 Step Reward (Dense Reward의 핵심)
-        # 포지션을 들고 다음 스텝으로 넘어가면, 가격 변동분을 즉시 보상으로 반영
-        if self.position == 1 and self.avg_entry_price > 0:
-            # 최고가 갱신
-            self.max_price_since_entry = max(self.max_price_since_entry, self.current_price)
-            
-            # 다음 스텝 가격으로 변동분 보상 계산
+                    stages_to_remove.append(i)
+                    self.loss_holding_violations += 1
+                else:
+                    # 1~5초 내 상승 패턴 탐지 보너스 (+0.5, 1회만 부여)
+                    if not stage.get('pattern_rewarded', False):
+                        reward += 0.5
+                        stage['pattern_rewarded'] = True
+            elif holding_sec > 5.0 and profit_rate <= 0:
+                # 5초 초과 시에도 미상승/손실 중이면 자동 손절
+                weighted_profit_reward = profit_rate * 100.0 * sell_weight
+                exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100.0 * sell_weight
+                sl_reward = weighted_profit_reward - exit_cost - 0.5
+                reward += sl_reward
+                
+                trade_info = {
+                    'entry_price': stage['entry_price'],
+                    'exit_price': self.current_price,
+                    'holding_time': holding_sec,
+                    'profit_rate': profit_rate,
+                    'reward': sl_reward,
+                    'exit_reason': 'TimeLimit StopLoss',
+                    'weight': sell_weight
+                }
+                self.episode_trades.append(trade_info)
+                stages_to_remove.append(i)
+                self.loss_holding_violations += 1
+
+        for i in sorted(stages_to_remove, reverse=True):
+            self.stages.pop(i)
+
+        # 3. Dense Step Reward (활성 포지션 보유에 따른 변동분 보상)
+        if len(self.stages) > 0:
             next_step_idx = self.current_step + 1
             if next_step_idx < len(self.prices):
                 next_price = float(self.prices[next_step_idx])
                 step_return = (next_price - self.current_price) / self.current_price
-                
-                # ✅ 분할 매수 비중에 따른 가중치 적용 (핵심)
-                # 1단계만 보유 시 보상 10%, 10단계(풀매수) 보유 시 보상 100%
-                weight = self.position_steps / self.max_split_count
-                
-                # Fix A: step reward 스케일 조정 (기본값: 1.0)
-                # 거래 결과 대비 step noise 비중을 줄여 에이전트가 매매 타이밍 학습에 집중하도록 유도
-                step_reward = step_return * self.step_reward_scale * weight
+                active_weight = len(self.stages) / MAX_STAGES
+                step_reward = step_return * self.step_reward_scale * active_weight
                 reward += step_reward
-                
-                # --- 리스크 관리 (손절 & 본전청산) ---
-                
-                # 현재 누적 수익률 (평단가 기준)
-                current_return = (self.current_price - self.avg_entry_price) / self.avg_entry_price
-                
-                # 최고 수익률 (진입 이후)
-                max_return = (self.max_price_since_entry - self.avg_entry_price) / self.avg_entry_price
-                
-                # 1. 손절매 (Stop Loss)
-                # 예: -2% 이하 시 손절
-                stop_loss_threshold = -(self.stop_loss_pct / 100.0)
-                
-                # 2. 본전 청산 (Breakeven)
-                # 예: 최고 수익률이 0.5% 이상이었다가, 다시 0.05% 이하로 떨어지면 청산
-                breakeven_activation = 0.005  # 0.5%
-                breakeven_trigger = 0.0005    # 0.05%
-                
-                force_exit_reason = None
-                
-                if current_return <= stop_loss_threshold:
-                    force_exit_reason = "Stop Loss"
-                    # 손절 페널티 부여
-                    reward -= 1.0
-                
-                elif max_return >= breakeven_activation and current_return <= breakeven_trigger:
-                     force_exit_reason = "Breakeven"
-                     # 본전 청산은 중립적이거나 약한 보상
-                     reward += 0.1
-                     
-                # 3. 최대 보유 시간 초과 (Time Limit)
-                # 시간이 너무 지체되면 강제 청산
-                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-                if not force_exit_reason and holding_time >= self.max_holding_time:
-                    force_exit_reason = "TimeLimit"
-                    # 시간 초과 페널티 (지루하게 오래 끌면 안됨)
-                    reward -= 0.5
-                
-                # 강제 청산 실행
-                if force_exit_reason:
-                    # 최소 보유 시간 체크 무시 (손절/본전청산/시간초과는 강제성이 있으므로)
-                    exit_reward = self._force_close_position(force_exit_reason)
-                    reward += exit_reward  # 청산 시 실현 손익 반영
-                    
-                    # 빠른 손절 체크 로직은 해제 (이 로직이 대체)
-                    pass
-                else:
-                    # 기존의 '시간 경과에 따른 손실 방치' 로직 유지 (Only if not forced closed)
-                    # holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time) # 위에서 계산함
-                    if self.loss_holding_mode == 'penalty_only':
-                         penalty, loss_holding_triggered = self._check_loss_holding_penalty_only(holding_time)
-                         reward += penalty
-        
-        # 보상 기록
+
         self.episode_rewards.append(reward)
-        
-        # 다음 스텝으로 이동
         self.current_step += 1
-        
-        # 에피소드 종료 체크
+
+        # 에피소드 종료 조건 체크
         if self.current_step >= self.episode_length - 1:
             terminated = True
-        
-        # 에피소드 최대 거래 횟수 달성 체크 (포지션이 없을 때 조기 종료)
-        if self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode and self.position == 0:
+        if self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode and len(self.stages) == 0:
             terminated = True
-            
-        # 최대 스텝 수 체크 (상대 스텝으로 계산)
         if self.max_episode_steps is not None and (self.current_step - (self.seq_len - 1)) >= self.max_episode_steps:
             truncated = True
-        
-        # 에피소드 종료 시 강제 청산 (통계용)
-        # 에피소드 종료 시 강제 청산 (통계용) 및 no_trade_penalty 적용
+
+        # 에피소드 종료 시 남아있는 모든 단계 강제 청산
         if terminated or truncated:
-            if self.position == 1:
-                holding_time = self._calculate_seconds_diff(self.entry_time, self.current_time)
-                weight = self.position_steps / self.max_split_count if self.max_split_count > 0 else 1.0
-                
-                # 가중치 적용된 실제 매도 및 수익 정산
-                profit_rate = (self.current_price - self.avg_entry_price) / self.avg_entry_price
-                weighted_profit_reward = profit_rate * 100 * weight
-                exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100 * weight
-                
+            sell_weight = 1.0 / MAX_STAGES
+            for stage in self.stages:
+                holding_time = self._calculate_seconds_diff(stage['entry_time'], self.current_time)
+                profit_rate = (self.current_price - stage['entry_price']) / stage['entry_price']
+                weighted_profit_reward = profit_rate * 100.0 * sell_weight
+                exit_cost = (self.transaction_cost_rate + self.sell_tax_rate) * 100.0 * sell_weight
                 final_trade_reward = weighted_profit_reward - exit_cost
-                
                 reward += final_trade_reward
-                if len(self.episode_rewards) > 0:
-                    self.episode_rewards[-1] += final_trade_reward
-                
-                _, reward_components = self._calculate_reward(
-                    self.avg_entry_price, self.current_price, holding_time
-                )
                 
                 self.episode_trades.append({
-                    'entry_price': self.avg_entry_price,
+                    'entry_price': stage['entry_price'],
                     'exit_price': self.current_price,
                     'holding_time': holding_time,
                     'profit_rate': profit_rate,
                     'reward': final_trade_reward,
-                    'reward_components': reward_components,
-                    'weight': weight,
+                    'weight': sell_weight,
                     'forced_liquidation': True
                 })
-                logger.debug(f"Forced liquidation on episode end: profit={profit_rate*100:.2f}%, reward={final_trade_reward:.4f}")
-            
-            # 거래를 한 번도 안 한 경우 패널티 부여 (no-trade collapse 방지)
+            self.stages = []
+
             if len(self.episode_trades) == 0:
                 reward -= self.no_trade_penalty
-                if len(self.episode_rewards) > 0:
-                    self.episode_rewards[-1] -= self.no_trade_penalty
-                logger.debug(f"No trade penalty applied: -{self.no_trade_penalty}")
-        
-        # 현재 가격 및 시간 업데이트
+
         if not (terminated or truncated):
-            # 에피소드가 계속되는 경우에만 업데이트
             self.current_price = self._get_current_price()
             self.current_time = float(self.episode_metadata[self.current_step, 2])
-        
-        # 다음 관측값
-        if not (terminated or truncated):
             observation = self._get_current_observation()
         else:
             observation = np.zeros((self.seq_len, self.obs_dim), dtype=np.float32)
-        
-        # 정보
+
         info = {
             'position': self.position,
+            'position_steps': self.position_steps,
             'current_price': self.current_price,
             'current_time': self.current_time,
-            'loss_holding_violations': self.loss_holding_violations,
-            'loss_holding_triggered': loss_holding_triggered
+            'loss_holding_violations': self.loss_holding_violations
         }
-        
         if terminated or truncated:
-            # 에피소드 종료 시 메타데이터 추가 (terminated, truncated 모두 포함)
-            episode_metadata = self._calculate_episode_metadata()
-            info['episode'] = episode_metadata
-        
+            info['episode'] = self._calculate_episode_metadata()
+
         return observation, reward, terminated, truncated, info
     
     def _calculate_episode_metadata(self) -> Dict[str, Any]:

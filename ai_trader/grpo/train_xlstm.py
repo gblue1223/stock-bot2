@@ -3,7 +3,7 @@
 xLSTM 기반 GRPO 훈련 스크립트 (train_xlstm.py)
 
 재활용 가능 데이터 추출기(data_extractor.py)와 scalping_env_xlstm.py를 사용하여
-최고 효율로 학습을 진행하고, GRU 체크포인트로부터 CNN 가중치를 부분 전이할 수 있습니다.
+5단계 분할 매매 및 1~5초 급등 패턴/손절 훈련을 수행합니다.
 """
 
 import os
@@ -71,11 +71,6 @@ class TrainingConfig:
         self.features = 28
         self.episode_steps = 600
         
-        self.loss_holding_mode = 'penalty_only'
-        self.loss_holding_penalty = 0.01
-        self.loss_holding_threshold = 2.5 # 손실 보유 허용 시간 (MIN_HOLDING=2보다 길어야 모순이 없음)
-        self.stagnation_exit_seconds = 180
-        
         self.hidden_dim = 128
         self.cnn_channels = 64
         self.rnn_hidden_dim = 128
@@ -107,11 +102,6 @@ class TrainingConfig:
         self.use_gae = False           # Whether to use GAE (default False for GRPO mode)
         
         self.base_price = 100000.0
-        self.stop_loss_pct = 2.0
-        self.max_split_count = 1
-        self.min_holding_time = 2
-        self.max_holding_time = 100
-        self.min_holding_penalty = 0.2
         self.no_trade_penalty = 0.0
         self.transaction_cost_rate = 0.00015  # 기본 거래 수수료율 (0.015%)
         self.buy_tax_rate = 0.0                # 매수 세금 (0%)
@@ -178,16 +168,8 @@ def create_environment(config: TrainingConfig, device: str):
             transaction_cost_rate=config.transaction_cost_rate,
             buy_tax_rate=config.buy_tax_rate,
             sell_tax_rate=config.sell_tax_rate,
-            loss_holding_mode=config.loss_holding_mode,
-            loss_holding_penalty=config.loss_holding_penalty,
-            loss_holding_threshold=config.loss_holding_threshold,
             max_episode_steps=config.episode_steps,
             base_price=config.base_price,
-            stop_loss_pct=config.stop_loss_pct,
-            max_split_count=config.max_split_count,
-            min_holding_time=config.min_holding_time,
-            max_holding_time=config.max_holding_time,
-            min_holding_penalty=config.min_holding_penalty,
             no_trade_penalty=config.no_trade_penalty,
             max_trades_per_episode=config.max_trades_per_episode,
             step_reward_scale=config.step_reward_scale,
@@ -233,24 +215,9 @@ def main():
     parser.add_argument('--seq_len', type=int, default=None)
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
-    parser.add_argument('--loss_holding_mode', choices=['penalty_only', 'force_close'], default=None)
-    parser.add_argument('--loss_holding_penalty', type=float, default=None,
-                        help='Penalty for loss holding (default: 0.01)')
-    parser.add_argument('--loss_holding_threshold', type=float, default=None,
-                        help='Time threshold in seconds for loss holding penalty (default: 2.5)')
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
     
-    # 손절 및 분할 매수 설정
-    parser.add_argument('--stop_loss', dest='stop_loss_pct', type=float, default=None,
-                        help='Stop loss percentage (default: 2.0)')
-    parser.add_argument('--max_split', dest='max_split_count', type=int, default=None,
-                        help='Max split buy count (default: 1)')
-    parser.add_argument('--min_holding', dest='min_holding_time', type=float, default=None,
-                        help='Min holding time in seconds (default: 2)')
-    parser.add_argument('--max_holding', dest='max_holding_time', type=float, default=None,
-                        help='Max holding time in seconds (default: 100)')
-    parser.add_argument('--min_holding_penalty', type=float, default=None,
-                        help='Penalty for early exit before min_holding (default: 0.2)')
+    # 보상 및 비용 설정
     parser.add_argument('--no_trade_penalty', type=float, default=None,
                         help='Penalty for making 0 trades in an episode (default: 0.0)')
     parser.add_argument('--transaction_cost', dest='transaction_cost_rate', type=float, default=None,

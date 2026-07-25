@@ -232,7 +232,7 @@ class GRPOPolicyE2EXLSTM(nn.Module):
     """
     def __init__(
         self,
-        obs_dim: int = 31,
+        obs_dim: int = 43,
         cnn_channels: int = 64,
         rnn_hidden_dim: int = 128,
         fc_hidden_dim: int = 256,
