@@ -1,3 +1,0 @@
-"""
-Koapys test package
-"""
