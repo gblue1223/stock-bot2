@@ -46,6 +46,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
         loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
+        min_1min_trade_value: float = 3000.0, # ✅ 1분간 최소 거래대금 조건 (백만원 단위, 3000 = 30억원)
         extracted_dir: Optional[str] = None  # ✅ 추가: 사전 추출 데이터 디렉토리
     ):
         self.extracted_dir = Path(extracted_dir) if extracted_dir else None
@@ -71,7 +72,8 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             max_trades_per_episode=max_trades_per_episode,
             step_reward_scale=step_reward_scale,
             win_bonus=win_bonus,
-            loss_penalty=loss_penalty
+            loss_penalty=loss_penalty,
+            min_1min_trade_value=min_1min_trade_value
         )
         
         if self.extracted_dir:
@@ -147,16 +149,21 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                         std = np.where(std < 1e-6, 1.0, std)
                         normalized_features = (raw_features - mean) / std
                         
+                        accum_idx = getattr(self, 'accum_trade_value_index', 5)
+                        raw_accum_trade = raw_features[:, accum_idx].copy()
+                        
                         GRPOScalpingEnvXLSTM._episode_cache[full_path] = (
                             normalized_features,
-                            data['metadata']
+                            data['metadata'],
+                            raw_accum_trade
                         )
                         
-                    features, metadata = GRPOScalpingEnvXLSTM._episode_cache[full_path]
+                    features, metadata, raw_accum_trade = GRPOScalpingEnvXLSTM._episode_cache[full_path]
                     
                     # 메모리 오염 방지를 위해 얕은 복사본 반환
                     features = features.copy()
                     metadata = metadata.copy()
+                    raw_accum_trade = raw_accum_trade.copy()
                     
                     # 에피소드 스텝만큼 슬라이싱
                     if self.max_episode_steps is not None:
@@ -167,7 +174,9 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                             end_idx = start_idx + needed_len
                             features = features[start_idx:end_idx]
                             metadata = metadata[start_idx:end_idx]
+                            raw_accum_trade = raw_accum_trade[start_idx:end_idx]
                             
+                    self.raw_accum_trade_value = raw_accum_trade
                     return features, metadata
                 except Exception as e:
                     logger.warning(f"Failed to load extracted episode (attempt {attempt+1}): {e}")

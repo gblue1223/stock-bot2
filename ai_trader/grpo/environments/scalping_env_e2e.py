@@ -86,6 +86,7 @@ class GRPOScalpingEnv(gym.Env):
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
         loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
+        min_1min_trade_value: float = 3000.0, # ✅ 1분간 최소 거래대금 조건 (백만원 단위, 3000 = 30억원)
     ):
         super().__init__()
         
@@ -95,6 +96,8 @@ class GRPOScalpingEnv(gym.Env):
         self.step_reward_scale = step_reward_scale
         self.win_bonus = win_bonus
         self.loss_penalty = loss_penalty
+        self.min_1min_trade_value = min_1min_trade_value
+        self.raw_accum_trade_value = None
         
         self.db_path = db_path
         self.table_name = table_name
@@ -166,6 +169,13 @@ class GRPOScalpingEnv(gym.Env):
         except ValueError as e:
             logger.error(f"Critical Column Missing: {e}")
             raise RuntimeError(f"Required column (등락률) missing from database features")
+
+        try:
+            self.accum_trade_value_index = self.feature_columns.index('누적거래대금')
+            logger.info(f"Column Mapping Identified: '누적거래대금' at Index {self.accum_trade_value_index}")
+        except ValueError:
+            self.accum_trade_value_index = 5
+            logger.warning("Column '누적거래대금' not found in features, using fallback index 5")
         
         self.valid_keys = []
         self._preload_valid_keys()
@@ -548,6 +558,11 @@ class GRPOScalpingEnv(gym.Env):
         self.episode_data, self.episode_metadata = self._sample_episode_start()
         self.episode_length = len(self.episode_data)
         
+        # 원본 누적거래대금 추출 (서브클래스에서 미지정 시)
+        if self.raw_accum_trade_value is None or len(self.raw_accum_trade_value) != len(self.episode_data):
+            idx = getattr(self, 'accum_trade_value_index', 5)
+            self.raw_accum_trade_value = self.episode_data[:, idx]
+        
         # 🔧 등락률로부터 가격 계산
         self._compute_prices()
         
@@ -863,14 +878,24 @@ class GRPOScalpingEnv(gym.Env):
         if action == 1:  # 매수 (5단계 분할)
             if len(self.stages) < MAX_STAGES:
                 if self.max_trades_per_episode is None or len(self.episode_trades) < self.max_trades_per_episode:
-                    self.stages.append({
-                        'entry_price': self.current_price,
-                        'entry_time': self.current_time,
-                        'pattern_rewarded': False
-                    })
-                    buy_weight = 1.0 / MAX_STAGES
-                    reward -= (self.transaction_cost_rate + self.buy_tax_rate) * 100.0 * buy_weight
-                    logger.debug(f"Buy (Stage {len(self.stages)}/{MAX_STAGES}): price={self.current_price:.1f}")
+                    # 1분간 (직전 60초) 거래대금 조건 검사 (기본 30억원 = 3,000 백만원 이상)
+                    can_buy = True
+                    if self.min_1min_trade_value > 0 and self.raw_accum_trade_value is not None:
+                        start_idx = max(0, self.current_step - 60)
+                        trade_val_1min = float(self.raw_accum_trade_value[self.current_step] - self.raw_accum_trade_value[start_idx])
+                        if trade_val_1min < self.min_1min_trade_value:
+                            can_buy = False
+                            logger.debug(f"Buy REJECTED: 1-min trade value {trade_val_1min:.1f}M < min {self.min_1min_trade_value:.1f}M")
+                    
+                    if can_buy:
+                        self.stages.append({
+                            'entry_price': self.current_price,
+                            'entry_time': self.current_time,
+                            'pattern_rewarded': False
+                        })
+                        buy_weight = 1.0 / MAX_STAGES
+                        reward -= (self.transaction_cost_rate + self.buy_tax_rate) * 100.0 * buy_weight
+                        logger.debug(f"Buy (Stage {len(self.stages)}/{MAX_STAGES}): price={self.current_price:.1f}")
 
         elif action == 2:  # 매도 (1단계씩 FIFO 청산)
             if len(self.stages) > 0:
