@@ -32,7 +32,7 @@ def get_feature_columns(conn, table_name: str, expected_features: int) -> list:
         all_columns = columns_df['column_name'].tolist()
         column_types = columns_df['column_type'].tolist()
         
-        exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호', '현재가'}
+        exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호'}
         
         feature_columns = []
         for col, col_type in zip(all_columns, column_types):
@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument("--table", type=str, default="datasets", help="테이블 이름")
     parser.add_argument("--output_dir", type=str, default="data/extracted_episodes", help="출력 디렉토리 경로")
     parser.add_argument("--seq_len", type=int, default=3000, help="시퀀스 길이")
-    parser.add_argument("--features", type=int, default=28, help="피처 개수")
+    parser.add_argument("--features", type=int, default=27, help="피처 개수")
     parser.add_argument("--max_steps", type=int, default=600, help="에피소드 최대 스텝 수")
     parser.add_argument("--limit", type=int, default=None, help="추출할 최대 에피소드 수 (기본: 전체)")
     

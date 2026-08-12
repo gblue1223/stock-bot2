@@ -16,9 +16,8 @@ from typing import Optional, Tuple
 
 # 특징별 정규화 전략 정의
 LOGSTD_FEATURES = {
+    "현재가",
     "누적거래대금",
-    "거래회전율",
-    "체결강도",
     *[f"매도대기금액{i}" for i in range(1, 11)],
     *[f"매수대기금액{i}" for i in range(1, 11)],
 }
@@ -33,18 +32,17 @@ DERIVED_FEATURES = {
     "시간_scalar"
 }
 
-# 특징 인덱스 매핑 (FINAL_COLUMNS 기준)
+# 특징 인덱스 매핑 (FINAL_COLUMNS 기준, 27개)
 FEATURE_INDICES = {
     "종목명_scalar": 0,
     "시간_sin": 1,
     "시간_cos": 2,
     "시간_scalar": 3,
     "등락률": 4,
-    "누적거래대금": 5,
-    "거래회전율": 6,
-    "체결강도": 7,
-    **{f"매도대기금액{i}": 7 + i for i in range(1, 11)},
-    **{f"매수대기금액{i}": 17 + i for i in range(1, 11)},
+    "현재가": 5,
+    "누적거래대금": 6,
+    **{f"매도대기금액{i}": 6 + i for i in range(1, 11)},
+    **{f"매수대기금액{i}": 16 + i for i in range(1, 11)},
 }
 
 
@@ -267,10 +265,10 @@ class NormalizationStats:
         }
 
 
-# 특징 이름 상수 (FINAL_COLUMNS와 동일)
+# 특징 이름 상수 (FINAL_COLUMNS와 동일, 27개)
 FEATURE_NAMES = [
     "종목명_scalar", "시간_sin", "시간_cos", "시간_scalar",
-    "등락률", "누적거래대금", "거래회전율", "체결강도",
+    "등락률", "현재가", "누적거래대금",
     *[f"매도대기금액{i}" for i in range(1, 11)],
     *[f"매수대기금액{i}" for i in range(1, 11)],
 ]

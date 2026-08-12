@@ -68,7 +68,7 @@ class TrainingConfig:
         self.extracted_dir = 'data/extracted_episodes'  # ✅ 기본값 추가
         self.table_name = 'datasets'
         self.seq_len = 3000
-        self.features = 28
+        self.features = 27
         self.episode_steps = 600
         
         self.hidden_dim = 128

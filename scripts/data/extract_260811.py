@@ -65,8 +65,6 @@ def run_extraction():
             COALESCE(TRY_CAST(현재가 AS DOUBLE), 0.0) / 1000000.0 AS 현재가,
             COALESCE(TRY_CAST(등락률 AS DOUBLE), 0.0) AS 등락률,
             COALESCE(TRY_CAST(누적거래대금 AS DOUBLE), 0.0) AS 누적거래대금,
-            COALESCE(TRY_CAST(거래회전율 AS DOUBLE), 0.0) AS 거래회전율,
-            COALESCE(TRY_CAST(체결강도 AS DOUBLE), 0.0) AS 체결강도,
             
             -- 매도대기금액 1~10 (백만원 단위 = 호가 * 수량 / 1,000,000)
             (COALESCE(TRY_CAST(매도호가1 AS DOUBLE), 0.0) * COALESCE(TRY_CAST(매도호가수량1 AS DOUBLE), 0.0)) / 1000000.0 AS 매도대기금액1,
@@ -113,8 +111,6 @@ def run_extraction():
         c.현재가,
         c.등락률,
         c.누적거래대금,
-        c.거래회전율,
-        c.체결강도,
         c.매도대기금액1, c.매도대기금액2, c.매도대기금액3, c.매도대기금액4, c.매도대기금액5,
         c.매도대기금액6, c.매도대기금액7, c.매도대기금액8, c.매도대기금액9, c.매도대기금액10,
         c.매수대기금액1, c.매수대기금액2, c.매수대기금액3, c.매수대기금액4, c.매수대기금액5,
