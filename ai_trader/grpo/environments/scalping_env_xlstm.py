@@ -78,7 +78,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         
         if self.extracted_dir:
             self.normalizer = None
-            logger.info(f"Loaded environment using pre-extracted data from: {self.extracted_dir} (RollingNormalizer disabled, Z-score applied pre-cache)")
+            logger.info(f"Loaded environment using pre-extracted data from: {self.extracted_dir} (RollingNormalizer disabled, Log+Z-score applied pre-cache)")
         else:
             logger.info("Loaded environment using live DuckDB queries")
 
@@ -143,11 +143,24 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                         data = np.load(full_path, allow_pickle=True)
                         raw_features = data['features'].astype(np.float32)
                         
-                        # Z-score normalize features along time axis (axis 0) to avoid step-by-step overhead
-                        mean = raw_features.mean(axis=0)
-                        std = raw_features.std(axis=0)
+                        # Log + Z-score 정규화: 큰 값 피처에 signed_log1p 적용 후 Z-score
+                        from lib.normalization import LOGSTD_FEATURES, signed_log1p
+                        
+                        log_indices = []
+                        if self.feature_columns:
+                            for i, col_name in enumerate(self.feature_columns):
+                                if col_name in LOGSTD_FEATURES:
+                                    log_indices.append(i)
+                        
+                        processed_features = raw_features.copy()
+                        if log_indices:
+                            processed_features[:, log_indices] = signed_log1p(processed_features[:, log_indices])
+                        
+                        # Z-score normalize (axis 0)
+                        mean = processed_features.mean(axis=0)
+                        std = processed_features.std(axis=0)
                         std = np.where(std < 1e-6, 1.0, std)
-                        normalized_features = (raw_features - mean) / std
+                        normalized_features = (processed_features - mean) / std
                         
                         accum_idx = getattr(self, 'accum_trade_value_index', 5)
                         raw_accum_trade = raw_features[:, accum_idx].copy()
