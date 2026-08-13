@@ -1067,7 +1067,7 @@ class GRPOScalpingEnv(gym.Env):
         if self.episode_trades:
             total_return = sum((t['profit_rate'] - self.round_trip_cost) * 100 * t.get('weight', 1.0) for t in self.episode_trades)
         else:
-            total_return = 0.0
+            total_return = -self.no_trade_penalty
             
         # 거래 횟수
         num_trades = len(self.episode_trades)

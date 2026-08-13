@@ -352,8 +352,14 @@ class GRPOTrainer:
             kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
             group_labels = kmeans.fit_predict(market_indicators)
             
-            # 클러스터 중심 로깅
-            logger.debug(f"K-means cluster centers:\n{kmeans.cluster_centers_}")
+            # K-means 붕괴 감지: 실제 그룹 수가 요청보다 적으면 폴백
+            actual_groups = len(set(group_labels))
+            if actual_groups < n_clusters:
+                logger.warning(f"K-means collapsed to {actual_groups} groups (requested {n_clusters}), falling back to rule-based grouping")
+                group_labels = self._rule_based_grouping(market_indicators)
+            else:
+                # 클러스터 중심 로깅
+                logger.debug(f"K-means cluster centers:\n{kmeans.cluster_centers_}")
             
         except Exception as e:
             logger.error(f"K-means clustering failed: {e}, falling back to rule-based grouping")
