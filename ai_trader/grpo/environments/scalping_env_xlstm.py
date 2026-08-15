@@ -46,7 +46,6 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
         loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
-        min_1min_trade_value: float = 3000.0, # ✅ 1분간 최소 거래대금 조건 (백만원 단위, 3000 = 30억원)
         extracted_dir: Optional[str] = None  # ✅ 추가: 사전 추출 데이터 디렉토리
     ):
         self.extracted_dir = Path(extracted_dir) if extracted_dir else None
@@ -72,8 +71,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             max_trades_per_episode=max_trades_per_episode,
             step_reward_scale=step_reward_scale,
             win_bonus=win_bonus,
-            loss_penalty=loss_penalty,
-            min_1min_trade_value=min_1min_trade_value
+            loss_penalty=loss_penalty
         )
         
         if self.extracted_dir:

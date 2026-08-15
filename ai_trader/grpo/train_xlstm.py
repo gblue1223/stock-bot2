@@ -110,7 +110,6 @@ class TrainingConfig:
         self.step_reward_scale = 1.0  # Dense step reward 스케일 비율
         self.win_bonus = 5.0          # 승리 보너스
         self.loss_penalty = 0.3       # 손실 페널티
-        self.min_1min_trade_value = 3000.0  # 1분간 최소 거래대금 조건 (백만원 단위, 3000 = 30억원)
         
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
@@ -176,7 +175,6 @@ def create_environment(config: TrainingConfig, device: str):
             step_reward_scale=config.step_reward_scale,
             win_bonus=config.win_bonus,
             loss_penalty=config.loss_penalty,
-            min_1min_trade_value=config.min_1min_trade_value,
             extracted_dir=config.extracted_dir
         )
     except Exception as e:
@@ -236,8 +234,6 @@ def main():
                         help='Bonus for winning trades (default: 5.0)')
     parser.add_argument('--loss_penalty', type=float, default=None,
                         help='Penalty for losing trades (default: 0.3)')
-    parser.add_argument('--min_1min_trade_value', type=float, default=None,
-                        help='1-minute minimum transaction value threshold in million KRW (default: 3000.0 = 3 billion KRW)')
     
     # 정규화 설정
     parser.add_argument('--use_raw_data',
