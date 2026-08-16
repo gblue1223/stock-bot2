@@ -46,6 +46,7 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
         loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
+        buy_signal_bonus: float = 0.5,  # ✅ 매수 신호(거래대금 증가 + 등락률 상승) 보너스
         extracted_dir: Optional[str] = None  # ✅ 추가: 사전 추출 데이터 디렉토리
     ):
         self.extracted_dir = Path(extracted_dir) if extracted_dir else None
@@ -71,7 +72,8 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             max_trades_per_episode=max_trades_per_episode,
             step_reward_scale=step_reward_scale,
             win_bonus=win_bonus,
-            loss_penalty=loss_penalty
+            loss_penalty=loss_penalty,
+            buy_signal_bonus=buy_signal_bonus
         )
         
         if self.extracted_dir:
@@ -92,9 +94,13 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                 
             metadata = self.manifest_data.get("metadata", {})
             self.feature_columns = metadata.get("feature_columns")
-            self.return_rate_index = metadata.get("return_rate_index", 0)
+            self.return_rate_index = metadata.get("return_rate_index", 1)
+            if self.feature_columns and '누적거래대금' in self.feature_columns:
+                self.accum_trade_value_index = self.feature_columns.index('누적거래대금')
+            else:
+                self.accum_trade_value_index = 2
             
-            logger.info(f"[Cache Mode] Feature mapping loaded: return_rate_index={self.return_rate_index}")
+            logger.info(f"[Cache Mode] Feature mapping loaded: return_rate_index={self.return_rate_index}, accum_trade_value_index={self.accum_trade_value_index}")
             
             # valid_keys 세팅
             self.valid_keys = []

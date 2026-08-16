@@ -86,6 +86,7 @@ class GRPOScalpingEnv(gym.Env):
         step_reward_scale: float = 1.0, # ✅ Dense Step Reward 스케일 조정 비율
         win_bonus: float = 5.0,         # ✅ 거래 수익(수수료 극복) 성공 보너스
         loss_penalty: float = 0.3,      # ✅ 거래 손실 페널티
+        buy_signal_bonus: float = 0.5,  # ✅ 매수 신호(거래대금 증가 + 등락률 상승) 보너스
     ):
         super().__init__()
         
@@ -95,6 +96,9 @@ class GRPOScalpingEnv(gym.Env):
         self.step_reward_scale = step_reward_scale
         self.win_bonus = win_bonus
         self.loss_penalty = loss_penalty
+        self.buy_signal_bonus = buy_signal_bonus
+        self.accum_trade_value_index = 2
+        self.raw_accum_trade_value = None
         
         self.db_path = db_path
         self.table_name = table_name
@@ -881,8 +885,14 @@ class GRPOScalpingEnv(gym.Env):
                         'pattern_rewarded': False
                     })
                     buy_weight = 1.0 / MAX_STAGES
-                    reward -= (self.transaction_cost_rate + self.buy_tax_rate) * 100.0 * buy_weight
-                    logger.debug(f"Buy (Stage {len(self.stages)}/{MAX_STAGES}): price={self.current_price:.1f}")
+                    entry_cost = (self.transaction_cost_rate + self.buy_tax_rate) * 100.0 * buy_weight
+                    reward -= entry_cost
+                    
+                    # ✅ 매수 신호 정렬 보너스 (거래대금 증가 + 등락률 상승 시 긍정적 보상)
+                    signal_bonus = self._calculate_buy_signal_reward(buy_weight)
+                    reward += signal_bonus
+                    
+                    logger.debug(f"Buy (Stage {len(self.stages)}/{MAX_STAGES}): price={self.current_price:.1f}, signal_bonus={signal_bonus:.3f}")
 
         elif action == 2:  # 매도 (1단계씩 FIFO 청산)
             if len(self.stages) > 0:
@@ -1036,6 +1046,42 @@ class GRPOScalpingEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
     
+    def _calculate_buy_signal_reward(self, buy_weight: float) -> float:
+        """
+        매수 진입 시점의 시장 신호(등락률 상승 + 거래대금 증가) 평가 및 보너스 산출
+        
+        조건:
+        1. 등락률/가격 상승: 직전 스텝(또는 단기 1~3초) 대비 현재 가격이 상승 중
+        2. 거래대금/매수대금 증가: 직전 스텝 대비 누적거래대금 증가(신규 체결 및 매수 유입)
+        
+        두 조건이 모두 충족될 경우 긍정적인 매수 타이밍으로 판단하여 보너스를 부여합니다.
+        """
+        if self.current_step <= 0 or self.buy_signal_bonus <= 0:
+            return 0.0
+            
+        prev_step = self.current_step - 1
+        
+        # 1. 등락률/가격 상승 여부
+        is_price_rising = self.current_price > self.prices[prev_step]
+        
+        # 2. 거래대금/매수대금 증가 여부
+        is_trade_val_increasing = False
+        if self.raw_accum_trade_value is not None and len(self.raw_accum_trade_value) > self.current_step:
+            trade_val_delta = float(self.raw_accum_trade_value[self.current_step] - self.raw_accum_trade_value[prev_step])
+            is_trade_val_increasing = (trade_val_delta > 0.0)
+        elif self.episode_data is not None and len(self.episode_data) > self.current_step:
+            trade_val_delta = float(self.episode_data[self.current_step, self.accum_trade_value_index] - 
+                                    self.episode_data[prev_step, self.accum_trade_value_index])
+            is_trade_val_increasing = (trade_val_delta > 0.0)
+            
+        # 3. 긍정적 매수 신호 판정: 등락률 상승 + 거래대금 증가 동시 만족
+        if is_price_rising and is_trade_val_increasing:
+            bonus = self.buy_signal_bonus * buy_weight
+            logger.debug(f"Positive Buy Signal Bonus (+{bonus:.3f}): price rising and trade value increased")
+            return bonus
+            
+        return 0.0
+
     def _calculate_episode_metadata(self) -> Dict[str, Any]:
         """
         에피소드 종료 시 메타데이터 계산

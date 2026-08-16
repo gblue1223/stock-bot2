@@ -110,6 +110,7 @@ class TrainingConfig:
         self.step_reward_scale = 1.0  # Dense step reward 스케일 비율
         self.win_bonus = 5.0          # 승리 보너스
         self.loss_penalty = 0.3       # 손실 페널티
+        self.buy_signal_bonus = 0.5   # 매수 신호(거래대금 증가 + 등락률 상승) 보너스
         
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
@@ -175,6 +176,7 @@ def create_environment(config: TrainingConfig, device: str):
             step_reward_scale=config.step_reward_scale,
             win_bonus=config.win_bonus,
             loss_penalty=config.loss_penalty,
+            buy_signal_bonus=config.buy_signal_bonus,
             extracted_dir=config.extracted_dir
         )
     except Exception as e:
@@ -234,6 +236,8 @@ def main():
                         help='Bonus for winning trades (default: 5.0)')
     parser.add_argument('--loss_penalty', type=float, default=None,
                         help='Penalty for losing trades (default: 0.3)')
+    parser.add_argument('--buy_signal_bonus', type=float, default=None,
+                        help='Bonus for entering on positive buy signals (rising price + trade value increase, default: 0.5)')
     
     # 정규화 설정
     parser.add_argument('--use_raw_data',
