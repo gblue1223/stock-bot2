@@ -16,9 +16,6 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict, Any
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # 프로젝트 루트 추가
 project_root = Path(__file__).parent.parent.parent
@@ -26,7 +23,11 @@ sys.path.insert(0, str(project_root))
 
 from ai_trader.grpo.environments.scalping_env_xlstm import GRPOScalpingEnvXLSTM
 from ai_trader.grpo.grpo import GRPOTrainer
-from ai_trader.grpo.inference.trade_logger import TradeLogger
+from ai_trader.grpo.evaluation import (
+    chronological_date_split, compatible_resume_best, evaluate_policy,
+    evaluation_signature, normalize_date, validate_checkpoint_dates,
+)
+from lib.observations import ObservationBuilder
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
 
 
@@ -95,22 +96,41 @@ class TrainingConfig:
         self.checkpoint_interval = 10
         self.output_dir = 'models/grpo_xlstm'
         self.load_policy = None
+        self.resume = False
         self.revert_patience = 0
         self.num_workers = 4
         self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
         self.num_epochs = 4            # Number of epochs per policy update
         self.use_gae = False           # Whether to use GAE (default False for GRPO mode)
+        self.train_end_date = None
+        self.validation_end_date = None
+        self.validation_fraction = 0.2
+        self.test_fraction = 0.2
+        self.embargo_dates = 0
+        self.evaluation_episodes = 8
+        self.evaluation_interval = 1
+        self.evaluation_seed = 42
+        self.cache_max_bytes = 256 * 1024 * 1024
+        self.initial_cash = 1_000_000.0
+        self.max_holding_seconds = 300.0
+        self.stop_loss_pct = 2.0
+        self.execution_config = {
+            'order_latency_ms': 100, 'cancel_latency_ms': 50,
+            'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
+            'fallback_depth': 100, 'require_order_book': False,
+        }
         
         self.base_price = 100000.0
+        self.price_scale = 1.0  # Direct DB price units; NPZ manifest declares its own units.
         self.no_trade_penalty = 0.0
         self.transaction_cost_rate = 0.00015  # 기본 거래 수수료율 (0.015%)
         self.buy_tax_rate = 0.0                # 매수 세금 (0%)
         self.sell_tax_rate = 0.0018            # 매도 세금 (0.18%)
         self.max_trades_per_episode = None
         self.step_reward_scale = 1.0  # Dense step reward 스케일 비율
-        self.win_bonus = 5.0          # 승리 보너스
-        self.loss_penalty = 0.3       # 손실 페널티
-        self.buy_signal_bonus = 0.5   # 매수 신호(거래대금 증가 + 등락률 상승) 보너스
+        self.win_bonus = 0.0          # Legacy compatibility; NAV rewards have no bonuses.
+        self.loss_penalty = 0.0
+        self.buy_signal_bonus = 0.0
         
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
@@ -140,6 +160,15 @@ class TrainingConfig:
 
     def validate(self):
         errors = []
+        if not isinstance(self.resume, bool):
+            errors.append("resume must be a boolean")
+        if self.resume and not self.load_policy:
+            errors.append("--resume requires --load_policy")
+        for name in ('seq_len', 'episode_steps', 'num_workers', 'episodes_per_group',
+                     'num_groups', 'batch_size', 'num_epochs', 'total_timesteps',
+                     'evaluation_episodes', 'evaluation_interval'):
+            if getattr(self, name) <= 0:
+                errors.append(f"{name} must be positive")
         # cache 디렉토리나 DB 파일 둘 중 하나는 존재해야 함
         if not self.extracted_dir and not self.db_path:
             errors.append("Either db_path or extracted_dir is required")
@@ -158,7 +187,7 @@ class TrainingConfig:
         logger.info("[OK] Configuration validated")
 
 
-def create_environment(config: TrainingConfig, device: str):
+def create_environment(config: TrainingConfig, device: str, allowed_dates=None):
     """환경 인스턴스 생성"""
     try:
         return GRPOScalpingEnvXLSTM(
@@ -171,13 +200,23 @@ def create_environment(config: TrainingConfig, device: str):
             sell_tax_rate=config.sell_tax_rate,
             max_episode_steps=config.episode_steps,
             base_price=config.base_price,
+            price_scale=config.price_scale,
             no_trade_penalty=config.no_trade_penalty,
             max_trades_per_episode=config.max_trades_per_episode,
             step_reward_scale=config.step_reward_scale,
             win_bonus=config.win_bonus,
             loss_penalty=config.loss_penalty,
             buy_signal_bonus=config.buy_signal_bonus,
-            extracted_dir=config.extracted_dir
+            extracted_dir=config.extracted_dir,
+            allowed_dates=allowed_dates,
+            cache_max_bytes=config.cache_max_bytes,
+            use_raw_data=config.use_raw_data,
+            rolling_window_size=config.rolling_window_size,
+            rolling_min_samples=config.rolling_min_samples,
+            initial_cash=config.initial_cash,
+            max_holding_seconds=config.max_holding_seconds,
+            stop_loss_pct=config.stop_loss_pct,
+            execution_config=config.execution_config,
         )
     except Exception as e:
         logger.error(f"Failed to create environment: {e}", exc_info=True)
@@ -203,6 +242,44 @@ def create_policy(config: TrainingConfig, env, device: str):
         raise
 
 
+def prepare_date_splits(config):
+    if config.extracted_dir:
+        with open(Path(config.extracted_dir) / 'manifest.json', encoding='utf-8') as handle:
+            dates = [episode['date'] for episode in json.load(handle)['episodes']]
+    else:
+        import duckdb
+        table = '"' + config.table_name.replace('"', '""') + '"'
+        with duckdb.connect(config.db_path, read_only=True) as connection:
+            dates = [row[0] for row in connection.execute(f'SELECT DISTINCT "날짜" FROM {table}').fetchall()]
+    return chronological_date_split(
+        dates, config.train_end_date, config.validation_end_date,
+        config.validation_fraction, config.test_fraction, config.embargo_dates)
+
+
+def load_resume_best_candidates(source, source_path, output_dir, signature):
+    """Only inspect named best checkpoints beside the source or in the output."""
+    source_path = Path(source_path).resolve()
+    paths = [source_path.parent / 'checkpoint_best.pt',
+             source_path.parent / 'checkpoints' / 'checkpoint_best.pt',
+             Path(output_dir).resolve() / 'checkpoints' / 'checkpoint_best.pt']
+    candidates, seen = [], {source_path}
+    for path in paths:
+        path = path.resolve()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            candidate = torch.load(path, map_location='cpu', weights_only=True)
+            if compatible_resume_best(candidate, source, signature):
+                candidates.append(candidate)
+                logger.info("Will re-evaluate compatible resume best: %s", path)
+            else:
+                logger.warning("Ignoring unrelated/incompatible resume best: %s", path)
+        except Exception as exc:
+            logger.warning("Cannot inherit resume best %s: %s", path, exc)
+    return candidates
+
+
 def main():
     parser = argparse.ArgumentParser(description='xLSTM 기반 GRPO E2E 훈련')
     parser.add_argument('--config', type=str, default=None, help='JSON 설정 파일')
@@ -212,6 +289,17 @@ def main():
     parser.add_argument('--db', dest='db_path', type=str, default=None, help='Database path')
     parser.add_argument('--table', dest='table_name', type=str, default=None, help='Table name')
     parser.add_argument('--extracted_dir', type=str, default=None, help='추출 데이터 디렉토리 경로')
+    parser.add_argument('--train_end_date', default=None)
+    parser.add_argument('--validation_end_date', default=None)
+    parser.add_argument('--validation_fraction', type=float, default=None)
+    parser.add_argument('--test_fraction', type=float, default=None)
+    parser.add_argument('--embargo_dates', type=int, default=None)
+    parser.add_argument('--evaluation_episodes', type=int, default=None)
+    parser.add_argument('--evaluation_interval', type=int, default=None)
+    parser.add_argument('--evaluation_seed', type=int, default=None)
+    parser.add_argument('--max_holding_seconds', type=float, default=None)
+    parser.add_argument('--stop_loss_pct', type=float, default=None)
+    parser.add_argument('--initial_cash', type=float, default=None)
     
     # 기타 인자들
     parser.add_argument('--seq_len', type=int, default=None)
@@ -281,7 +369,10 @@ def main():
     parser.add_argument('--batch_size', type=int, default=None, help='Mini-batch size for PPO updates (default: 64)')
     parser.add_argument('--checkpoint_interval', type=int, default=None)
     parser.add_argument('--output_dir', type=str, default=None)
-    parser.add_argument('--load_policy', type=str, default=None)
+    parser.add_argument('--load_policy', type=str, default=None,
+                        help='Load compatible weights for a new fine-tuning run')
+    parser.add_argument('--resume', action='store_true', default=None,
+                        help='Also restore optimizer and counters; total_timesteps is the cumulative target')
     parser.add_argument('--revert_patience', type=int, default=None)
     parser.add_argument('--num_epochs', type=int, default=None, help='Number of epochs per policy update')
     parser.add_argument('--use_gae', type=lambda x: x.lower() in ('true', '1', 'yes'), default=None,
@@ -294,6 +385,7 @@ def main():
     logger.info("=" * 80)
     
     device = "cpu"
+    vec_env = ref_env = validation_env = test_env = trainer = None
     try:
         config = TrainingConfig(args.config)
         
@@ -350,6 +442,10 @@ def main():
                 logger.warning(f"Failed to auto-detect/adjust config from load_policy: {e}. Proceeding with manual config.")
 
         config.validate()
+        date_splits = prepare_date_splits(config)
+        os.makedirs(config.output_dir, exist_ok=True)
+        with open(Path(config.output_dir) / 'date_splits.json', 'w', encoding='utf-8') as handle:
+            json.dump(date_splits, handle, ensure_ascii=False, indent=2)
         device = config.device
         if device == 'cuda' and not torch.cuda.is_available():
             device = 'cpu'
@@ -367,14 +463,17 @@ def main():
              logger.warning("No extracted_dir provided, fallback to single process to prevent IPC crash on Windows.")
              config.num_workers = 1
              
-        env_fns = [functools.partial(create_environment, config, device) for _ in range(config.num_workers)]
+        env_fns = [functools.partial(create_environment, config, device, date_splits['train'])
+                   for _ in range(config.num_workers)]
         
         if config.num_workers > 1:
             vec_env = SubprocVecEnv(env_fns)
         else:
             vec_env = DummyVecEnv(env_fns)
             
-        ref_env = vec_env.envs[0] if config.num_workers <= 1 else create_environment(config, device)
+        ref_env = (vec_env.envs[0] if config.num_workers <= 1
+                   else create_environment(config, device, date_splits['train']))
+        validation_env = create_environment(config, device, date_splits['validation'])
         
         # 정책 모델 생성
         logger.info("[STEP 3/6] Creating policy...")
@@ -385,43 +484,31 @@ def main():
         logger.info(f"  Total parameters: {total_params:,}")
         
         start_iteration = 0
+        checkpoint = None
         if config.load_policy:
             logger.info(f"[LOAD POLICY] Loading from {config.load_policy}...")
             try:
                 checkpoint = torch.load(config.load_policy, map_location=device, weights_only=False)
+                ObservationBuilder.from_schema(ref_env.observation_schema).validate_schema(
+                    checkpoint.get('observation_schema'))
+                validate_checkpoint_dates(checkpoint, date_splits)
                 state_dict = checkpoint.get('policy_state_dict', checkpoint.get('state_dict', checkpoint))
                 
                 # GRU 체크포인트 감지 시 CNN 가중치 전이(Transfer Learning) 적용
                 has_gru = any('gru' in k for k in state_dict.keys())
                 if has_gru:
+                    if config.resume:
+                        raise ValueError("Cannot resume a GRU optimizer into an xLSTM policy")
                     logger.info("⚠️ GRU weights detected in checkpoint. Transferring CNN layers only. xLSTM/FC will be initialized randomly.")
                     cnn_state_dict = {k: v for k, v in state_dict.items() if k.startswith(('conv', 'bn'))}
                     missing, unexpected = policy.load_state_dict(cnn_state_dict, strict=False)
                     logger.info(f"  Transfer completed. CNN loaded successfully.")
                 else:
-                    missing, unexpected = policy.load_state_dict(state_dict, strict=False)
+                    policy.load_state_dict(state_dict, strict=True)
                     logger.info("  Checkpoint loaded successfully.")
                     
-                # 체크포인트에서 extra_state 복원 (curriculum cost rate 등)
-                restored_cost_rate = None
-                if isinstance(checkpoint, dict) and 'extra_state' in checkpoint:
-                    extra = checkpoint['extra_state']
-                    restored_cost_rate = extra.get('current_cost_rate', None)
-                    logger.info(f"[RESTORE] Extra state found: {extra}")
-                    
-                # Iteration 정보 복원
-                try:
-                    if isinstance(checkpoint, dict) and 'iteration' in checkpoint:
-                        start_iteration = checkpoint['iteration']
-                        logger.info(f"Resuming from iteration: {start_iteration} (loaded from checkpoint metadata)")
-                    else:
-                        import re
-                        match = re.search(r'checkpoint_iter(\d+)\.pt', config.load_policy)
-                        if match:
-                            start_iteration = int(match.group(1))
-                            logger.info(f"Resuming from iteration: {start_iteration} (extracted from filename)")
-                except Exception as e:
-                    logger.warning(f"Failed to restore iteration info: {e}. Defaulting to 0.")
+                if not config.resume:
+                    logger.info("Loaded weights for a new fine-tuning run (fresh optimizer and counters)")
             except Exception as e:
                 logger.error(f"Failed to load policy: {e}", exc_info=True)
                 raise
@@ -449,8 +536,35 @@ def main():
             device=device,
             tensorboard_log_dir=tensorboard_dir,
             use_gae=config.use_gae,
-            num_epochs=config.num_epochs
+            num_epochs=config.num_epochs,
+            observation_schema=ref_env.observation_schema,
+            evaluation_callback=lambda current_policy: evaluate_policy(
+                current_policy, validation_env, config.evaluation_episodes,
+                config.evaluation_seed, device),
+            evaluation_interval=config.evaluation_interval,
         )
+        trainer.extra_checkpoint_state = {'date_splits': date_splits,
+                                          'training_config': dict(config.__dict__)}
+        if checkpoint is not None:
+            # Keep all ancestral exposure dates when writing a fine-tuned model.
+            lineage = checkpoint['extra_state']['date_splits']
+            trainer.extra_checkpoint_state['date_splits'] = {
+                **date_splits,
+                'train': sorted(set(date_splits['train']) | {normalize_date(day) for day in lineage.get('train', [])}),
+                'validation': sorted(set(date_splits['validation']) | {normalize_date(day) for day in lineage.get('validation', [])}),
+            }
+        if config.resume:
+            start_iteration = trainer.restore_training_progress(checkpoint)
+            if config.total_timesteps <= trainer.total_timesteps:
+                raise ValueError("For --resume, total_timesteps must exceed the saved cumulative timesteps")
+            config.lr = trainer.learning_rate
+            trainer.extra_checkpoint_state['training_config'] = dict(config.__dict__)
+            logger.info("Resuming iteration=%s, timesteps=%s, updates=%s with saved optimizer",
+                        start_iteration, trainer.total_timesteps, trainer.num_updates)
+        signature = evaluation_signature(dict(config.__dict__), date_splits, ref_env.observation_schema)
+        trainer.extra_checkpoint_state['evaluation_signature'] = signature
+        resume_best_checkpoints = (load_resume_best_candidates(
+            checkpoint, config.load_policy, config.output_dir, signature) if config.resume else [])
         
         # 7. 고정 거래 비용 적용 (커리큘럼 미사용)
         current_cost_rate = config.transaction_cost_rate
@@ -458,9 +572,9 @@ def main():
         logger.info(f"[OK] Fixed transaction cost rate applied: {current_cost_rate:.6f}")
 
         # 훈련 관련 메트릭스 출력
-        episodes_per_iteration = config.episodes_per_group * config.num_groups
-        TIMESTEP_TO_ITERATION_RATIO = 25
-        total_episodes = (config.total_timesteps // TIMESTEP_TO_ITERATION_RATIO) * episodes_per_iteration
+        import math
+        remaining_timesteps = config.total_timesteps - trainer.total_timesteps
+        total_episodes = max(1, math.ceil(remaining_timesteps / config.episode_steps))
         
         logger.info("=" * 80)
         logger.info(f"Total Timesteps: {config.total_timesteps:,}")
@@ -483,24 +597,49 @@ def main():
             on_iteration_end=None,
             start_iteration=start_iteration,
             max_timesteps=config.total_timesteps,
-            revert_to_best_patience=config.revert_patience
+            revert_to_best_patience=config.revert_patience,
+            resume=config.resume,
+            resume_best_checkpoints=resume_best_checkpoints,
         )
         
         training_time = time.time() - start_time
         logger.info("=" * 80)
         logger.info(f"[COMPLETE] Training Finished in {training_time/60:.2f}m")
         
+        # Test is opened only after validation has selected the final weights.
+        selected_path = Path(config.output_dir) / 'checkpoints' / 'checkpoint_best.pt'
+        if not selected_path.exists():
+            raise RuntimeError("Training produced no validated checkpoint")
+        selected = torch.load(selected_path, map_location=device, weights_only=False)
+        policy.load_state_dict(selected['policy_state_dict'], strict=True)
+        test_env = create_environment(config, device, date_splits['test'])
+        test_metrics = evaluate_policy(policy, test_env, config.evaluation_episodes,
+                                       config.evaluation_seed, device)
+        report = {'date_splits': date_splits, 'training': final_metrics,
+                  'validation': selected['extra_state']['validation_metrics'],
+                  'test': test_metrics, 'test_used_for_model_selection': False}
+        with open(Path(config.output_dir) / 'evaluation_report.json', 'w', encoding='utf-8') as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
         final_model_path = os.path.join(config.output_dir, f'{config.env}_{config.policy}_model.pt')
-        trainer.save_checkpoint(
-            final_model_path, final_metrics['num_updates'],
-            extra_state=trainer.extra_checkpoint_state
-        )
+        import shutil
+        shutil.copyfile(selected_path, final_model_path)
         logger.info(f"Saved final model: {final_model_path}")
         return True
         
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
         return False
+    finally:
+        if trainer is not None and trainer.writer is not None:
+            trainer.writer.close()
+        if vec_env is not None:
+            vec_env.close()
+        for environment in (validation_env, test_env):
+            if environment is not None:
+                environment.close()
+        if ref_env is not None and not (vec_env is not None and hasattr(vec_env, 'envs')
+                                        and ref_env in vec_env.envs):
+            ref_env.close()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() else 1)

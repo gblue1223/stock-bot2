@@ -11,6 +11,7 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from lib.normalization import compute_stock_name_scalar_batch
+from lib.market_data import EXECUTION_COLUMNS
 
 def run_extraction():
     src_db = 'C:/Users/user/Workspace/datasets@raw/datasets_all.duckdb'
@@ -29,8 +30,7 @@ def run_extraction():
         
     os.makedirs(dst_dir, exist_ok=True)
     if os.path.exists(dst_db):
-        print(f"Removing existing destination DB: {dst_db}")
-        os.remove(dst_db)
+        raise FileExistsError(f"Destination already exists; choose a new path: {dst_db}")
         
     start_time = time.time()
     
@@ -54,15 +54,25 @@ def run_extraction():
     # 2. Execute High-Performance Streaming SQL Extraction
     print("[STEP 2/4] Executing streaming extraction & feature calculations in DuckDB...")
     
-    sql = """
+    execution_columns = [c for c in EXECUTION_COLUMNS if c != "현재가"]
+    source_columns = conn.execute("DESCRIBE src.datasets").fetchdf()["column_name"].tolist()
+    quote_projection = ', "호가시간"' if "호가시간" in source_columns else ''
+    quote_select = ', c."호가시간"' if "호가시간" in source_columns else ''
+    sequence_projection = '"번호"' if "번호" in source_columns else 'rowid'
+    execution_projection = ",\n".join(
+        f'COALESCE(TRY_CAST("{c}" AS DOUBLE), 0.0) AS "{c}"' for c in execution_columns)
+    execution_select = ", ".join(f'c."{c}"' for c in execution_columns)
+    sql = f"""
     CREATE TABLE datasets AS
     WITH filtered AS (
         SELECT 
             날짜,
             종목코드,
             종목명,
-            시간,
-            COALESCE(TRY_CAST(현재가 AS DOUBLE), 0.0) / 1000000.0 AS 현재가,
+            시간{quote_projection},
+            {sequence_projection} AS 번호,
+            COALESCE(TRY_CAST(현재가 AS DOUBLE), 0.0) AS 현재가,
+            {execution_projection},
             COALESCE(TRY_CAST(등락률 AS DOUBLE), 0.0) AS 등락률,
             COALESCE(TRY_CAST(누적거래대금 AS DOUBLE), 0.0) AS 누적거래대금,
             
@@ -107,8 +117,10 @@ def run_extraction():
         c.날짜,
         c.종목코드,
         c.종목명,
-        c.시간,
+        c.시간{quote_select},
+        c.번호,
         c.현재가,
+        {execution_select},
         c.등락률,
         c.누적거래대금,
         c.매도대기금액1, c.매도대기금액2, c.매도대기금액3, c.매도대기금액4, c.매도대기금액5,

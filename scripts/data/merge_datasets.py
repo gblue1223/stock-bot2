@@ -156,7 +156,7 @@ def _build_union_schema(inputs: List[str], table: str, strict: bool = False) -> 
         ordered_cols = []
         if "날짜" in cols_types:
             ordered_cols.append("날짜")
-        for c in sorted(k for k in cols_types.keys() if k not in {"날짜", "번호"}):
+        for c in sorted(k for k in cols_types.keys() if k != "날짜"):
             ordered_cols.append(c)
         if strict and first_schema is not None:
             # keep the exact order/types from the first schema
@@ -211,6 +211,9 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
                        threads: int = max(1, os.cpu_count() or 1), strict_schema: bool = True,
                        sort_by: str = "name", reverse_sort: bool = False, 
                        temp_directory: str | None = None) -> None:
+    inputs = [p for p in inputs if Path(p).resolve() != Path(output).resolve()]
+    if not inputs:
+        raise ValueError("No input databases remain after excluding the output database")
     if temp_directory is None:
         temp_directory = tempfile.gettempdir()
     # Compute union or strict schema first
@@ -273,7 +276,7 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
                 # Insert by name; requires all columns exist in target
                 # Exclude 번호 column if it exists
                 src_schema = _read_schema(conn, alias, table)
-                src_cols = [c for c, _ in src_schema if c != "번호"]
+                src_cols = [c for c, _ in src_schema]
                 cols_list = ", ".join([f'"{c}"' for c in src_cols])
                 conn.execute(f"INSERT INTO {table} ({cols_list}) SELECT {cols_list} FROM {alias}.{table}")
                 inserted_so_far += file_rows
@@ -291,7 +294,8 @@ def merge_duckdb_files(inputs: List[str], output: str, table: str = DEFAULT_TABL
         print("데이터 정렬중: 날짜, 종목코드, 시간 순서로...")
         try:
             # Create a temporary sorted table
-            conn.execute(f"CREATE TABLE {table}_sorted AS SELECT * FROM {table} ORDER BY \"날짜\", \"종목코드\", \"시간\"")
+            sequence_order = ', "번호"' if any(c == '번호' for c, _ in union_schema) else ''
+            conn.execute(f'CREATE TABLE {table}_sorted AS SELECT * FROM {table} ORDER BY "날짜", "종목코드", TRY_CAST("시간" AS DOUBLE){sequence_order}')
             # Drop original and rename
             conn.execute(f"DROP TABLE {table}")
             conn.execute(f"ALTER TABLE {table}_sorted RENAME TO {table}")

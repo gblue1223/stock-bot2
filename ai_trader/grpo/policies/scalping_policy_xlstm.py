@@ -268,11 +268,22 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         # 4. 정책 및 가치 헤드
         self.policy_head = nn.Linear(fc_hidden_dim, action_dim)
         self.value_head = nn.Linear(fc_hidden_dim, 1)
+        # A PPO likelihood must depend on the observation and parameters only.
+        # Keep checkpoint-compatible BatchNorm tensors, but freeze their statistics
+        # and disable recurrent dropout in both rollout and gradient evaluation.
+        self.train()
         
         logger.info(f"GRPOPolicyE2EXLSTM initialized: obs_dim={obs_dim}, "
                     f"cnn_channels={cnn_channels}, rnn_hidden_dim={rnn_hidden_dim}, "
                     f"action_dim={action_dim}")
                     
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.bn1.eval()
+        self.bn2.eval()
+        self.xlstm.dropout.eval()
+        return self
+
     def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         정책 네트워크 forward pass
@@ -306,6 +317,15 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         
         # 정책 및 가치 헤드
         action_logits = self.policy_head(fc_out)
+        if self.obs_dim > 15 and self.action_dim == 3:
+            active_stages = (state[:, -1, -15::3] > 0.5).sum(dim=-1)
+            valid_actions = torch.stack([
+                torch.ones_like(active_stages, dtype=torch.bool),
+                active_stages < 5,
+                active_stages > 0,
+            ], dim=-1)
+            action_logits = action_logits.masked_fill(
+                ~valid_actions, torch.finfo(action_logits.dtype).min)
         state_value = self.value_head(fc_out)
         
         return action_logits, state_value

@@ -205,7 +205,7 @@ def load_and_clean_from_duckdb(db_path: str, code: str, name: str, date: str,
                 SELECT *
                 FROM {table}
                 WHERE "종목코드" = ? AND "날짜" = ?
-                ORDER BY "시간"
+                ORDER BY TRY_CAST("시간" AS DOUBLE), rowid
             """
             df = conn.execute(query, [code, date]).df()
             
@@ -285,7 +285,7 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     # 텍스트 컬럼: forward fill 후 backward fill, 그래도 없으면 빈 문자열
     for col in text_cols:
         if col in df.columns:
-            df[col] = df[col].ffill().bfill().fillna('').infer_objects(copy=False)
+            df[col] = df[col].ffill().fillna('').infer_objects(copy=False)
     
     # 숫자 컬럼: forward fill 후 backward fill, 그래도 없으면 0
     for col in numeric_cols:
@@ -295,7 +295,7 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
                 # 안전장치: 만약 여전히 DataFrame이면 첫 열 사용
                 series = series.iloc[:, 0]
             series = pd.to_numeric(series, errors='coerce')
-            series = series.ffill().bfill().fillna(0)
+            series = series.ffill().fillna(0)
             df[col] = series
     
     return df
@@ -379,7 +379,10 @@ def merge_from_duckdb(group_info: Dict[str, Tuple[str, str, str, str]], code: st
         df = fill_missing_values(df)
         
         # 최종 컬럼 순서 맞추기
-        df = df[["번호", *FINAL_COLUMNS]]
+        if "번호" not in df:
+            df["번호"] = np.arange(len(df), dtype=np.int64)
+        ordered = ["번호", *FINAL_COLUMNS]
+        df = df[ordered + [c for c in df if c not in ordered]]
         return df
     
     # 레거시: 여러 타입이 분리되어 있는 경우 (향후 확장용)
@@ -510,87 +513,18 @@ def _encode_char_scalar(series: pd.Series) -> pd.Series:
 
 
 def apply_feature_normalization(df: pd.DataFrame) -> pd.DataFrame:
+    """Build deterministic features while preserving raw market values.
+
+    Statistical scaling belongs to the observation builder, using only its
+    observed window. Fitting means/minima to a whole stock-day leaks the future.
+    This historical command name is retained for CLI compatibility.
     """
-    Normalize columns per rules:
-    - Log + Standard: specified quantity and flow columns
-    - Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
-    - Character-level scalar encoding for '종목명' (append scalar, keep original)
-    - Min-Max: remaining numeric columns (excluding '번호' and text columns and already-normalized columns)
-    """
-    out = df.copy()
-
-    # Define column groups (lib.normalization에서 가져옴)
-    logstd_cols: set[str] = LOGSTD_FEATURES
-    stdonly_cols: set[str] = STDONLY_FEATURES
-
-    broker_cat_cols = [*[f"매도거래원{i}" for i in range(1, 6)], *[f"매수거래원{i}" for i in range(1, 6)]]
-
-    # Ensure optional numeric columns exist (batch add to avoid fragmentation)
-    numeric_targets = logstd_cols | stdonly_cols
-    missing_numeric = [col for col in numeric_targets if col not in out.columns]
-    if missing_numeric:
-        add_df = pd.DataFrame({col: pd.Series(0.0, index=out.index) for col in missing_numeric}, index=out.index)
-        out = pd.concat([out, add_df], axis=1)
-
-    # Log + Standard scaling for heavy-tailed columns
-    for col in sorted(logstd_cols):
-        if col in out.columns:
-            out[col] = _standard_scale(_signed_log1p(out[col]))
-
-    # Standard scaling for percentage columns that can be negative
-    for col in sorted(stdonly_cols):
-        if col in out.columns:
-            out[col] = _standard_scale(out[col])
-
-    # Character-level scalar encoding for broker categorical columns (append scalar, keep originals)
-    broker_scalar_cols: List[str] = []
-    _broker_new: Dict[str, pd.Series] = {}
-    for col in broker_cat_cols:
-        if col in out.columns:
-            scalar_col = f"{col}_scalar"
-            _broker_new[scalar_col] = _encode_char_scalar(out[col])
-            broker_scalar_cols.append(scalar_col)
-
-    if _broker_new:
-        out = pd.concat([out, pd.DataFrame(_broker_new, index=out.index)], axis=1)
-
-    # Character-level scalar encoding for '종목명'
-    _extra_new: Dict[str, pd.Series] = {}
-    if '종목명' in out.columns:
-        _extra_new["종목명_scalar"] = _encode_char_scalar(out['종목명'])
-        broker_scalar_cols.append("종목명_scalar")
-
-    # '시간' 파생 피처: sin/cos 주기 변환 + 장 시작 후 경과 시간 (z-score)
-    if '시간' in out.columns:
-        # lib.normalization의 중앙화된 함수 사용
-        time_sin, time_cos, time_scalar = compute_time_features_batch(
-            out['시간'], 
-            use_zscore_for_scalar=True  # 학습 데이터는 z-score 사용
-        )
-        _extra_new['시간_sin'] = time_sin
-        _extra_new['시간_cos'] = time_cos
-        _extra_new['시간_scalar'] = time_scalar
-        # 파생 컬럼들은 이미 정상화 되었거나 [-1,1] 구간이므로 추가 스케일 제외 목록에 포함
-        broker_scalar_cols.extend(['시간_sin', '시간_cos', '시간_scalar'])
-
-    if _extra_new:
-        out = pd.concat([out, pd.DataFrame(_extra_new, index=out.index)], axis=1)
-
-    # Min-Max for remaining numeric columns not already processed
-    processed = set(["번호", "시간"]) | TEXT_COLUMNS | logstd_cols | stdonly_cols | set(broker_scalar_cols)
-    numeric_rest = [c for c in out.columns if c not in processed and pd.api.types.is_numeric_dtype(out[c])]
-    for col in numeric_rest:
-        out[col] = _minmax_scale(out[col])
-
-    # Final safety: fill any remaining NaNs
-    for col in out.columns:
-        if col in TEXT_COLUMNS:
-            out[col] = out[col].astype(str).replace({"nan": ""}).fillna("")
-        else:
-            out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0)
-
-    # Defragment the frame once before returning (improves downstream setitem performance)
-    out = out.copy()
+    out = fill_missing_values(df.copy())
+    if "종목명" in out:
+        out["종목명_scalar"] = compute_stock_name_scalar_batch(out["종목명"])
+    if "시간" in out:
+        sine, cosine, scalar = compute_time_features_batch(out["시간"], use_zscore_for_scalar=False)
+        out["시간_sin"], out["시간_cos"], out["시간_scalar"] = sine, cosine, scalar
     return out
 
 
@@ -606,7 +540,7 @@ def ensure_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame, table
         col_defs: list[str] = []
         for col in df.columns:
             series = df[col]
-            if col == '번호' or pd.api.types.is_integer_dtype(series):
+            if col in {'번호', '시간'} or pd.api.types.is_integer_dtype(series):
                 duck_type = 'BIGINT'
             elif col in TEXT_COLUMNS or col in {'날짜', '종목명'} or series.dtype == object:
                 duck_type = 'VARCHAR'
@@ -625,13 +559,13 @@ def ensure_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame, table
                 series = df[col]
                 if col in TEXT_COLUMNS or col == '날짜' or series.dtype == object:
                     col_type = 'VARCHAR'
-                elif pd.api.types.is_integer_dtype(series) or col == '번호':
+                elif pd.api.types.is_integer_dtype(series) or col in {'번호', '시간'}:
                     col_type = 'BIGINT'
                 else:
                     col_type = 'DOUBLE'
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN \"{col}\" {col_type}")
         # Enforce VARCHAR for known text columns if mismatched (e.g., '종목코드' mistakenly INT)
-        text_like = set(TEXT_COLUMNS) | {"날짜", "종목코드", "시간"}
+        text_like = set(TEXT_COLUMNS) | {"날짜", "종목코드"}
         # Drop dependent index before altering types to avoid catalog error
         try:
             conn.execute("DROP INDEX IF EXISTS idx_datasets_code_date_time")
@@ -641,6 +575,8 @@ def ensure_table_duckdb(conn: duckdb.DuckDBPyConnection, df: pd.DataFrame, table
             ctype = existing_types.get(col, "")
             if "CHAR" not in ctype and "STRING" not in ctype and "VARCHAR" not in ctype:
                 conn.execute(f"ALTER TABLE {table} ALTER COLUMN \"{col}\" TYPE VARCHAR")
+        if '시간' in existing_types and existing_types['시간'] != 'BIGINT':
+            conn.execute(f'ALTER TABLE {table} ALTER COLUMN "시간" TYPE BIGINT USING CAST(CAST("시간" AS DOUBLE) AS BIGINT)')
     # Helpful index (recreate if dropped)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_datasets_code_date_time ON datasets(\"날짜\", \"종목코드\", \"시간\")")

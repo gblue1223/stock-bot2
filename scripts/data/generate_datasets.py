@@ -24,7 +24,7 @@ if str(project_root) not in sys.path:
 try:
     from scripts.data.normalize_datasets import (
         TEXT_COLUMNS, DROP_COLUMNS, FINAL_COLUMNS,
-        clean_column_name, fill_missing_values,
+        clean_column_name, fill_missing_values, compute_order_book_amounts,
         ensure_table_duckdb,
         month_key_from_yyyymmdd, monthly_db_path,
         checkpoint_db_once, parallel_checkpoint_months,
@@ -34,7 +34,7 @@ except ImportError:
     sys.path.append(str(Path(__file__).parent))
     from normalize_datasets import (
         TEXT_COLUMNS, DROP_COLUMNS, FINAL_COLUMNS,
-        clean_column_name, fill_missing_values,
+        clean_column_name, fill_missing_values, compute_order_book_amounts,
         ensure_table_duckdb,
         month_key_from_yyyymmdd, monthly_db_path,
         checkpoint_db_once, parallel_checkpoint_months,
@@ -128,7 +128,8 @@ def _coalesce_into_base(base: pd.DataFrame, temp: pd.DataFrame, overlap_cols: Li
     for col in overlap_cols:
         new_col = f"{col}_new"
         if new_col in temp.columns:
-            base[col] = base[col].combine_first(temp[new_col])
+            temp[col] = temp[col].combine_first(temp[new_col])
+            base[col] = temp[col]
             temp = temp.drop(columns=[new_col])
     return base, temp
 
@@ -142,7 +143,10 @@ def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame
     # 각 파일 로드
     for file_type, file_path in files.items():
         df = load_and_clean_csv(file_path)
-        df = fill_missing_values(df)
+        if file_type == "orderbook" and "시간" in df:
+            # Preserve quote age across later execution/trader events.
+            df["호가시간"] = df["시간"]
+        # Fill only after combining source events in causal sequence order.
         dfs[file_type] = df
     
     # 번호의 합집합 구성
@@ -168,6 +172,9 @@ def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame
     merged_df['종목코드'] = merged_df.get('종목코드', pd.Series(index=merged_df.index, dtype=object)).fillna(code).replace({"": code})
     merged_df['종목명'] = merged_df.get('종목명', pd.Series(index=merged_df.index, dtype=object)).fillna(name).replace({"": name})
 
+    merged_df = fill_missing_values(merged_df)
+    merged_df = compute_order_book_amounts(merged_df)
+
     # 누락 컬럼 생성 (최종 스키마 강제)
     for col in FINAL_COLUMNS:
         if col not in merged_df.columns:
@@ -177,7 +184,9 @@ def merge_csv_files(files: Dict[str, str], code: str, name: str) -> pd.DataFrame
     merged_df = fill_missing_values(merged_df)
 
     # 최종 컬럼 순서
-    merged_df = merged_df[["번호", *FINAL_COLUMNS]]
+    # Retain raw execution prices and depth; model features are selected later.
+    ordered = ["번호", *FINAL_COLUMNS]
+    merged_df = merged_df[ordered + [c for c in merged_df if c not in ordered]]
     
     return merged_df
 

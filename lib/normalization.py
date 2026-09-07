@@ -321,12 +321,10 @@ def compute_time_features(time_str: str) -> Tuple[float, float, float]:
         return 0.0, 0.0, 0.0
     
     try:
-        # HHMMSSmmm -> seconds
-        time_str = str(time_str).zfill(9)
-        hh = int(time_str[0:2])
-        mm = int(time_str[2:4])
-        ss = int(time_str[4:6])
-        secs = hh * 3600 + mm * 60 + ss
+        from lib.market_data import parse_time_seconds
+        secs = parse_time_seconds(time_str)
+        if not np.isfinite(secs):
+            raise ValueError("Invalid HHMMSSmmm timestamp")
         
         # sin/cos 주기 변환 (하루 24시간 주기)
         SECONDS_IN_DAY = 24 * 60 * 60
@@ -382,34 +380,12 @@ def compute_stock_name_scalar_batch(stock_names: pd.Series) -> pd.Series:
     Returns:
         0~1 범위의 스칼라 값 Series
     """
-    # NaN과 빈 문자열 처리
-    cats = stock_names.astype(str).str.strip()
-    cats = cats.replace({"nan": "", "None": "", "<NA>": ""})
-    
-    # 유효한 문자만 추출 (빈 문자열 제외)
-    valid_strings = [s for s in cats.tolist() if s]
-    if not valid_strings:
-        return pd.Series(0.0, index=stock_names.index, dtype=float)
-    
-    unique_chars = sorted(set("".join(valid_strings)))
-    if not unique_chars:
-        return pd.Series(0.0, index=stock_names.index, dtype=float)
-    
-    char_to_id = {ch: idx + 1 for idx, ch in enumerate(unique_chars)}
-    max_id = float(len(unique_chars))
-
-    def _encode(s: str) -> float:
-        if not s or s in ("", "nan", "None", "<NA>"):
-            return 0.0
-        ids = [char_to_id.get(ch, 0) for ch in s]
-        if not ids:
-            return 0.0
-        return float(np.mean(ids)) / max_id
-
-    return cats.apply(_encode).astype(float)
+    # The same name must have the same encoding in every batch and in live use.
+    cats = stock_names.fillna("").astype(str).str.strip()
+    return cats.apply(compute_stock_name_scalar).astype(float)
 
 
-def compute_time_features_batch(time_series: pd.Series, use_zscore_for_scalar: bool = True) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def compute_time_features_batch(time_series: pd.Series, use_zscore_for_scalar: bool = False) -> Tuple[pd.Series, pd.Series, pd.Series]:
     """
     시간 Series에서 파생 피처 배치 계산 (학습 데이터 전처리용)
     
@@ -421,18 +397,10 @@ def compute_time_features_batch(time_series: pd.Series, use_zscore_for_scalar: b
     Returns:
         (시간_sin, 시간_cos, 시간_scalar) 튜플
     """
-    # HHMMSSmmm -> seconds 변환
-    def _time_to_seconds(t) -> int:
-        try:
-            s = str(int(t)).rjust(9, '0')
-            hh = int(s[0:2])
-            mm = int(s[2:4])
-            ss = int(s[4:6])
-            return hh * 3600 + mm * 60 + ss
-        except Exception:
-            return 0
-    
-    secs = time_series.apply(_time_to_seconds).astype(int)
+    from lib.market_data import times_to_seconds
+    secs = pd.Series(times_to_seconds(time_series.to_numpy()), index=time_series.index)
+    if not np.isfinite(secs).all():
+        raise ValueError("Invalid HHMMSSmmm timestamps")
     
     # sin/cos 주기 변환
     SECONDS_IN_DAY = 24 * 60 * 60
@@ -456,8 +424,9 @@ def compute_time_features_batch(time_series: pd.Series, use_zscore_for_scalar: b
         # 고정 범위 매핑 (실시간 추론용)
         time_scalar = (sec_from_open - 10800) / 10800.0
     
-    return pd.Series(time_sin, index=time_series.index), \
-           pd.Series(time_cos, index=time_series.index), \
+    return (pd.Series(time_sin, index=time_series.index),
+            pd.Series(time_cos, index=time_series.index),
+            pd.Series(time_scalar, index=time_series.index))
 
 # ============================================================================
 # Feature Definition Functions (Moved from ai_trader/lstm/train.py)

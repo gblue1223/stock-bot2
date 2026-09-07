@@ -68,7 +68,10 @@ class GRPOTrainer:
         device: str = 'cpu',
         tensorboard_log_dir: Optional[str] = None,
         use_gae: bool = True,
-        num_epochs: int = 4
+        num_epochs: int = 4,
+        observation_schema: Optional[Dict[str, Any]] = None,
+        evaluation_callback: Optional[Callable[[nn.Module], Dict[str, Any]]] = None,
+        evaluation_interval: int = 1,
     ):
         self.policy = policy
         
@@ -99,6 +102,9 @@ class GRPOTrainer:
         self.batch_size = batch_size
         self.use_gae = use_gae
         self.num_epochs = num_epochs
+        self.observation_schema = observation_schema
+        self.evaluation_callback = evaluation_callback
+        self.evaluation_interval = max(1, evaluation_interval)
         logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}")
         
         # Optimizer 초기화
@@ -129,6 +135,7 @@ class GRPOTrainer:
         벡터화된 환경(SubprocVecEnv)을 이용한 배치 롤아웃 수집 (GIL 우회 및 GPU Batch Inference)
         """
         logger.info(f"Collecting {num_episodes} rollouts using Vectorized Environments...")
+        self.policy.eval()
         
         # self.env가 VecEnv라고 가정 (SubprocVecEnv)
         vec_env = self.env
@@ -140,12 +147,14 @@ class GRPOTrainer:
         current_states = [[] for _ in range(num_envs)]
         current_actions = [[] for _ in range(num_envs)]
         current_rewards = [[] for _ in range(num_envs)]
-        current_next_states = [[] for _ in range(num_envs)]
         current_dones = [[] for _ in range(num_envs)]
         current_log_probs = [[] for _ in range(num_envs)]
         
         # 최초 Reset
         obs, infos = vec_env.reset()
+        start_infos = [dict(info) for info in infos]
+        start_market = [np.asarray(info.get('market_context', self._initial_market_indicators(state)))
+                        for state, info in zip(obs, infos)]
         
         episodes_done = 0
         
@@ -205,20 +214,6 @@ class GRPOTrainer:
                 current_actions[i].append(actions[i])
                 current_rewards[i].append(rewards[i])
                 
-                # SubprocVecEnv는 done=True시 자동 reset하며 next_obs는 새 에피소드의 시작을 담습니다.
-                # 실제 터미널 상태는 info['terminal_observation']에 있을 수 있습니다.
-                if dones[i]:
-                    actual_next_obs = step_infos[i].get('terminal_observation', next_obs[i])
-                    
-                    # terminal_observation도 형변환
-                    if isinstance(actual_next_obs, (list, tuple)):
-                        actual_next_obs = np.array(actual_next_obs, dtype=np.float32)
-                    elif hasattr(actual_next_obs, 'astype'):
-                        actual_next_obs = actual_next_obs.astype(np.float32)
-                else:
-                    actual_next_obs = next_obs[i]
-                    
-                current_next_states[i].append(actual_next_obs)
                 current_dones[i].append(dones[i])
                 current_log_probs[i].append(log_probs[i])
                 
@@ -239,12 +234,13 @@ class GRPOTrainer:
                         
                     ep_info['episode_reward'] = ep_reward
                     ep_info['episode_steps'] = ep_steps
+                    ep_info['initial_market_indicators'] = start_market[i].tolist()
+                    ep_info['episode_start'] = start_infos[i]
                     
                     episode_data = {
                         'states': np.array(current_states[i]),
                         'actions': np.array(current_actions[i]),
                         'rewards': np.array(current_rewards[i]),
-                        'next_states': np.array(current_next_states[i]),
                         'dones': np.array(current_dones[i]),
                         'log_probs': np.array(current_log_probs[i]),
                         'metadata': ep_info
@@ -258,9 +254,11 @@ class GRPOTrainer:
                     current_states[i] = []
                     current_actions[i] = []
                     current_rewards[i] = []
-                    current_next_states[i] = []
                     current_dones[i] = []
                     current_log_probs[i] = []
+                    start_infos[i] = dict(step_infos[i].get('reset_info', {}))
+                    start_market[i] = np.asarray(start_infos[i].get(
+                        'market_context', self._initial_market_indicators(next_obs[i])))
             
             obs = next_obs
             
@@ -299,6 +297,20 @@ class GRPOTrainer:
         
         return action, log_prob
     
+    @staticmethod
+    def _initial_market_indicators(state: np.ndarray) -> np.ndarray:
+        """Regime features observed before any action, excluding position fields."""
+        state = np.asarray(state, dtype=np.float64)
+        if state.ndim != 2 or not len(state):
+            raise ValueError("Expected an initial sequence observation")
+        market = state[:, :-15] if state.shape[1] > 15 else state
+        changes = np.diff(market, axis=0)
+        return np.array([
+            np.std(changes) if changes.size else 0.0,
+            np.mean(market[-1] - market[0]),
+            np.mean(np.ptp(market, axis=0)),
+        ])
+
     def group_episodes(self, episodes: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
         """
         에피소드를 시장 상황별로 그룹화
@@ -320,27 +332,20 @@ class GRPOTrainer:
         market_indicators = []
         
         for episode in episodes:
-            # 에피소드의 보상 시퀀스에서 변동성과 추세 강도 계산
-            rewards = episode['rewards']
-            
-            # 변동성: 보상의 표준편차
-            volatility = np.std(rewards) if len(rewards) > 1 else 0.0
-            
-            # 추세 강도: 보상의 평균 (양수면 상승, 음수면 하락)
-            trend_strength = np.mean(rewards)
-            
-            # 추가 지표: 보상의 범위 (최대 - 최소)
-            reward_range = np.max(rewards) - np.min(rewards) if len(rewards) > 0 else 0.0
-            
-            # 지표를 벡터로 저장
-            indicators = np.array([volatility, trend_strength, reward_range])
+            indicators = episode.get('metadata', {}).get('initial_market_indicators')
+            if indicators is None:
+                indicators = self._initial_market_indicators(episode['states'][0])
+            indicators = np.asarray(indicators, dtype=np.float64)
+            if indicators.shape != (3,) or not np.isfinite(indicators).all():
+                raise ValueError("Invalid pre-action market regime indicators")
             market_indicators.append(indicators)
         
         market_indicators = np.array(market_indicators)
         
         # 2. K-means 클러스터링으로 그룹화
         # num_groups가 에피소드 수보다 많으면 조정
-        n_clusters = min(self.num_groups, len(episodes))
+        n_clusters = min(self.num_groups, max(1, len(episodes) // 2),
+                         len(np.unique(market_indicators, axis=0)))
         
         if n_clusters < 2:
             # 클러스터링이 불가능한 경우 모든 에피소드를 그룹 0에 할당
@@ -530,6 +535,17 @@ class GRPOTrainer:
         
         return group_advantages
     
+    def _episode_tensor_batches(self, states: np.ndarray, actions: np.ndarray):
+        """Slice the CPU replay before moving each bounded batch to the device."""
+        if len(states) != len(actions):
+            raise ValueError("Episode states/actions lengths must match")
+        for start in range(0, len(states), self.batch_size):
+            end = min(start + self.batch_size, len(states))
+            yield (
+                torch.from_numpy(states[start:end]).float().to(self.device),
+                torch.from_numpy(actions[start:end]).long().to(self.device),
+            )
+
     def update_policy(
         self,
         episodes: List[Dict[str, Any]],
@@ -560,6 +576,7 @@ class GRPOTrainer:
             업데이트 메트릭 딕셔너리
         """
         # 1. 데이터 준비
+        self.policy.train()
         all_states = []
         all_actions = []
         all_old_log_probs = []
@@ -575,22 +592,15 @@ class GRPOTrainer:
                 rewards = episode['rewards']
                 dones = episode['dones']
                 
-                # 텐서화
-                states_tensor_ep = torch.from_numpy(states).float().to(self.device)
-                actions_tensor_ep = torch.from_numpy(actions).long().to(self.device)
-                
                 with torch.no_grad():
-                    # 현재 정책에서 값 함수 추정 (evaluate_actions가 values 반환)
-                    # 메모리 부족(CUDA illegal memory access) 방지를 위해 미니 배치 단위로 평가
+                    # Both device transfer and forward are bounded by batch_size.
+                    # Keep value estimates on CPU as well; do not retain an entire
+                    # episode's observation tensor during the later PPO update.
                     values_ep_list = []
-                    for start_i in range(0, len(states_tensor_ep), self.batch_size):
-                        end_i = min(start_i + self.batch_size, len(states_tensor_ep))
-                        batch_s = states_tensor_ep[start_i:end_i]
-                        batch_a = actions_tensor_ep[start_i:end_i]
+                    for batch_s, batch_a in self._episode_tensor_batches(states, actions):
                         _, _, v = self.policy.evaluate_actions(batch_s, batch_a)
-                        values_ep_list.append(v)
-                    values_ep = torch.cat(values_ep_list, dim=0)
-                    values_ep = values_ep.squeeze(-1).cpu().numpy() if values_ep.dim() > 1 else values_ep.cpu().numpy()
+                        values_ep_list.append(v.reshape(-1).cpu().numpy())
+                    values_ep = np.concatenate(values_ep_list)
                 
                 # GAE 계산 (타임스텝별 세부 기여도 평가)
                 adv_ep, ret_ep = self._compute_gae(rewards, dones, values_ep)
@@ -603,15 +613,15 @@ class GRPOTrainer:
                 relative_adv_step = group_adv / num_steps
                 adv_hybrid = adv_ep + alpha * relative_adv_step
                 
-                # 리턴 값도 하이브리드 어드밴티지에 맞춰 업데이트 (Q = A + V)
-                ret_hybrid = adv_hybrid + values_ep
+                # The critic predicts actual discounted NAV rewards, not the
+                # group-relative policy baseline (which changes with the batch).
                 
                 # 축적
                 all_states.append(states)
                 all_actions.append(actions)
                 all_old_log_probs.append(old_log_probs)
                 all_advantages.append(adv_hybrid)
-                all_returns.append(ret_hybrid)
+                all_returns.append(ret_ep)
         else:
             for episode, advantage in zip(episodes, advantages):
                 states = episode['states']
@@ -765,7 +775,8 @@ class GRPOTrainer:
                 # 10. KL 발산 계산 (조기 종료 체크)
                 with torch.no_grad():
                     # KL 발산: KL(π_old || π_new)
-                    kl_divergence = (batch_old_log_probs - log_probs).mean()
+                    log_ratio = log_probs - batch_old_log_probs
+                    kl_divergence = ((torch.exp(log_ratio) - 1) - log_ratio).mean()
                     
                     # 클리핑 비율 계산
                     clip_fraction = ((ratio < 1.0 - self.clip_epsilon) | 
@@ -865,6 +876,51 @@ class GRPOTrainer:
         
         return advantages.astype(np.float32), returns.astype(np.float32)
     
+    def _seed_resume_best(self, checkpoint_path, start_iteration, candidates):
+        """Protect a resumed model's validated baseline before any new update."""
+        if self.evaluation_callback is None:
+            raise ValueError("Resume best preservation requires a validation callback")
+
+        def score(metrics):
+            value = float(metrics['mean_net_return'])
+            if not np.isfinite(value):
+                raise ValueError("Validation mean_net_return must be finite")
+            return value
+
+        best_metrics = self.evaluation_callback(self.policy)
+        best_score = score(best_metrics)
+        best_checkpoint = None
+        if candidates:
+            import copy
+            original_state = copy.deepcopy(self.policy.state_dict())
+            try:
+                for candidate in candidates:
+                    if candidate.get('observation_schema') != self.observation_schema:
+                        raise ValueError("Resume best checkpoint observation schema mismatch")
+                    self.policy.load_state_dict(candidate['policy_state_dict'], strict=True)
+                    metrics = self.evaluation_callback(self.policy)
+                    value = score(metrics)
+                    if value >= best_score:
+                        best_score, best_metrics, best_checkpoint = value, metrics, candidate
+            finally:
+                # Training still continues from the requested source checkpoint,
+                # including its optimizer state, regardless of which best wins.
+                self.policy.load_state_dict(original_state, strict=True)
+        if checkpoint_path:
+            destination = os.path.join(os.path.dirname(checkpoint_path.format(0)), 'checkpoint_best.pt')
+            extra = dict(self.extra_checkpoint_state)
+            extra.update({'best_validation_return': best_score,
+                          'validation_metrics': best_metrics,
+                          'selection_metric': 'validation.mean_net_return'})
+            if best_checkpoint is None:
+                self.save_checkpoint(destination, start_iteration, extra_state=extra)
+            else:
+                selected = dict(best_checkpoint)
+                selected['extra_state'] = extra
+                torch.save(selected, destination)
+        logger.info("Preserved resume validation baseline: %.6f%%", best_score)
+        return best_score
+
     def train(
         self,
         total_episodes: int,
@@ -873,7 +929,9 @@ class GRPOTrainer:
         on_iteration_end: Optional[Callable[[int, Dict[str, Any]], None]] = None,
         start_iteration: int = 0,
         max_timesteps: Optional[int] = None,
-        revert_to_best_patience: int = 0
+        revert_to_best_patience: int = 0,
+        resume: bool = False,
+        resume_best_checkpoints: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         GRPO 훈련 실행
@@ -893,72 +951,30 @@ class GRPOTrainer:
         
         logger.info(f"Starting GRPO training for {total_episodes} episodes...")
         
-        num_iterations = total_episodes // (self.episodes_per_group * self.num_groups)
+        if total_episodes <= 0:
+            raise ValueError("total_episodes must be positive")
+        episodes_per_iteration = self.episodes_per_group * self.num_groups
+        num_iterations = start_iteration + int(np.ceil(total_episodes / episodes_per_iteration))
         logger.info(f"Total iterations: {num_iterations} (Starting from {start_iteration})")
         
         start_time = time.time()
         iteration_times = []
         
-        # Best checkpoint 추적: 역대 최고 성능 가중치 자동 저장
-        best_mean_reward = float('-inf')
-        best_raw_reward = float('-inf')  # 단일 최고 수익률 추적용 (신규 추가)
-        recent_rewards = []  # EMA 계산용 최근 보상 기록
-        no_improve_count = 0  # 연속 미개선 횟수
-        revert_count = 0  # 리버트 횟수
-        max_reverts = 20  # 최대 리버트 허용 횟수
-        
-        # 기존 checkpoint_best.pt 및 checkpoint_raw_best.pt에서 이전 세션 정보 복원
-        if checkpoint_path:
-            _best_ckpt_path = os.path.join(
-                os.path.dirname(checkpoint_path.format(0)),
-                'checkpoint_best.pt'
-            )
-            _best_raw_ckpt_path = os.path.join(
-                os.path.dirname(checkpoint_path.format(0)),
-                'checkpoint_raw_best.pt'
-            )
-            
-            # 1) checkpoint_best.pt에서 best_ema_reward 및 best_raw_reward 복원
-            if os.path.exists(_best_ckpt_path):
-                try:
-                    _best_meta = torch.load(_best_ckpt_path, map_location='cpu', weights_only=False)
-                    _saved_reward = None
-                    _saved_raw_reward = None
-                    if isinstance(_best_meta.get('extra_state'), dict):
-                        _saved_reward = _best_meta['extra_state'].get('best_ema_reward')
-                        _saved_raw_reward = _best_meta['extra_state'].get('best_raw_reward')
-                    if _saved_reward is not None:
-                        best_mean_reward = _saved_reward
-                        logger.info(f"📊 Loaded previous best EMA reward: {best_mean_reward:.4f} from checkpoint_best.pt")
-                    if _saved_raw_reward is not None:
-                        best_raw_reward = _saved_raw_reward
-                        logger.info(f"📊 Loaded previous best Raw reward: {best_raw_reward:.4f} from checkpoint_best.pt")
-                    del _best_meta  # GPU 메모리 절약
-                except Exception as e:
-                    logger.warning(f"Could not load best EMA reward from checkpoint_best.pt: {e}")
-            
-            # 2) checkpoint_raw_best.pt가 존재하면 거기서 단일 최고 수익률 정보 복원 (최신화 적용)
-            if os.path.exists(_best_raw_ckpt_path):
-                try:
-                    _best_raw_meta = torch.load(_best_raw_ckpt_path, map_location='cpu', weights_only=False)
-                    if isinstance(_best_raw_meta.get('extra_state'), dict):
-                        _saved_raw_reward = _best_raw_meta['extra_state'].get('best_raw_reward')
-                        if _saved_raw_reward is not None:
-                            best_raw_reward = _saved_raw_reward
-                            logger.info(f"📊 Loaded previous best Raw reward: {best_raw_reward:.4f} from checkpoint_raw_best.pt")
-                    del _best_raw_meta  # GPU 메모리 절약
-                except Exception as e:
-                    logger.warning(f"Could not load best Raw reward from checkpoint_raw_best.pt: {e}")
-            
-            # 3) 예외 백업: raw best가 여전히 초기값이면 EMA 값을 기본값으로 세팅
-            if best_raw_reward == float('-inf') and best_mean_reward != float('-inf'):
-                best_raw_reward = best_mean_reward
-                logger.info(f"📊 Previous best Raw reward initialized to best EMA reward: {best_raw_reward:.4f}")
-        
+        # Model selection uses the current weights on validation paths only.
+        best_validation_return = float('-inf')
+        if resume:
+            best_validation_return = self._seed_resume_best(
+                checkpoint_path, start_iteration, resume_best_checkpoints or [])
+        no_improve_count = 0
+        validation_metrics = None
+
         for iteration in range(start_iteration, num_iterations):
             iteration_start_time = time.time()
             # 1. 롤아웃 수집
-            num_episodes = self.episodes_per_group * self.num_groups
+            if max_timesteps and self.total_timesteps >= max_timesteps:
+                break
+            num_episodes = min(episodes_per_iteration,
+                               total_episodes - (iteration - start_iteration) * episodes_per_iteration)
             episodes = self.collect_rollouts(num_episodes)
             
             # 2. 에피소드 그룹화
@@ -999,91 +1015,42 @@ class GRPOTrainer:
             mean_sharpe = np.mean([ep['metadata'].get('sharpe_ratio', 0.0) for ep in episodes])
             mean_holding_time = np.mean([ep['metadata'].get('avg_holding_time', 0.0) for ep in episodes])
             
-            # Best checkpoint 저장: 3-iteration EMA 기반 역대 최고 Mean Reward 갱신 시
-            if checkpoint_path:
-                recent_rewards.append(mean_reward)
-                # 최소 3개 이터레이션이 쌓인 후부터 EMA 기반으로 판단
-                if len(recent_rewards) >= 3:
-                    ema_reward = np.mean(recent_rewards[-3:])
-                else:
-                    ema_reward = np.mean(recent_rewards)
-                
-                # [안전용] EMA-3 기준 checkpoint_best.pt 저장
-                if ema_reward > best_mean_reward:
-                    best_mean_reward = ema_reward
-                    # checkpoint_path 형식: .../checkpoints/checkpoint_iter{}.pt
-
-                    best_checkpoint_path = os.path.join(
-                        os.path.dirname(checkpoint_path.format(0)),
-                        'checkpoint_best.pt'
-                    )
-                    # best_ema_reward와 best_raw_reward를 함께 저장
-                    _extra = dict(self.extra_checkpoint_state) if self.extra_checkpoint_state else {}
-                    _extra['best_ema_reward'] = best_mean_reward
-                    _extra['best_raw_reward'] = best_raw_reward
-                    self.save_checkpoint(
-                        best_checkpoint_path, iteration + 1,
-                        extra_state=_extra
-                    )
-                    logger.info(f"🏆 New best EMA reward: {ema_reward:.4f} (raw: {mean_reward:.4f}) at iteration {iteration + 1}")
+            validation_metrics = None
+            if (self.evaluation_callback is not None and
+                    ((iteration + 1) % self.evaluation_interval == 0 or
+                     iteration + 1 == num_iterations or
+                     (max_timesteps and self.total_timesteps >= max_timesteps))):
+                validation_metrics = self.evaluation_callback(self.policy)
+                score = float(validation_metrics['mean_net_return'])
+                if not np.isfinite(score):
+                    raise ValueError("Validation mean_net_return must be finite")
+                if self.writer:
+                    self.writer.add_scalar('validation/mean_net_return', score, iteration)
+                logger.info("Validation net return: %.6f%% (current weights)", score)
+                if score > best_validation_return:
+                    best_validation_return = score
                     no_improve_count = 0
+                    if checkpoint_path:
+                        selected_path = os.path.join(
+                            os.path.dirname(checkpoint_path.format(0)), 'checkpoint_best.pt')
+                        extra = dict(self.extra_checkpoint_state)
+                        extra.update({'best_validation_return': score,
+                                      'validation_metrics': validation_metrics,
+                                      'selection_metric': 'validation.mean_net_return'})
+                        self.save_checkpoint(selected_path, iteration + 1, extra_state=extra)
                 else:
                     no_improve_count += 1
-                
-                # [유저용] 단일 수익률(Raw Reward) 기준 checkpoint_raw_best.pt 저장
-                if mean_reward > best_raw_reward:
-                    best_raw_reward = mean_reward
-                    best_raw_checkpoint_path = os.path.join(
-                        os.path.dirname(checkpoint_path.format(0)),
-                        'checkpoint_raw_best.pt'
-                    )
-                    _extra_raw = dict(self.extra_checkpoint_state) if self.extra_checkpoint_state else {}
-                    _extra_raw['best_ema_reward'] = best_mean_reward
-                    _extra_raw['best_raw_reward'] = best_raw_reward
-                    self.save_checkpoint(
-                        best_raw_checkpoint_path, iteration + 1,
-                        extra_state=_extra_raw
-                    )
-                    logger.info(f"🔥 New best Raw reward: {mean_reward:.4f} at iteration {iteration + 1} (Saved checkpoint_raw_best.pt)")
-                
-                # Revert-to-Best 체크
-                best_checkpoint_path = os.path.join(
-                    os.path.dirname(checkpoint_path.format(0)),
-                    'checkpoint_best.pt'
-                )
-                
-                # 현재 EMA vs best 로깅 (디버깅용)
-                if len(recent_rewards) >= 3:
-                    _current_ema = np.mean(recent_rewards[-3:])
-                    _gap = best_mean_reward - _current_ema
-                    logger.info(f"📈 EMA-3: {_current_ema:.4f} | Best: {best_mean_reward:.4f} | Gap: {_gap:.4f} | No-improve: {no_improve_count}/{revert_to_best_patience}")
-                
-                if (revert_to_best_patience > 0 and 
-                    no_improve_count >= revert_to_best_patience and 
-                    revert_count < max_reverts and 
-                    os.path.exists(best_checkpoint_path)):
-                    
-                    revert_count += 1
-                    
-                    # 3회 연속 Revert마다 patience를 2배로 증가 (무한 루프 방지)
-                    if revert_count > 0 and revert_count % 3 == 0:
-                        old_patience = revert_to_best_patience
-                        revert_to_best_patience = min(revert_to_best_patience * 2, 30)
-                        logger.info(f"⚠️ {revert_count} consecutive reverts detected. "
-                                    f"Increasing patience: {old_patience} → {revert_to_best_patience}")
-                    
-                    logger.info(f"🔄 Reverting to best checkpoint (no improvement for {no_improve_count} iterations, "
-                                f"revert #{revert_count}/{max_reverts})")
-                    self.load_checkpoint(best_checkpoint_path)
-                    
-                    # Reset optimizer to clear momentum and force the correct learning rate
-                    self.optimizer = optim.Adam(self.policy.parameters(), lr=self.learning_rate)
-                    
-                    # Reset patience and recent rewards
-                    no_improve_count = 0
-                    recent_rewards = []
-            
-            # 콜백 호출 (Curriculum Learning 등)
+                if (checkpoint_path and revert_to_best_patience > 0 and
+                        no_improve_count >= revert_to_best_patience):
+                    selected_path = os.path.join(
+                        os.path.dirname(checkpoint_path.format(0)), 'checkpoint_best.pt')
+                    if os.path.exists(selected_path):
+                        # Reverting parameters must not rewind the actual training budget.
+                        steps, updates = self.total_timesteps, self.num_updates
+                        self.load_checkpoint(selected_path)
+                        self.total_timesteps, self.num_updates = steps, updates
+                        no_improve_count = 0
+
             if on_iteration_end:
                 metrics_summary = {
                     'mean_reward': mean_reward,
@@ -1091,6 +1058,7 @@ class GRPOTrainer:
                     'mean_trades': mean_trades,
                     'mean_sharpe': mean_sharpe,
                     'mean_holding_time': mean_holding_time,
+                    'validation': validation_metrics,
                     'iteration': iteration + 1,
                     'total_iterations': num_iterations
                 }
@@ -1237,57 +1205,32 @@ class GRPOTrainer:
             group_sharpe = [ep['metadata'].get('sharpe_ratio', 0.0) for ep in group_episodes]
             group_mean_sharpe = np.mean(group_sharpe) if group_sharpe else 0.0
             
-            # 그룹별 정책 엔트로피 계산
-            # 각 에피소드의 상태에서 정책 엔트로피를 계산
+            # Preserve the original mean-of-episode-means aggregation while
+            # limiting logging transfers/forwards to the training mini-batch size.
             group_entropies = []
-            for ep in group_episodes:
-                states = ep['states']
-                states_tensor = torch.from_numpy(states).float().to(self.device)
-                
-                with torch.no_grad():
-                    # 정책에서 행동 확률 분포 얻기
-                    if hasattr(self.policy, 'forward'):
-                        result = self.policy(states_tensor)
-                        if isinstance(result, tuple):
-                            action_logits, _ = result  # (action_logits, state_value) 튜플
-                            action_probs = torch.softmax(action_logits, dim=-1)
-                        else:
-                            action_probs = result
-                        
-                        # 엔트로피 계산: -sum(p * log(p))
-                        entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=-1).mean()
-                        group_entropies.append(entropy.item())
-            
-            group_mean_entropy = np.mean(group_entropies) if group_entropies else 0.0
-            
-            # 그룹별 KL 발산 계산
-            # 참조 정책과 현재 정책 간의 KL 발산
             group_kl_divergences = []
-            if self.reference_policy is not None:
+            with torch.no_grad():
                 for ep in group_episodes:
-                    states = ep['states']
-                    actions = ep['actions']
-                    states_tensor = torch.from_numpy(states).float().to(self.device)
-                    actions_tensor = torch.from_numpy(actions).long().to(self.device)
-                    
-                    with torch.no_grad():
-                        # 현재 정책의 로그 확률
-                        if hasattr(self.policy, 'evaluate_actions'):
-                            current_log_probs, _, _ = self.policy.evaluate_actions(
-                                states_tensor, actions_tensor
-                            )
-                            
-                            # 참조 정책의 로그 확률
+                    entropy_sum = 0.0
+                    kl_sum = 0.0
+                    sample_count = 0
+                    for states_batch, actions_batch in self._episode_tensor_batches(
+                            ep['states'], ep['actions']):
+                        current_log_probs, entropy, _ = self.policy.evaluate_actions(
+                            states_batch, actions_batch)
+                        entropy_sum += entropy.sum().item()
+                        sample_count += len(states_batch)
+                        if self.reference_policy is not None:
                             ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
-                                states_tensor, actions_tensor
-                            )
-                            
-                            # KL 발산: KL(π_ref || π_current)
-                            kl_div = (ref_log_probs - current_log_probs).mean()
-                            group_kl_divergences.append(kl_div.item())
-            
+                                states_batch, actions_batch)
+                            kl_sum += (ref_log_probs - current_log_probs).sum().item()
+                    if sample_count:
+                        group_entropies.append(entropy_sum / sample_count)
+                        if self.reference_policy is not None:
+                            group_kl_divergences.append(kl_sum / sample_count)
+            group_mean_entropy = np.mean(group_entropies) if group_entropies else 0.0
             group_mean_kl = np.mean(group_kl_divergences) if group_kl_divergences else 0.0
-            
+
             # 그룹 메트릭 로깅
             self.writer.add_scalar(f'group_{group_id}/mean_return', group_mean_reward, iteration)
             self.writer.add_scalar(f'group_{group_id}/std_return', group_std_reward, iteration)
@@ -1322,7 +1265,10 @@ class GRPOTrainer:
         policy_config = {
             'policy_type': policy_class_name,
             'action_dim': self.policy.action_dim if hasattr(self.policy, 'action_dim') else 3,
-            'hidden_dim': self.policy.hidden_dim if hasattr(self.policy, 'hidden_dim') else 128,
+            'hidden_dim': getattr(self.policy, 'fc_hidden_dim', getattr(self.policy, 'hidden_dim', 128)),
+            'obs_dim': getattr(self.policy, 'obs_dim', None),
+            'cnn_channels': getattr(self.policy, 'cnn_channels', None),
+            'rnn_hidden_dim': getattr(self.policy, 'rnn_hidden_dim', None),
         }
         
         # GRPOPolicy의 경우 embedding_dim 저장
@@ -1334,6 +1280,7 @@ class GRPOTrainer:
             'total_timesteps': self.total_timesteps,
             'num_updates': self.num_updates,
             'policy_state_dict': self.policy.state_dict(),
+            'observation_schema': self.observation_schema,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': {
                 'episodes_per_group': self.episodes_per_group,
@@ -1358,6 +1305,22 @@ class GRPOTrainer:
         if extra_state:
             logger.info(f"  Extra state saved: {extra_state}")
     
+    def restore_training_progress(self, checkpoint: Dict[str, Any]) -> int:
+        """Restore optimizer/counters only for an explicitly requested resume."""
+        required = ('optimizer_state_dict', 'total_timesteps', 'num_updates', 'iteration')
+        missing = [name for name in required if name not in checkpoint]
+        if missing:
+            raise ValueError(f"Resume requires a full training checkpoint; missing {missing}")
+        for name in ('total_timesteps', 'num_updates', 'iteration'):
+            value = checkpoint[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"Invalid checkpoint {name}: expected a nonnegative integer")
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.total_timesteps = checkpoint['total_timesteps']
+        self.num_updates = checkpoint['num_updates']
+        self.learning_rate = self.optimizer.param_groups[0]['lr']
+        return checkpoint['iteration']
+
     def load_checkpoint(self, checkpoint_path: str) -> Optional[Dict[str, Any]]:
         """
         체크포인트 로드
@@ -1370,10 +1333,10 @@ class GRPOTrainer:
         """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
+        if checkpoint.get('observation_schema') != self.observation_schema:
+            raise ValueError('Checkpoint observation schema does not match the training environment')
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.total_timesteps = checkpoint['total_timesteps']
-        self.num_updates = checkpoint['num_updates']
+        self.restore_training_progress(checkpoint)
         
         extra_state = checkpoint.get('extra_state', None)
         

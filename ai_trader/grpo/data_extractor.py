@@ -1,200 +1,143 @@
 #!/usr/bin/env python3
-"""
-xLSTM 및 E2E 학습용 재활용 가능 데이터 추출기 (Data Extractor)
-
-DuckDB 데이터베이스에서 유효한 에피소드(종목코드, 날짜)를 추출하고
-결측값 및 이상치 처리를 거쳐 초고속 학습을 위한 압축된 numpy 파일(.npz)로 저장합니다.
-"""
-
-import os
-import sys
+"""Extract causal raw episodes with a versioned feature/execution contract."""
+import argparse
 import json
 import logging
-import argparse
-import numpy as np
-import duckdb
+import os
+import sys
 from pathlib import Path
-from tqdm import tqdm
 
-# 로깅 설정
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+import duckdb
+import numpy as np
+import pandas as pd
+
+project_root = Path(__file__).resolve().parents[2]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+from lib.market_data import (canonical_feature_columns, validate_feature_columns,
+                             chronological_order, execution_arrays, PRICE_SCALES)
+from lib.normalization import compute_stock_name_scalar_batch, compute_time_features_batch
+
 logger = logging.getLogger("DataExtractor")
 
-def get_feature_columns(conn, table_name: str, expected_features: int) -> list:
-    """특징 컬럼 목록 가져오기"""
-    try:
-        query = f"DESCRIBE {table_name}"
-        columns_df = conn.execute(query).fetchdf()
-        all_columns = columns_df['column_name'].tolist()
-        column_types = columns_df['column_type'].tolist()
-        
-        exclude_columns = {'날짜', '종목코드', '시간', '종목명', '번호'}
-        
-        feature_columns = []
-        for col, col_type in zip(all_columns, column_types):
-            if col not in exclude_columns:
-                if any(numeric_type in col_type.upper() for numeric_type in ['DOUBLE', 'FLOAT', 'INTEGER', 'BIGINT', 'DECIMAL']):
-                    feature_columns.append(col)
-        
-        if len(feature_columns) == expected_features:
-            logger.info(f"✅ Feature columns match expected size: {len(feature_columns)}")
-        elif len(feature_columns) > expected_features:
-            logger.warning(f"Found {len(feature_columns)} features, using first {expected_features}.")
-            feature_columns = feature_columns[:expected_features]
-        else:
-            raise RuntimeError(f"Insufficient features in DB: found {len(feature_columns)}, expected {expected_features}")
-            
-        return feature_columns
-    except Exception as e:
-        logger.error(f"Failed to retrieve feature columns: {e}")
-        raise
 
-def extract_data(db_path: str, table_name: str, output_dir: str, seq_len: int, features: int, max_steps: int, limit: int = None):
-    """DuckDB에서 데이터를 추출하여 저장"""
+def _identifier(value):
+    return '"' + str(value).replace('"', '""') + '"'
+
+
+def get_feature_columns(conn, table_name: str, expected_features: int) -> list:
+    """Select a registered schema by name; database order cannot change semantics."""
+    schema = conn.execute(f"DESCRIBE {_identifier(table_name)}").fetchdf()
+    available = dict(zip(schema.column_name, schema.column_type))
+    requested = canonical_feature_columns(expected_features)
+    derived = {"종목명_scalar", "시간_sin", "시간_cos", "시간_scalar"}
+    missing = set(requested) - set(available) - derived
+    if missing:
+        raise ValueError(f"Missing required model features: {sorted(missing)}")
+    for name in set(requested) - derived:
+        if not any(t in available[name].upper() for t in ("DOUBLE", "FLOAT", "REAL", "INT", "DECIMAL")):
+            raise ValueError(f"Feature {name} must be numeric, found {available[name]}")
+    return validate_feature_columns(requested, expected_features)
+
+
+def extract_data(db_path: str, table_name: str, output_dir: str, seq_len: int,
+                 features: int, max_steps: int, limit: int = None, price_unit: str = "krw"):
+    """Write a new extraction. Existing manifests are protected from overwrites."""
+    if price_unit not in PRICE_SCALES:
+        raise ValueError(f"Unknown price unit: {price_unit}")
     db_path = str(Path(db_path).resolve())
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Connecting to DuckDB: {db_path}")
-    if not os.path.exists(db_path):
-        logger.error(f"Database file not found: {db_path}")
-        return False
-        
+    output = Path(output_dir)
+    if (output / "manifest.json").exists():
+        raise FileExistsError("Output manifest already exists; use a new directory for regeneration")
+    if not Path(db_path).is_file():
+        raise FileNotFoundError(db_path)
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = []
+    rejected = {}
     conn = duckdb.connect(db_path, read_only=True)
-    
     try:
         feature_cols = get_feature_columns(conn, table_name, features)
-        return_rate_index = feature_cols.index('등락률')
-        
-        # 유효한 키(종목코드, 날짜) 추출
-        min_required = seq_len + max_steps + 100
-        logger.info(f"Searching for valid episodes with at least {min_required} steps...")
-        
-        query = f"""
-            SELECT 종목코드, 날짜, COUNT(*) as cnt
-            FROM {table_name}
-            GROUP BY 종목코드, 날짜
-            HAVING COUNT(*) >= ?
-        """
-        keys_df = conn.execute(query, [min_required]).fetchdf()
-        total_keys = len(keys_df)
-        logger.info(f"Found {total_keys} valid stock-date keys.")
-        
-        if total_keys == 0:
-            logger.warning("No valid episodes found with current length requirements. Trying fallback...")
-            min_required = seq_len + 100
-            keys_df = conn.execute(query, [min_required]).fetchdf()
-            total_keys = len(keys_df)
-            logger.info(f"Fallback found {total_keys} keys.")
-            
-        if total_keys == 0:
-            logger.error("No valid keys found. Aborting.")
-            return False
-            
-        # 셔플을 통해 무작위 에피소드 샘플 추출 및 특정 변동성 치우침 현상 방지
-        keys_df = keys_df.sample(frac=1.0, random_state=42).reset_index(drop=True)
-            
-        if limit and limit < total_keys:
-            logger.info(f"Limiting extraction to {limit} random episodes.")
-            keys_df = keys_df.iloc[:limit]
-            total_keys = limit
-
-        manifest = []
-        
-        # 개별 키 추출 루프
-        for idx, row in enumerate(tqdm(keys_df.itertuples(), total=total_keys, desc="Extracting Episodes")):
-            stock_code = str(row.종목코드)
-            date = int(row.날짜)
-            
-            # 쿼리 및 데이터 로드
-            query = f"""
-                SELECT 종목코드, 날짜, 시간, {', '.join(feature_cols)}
-                FROM {table_name}
-                WHERE 종목코드 = ? AND 날짜 = ?
-                ORDER BY 시간
-            """
-            df = conn.execute(query, [stock_code, date]).fetchdf()
-            
-            if len(df) < seq_len + 10:
-                continue
-                
-            # 결측치 처리 및 분리
-            df_features = df[feature_cols].fillna(0.0)
-            metadata = df[['종목코드', '날짜', '시간']].values.astype(str)
-            features_data = df_features.values.astype(np.float32)
-            
-            # 무한대나 NaN 재검증
-            if not np.isfinite(features_data).all():
-                continue
-                
-            # 비정상 등락률 검증 (수익률 35% 초과 기각)
-            return_rates = features_data[:, return_rate_index] / 100.0  # 원본 데이터 기준 % 단위이므로 나누어줌
-            max_abs_return = np.max(np.abs(return_rates))
-            if max_abs_return > 0.35:
-                continue
-                
-            # 파일로 저장
-            filename = f"episode_{stock_code}_{date}.npz"
-            file_path = output_path / filename
-            
-            np.savez_compressed(
-                file_path,
-                features=features_data,
-                metadata=metadata
-            )
-            
-            manifest.append({
-                "file_path": filename,
-                "stock_code": stock_code,
-                "date": date,
-                "length": len(features_data)
-            })
-            
-        # Manifest 저장
-        manifest_data = {
-            "metadata": {
-                "feature_columns": feature_cols,
-                "return_rate_index": return_rate_index,
-                "expected_features": features
-            },
-            "episodes": manifest
-        }
-        manifest_path = output_path / "manifest.json"
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest_data, f, indent=2, ensure_ascii=False)
-            
-        logger.info(f"Successfully extracted {len(manifest)} episodes to {output_dir}")
-        logger.info(f"Manifest saved to {manifest_path}")
+        schema = conn.execute(f"DESCRIBE {_identifier(table_name)}").fetchdf().column_name.tolist()
+        # Eligibility uses only enough history plus a decision point. Do not
+        # remove an entire day based on its later return or maximum volatility.
+        keys = conn.execute(f"""
+            SELECT "종목코드", "날짜", COUNT(*) AS cnt FROM {_identifier(table_name)}
+            GROUP BY "종목코드", "날짜" HAVING COUNT(*) >= ?
+            ORDER BY "날짜", "종목코드"
+        """, [seq_len + 1]).fetchdf()
+        if limit is not None:
+            keys = keys.sample(n=min(limit, len(keys)), random_state=42)
+        for row in keys.itertuples(index=False):
+            stock, date, _ = row
+            tie = '"번호", rowid' if "번호" in schema else "rowid"
+            frame = conn.execute(f"""
+                SELECT * FROM {_identifier(table_name)}
+                WHERE "종목코드" = ? AND "날짜" = ?
+                ORDER BY TRY_CAST("시간" AS DOUBLE), {tie}
+            """, [stock, date]).fetchdf()
+            try:
+                frame = frame.iloc[chronological_order(frame["시간"])].reset_index(drop=True)
+                # No backward fill: an event can use only previously seen values.
+                for column in frame:
+                    if column not in {"날짜", "종목코드", "종목명", "시간", "번호"}:
+                        frame[column] = pd.to_numeric(frame[column], errors="coerce").ffill().fillna(0.0)
+                names = frame["종목명"] if "종목명" in frame else pd.Series("", index=frame.index)
+                frame["종목명_scalar"] = compute_stock_name_scalar_batch(names)
+                sine, cosine, scalar = compute_time_features_batch(frame["시간"], use_zscore_for_scalar=False)
+                frame["시간_sin"], frame["시간_cos"], frame["시간_scalar"] = sine, cosine, scalar
+                values = frame[feature_cols].to_numpy(dtype=np.float32)
+                if not np.isfinite(values).all():
+                    raise ValueError("nonfinite_features")
+                metadata = frame[["종목코드", "날짜", "시간"]].to_numpy().astype(str)
+                execution = execution_arrays(frame, price_unit)
+                if any(not np.isfinite(v).all() for v in execution.values()):
+                    raise ValueError("nonfinite_execution")
+                filename = f"episode_{str(stock).zfill(6)}_{date}.npz"
+                target = output / filename
+                if target.exists():
+                    raise FileExistsError(f"Refusing to overwrite {target}")
+                partial = target.with_suffix(".npz.part")
+                with partial.open("wb") as stream:
+                    np.savez_compressed(stream, features=values, metadata=metadata,
+                                        **{"execution_" + k: v for k, v in execution.items()})
+                os.replace(partial, target)
+                manifest.append({"file_path": filename, "stock_code": str(stock).zfill(6),
+                                 "date": int(date), "length": len(values)})
+            except FileExistsError:
+                raise
+            except ValueError as exc:
+                reason = str(exc)
+                rejected[reason] = rejected.get(reason, 0) + 1
+                logger.warning("Rejected %s/%s: %s", stock, date, reason)
+        if not manifest:
+            raise ValueError(f"No valid episodes extracted; rejected={rejected}")
+        payload = {"metadata": {"schema_version": 2, "feature_columns": feature_cols,
+                    "return_rate_index": feature_cols.index("등락률"), "expected_features": features,
+                    "feature_transform": "raw", "price_unit": price_unit,
+                    "execution_price_unit": "krw", "timestamp_format": "HHMMSSmmm",
+                    "source_db": db_path, "rejected_episodes": rejected},
+                   "episodes": manifest}
+        partial = output / "manifest.json.part"
+        partial.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(partial, output / "manifest.json")
         return True
-        
-    except Exception as e:
-        logger.error(f"Extraction failed: {e}", exc_info=True)
-        return False
     finally:
         conn.close()
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DuckDB에서 학습용 에피소드 데이터 추출")
-    parser.add_argument("--db", type=str, required=True, help="DuckDB 데이터베이스 경로")
-    parser.add_argument("--table", type=str, default="datasets", help="테이블 이름")
-    parser.add_argument("--output_dir", type=str, default="data/extracted_episodes", help="출력 디렉토리 경로")
-    parser.add_argument("--seq_len", type=int, default=3000, help="시퀀스 길이")
-    parser.add_argument("--features", type=int, default=27, help="피처 개수")
-    parser.add_argument("--max_steps", type=int, default=600, help="에피소드 최대 스텝 수")
-    parser.add_argument("--limit", type=int, default=None, help="추출할 최대 에피소드 수 (기본: 전체)")
-    
+    logging.basicConfig(level=logging.INFO)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--db", required=True)
+    parser.add_argument("--table", default="datasets")
+    parser.add_argument("--output_dir", default="data/extracted_episodes_v2")
+    parser.add_argument("--seq_len", type=int, default=3000)
+    parser.add_argument("--features", type=int, default=27)
+    parser.add_argument("--max_steps", type=int, default=600)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--price-unit", required=True, choices=tuple(PRICE_SCALES),
+                        help="Unit of source current/quote prices; never inferred from their magnitude")
     args = parser.parse_args()
-    
-    extract_data(
-        db_path=args.db,
-        table_name=args.table,
-        output_dir=args.output_dir,
-        seq_len=args.seq_len,
-        features=args.features,
-        max_steps=args.max_steps,
-        limit=args.limit
-    )
+    extract_data(args.db, args.table, args.output_dir, args.seq_len, args.features,
+                 args.max_steps, args.limit, args.price_unit)

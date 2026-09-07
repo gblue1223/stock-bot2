@@ -1,455 +1,165 @@
-# Stock Bot 🚀
+# Stock Bot — xLSTM 스캘핑 연구·리플레이
 
-**AI-Powered Korean Stock Market Scalping System**
+원본 틱 데이터로 매수·보유·매도 정책을 학습하고, 비용과 체결 제약을 포함한 시뮬레이터에서 평가하는 프로젝트입니다. 현재 실행 경로는 xLSTM + GRPO입니다. 이 저장소는 주문 의사결정과 리플레이를 제공하며 브로커에 실주문을 전송하지 않습니다.
 
-한국 주식 시장에서 초단위 스캘핑을 위한 AI 트레이딩 시스템입니다. AutoEncoder 기반 임베딩과 GRPO 강화학습을 결합하여 실시간 매매 결정을 내립니다.
+## 실행
 
-## ✨ 주요 특징
+Python 3.10 이상을 사용합니다. 현재 회귀 검사는 Python 3.12 / PyTorch 2.8 CPU에서 실행했습니다. 아래 명령은 프로젝트 루트에서 해당 가상환경을 활성화한 후 실행합니다.
 
-- **🚀 초고속 추론**: 2.87ms 실시간 매매 결정 (목표 10ms 대비 3배 빠름)
-- **⚡ 혁신적 학습 속도**: 10-100배 빠른 AutoEncoder 기반 자기지도 학습
-- **🎯 스캘핑 특화**: 30초 이내 초단위 거래에 최적화
-- **🧠 GRPO 강화학습**: 그룹 상대 정책 최적화로 안정적 학습
-- **📊 대용량 데이터**: 15억개 데이터도 몇 주 안에 학습 가능
-
-## 🏗️ 시스템 아키텍처
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    DuckDB 데이터베이스                        │
-│         (datasets_norm_all.duckdb / table: datasets)        │
-└────────────────────┬────────────────────────────────────────┘
-                     │
-                     ├──────────────────┬─────────────────────┐
-                     │                  │                     │
-                     ▼                  ▼                     ▼
-          ┌──────────────────┐  ┌──────────────┐   ┌─────────────────┐
-          │  AutoEncoder     │  │  GRPO 훈련   │   │  실시간 추론     │
-          │  사전 훈련        │  │  (RL Agent)  │   │  (Live Trading) │
-          └──────────┬───────┘  └──────┬───────┘   └────────┬────────┘
-                     │                  │                     │
-                     ▼                  │                     │
-          ┌──────────────────┐         │                     │
-          │  Fine-tuning     │◄────────┴─────────────────────┘
-          │  (트레이딩 특화)   │
-          └──────────────────┘
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest --basetemp .test_artifacts/pytest-manual
+python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
 ```
 
-## 📋 목차
+예제 설정은 비교적 작은 모델과 120틱 관측으로 시작합니다. 최적 수익을 보장하는 설정은 아닙니다. `seq_len`과 `episode_steps`는 이벤트 개수이고, `max_holding_seconds`는 실제 초입니다. 기존 기본값처럼 3000틱의 겹치는 관측창을 많이 수집하면 RAM 사용량이 커지므로 모델·배치·rollout 크기를 함께 조정해야 합니다.
 
-- [빠른 시작](#빠른-시작)
-- [AutoEncoder 임베딩](#autoencoder-임베딩)
-- [GRPO 강화학습](#grpo-강화학습)
-- [성능 벤치마크](#성능-벤치마크)
-- [데이터 정규화](#데이터-정규화)
-- [설치 및 설정](#설치-및-설정)
+훈련은 거래일을 시간순으로 train/validation/test에 분리합니다(기본 60/20/20, 최소 3일). 설정의 `train_end_date`, `validation_end_date`로 경계를 지정하거나 `embargo_dates`로 경계 뒤 거래일을 제외할 수 있습니다. 한 에피소드는 하나의 종목·거래일 안에 있으므로 관측창과 보유 구간이 다른 분할로 넘어가지 않습니다.
 
-## 🚀 빠른 시작
+업데이트된 가중치를 고정 검증 시드로 평가한 뒤 `checkpoint_best.pt`를 선택합니다. 마지막에 그 가중치로만 test를 평가합니다. 결과에는 합성 호가 사용 여부와 미청산 수량도 포함됩니다.
 
-## 0단계: 데이터 정규화
+출력 파일:
 
-```bash
-python scripts/data/generate_datasets.py \
-  "D:\Workspace\Project\stock-bot\hoga-crawler\data" \
-  -o "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  --workers 12 \
-  --tmp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
-  --checkpoint-interval 50 \
-  --single-output \
-  --start-date 20250922 --end-date 20250930
+- `training_config.json`, `date_splits.json`: 실제 설정과 날짜 분할
+- `checkpoints/checkpoint_best.pt`: validation 순수익으로 선택한 가중치
+- `evaluation_report.json`: 학습·검증·테스트 결과
+- `scalping_xlstm_model.pt`: 선택된 best와 동일한 최종 모델
 
-python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets@raw" \
-  --out "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  --temp-dir "C:\Users\user\Workspace\datasets@raw\tmp" \
-  --threads 4 \
-  --memory-limit 64GB
+`--load_policy`만 지정하면 호환 가중치로 새 fine-tuning을 시작하고 optimizer와 진행 카운터는 초기화합니다. `--load_policy ... --resume`를 함께 지정하면 optimizer·iteration·누적 timestep을 복원합니다. 재개할 때 `total_timesteps`는 추가량이 아니라 누적 목표이며, 저장된 진행량보다 커야 합니다. 두 경로 모두 관측 스키마와 기존 학습 날짜가 새 holdout을 오염시키는지 검사합니다.
 
-python scripts/data/normalize_datasets.py \
-  "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  -o "C:\Users\user\Workspace\datasets\datasets_norm.duckdb" \
-  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --workers 12 \
-  --time-start 90000000 \
-  --time-end 110000000 \
-  --checkpoint-interval 50 \
-  --ignoring-stocks-csv scripts/data/ignoring_stocks.csv \
-  --qualifying-minutes 1
+## Colab A100 학습
 
-python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
-  --out "C:\Users\user\Workspace\datasets\datasets_norm_all.duckdb" \
-  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --threads 4 \
-  --memory-limit 64GB
+`ai_trader/grpo/colab_train_xlstm.ipynb`를 사용합니다. 수정된 프로젝트 코드가 포함된 Git revision 또는 업로드한 소스 폴더가 필요합니다. 노트북만 교체하고 이전 코드를 clone하면 수정된 학습기를 사용할 수 없습니다.
 
-# OR
+관측 1024틱, 에피소드 300틱, CNN/mLSTM/FC 64/128/256으로 시작합니다. A100 40GB의 배치 상한은 64, 80GB는 128이며 실제 역전파 사전 점검에서 메모리가 부족하면 줄입니다. 회당 rollout은 16개이고 여유 RAM 16GiB 미만에서는 8개로 축소합니다. worker는 CPU와 RAM에 맞춰 최대 4/8개, 캐시는 worker당 128MiB로 제한합니다. GAE 및 TensorBoard 추론도 `batch_size` 이하로 나누어 GPU에 전송합니다.
 
-python scripts/data/export_datasets.py \
-  --input-db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-  --input-table datasets \
-  --output-db "C:\Users\user\Workspace\datasets\datasets_raw.duckdb" \
-  --output-table datasets \
-  --tmp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --workers 12 \
-  --time-start 90000000 \
-  --time-end 110000000 \
-  --checkpoint-interval 50 \
-  --qualifying-minutes 1
+`MODE='new'`와 새 `RUN_NAME`이 기본입니다. 재개는 `MODE='resume'`와 `LOAD_POLICY`를 명시하며 관측·체결·학습 설정을 복원합니다. 초기 목표는 100,000틱이고 재개할 때는 누적 목표를 늘립니다. `ENABLE_TF32`는 사전 점검과 실제 학습 프로세스에 함께 적용하며 AMP/BF16은 사용하지 않습니다.
 
-python scripts/data/merge_datasets.py "C:\Users\user\Workspace\datasets" \
-  --out "C:\Users\user\Workspace\datasets\datasets_raw_all.duckdb" \
-  --temp-dir "C:\Users\user\Workspace\datasets\tmp" \
-  --table datasets \
-  --threads 4 \
-  --memory-limit 64GB
+Drive에 `colab_config.json`, 소스·manifest 해시와 GPU 점검 결과가 담긴 `colab_run.json`, 학습 로그와 회당 체크포인트를 저장합니다. 끝의 평가 셀에서 순수익·실현손익·합성 체결·미청산 수량을 확인할 수 있고, 선택적인 체결 스트레스 검사는 validation에만 적용합니다. 실제 A100의 최대 메모리와 학습 속도는 Colab 사전 점검 및 실제 학습에서 확인해야 합니다.
+
+## 체결 시뮬레이터
+
+`ai_trader/grpo/environments/execution.py`가 주문과 체결을 담당하고, 환경이 현금·수량·FIFO 포지션·수수료를 정산합니다.
+
+| 설정 | 기본값 | 의미 |
+| --- | ---: | --- |
+| initial_cash | 1,000,000 | 초기 원화 자금 |
+| max_holding_seconds | 300 | 모든 포지션의 청산 주문을 요청하는 보유시간 |
+| stop_loss_pct | 2 | 손절 기준 퍼센트 |
+| order_latency_ms | 100 | 주문이 시장에 도착하기까지의 지연 |
+| cancel_latency_ms | 50 | 취소 요청이 반영되기까지의 지연 |
+| order_ttl_seconds | 2 | 잔여 주문의 만료시간 |
+| slippage_bps | 2 | 표시 호가에 추가 적용하는 불리한 가격 조정 |
+| spread_bps | 10 | 실제 호가가 없을 때만 가정하는 왕복 스프레드 |
+| fallback_depth | 100 | 합성 호가 사용 시 이벤트마다 가정하는 주식 수 |
+| require_order_book | false | true이면 실제 호가가 없는 데이터 거부 |
+| max_quote_age_seconds | 1 | 호가 시각이 있는 데이터에서 허용하는 호가 나이 |
+| tick_size | 0 | 0이면 추가 반올림 없음; 양수면 명시한 틱으로 불리하게 반올림 |
+
+체결 설정은 JSON의 `execution_config` 안에 둡니다. 위 값은 시뮬레이션 가정이며, 실제 증권사의 지연·세금·수수료를 대신하지 않습니다. 매수/매도 수수료와 세금은 `transaction_cost_rate`, `buy_tax_rate`, `sell_tax_rate`로 분리합니다.
+
+체결기는 다음을 보장합니다.
+
+- 주문 제출 시 이미 본 이벤트로 체결하지 않습니다. 지연 이후의 이벤트에서 매수는 ask, 매도는 bid를 사용합니다.
+- 여러 호가를 가격순으로 소진하고 실제 가능한 수량만 부분체결합니다. 같은 계좌가 소비한 잔량은 반복 관측했다고 복원하지 않습니다.
+- 잔여 주문은 대기·취소·만료될 수 있습니다. 취소가 도착하기 전에 체결될 수 있는 경합도 처리합니다.
+- 정수 주식 수, 가용 현금과 재고를 적용해 음수 현금·공매도를 막습니다.
+- 지정가는 반대편 호가와 실제로 맞는 경우만 체결합니다. 최근 체결가가 지정가에 닿았다는 이유로 수동 대기열 체결을 추정하지 않습니다.
+- 호가 시각이 보존된 데이터에서는 오래된 호가로 체결하지 않습니다.
+- 보유시간 만료는 틱 사이의 타이머로 주문을 예약합니다. 시장 이벤트가 없거나 호가 잔량이 부족하면 정해진 초에 체결을 보장할 수 없으며, 실제 경과시간과 미청산 수량을 그대로 보고합니다.
+
+에피소드 종료 때도 마지막 이벤트의 가격과 비용을 반영합니다. 지연·잔량 때문에 청산할 수 없으면 가상의 체결을 만들지 않습니다. `liquidation_complete=false`, `open_quantity`, `realized_net_pnl`, `unrealized_net_pnl`을 함께 확인해야 합니다.
+
+보상은 매 스텝 청산 평가액(NAV)의 변화 / 초기 자금 × 100입니다. 현금과 보유 주식을 매도 호가·매도 비용 기준으로 평가하며, 보상 합과 보고 `net_return`이 일치합니다. 이전의 상승 보너스·승리 보너스·미거래 페널티는 무시되고 경고를 남깁니다. 거래하지 않으면 순수익과 보상은 0입니다.
+
+## 별도 백테스트와 비용 스트레스
+
+새 학습 체크포인트에는 관측 스키마, 비용·체결 설정과 날짜 분할이 저장됩니다. 별도 백테스트가 이를 그대로 읽습니다.
+
+```powershell
+python -m ai_trader.grpo.backtest --policy models/scalping_v3/checkpoints/checkpoint_best.pt --output models/scalping_v3/replay_test.json
+python -m ai_trader.grpo.backtest --policy models/scalping_v3/checkpoints/checkpoint_best.pt --partition validation --order-latency-ms 300 --slippage-bps 5 --output models/scalping_v3/replay_stress.json
 ```
 
-### 1단계: AutoEncoder 훈련
+`--extracted-dir`로 데이터 경로를 이동할 수 있고, `--episodes`, `--seed`, `--spread-bps`, `--require-order-book`을 지원합니다. 모델·조건을 고르는 비교에는 validation을 사용하고 최종 test를 반복적인 모델 선택에 사용하지 않습니다.
 
-```bash
-# 사전 훈련 데이터 생성
-$ python scripts/pre/autoencoder/parallel_preprocessing.py \
-    --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --seq-len 120 \
-    --batch-size 5000 \
-    --start-year 2024 --start-month 9 \
-    --end-year 2025 --end-month 9 \
-    --output "C:\Users\user\Workspace\datasets@20260117\pre_training_data" \
-    --max-workers 4
+지표의 단위는 다음과 같습니다.
 
-# autoencoder_training_complete.ipynb 실행
+- `mean_net_return`: 초기 자금 대비 에피소드별 비용 차감 NAV 수익률의 평균(%)
+- `max_drawdown`: 에피소드별 NAV 최대낙폭의 최댓값(%); 전체 기간을 이어 붙인 계좌 낙폭은 아님
+- `mean_realized_net_pnl`: 실현손익 평균(원)
+- `synthetic_execution_episodes`, `execution_models`: 합성 호가 사용 여부
+- `incomplete_liquidation_episodes`, `max_open_quantity`: 종료 시 잔여 재고
+- 환경의 `sharpe_ratio`: 연율화하지 않은 이벤트별 NAV 변화 기준; 일별 계좌 수익률 Sharpe와 다름
+
+현재 시뮬레이터는 공개된 호가 잔량을 사용하는 리플레이입니다. 자신의 주문이 이후 시장 경로를 바꾸는 시장충격이나 수동 지정가 대기열 순위는 추정하지 않습니다. 보유 주식의 평가액도 전체 수량이 즉시 그 가격에 매도된다는 증거는 아닙니다.
+
+## 데이터 생성과 기존 캐시
+
+새 추출은 숫자 시간·동일 시각의 이벤트 순번을 보존하며, 모델 특징과 원화 가격/주식 수 실행 배열을 분리합니다.
+
+```powershell
+python -m ai_trader.grpo.data_extractor --db "D:/path/to/datasets_raw.duckdb" --output_dir data/extracted_episodes_v2 --seq_len 120 --features 27 --max_steps 300 --price-unit krw
 ```
 
-### 2단계: GRPO 강화학습 훈련
+소스 DB는 명시적 특징 스키마의 컬럼을 포함해야 합니다. `scripts/data/generate_datasets.py`로 원본 CSV의 체결·호가·거래원 이벤트를 합칠 수 있습니다. `--price-unit`은 원본 가격 단위를 반드시 지정합니다. 현재 `extract_260811.py`가 만드는 데이터는 KRW이며, 과거에 만들어진 백만원 단위 DB에는 `million_krw`가 필요합니다. 서로 다른 가격 단위를 섞은 DB는 먼저 단위를 통일해야 합니다.
 
-```bash
-# 속도를 위한 전처리 작업.
-# colab_embedding_gen.ipynb
-# OR
-python scripts/data/generate_embeddings_parallel.py \
-  --db_path "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-  --model_path "C:\Users\user\Workspace\datasets@20260117\autoencoder_seq120\best_model.pt" \
-  --output_dir "C:\Users\user\Workspace\datasets@20260117\embeddings_v4" \
-  --state_file "C:\Users\user\Workspace\datasets@20260117\embeddings_v4\processed_stocks.txt" \
-  --table_name "datasets" \
-  --seq_len 3000 \
-  --batch_size 4096 \
-  --num_workers 2 \
-  --device cuda
-```
+추출기는 이미 있는 manifest나 에피소드 파일을 덮어쓰지 않습니다. 새 출력 디렉터리를 사용합니다. `scripts/data/normalize_datasets.py`는 이제 결정적인 파생 피처를 생성하고 원본 숫자를 보존합니다. 하루 전체 mean/std 정규화는 하지 않습니다.
 
-```bash
-# GRPO로 스캘핑 전략 학습 (RollingNormalizer 사용 - 권장, entropy_coef: 0.05(모험적))
-python ai_trader/grpo/train_e2e.py \
-    --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --seq_len 3000 \
-    --features 28 \
-    --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v10" \
-    --num_workers 2 \
-    --min_holding 2 \
-    --max_holding 300 \
-    --entropy_coef 0.15 \
-    --transaction_cost 0.00015 \
-    --no_trade_penalty 50.0 \
-    --lr 0.0001
+NPZ 계약:
 
-# Fine-tuning (기존 모델 로드)
-python ai_trader/grpo/train_e2e.py \
-    --db "C:\Users\user\Workspace\datasets@20260117\datasets_raw_09_11.duckdb" \
-    --load_policy "models/grpo_scalping_v10/checkpoints/checkpoint_iter770.pt" \
-    --seq_len 3000 \
-    --features 28 \
-    --total_timesteps 200000 \
-    --output_dir "models/grpo_scalping_v10" \
-    --early_exit_penalty 1.2 \
-    --num_workers 2 \
-    --min_holding 2 \
-    --max_holding 300 \
-    --entropy_coef 0.15 \
-    --transaction_cost 0.00215 \
-    --no_trade_penalty 30.0 \
-    --lr 0.00001
-```
+- `features`: manifest에 적힌 순서의 원본 모델 피처
+- `metadata`: 종목코드·날짜·HHMMSSmmm 시각, shape `(N, 3)`
+- `execution_last_price`: 원화 가격, shape `(N,)`
+- `execution_bid_prices / execution_ask_prices`: 원화 호가, shape `(N, levels)`
+- `execution_bid_sizes / execution_ask_sizes`: 주식 수, 같은 shape
+- `execution_quote_timestamp`: 보존된 호가 갱신 시각(자정 이후 초), 있을 때만 사용
+- manifest metadata: `schema_version=2`, `feature_columns`, `price_unit`, `execution_price_unit=krw`, `feature_transform=raw`
 
-### 3단계: 실시간 추론 (2.87ms)
+호가가 없는 경우 이를 대기금액만으로 복원하지 않습니다. 합성 스프레드/잔량 모드를 쓰고 결과를 표시합니다. 실제 호가 검증에는 원본 호가 가격·수량·시각을 보존한 새 추출 데이터가 필요합니다.
+
+기존 `data/extracted_episodes`는 원본 파일 변경 없이 로드 시 안정 정렬합니다. 알려진 기존 27개 컬럼 순서는 명시적 legacy adapter로 백만원 가격을 원화로 환산합니다. 기존 파일에 없던 호가나 수집 당시 이름 인코딩 정보는 복원하지 않습니다. 실제 운영용 데이터를 준비할 때에는 현재 파생 피처 규칙과 원본 호가를 사용해 재추출하는 것이 필요합니다.
+
+## 관측과 추론
+
+`lib/observations.py`의 `ObservationBuilder`를 학습·사전학습·추론에서 공유합니다. 현재까지의 관측창에서만 log 변환 및 rolling 통계를 계산합니다. 미래 데이터를 넣어 통계를 만들지 않습니다.
+
+체크포인트 스키마가 특징 순서·가격 단위·관측 길이·정규화·최대 보유시간·15개 포지션 피처를 고정합니다. 구모델에 이 정보가 없거나 규격이 다르면 로드를 거부합니다. 기존 가중치를 곧바로 실전에 재사용하지 말고 수정된 파이프라인으로 재학습해야 합니다.
 
 ```python
-from ai_trader.grpo.inference.grpo_infer import GRPOInference
-
-# 초고속 실시간 매매 결정
-inference = GRPOInference(
-    policy_path='models/grpo_scalping/policy_final.pt',
-    embedding_model_path='models/autoencoder/best_model.pt',
-    device='cuda'
+from ai_trader.grpo.inference.enhanced_grpo_infer_xlstm import (
+    GRPOInferenceE2EXLSTM, EnhancedGRPOInferenceXLSTM, Position,
 )
 
-# 실시간 데이터로 매매 결정
-action, confidence = inference.predict(live_market_data)  # action: 0=보유, 1=매수, 2=매도
-```
-
-## 🧠 AutoEncoder 임베딩
-
-### 핵심 혁신: AutoEncoder 기반 임베딩
-
-AutoEncoder + Fine-tuning 방식으로 효율적인 자기지도 학습을 제공합니다.
-
-| 방식            | 학습 속도 | 추론 속도  | 구현 복잡도 | 확장성   | 15억 데이터 학습 |
-| --------------- | --------- | ---------- | ----------- | -------- | ---------------- |
-| **AutoEncoder** | **몇 주** | **2.87ms** | **낮음**    | **우수** | **가능**         |
-
-### 주요 장점
-
-- ✅ **10-100배 빠른 학습**: 복잡한 positive/negative 쌍 생성 불필요
-- ✅ **3배 빠른 추론**: 2.87ms vs 목표 10ms
-- ✅ **간단한 구현**: 재구성 손실만으로 학습
-- ✅ **확장성**: 대용량 데이터에서도 선형적 시간 복잡도
-
-### Masked AutoEncoder
-
-```python
-from ai_trader.embedding.autoencoder_model import MaskedAutoEncoder
-
-# 마스킹 기법으로 강건한 표현 학습
-model = MaskedAutoEncoder(
-    input_dim=60,
-    embedding_dim=128,
-    seq_len=3000,
-    mask_ratio=0.15  # 15% 마스킹
-)
-
-# 자기지도 학습으로 빠른 사전 훈련
-reconstruction, embedding, mask = model(input_sequence)
-```
-
-### Fine-tuning for Trading
-
-```python
-from ai_trader.embedding.fine_tuning import FineTunedEmbedding, TradingTaskHead
-
-# 트레이딩 특화 헤드 추가
-task_head = TradingTaskHead(
-    embedding_dim=128,
-    task_type='classification',  # 또는 'regression', 'ranking'
-    num_classes=3
-)
-
-# 사전 훈련된 인코더 + 트레이딩 헤드
-finetuned_model = FineTunedEmbedding(
-    base_model=pretrained_autoencoder,
-    task_head=task_head,
-    freeze_encoder=False  # 인코더도 함께 학습
+base = GRPOInferenceE2EXLSTM("models/scalping_v3/scalping_xlstm_model.pt", device="cpu")
+engine = EnhancedGRPOInferenceXLSTM(base)
+# raw_window: 현재까지 도착한 원본 피처; checkpoint의 순서와 단위를 따릅니다.
+# position의 가격은 원화, entry_time/current_time_seconds는 자정 이후 초입니다.
+action, probability, info = engine.predict(
+    raw_window,
+    current_position=None,
+    current_price=latest_price_krw,
+    current_time_seconds=latest_seconds,
+    feature_columns=base.observation_schema["feature_columns"],
 )
 ```
 
-## 🎮 GRPO 강화학습
+`probability`는 행동 선택 확률이며 거래 수익 확률로 보정된 값은 아닙니다. 실시간 래퍼는 최대 보유시간, 손절, 익절, 침체 청산, 활성 상태를 유지하는 트레일링 스탑을 적용합니다. 리플레이 기본 리스크는 최대 보유시간과 손절을 사용합니다. 실시간 추가 규칙을 사용할 때에는 해당 규칙까지 포함한 별도 검증이 필요합니다.
 
-### 그룹 상대 정책 최적화
+반환값은 주문 의도입니다. `risk_exit_all=true`이면 전체 포지션 청산 의도이며, 실제 주문·체결 확인 없이 포지션을 삭제해서는 안 됩니다. 브로커 접수/부분체결/취소/잔고 대사는 외부 실행 계층에서 연결해야 합니다.
 
-#### 훈련-추론 일관성 (중요!)
+## 사전학습
 
-훈련 환경과 실시간 거래가 **동일한 정규화 전략**을 사용합니다:
-- **RollingNormalizer**: 최근 1000개 샘플의 mean/std로 적응형 정규화
-- **분포 이동 문제 해결**: 훈련과 추론의 데이터 분포 일치
-- **실시간 성능 향상**: 일관된 전처리 파이프라인
+BC는 호환되는 스키마와 학습 날짜 이력이 있는 GRU teacher만 받습니다. 현재 5분할 포지션 규격은 시장 피처 + 15채널입니다. 데이터의 train 날짜만 사용하고 teacher의 학습·선택 날짜가 holdout에 섞이면 거부합니다. fast 경로도 동일한 forward/관측을 사용하며 지원되지 않던 TorchScript 단계를 제거했습니다.
 
-```bash
-# 원본 데이터 + RollingNormalizer 사용 (권장)
-python ai_trader/grpo/train_e2e.py \
-    --db "C:\Users\user\Workspace\datasets@raw\datasets_all.duckdb" \
-    --embedding_model models/autoencoder/best_model.pt \
-    --total_timesteps 100000 \
-    --use_raw_data true \
-    --rolling_window_size 1000 \
-    --output_dir models/grpo_scalping
-
-# JSON 설정thon ai_trader/grpo/train_scalping_e2e.py --config config/training_config.json
+```powershell
+python -m ai_trader.grpo.pretrain_behavior_cloning --teacher_policy models/teacher.pt --extracted_dir data/extracted_episodes_v2 --output_path models/pretrain/xlstm.pt
 ```
 
-### 실시간 추론 파이프라인
+스키마나 날짜 이력을 모르는 구 teacher는 사용할 수 없습니다. BC 포지션 예제는 보이는 과거 가격에서 만든 가상 상태이며, 실제 체결 데이터로 만든 매매 성과가 아닙니다.
 
-```python
-from ai_trader.grpo.inference.grpo_infer import GRPOInference
+## 검증 범위
 
-# 초고속 실시간 매매 결정 (2.87ms)
-inference = GRPOInference(
-    policy_path='models/grpo_scalping/policy_final.pt',
-    embedding_model_path='models/autoencoder/best_model.pt',
-    device='cuda',
-    use_torchscript=True  # TorchScript 컴파일로 속도 향상
-)
+회귀 검사는 시간 역행·미래 변경 불변성·원본 가격·마지막 틱 정산·보상/NAV 일치·지연/잔량/취소/만료·리스크 청산·관측 호환성·정책 확률 재현·날짜 분할·best 저장·BC 역전파·작은 CPU 학습/검증/백테스트를 포함합니다.
 
-# 실시간 데이터로 매매 결정
-action, confidence = inference.predict(live_market_data)
-# action: 0=보유, 1=매수, 2=매도
-# confidence: 예측 신뢰도 (0.0 ~ 1.0)
-```
-
-### 스캘핑 특화 보상 구조
-
-- **거래 비용**: 0.215% (수수료 + 세금)
-- **빠른 손절 룰**: 1.5초 내 미상승 시 자동 매도
-- **장기 보유 페널티**: 60초 초과 시 페널티
-- **그룹 상대 어드밴티지**: 시장 상황별 상대 성능 비교
-
-## 📊 성능 벤치마크
-
-### 🎯 성능 목표 vs 실제 결과
-
-| 메트릭            | 목표   | 실제 결과  | 달성도          |
-| ----------------- | ------ | ---------- | --------------- |
-| **추론 속도**     | < 10ms | **2.87ms** | ✅ **3배 개선** |
-| **승률**          | > 50%  | TBD        | 🔄 백테스팅 중  |
-| **샤프 비율**     | > 1.0  | TBD        | 🔄 백테스팅 중  |
-| **최대 낙폭**     | < 10%  | TBD        | 🔄 백테스팅 중  |
-| **평균 보유시간** | < 30초 | TBD        | 🔄 백테스팅 중  |
-
-### 추론 속도 (목표 10ms 대비 3배 개선)
-
-```
-단일 샘플: 2.87ms (목표 대비 71% 개선)
-배치 16:   880 samples/sec
-배치 64:   1,052 samples/sec
-메모리:    GPU 사용량 < 2GB
-```
-
-### 학습 속도 (혁신적 성능)
-
-```
-1,000 샘플:  281 samples/sec
-5,000 샘플:  434 samples/sec
-확장성:      선형적 시간 복잡도
-15억 데이터: 몇 주 내 학습 가능 (기존: 몇 년)
-```
-
-### 벤치마크 실행
-
-```bash
-# 성능 벤치마크 테스트
-python -m pytest tests/test_performance_benchmark.py -v -s
-
-# AutoEncoder 성능 벤치마크
-python scripts/benchmark_autoencoder.py \
-    --model-path models/autoencoder/best_model.pt \
-    --batch-sizes 1,16,64 \
-    --num-samples 1000 \
-    --device cuda
-
-# 간단한 추론 속도 테스트
-python -c "
-import torch, time
-from ai_trader.embedding.autoencoder_model import AutoEncoderEmbedding
-
-model = AutoEncoderEmbedding(input_dim=50, embedding_dim=128, seq_len=3000)
-model.eval()
-
-test_input = torch.randn(1, 60, 50)
-start_time = time.time()
-with torch.no_grad():
-    for _ in range(100):
-        reconstruction, embedding = model(test_input)
-
-avg_time_ms = (time.time() - start_time) / 100 * 1000
-print(f'추론 시간: {avg_time_ms:.2f}ms')
-"
-```
-
-## 🧪 테스트
-
-### 전체 테스트 실행
-
-```bash
-# 모든 단위 테스트 (38개)
-python -m pytest tests/test_embedding_model.py tests/test_embedding_losses.py tests/test_autoencoder_data.py -v
-
-# 성능 벤치마크
-python -m pytest tests/test_performance_benchmark.py -v -s
-
-# 통합 테스트
-python -m pytest tests/test_autoencoder_integration.py -v
-```
-
-### 테스트 결과
-
-```
-✅ 단위 테스트: 38개 모두 통과
-✅ 성능 테스트: 목표 대비 3배 빠른 추론 속도
-✅ 통합 테스트: End-to-End 파이프라인 검증
-```
-
-## 🏗️ 프로젝트 구조
-
-```
-ai_trader/
-├── embedding/              # AutoEncoder 임베딩 모델
-│   ├── autoencoder_model.py    # AutoEncoder & MaskedAutoEncoder
-│   ├── autoencoder_trainer.py  # 훈련 파이프라인
-│   ├── fine_tuning.py          # Fine-tuning 시스템
-│   └── data.py                 # 데이터 로더
-├── grpo/                   # GRPO 강화학습
-│   ├── environments/
-│   │   └── scalping_env.py     # 스캘핑 환경 (RollingNormalizer 통합)
-│   ├── policies/
-│   │   └── scalping_policy.py  # GRPO 정책 네트워크
-│   ├── grpo.py                 # GRPO 알고리즘
-│   ├──alping_e2e.py       # 훈련 스크립트 (Enhanced)
-│   └── inference/
-│       ├── grpo_infer.py       # 기본 추론 엔진
-│       └── enhanced_grpo_infer.py  # 향상된 추론 엔진
-└── reporting/              # 보고서 생성
-    └── html_report.py          # HTML 리포트
-
-lib/                        # 공통 라이브러리
-├── rolling_normalization.py    # RollingNormalizer
-└── normalization.py            # 정규화 전략
-
-scripts/                    # 데이터 처리
-├── data/
-│   ├── normalize_datasets.py   # 데이터 정규화
-│   └── merge_datasets.py       # 데이터 병합
-└── live/
-    └── live_trading.py         # 실시간 거래 시스템
-
-tests/                      # 테스트 스위트
-├── test_autoencoder_*.py
-├── test_performance_benchmark.py
-└── test_autoencoder_integration.py
-```
-
-## 📁 데이터 스키마
-
-```bash
-# 60개 이상의 특징을 가진 시계열 데이터
-날짜 번호 종목코드 종목명 시간 등락률 누적거래대금 거래회전율 체결강도
-매도대기금액1~10 매수대기금액1~10 종목명_scalar 시간_sin 시간_cos 시간_scalar
-```
-
-## ⚙️ 설치 및 설정
-
-### 시스템 요구사항
-
-- Python 3.8+
-- PyTorch 2.2+
-- CUDA 지원 GPU (권장)
-- 16GB+ RAM (32GB 권장)
-
-### 설치
-
-```bash
-# 의존성 설치
-pip install -r requirements.txt
-
-# GPU 지원 (CUDA 사용 시)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
-
-# 개발 환경 설정
-pip install -e .
-```
-
-### 환경 변수
-
-```bash
-# .env 파일 생성
-DB_PATH="C:\Users\user\Workspace\datasets@20260109\datasets_norm_all.duckdb"
-MODEL_DIR="models"
-DEVICE="cuda"  # 또는 "cpu"
-```
+기존 NPZ 3개에서도 정렬된 관측값과 원화 환산을 확인했습니다. 전체 기존 데이터 재생성, 장시간 모델 재학습, 실거래 수익성 또는 현재 xLSTM의 2.87ms 추론은 이번 변경으로 검증한 항목이 아닙니다.

@@ -32,6 +32,10 @@ class RollingNormalizer:
             min_samples: 정규화에 필요한 최소 샘플 수
             feature_names: 특징 이름 리스트
         """
+        if window_size < 1 or min_samples < 1 or min_samples > window_size:
+            raise ValueError("Require 1 <= min_samples <= window_size")
+        if feature_names is not None and (not feature_names or len(set(feature_names)) != len(feature_names)):
+            raise ValueError("feature_names must be an explicit ordered list of unique names")
         self.window_size = window_size
         self.min_samples = min_samples
         self.feature_names = feature_names
@@ -126,7 +130,7 @@ class RollingNormalizer:
         if len(original_shape) == 1:
             normalized = normalized.reshape(-1)
         
-        return normalized
+        return normalized.astype(np.float32)
 
     def _ensure_2d(self, features: np.ndarray) -> np.ndarray:
         if features.ndim == 1:
@@ -134,9 +138,15 @@ class RollingNormalizer:
         return features
 
     def _transform(self, features: np.ndarray) -> np.ndarray:
+        if features.ndim != 2 or not len(features):
+            raise ValueError("Expected nonempty two-dimensional raw features")
+        if self.feature_names is not None and features.shape[1] != len(self.feature_names):
+            raise ValueError("Raw feature width does not match the configured feature order")
+        if not np.isfinite(features).all():
+            raise ValueError("Cannot normalize nonfinite market data")
         if self.strategies is None:
-            return features.astype(np.float32, copy=True)
-        transformed = features.astype(np.float32, copy=True)
+            return features.astype(np.float64, copy=True)
+        transformed = features.astype(np.float64, copy=True)
         for idx, strategy in enumerate(self.strategies):
             if strategy == "log_std":
                 transformed[:, idx] = signed_log1p(transformed[:, idx])
@@ -146,7 +156,7 @@ class RollingNormalizer:
     def _update_window(self, transformed: np.ndarray) -> None:
         batch_size, n_features = transformed.shape
         if self.windows is None:
-            self.windows = np.zeros((self.window_size, n_features), dtype=np.float32)
+            self.windows = np.zeros((self.window_size, n_features), dtype=np.float64)
             self.num_features = n_features
         elif self.num_features is None:
             self.num_features = n_features
