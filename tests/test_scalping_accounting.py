@@ -9,7 +9,7 @@ class ReplayFixture(GRPOScalpingEnv):
         self.input_prices = np.asarray(prices, dtype=np.float64)
         self.input_seconds = np.arange(len(prices), dtype=float) if seconds is None else np.asarray(seconds)
         self.input_execution = execution or {}
-        defaults = dict(seq_len=1, expected_features=2, initial_cash=10000,
+        defaults = dict(max_stages=5, seq_len=1, expected_features=2, initial_cash=10000,
                         transaction_cost_rate=0, sell_tax_rate=0,
                         rolling_min_samples=1, stop_loss_pct=50,
                         execution_config=dict(order_latency_ms=0, slippage_bps=0, spread_bps=0))

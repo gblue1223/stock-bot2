@@ -21,7 +21,7 @@ COLUMNS = ["누적거래대금", "등락률", "현재가"]
 
 def builder():
     return ObservationBuilder(COLUMNS, seq_len=8, rolling_window_size=3,
-                              rolling_min_samples=2, max_holding_seconds=10)
+                              rolling_min_samples=2, max_holding_seconds=10, max_stages=5)
 
 
 def write_episode(directory, suffix_multiplier=1):
@@ -85,7 +85,7 @@ def test_stage_metadata_preserves_elapsed_time_and_five_stages():
     np.testing.assert_allclose(obs[-1, 3:6], [1, 0.01, 0.5])
     assert np.count_nonzero(obs[-1, 6:]) == 0
     np.testing.assert_array_equal(action_mask(0), [True, True, False])
-    np.testing.assert_array_equal(action_mask(5), [True, False, True])
+    np.testing.assert_array_equal(action_mask(5, max_stages=5), [True, False, True])
     with pytest.raises(ValueError, match="after"):
         spec.build(np.ones((8, 3)), [{"entry_price": 100, "entry_time_seconds": 7}], 101, 6)
 
@@ -147,7 +147,7 @@ def test_stagnation_and_inventory_action_masks():
 def test_strict_policy_load_and_masked_prediction(tmp_path):
     spec = builder()
     policy = GRPOPolicyE2EXLSTM(obs_dim=spec.obs_dim, cnn_channels=4,
-                               rnn_hidden_dim=4, fc_hidden_dim=8)
+                               rnn_hidden_dim=4, fc_hidden_dim=8, max_stages=spec.max_stages)
     with torch.no_grad():
         policy.policy_head.weight.zero_()
         policy.policy_head.bias.copy_(torch.tensor([0., 1., 20.]))
@@ -172,11 +172,11 @@ def test_distillation_backward_for_flat_and_full_inventory(tmp_path):
     states = torch.stack([dataset[0], dataset[5]])
     assert states[1, -1, 3::3].sum() == 5
     teacher = GRPOPolicyE2E(obs_dim=spec.obs_dim, cnn_channels=4, rnn_hidden_dim=4, fc_hidden_dim=8).eval()
-    student = GRPOPolicyE2EXLSTM(obs_dim=spec.obs_dim, cnn_channels=4, rnn_hidden_dim=4, fc_hidden_dim=8)
+    student = GRPOPolicyE2EXLSTM(obs_dim=spec.obs_dim, cnn_channels=4, rnn_hidden_dim=4, fc_hidden_dim=8, max_stages=spec.max_stages)
     with torch.no_grad():
         teacher_logits, teacher_values = teacher(states)
     student_logits, student_values = student(states)
-    loss = distillation_loss(teacher_logits, teacher_values, student_logits, student_values, states, 3, 2.)
+    loss = distillation_loss(teacher_logits, teacher_values, student_logits, student_values, states, 3, 2., spec.max_stages)
     assert torch.isfinite(loss)
     loss.backward()
     grads = [p.grad for p in student.parameters() if p.grad is not None]

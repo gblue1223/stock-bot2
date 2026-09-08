@@ -219,9 +219,13 @@ def test_training_cli_end_to_end_with_three_date_holdout(tmp_path, workers):
               'checkpoint_segments': 2, 'evaluation_episodes': 1, 'evaluation_interval': 1,
               'rolling_window_size': 8, 'rolling_min_samples': 1, 'max_holding_seconds': 2,
               'use_gae': True}
+    expected_stages = 1 if workers == 1 else 5
+    if workers == 2:
+        config['max_stages'] = 2  # CLI must override this JSON value.
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(config), encoding='utf-8')
-    process = subprocess.run([sys.executable, '-m', 'ai_trader.grpo.train_xlstm', '--config', str(config_path)],
+    stage_args = [] if workers == 1 else ['--max_stages', '5']
+    process = subprocess.run([sys.executable, '-m', 'ai_trader.grpo.train_xlstm', '--config', str(config_path), *stage_args],
                              cwd=Path(__file__).resolve().parents[1], capture_output=True,
                              env={**os.environ, 'OMP_NUM_THREADS': '1', 'MKL_NUM_THREADS': '1'}, timeout=30)
     assert process.returncode == 0, process.stderr.decode('utf-8', errors='replace')[-4000:]
@@ -233,6 +237,9 @@ def test_training_cli_end_to_end_with_three_date_holdout(tmp_path, workers):
     selected = torch.load(output / 'scalping_xlstm_model.pt', weights_only=False)
     assert selected['observation_schema']['feature_columns'] == manifest['metadata']['feature_columns']
     assert selected['extra_state']['validation_metrics'] == report['validation']
+    assert selected['observation_schema']['max_stages'] == expected_stages
+    assert selected['extra_state']['training_config']['max_stages'] == expected_stages
+    config['max_stages'] = expected_stages
 
     # A historical iteration larger than this run's length must never suppress
     # fine-tuning; only --resume restores progress and Adam state.

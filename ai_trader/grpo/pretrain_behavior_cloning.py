@@ -22,7 +22,7 @@ from ai_trader.grpo.policies.scalping_policy_e2e import GRPOPolicyE2E
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
 from ai_trader.grpo.evaluation import chronological_date_split, normalize_date
 from lib.market_data import chronological_order, times_to_seconds, resolve_feature_price_unit
-from lib.observations import MAX_STAGES, ObservationBuilder
+from lib.observations import ObservationBuilder, validate_max_stages
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +115,7 @@ class OfflineEpisodeDataset(Dataset):
         stages = []
         current_price = None if prices is None else float(prices[end - 1])
         if self.simulate_positions and prices is not None:
-            count = index % (MAX_STAGES + 1)
+            count = index % (self.observation_builder.max_stages + 1)
             # Never create positions earlier than the schema's maximum holding horizon.
             eligible = np.flatnonzero(seconds[start:end] >= seconds[end - 1] - self.observation_builder.max_holding_seconds)
             if count and len(eligible):
@@ -127,12 +127,13 @@ class OfflineEpisodeDataset(Dataset):
 
 
 def distillation_loss(teacher_logits, teacher_values, student_logits, student_values,
-                      states, feature_count: int, temperature: float):
+                      states, feature_count: int, temperature: float, max_stages: int = 1):
     if temperature <= 0:
         raise ValueError("temperature must be positive")
+    max_stages = validate_max_stages(max_stages)
     inventory = states[:, -1, feature_count::3].sum(dim=-1)
     valid = torch.stack((torch.ones_like(inventory, dtype=torch.bool),
-                         inventory < MAX_STAGES, inventory > 0), dim=-1)
+                         inventory < max_stages, inventory > 0), dim=-1)
     # Finite sentinel avoids KL's 0 * infinity when an action is invalid.
     sentinel = torch.finfo(student_logits.dtype).min
     teacher_scaled = (teacher_logits / temperature).masked_fill(~valid, sentinel)
@@ -191,7 +192,7 @@ def pretrain(teacher_path: str, extracted_dir: str, output_path: str,
     teacher = GRPOPolicyE2E(**model_args).to(device)
     teacher.load_state_dict(state, strict=True)
     teacher.eval()
-    student = GRPOPolicyE2EXLSTM(**model_args).to(device)
+    student = GRPOPolicyE2EXLSTM(**model_args, max_stages=builder.max_stages).to(device)
     for name in ("conv1", "bn1", "conv2", "bn2"):
         getattr(student, name).load_state_dict(getattr(teacher, name).state_dict(), strict=True)
     student.train()
@@ -204,7 +205,7 @@ def pretrain(teacher_path: str, extracted_dir: str, output_path: str,
                 teacher_logits, teacher_values = teacher(states)
             student_logits, student_values = student(states)
             loss = distillation_loss(teacher_logits, teacher_values, student_logits, student_values,
-                                     states, len(builder.feature_columns), temperature)
+                                     states, len(builder.feature_columns), temperature, builder.max_stages)
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite distillation loss")
             optimizer.zero_grad()

@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
 from torch.distributions import Categorical
+from lib.observations import validate_max_stages
 
 logger = logging.getLogger(__name__)
 
@@ -237,9 +238,11 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         rnn_hidden_dim: int = 128,
         fc_hidden_dim: int = 256,
         action_dim: int = 3,
-        checkpoint_segments: int = 16
+        checkpoint_segments: int = 16,
+        max_stages: int = 1
     ):
         super().__init__()
+        self.max_stages = validate_max_stages(max_stages)
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.cnn_channels = cnn_channels
@@ -321,7 +324,7 @@ class GRPOPolicyE2EXLSTM(nn.Module):
             active_stages = (state[:, -1, -15::3] > 0.5).sum(dim=-1)
             valid_actions = torch.stack([
                 torch.ones_like(active_stages, dtype=torch.bool),
-                active_stages < 5,
+                active_stages < self.max_stages,
                 active_stages > 0,
             ], dim=-1)
             action_logits = action_logits.masked_fill(

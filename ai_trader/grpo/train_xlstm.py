@@ -27,7 +27,7 @@ from ai_trader.grpo.evaluation import (
     chronological_date_split, compatible_resume_best, evaluate_policy,
     evaluation_signature, normalize_date, validate_checkpoint_dates,
 )
-from lib.observations import ObservationBuilder
+from lib.observations import ObservationBuilder, validate_max_stages
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
 
 
@@ -112,6 +112,7 @@ class TrainingConfig:
         self.evaluation_seed = 42
         self.cache_max_bytes = 256 * 1024 * 1024
         self.initial_cash = 1_000_000.0
+        self.max_stages = 1
         self.max_holding_seconds = 300.0
         self.stop_loss_pct = 2.0
         self.execution_config = {
@@ -160,6 +161,7 @@ class TrainingConfig:
 
     def validate(self):
         errors = []
+        validate_max_stages(self.max_stages)
         if not isinstance(self.resume, bool):
             errors.append("resume must be a boolean")
         if self.resume and not self.load_policy:
@@ -214,6 +216,7 @@ def create_environment(config: TrainingConfig, device: str, allowed_dates=None):
             rolling_window_size=config.rolling_window_size,
             rolling_min_samples=config.rolling_min_samples,
             initial_cash=config.initial_cash,
+            max_stages=config.max_stages,
             max_holding_seconds=config.max_holding_seconds,
             stop_loss_pct=config.stop_loss_pct,
             execution_config=config.execution_config,
@@ -233,6 +236,7 @@ def create_policy(config: TrainingConfig, env, device: str):
             rnn_hidden_dim=config.rnn_hidden_dim,
             fc_hidden_dim=config.hidden_dim,
             action_dim=config.action_dim,
+            max_stages=config.max_stages,
             checkpoint_segments=config.checkpoint_segments
         )
         policy.to(device)
@@ -297,6 +301,8 @@ def main():
     parser.add_argument('--evaluation_episodes', type=int, default=None)
     parser.add_argument('--evaluation_interval', type=int, default=None)
     parser.add_argument('--evaluation_seed', type=int, default=None)
+    parser.add_argument('--max_stages', '--max-stages', type=int, choices=range(1, 6), default=None,
+                        help='Maximum position entries (1-5; default: 1, no split entries)')
     parser.add_argument('--max_holding_seconds', type=float, default=None)
     parser.add_argument('--stop_loss_pct', type=float, default=None)
     parser.add_argument('--initial_cash', type=float, default=None)

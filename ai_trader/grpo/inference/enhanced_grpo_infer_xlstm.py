@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
-from lib.observations import MAX_STAGES, ObservationBuilder, action_mask
+from lib.observations import ObservationBuilder, action_mask
 
 
 class Action(Enum):
@@ -68,7 +68,8 @@ class GRPOInferenceE2EXLSTM:
         policy = GRPOPolicyE2EXLSTM(
             obs_dim=obs_dim, cnn_channels=int(state["conv1.weight"].shape[0]),
             rnn_hidden_dim=int(state["xlstm.cells.0.w_q.weight"].shape[0]),
-            fc_hidden_dim=int(state["fc1.weight"].shape[0]), action_dim=3)
+            fc_hidden_dim=int(state["fc1.weight"].shape[0]), action_dim=3,
+            max_stages=self.observation_builder.max_stages)
         policy.load_state_dict(state, strict=True)
         policy.to(self.device)
         policy.eval()
@@ -96,7 +97,7 @@ class GRPOInferenceE2EXLSTM:
                                        current_time_seconds=current_time_seconds,
                                        feature_columns=feature_columns, feature_price_unit=feature_price_unit)
         inputs = torch.from_numpy(state).unsqueeze(0).to(self.device)
-        valid = torch.as_tensor(action_mask(len(stages)), device=self.device)
+        valid = torch.as_tensor(action_mask(len(stages), self.observation_builder.max_stages), device=self.device)
         with torch.inference_mode():
             logits, _ = self.policy(inputs)
             logits = logits.masked_fill(~valid.unsqueeze(0), -torch.inf)
@@ -147,8 +148,8 @@ class EnhancedGRPOInferenceXLSTM:
         self.stats["total_predictions"] += 1
         positions = ([] if current_position is None else
                      [current_position] if isinstance(current_position, Position) else list(current_position))
-        if len(positions) > MAX_STAGES:
-            raise ValueError("At most five filled stages are supported")
+        if len(positions) > self.base_inference.observation_builder.max_stages:
+            raise ValueError("Filled stages exceed checkpoint max_stages")
         if positions:
             if not np.isfinite(current_price) or current_price <= 0:
                 raise ValueError("Risk decisions require the latest positive raw execution price")
@@ -198,7 +199,7 @@ class EnhancedGRPOInferenceXLSTM:
             current_time_seconds=current_time_seconds, feature_columns=feature_columns,
             feature_price_unit=feature_price_unit)
         info = {"raw_action": action, "confidence": confidence}
-        if not action_mask(len(stages))[action]:
+        if not action_mask(len(stages), self.base_inference.observation_builder.max_stages)[action]:
             info.update(filtered=True, filter_reason="Invalid action for filled inventory")
             return Action.HOLD.value, confidence, info
         if action == Action.BUY.value:

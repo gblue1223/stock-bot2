@@ -96,6 +96,7 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     assert config['use_raw_data'] and config['use_gae']
     assert config['batch_size'] == 64 and config['num_workers'] <= 4
     assert config['max_trades_per_episode'] is None
+    assert config['max_stages'] == 1
     for field in ('win_bonus', 'loss_penalty', 'buy_signal_bonus', 'no_trade_penalty'):
         assert config[field] == 0
     assert config['max_holding_seconds'] == 300
@@ -145,3 +146,11 @@ def test_restore_rejects_old_checkpoint_and_exhausted_resume_budget():
         helpers()['restore_run_config'](base, checkpoint, 'resume')
     # Fine tuning starts a new budget; it need not exceed the old cumulative steps.
     assert not helpers()['restore_run_config'](base, checkpoint, 'finetune')['resume']
+
+
+def test_legacy_five_stage_notebook_resume_restores_recorded_limit():
+    checkpoint, base = checkpoint_and_base()
+    checkpoint['observation_schema']['max_stages'] = 5
+    checkpoint['extra_state']['training_config'].pop('max_stages')
+    restored = helpers()['restore_run_config'](base, checkpoint, 'resume')
+    assert base['max_stages'] == 1 and restored['max_stages'] == 5

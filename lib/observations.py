@@ -11,22 +11,31 @@ import numpy as np
 from lib.normalization import LOGSTD_FEATURES
 
 SCHEMA_VERSION = 2
-MAX_STAGES = 5
+MAX_STAGES = 5  # Fixed observation capacity; unused slots stay zero.
 STAGE_FIELDS = ("is_active", "profit_rate", "holding_fraction")
 NORMALIZATION = "causal_window_log_zscore_v1"
 
 
-def action_mask(stage_count: int) -> np.ndarray:
+def validate_max_stages(max_stages: int) -> int:
+    if isinstance(max_stages, (bool, np.bool_)) or not isinstance(max_stages, (int, np.integer)) or not 1 <= max_stages <= MAX_STAGES:
+        raise ValueError("max_stages must be an integer between 1 and 5")
+    return int(max_stages)
+
+
+def action_mask(stage_count: int, max_stages: int = 1) -> np.ndarray:
     """Return valid HOLD/BUY/SELL actions for filled inventory."""
-    if not isinstance(stage_count, (int, np.integer)) or not 0 <= stage_count <= MAX_STAGES:
-        raise ValueError("stage_count must be an integer between 0 and 5")
-    return np.array([True, stage_count < MAX_STAGES, stage_count > 0], dtype=bool)
+    max_stages = validate_max_stages(max_stages)
+    if not isinstance(stage_count, (int, np.integer)) or not 0 <= stage_count <= max_stages:
+        raise ValueError("stage_count must be between zero and max_stages")
+    return np.array([True, stage_count < max_stages, stage_count > 0], dtype=bool)
 
 
 class ObservationBuilder:
     def __init__(self, feature_columns: Sequence[str], seq_len: int = 3000,
                  rolling_window_size: int = 1000, rolling_min_samples: int = 100,
-                 max_holding_seconds: float = 300.0, feature_price_unit: str = "krw"):
+                 max_holding_seconds: float = 300.0, feature_price_unit: str = "krw",
+                 max_stages: int = 1):
+        self.max_stages = validate_max_stages(max_stages)
         self.feature_columns = list(feature_columns)
         if (not self.feature_columns or any(not isinstance(x, str) or not x for x in self.feature_columns)
                 or len(set(self.feature_columns)) != len(self.feature_columns)):
@@ -54,7 +63,7 @@ class ObservationBuilder:
         return {"version": SCHEMA_VERSION, "feature_columns": list(self.feature_columns),
                 "seq_len": self.seq_len, "rolling_window_size": self.rolling_window_size,
                 "rolling_min_samples": self.rolling_min_samples,
-                "max_holding_seconds": self.max_holding_seconds, "max_stages": MAX_STAGES,
+                "max_holding_seconds": self.max_holding_seconds, "max_stages": self.max_stages,
                 "stage_fields": list(STAGE_FIELDS), "normalization": NORMALIZATION,
                 "feature_price_unit": self.feature_price_unit}
 
@@ -63,7 +72,7 @@ class ObservationBuilder:
         if not isinstance(schema, Mapping):
             raise ValueError("Checkpoint has no observation_schema; retrain using the current pipeline")
         required = ("feature_columns", "seq_len", "rolling_window_size",
-                    "rolling_min_samples", "max_holding_seconds", "feature_price_unit")
+                    "rolling_min_samples", "max_holding_seconds", "feature_price_unit", "max_stages")
         if any(key not in schema for key in required):
             raise ValueError("Incomplete observation_schema; retrain using the current pipeline")
         builder = cls(**{key: schema[key] for key in required})
@@ -104,8 +113,8 @@ class ObservationBuilder:
               current_price: float | None = None,
               current_time_seconds: float | None = None) -> np.ndarray:
         """Build market history plus five FIFO stages, with timestamps in seconds."""
-        if len(stages) > MAX_STAGES:
-            raise ValueError("At most five filled stages are supported")
+        if len(stages) > self.max_stages:
+            raise ValueError("Filled stages exceed configured max_stages")
         # Fix the history span across environment, BC and live callers.
         features = self.normalize(np.asarray(raw_window)[-self.seq_len:])
         state = np.zeros((self.seq_len, self.obs_dim), dtype=np.float32)

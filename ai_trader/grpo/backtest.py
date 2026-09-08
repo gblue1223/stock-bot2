@@ -33,6 +33,7 @@ def run_backtest(policy_path, *, extracted_dir=None, partition='test', episodes=
         allowed_dates=splits[partition], expected_features=len(schema['feature_columns']),
         seq_len=schema['seq_len'], max_episode_steps=config['episode_steps'],
         rolling_window_size=schema['rolling_window_size'], rolling_min_samples=schema['rolling_min_samples'],
+        max_stages=schema['max_stages'],
         max_holding_seconds=schema['max_holding_seconds'], initial_cash=config['initial_cash'],
         transaction_cost_rate=config['transaction_cost_rate'], buy_tax_rate=config['buy_tax_rate'],
         sell_tax_rate=config['sell_tax_rate'], stop_loss_pct=config['stop_loss_pct'],

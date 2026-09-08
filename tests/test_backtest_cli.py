@@ -9,7 +9,7 @@ from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
 from lib.observations import ObservationBuilder
 
 
-def checkpoint_fixture(tmp_path):
+def checkpoint_fixture(tmp_path, max_stages=1):
     directory = tmp_path / 'episodes'
     directory.mkdir()
     dates = ['20260101', '20260102', '20260103']
@@ -28,8 +28,8 @@ def checkpoint_fixture(tmp_path):
     (directory / 'manifest.json').write_text(json.dumps({
         'metadata': dict(schema_version=2, feature_columns=columns, price_unit='krw', return_rate_index=1),
         'episodes': episodes}), encoding='utf-8')
-    builder = ObservationBuilder(columns, seq_len=4, rolling_window_size=4, rolling_min_samples=2)
-    policy = GRPOPolicyE2EXLSTM(obs_dim=18, cnn_channels=4, rnn_hidden_dim=4, fc_hidden_dim=8)
+    builder = ObservationBuilder(columns, seq_len=4, rolling_window_size=4, rolling_min_samples=2, max_stages=max_stages)
+    policy = GRPOPolicyE2EXLSTM(obs_dim=18, cnn_channels=4, rnn_hidden_dim=4, fc_hidden_dim=8, max_stages=max_stages)
     with torch.no_grad():
         policy.policy_head.weight.zero_()
         policy.policy_head.bias.copy_(torch.tensor([5., 0., 0.]))
@@ -43,12 +43,14 @@ def checkpoint_fixture(tmp_path):
     return path
 
 
-def test_backtest_cli_reuses_recorded_holdout_settings_and_writes_json(tmp_path):
-    path = checkpoint_fixture(tmp_path)
+@pytest.mark.parametrize('max_stages', [1, 5])
+def test_backtest_cli_reuses_recorded_holdout_settings_and_writes_json(tmp_path, max_stages):
+    path = checkpoint_fixture(tmp_path, max_stages)
     output = tmp_path / 'report.json'
     assert main(['--policy', str(path), '--output', str(output), '--order-latency-ms', '250']) == 0
     report = json.loads(output.read_text(encoding='utf-8'))
     assert report['dates'] == ['20260103']
+    assert report['observation_schema']['max_stages'] == max_stages
     assert report['execution_config']['order_latency_ms'] == 250
     assert report['metrics']['mean_net_return'] == 0
     assert report['metrics']['synthetic_execution_episodes'] == 0

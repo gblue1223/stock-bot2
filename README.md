@@ -102,6 +102,17 @@ python -m ai_trader.grpo.backtest --policy models/scalping_v3/checkpoints/checkp
 python -m ai_trader.grpo.data_extractor --db "D:/path/to/datasets_raw.duckdb" --output_dir data/extracted_episodes_v2 --seq_len 120 --features 27 --max_steps 300 --price-unit krw
 ```
 
+분할 매수 단계 수는 학습 CLI의 `--max_stages`(또는 `--max-stages`)로 설정합니다. 허용 범위는 1~5이며 기본값은 **1**입니다. 1이면 초기 자금과 가용 현금 한도에서 한 번 매수하고 매도 신호에 보유 전량을 주문합니다. 5이면 매수 주문당 초기 자금의 최대 1/5을 사용하고, 매도 신호에 가장 오래된 단계부터 정리합니다. 부분 체결·수수료·호가 수량에 따라 실제 투자 비중과 청산 시점은 달라집니다.
+
+```powershell
+python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --max_stages 1 --output_dir models/scalping_single
+python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --max_stages 5 --output_dir models/scalping_five
+```
+
+CLI 값은 JSON 설정의 `max_stages`보다 우선합니다. `--max_trades_per_episode`는 별도의 거래 횟수 제한입니다. 관측값은 5개 슬롯을 예약하고 미사용 슬롯을 0으로 채우므로 27개 시장 특징 기준 42차원을 유지합니다. 분할 수는 체크포인트 관측 스키마와 학습 설정에 기록되며, 추론·백테스트는 저장된 값을 복원합니다. 기존 v2 5분할 체크포인트는 그대로 추론할 수 있지만, CLI로 이어서 학습하려면 `--max_stages 5`를 명시해야 합니다. 다른 분할 수의 체크포인트 로딩은 거부되므로 변경 시 새 학습을 시작하세요. 원시 에피소드는 다시 추출할 필요가 없습니다.
+
+Colab 노트북의 새 학습도 기본 1단계이며 설정 셀의 `MAX_STAGES`(기존 노트북은 `max_stages`)로 변경합니다. A100 노트북의 `resume`/`finetune`은 체크포인트의 분할 수를 보존합니다.
+
 호가를 보존한 원본 DB에서 A100 노트북용 오전 9~11시 데이터를 직접 만들 수도 있습니다. 대기금액 컬럼이 없으면 원본 호가×수량으로 계산하고, 실제 호가·수량은 별도 실행 배열로 저장합니다. 중간 DB 전체를 복제할 필요가 없습니다.
 
 ```powershell

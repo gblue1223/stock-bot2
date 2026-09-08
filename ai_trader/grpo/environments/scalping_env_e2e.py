@@ -12,7 +12,7 @@ import gymnasium as gym
 from gymnasium import spaces
 
 from lib.market_data import parse_time_seconds, times_to_seconds
-from lib.observations import ObservationBuilder
+from lib.observations import ObservationBuilder, validate_max_stages
 from .execution import ExecutionSimulator
 
 logger = logging.getLogger(__name__)
@@ -31,8 +31,9 @@ class GRPOScalpingEnv(gym.Env):
                  step_reward_scale=1.0, win_bonus=0.0, loss_penalty=0.0,
                  buy_signal_bonus=0.0, initial_cash=1000000.0,
                  max_holding_seconds=300.0, stop_loss_pct=2.0,
-                 execution_config=None, allowed_dates=None, price_scale=1.0):
+                 execution_config=None, allowed_dates=None, price_scale=1.0, max_stages=1):
         super().__init__()
+        self.max_stages = validate_max_stages(max_stages)
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table_name):
             raise ValueError('table_name must be a simple SQL identifier')
         if seq_len < 1 or expected_features < 1 or initial_cash <= 0 or not np.isfinite(initial_cash):
@@ -85,7 +86,7 @@ class GRPOScalpingEnv(gym.Env):
             rolling_window_size=self.rolling_window_size,
             rolling_min_samples=self.rolling_min_samples,
             max_holding_seconds=self.max_holding_seconds,
-            feature_price_unit=self.price_unit)
+            feature_price_unit=self.price_unit, max_stages=self.max_stages)
         self.obs_dim = self.expected_features + self.MAX_STAGES * 3
         self.observation_space = spaces.Box(-np.inf, np.inf, (self.seq_len, self.obs_dim), np.float32)
         self.action_space = spaces.Discrete(3)
@@ -115,7 +116,7 @@ class GRPOScalpingEnv(gym.Env):
 
     @property
     def max_split_count(self):
-        return self.MAX_STAGES
+        return self.max_stages
 
     @property
     def quantity(self):
@@ -356,10 +357,10 @@ class GRPOScalpingEnv(gym.Env):
         elif action == 1:
             open_order_ids = {st['order_id'] for st in self.stages} | {o.order_id for o in self._pending('buy')}
             within_limit = self.max_trades_per_episode is None or len(self.episode_trades) < self.max_trades_per_episode
-            if len(open_order_ids) < self.MAX_STAGES and within_limit and not self._pending('buy'):
+            if len(open_order_ids) < self.max_stages and within_limit and not self._pending('buy'):
                 ask = self.simulator.snapshot.asks[0][0] if self.simulator.snapshot.asks else self.current_price
                 expected = self.simulator.execution_price(ask, 'buy') * (1 + self.buy_fee_rate)
-                qty = int(min(self.cash, self.initial_cash / self.MAX_STAGES) / expected)
+                qty = int(min(self.cash, self.initial_cash / self.max_stages) / expected)
                 if qty > 0:
                     self.simulator.submit('buy', qty, now)
         elif action == 2 and self.stages and not self._pending('sell'):
