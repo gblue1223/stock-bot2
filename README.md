@@ -102,6 +102,16 @@ python -m ai_trader.grpo.backtest --policy models/scalping_v3/checkpoints/checkp
 python -m ai_trader.grpo.data_extractor --db "D:/path/to/datasets_raw.duckdb" --output_dir data/extracted_episodes_v2 --seq_len 120 --features 27 --max_steps 300 --price-unit krw
 ```
 
+호가를 보존한 원본 DB에서 A100 노트북용 오전 9~11시 데이터를 직접 만들 수도 있습니다. 대기금액 컬럼이 없으면 원본 호가×수량으로 계산하고, 실제 호가·수량은 별도 실행 배열로 저장합니다. 중간 DB 전체를 복제할 필요가 없습니다.
+
+```powershell
+python -m ai_trader.grpo.data_extractor --db "D:/path/to/raw_with_orderbook.duckdb" --output_dir data/extracted_episodes_v2 --seq_len 1024 --features 27 --max_steps 300 --price-unit krw --time-start 90000000 --time-end 110000000 --workers 4 --threads 2 --memory-limit 3GB --compression-level 1
+```
+
+`--workers`는 병렬 에피소드 처리 수입니다. `--executor process`는 Python 문자열 처리도 여러 CPU 프로세스로 나눕니다. 이때 DuckDB의 `--memory-limit`은 프로세스마다 적용되므로, 예를 들어 `--workers 4 --executor process --memory-limit 1GB`는 DB 버퍼만 최대 약 4GB이며 worker별 Pandas/NumPy 배열 메모리가 추가로 필요합니다. 기본 thread 모드에서는 DB 버퍼를 공유합니다. `--compression-level 1`은 압축 시간을 줄이며 NPZ 형식은 같습니다. `seq_len`은 추출 대상의 최소 길이를 결정하고, `max_steps`는 실행 설정 기록용이며 파일에는 해당 시간 구간 전체를 저장합니다.
+
+중단 시 같은 명령에 `--resume`을 붙이면 `completed.jsonl`에 기록된 파일부터 이어갑니다. 원본 경로·크기·수정 시각과 추출 설정이 같아야 하며, 완성된 `manifest.json`이 있는 출력은 덮어쓰지 않습니다. `progress.json`에서 진행량을 확인할 수 있습니다. 원본에 호가 갱신 시각이 없으면 이를 임의로 만들어 저장하지 않습니다.
+
 소스 DB는 명시적 특징 스키마의 컬럼을 포함해야 합니다. `scripts/data/generate_datasets.py`로 원본 CSV의 체결·호가·거래원 이벤트를 합칠 수 있습니다. `--price-unit`은 원본 가격 단위를 반드시 지정합니다. 현재 `extract_260811.py`가 만드는 데이터는 KRW이며, 과거에 만들어진 백만원 단위 DB에는 `million_krw`가 필요합니다. 서로 다른 가격 단위를 섞은 DB는 먼저 단위를 통일해야 합니다.
 
 추출기는 이미 있는 manifest나 에피소드 파일을 덮어쓰지 않습니다. 새 출력 디렉터리를 사용합니다. `scripts/data/normalize_datasets.py`는 이제 결정적인 파생 피처를 생성하고 원본 숫자를 보존합니다. 하루 전체 mean/std 정규화는 하지 않습니다.

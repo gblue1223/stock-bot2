@@ -140,3 +140,4 @@ scripts/gcp/config.sh
 *.npy
 *.npz
 extracted_episodes/
+data/extracted_episodes_v2/
