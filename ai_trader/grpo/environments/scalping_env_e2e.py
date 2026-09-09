@@ -208,9 +208,10 @@ class GRPOScalpingEnv(gym.Env):
         self.cash, self.realized_net_pnl = self.initial_cash, 0.0
         self.loss_holding_violations = 0
         self.buy_action_outcomes = dict.fromkeys((
-            'submitted', 'risk_exit_active', 'max_stages', 'max_trades',
+            'submitted', 'risk_exit_active', 'signal_exit_active', 'max_stages', 'max_trades',
             'pending_buy', 'insufficient_budget_for_one_share'), 0)
         self._exit_requested, self._done = False, False
+        self._signal_exit_order_id = None
         self.simulator.reset()
         self._update_market_fields()
         self.simulator.process(self._snapshot(self.current_step))
@@ -334,6 +335,16 @@ class GRPOScalpingEnv(gym.Env):
         if qty > 0:
             self.simulator.submit('sell', qty, timestamp, reason=reason)
 
+    def _request_stage_exit(self, timestamp):
+        """Finish the selected FIFO stage, including fills racing its cancellation."""
+        self.simulator.cancel_all(timestamp, side='buy')
+        target = next((stage for stage in self.stages
+                       if stage['order_id'] == self._signal_exit_order_id), None)
+        pending_qty = sum(order.remaining for order in self._pending('sell'))
+        qty = (target['quantity'] if target is not None else 0) - pending_qty
+        if qty > 0:
+            self.simulator.submit('sell', qty, timestamp, reason='signal')
+
     def _equity(self):
         return self.cash + self.quantity * self.simulator.liquidation_mark() * (1 - self.sell_fee_rate)
 
@@ -359,6 +370,10 @@ class GRPOScalpingEnv(gym.Env):
             self._request_exit('risk_exit_retry', now)
             if action == 1:
                 self.buy_action_outcomes['risk_exit_active'] += 1
+        elif self._signal_exit_order_id is not None:
+            self._request_stage_exit(now)
+            if action == 1:
+                self.buy_action_outcomes['signal_exit_active'] += 1
         elif action == 1:
             open_order_ids = {st['order_id'] for st in self.stages} | {o.order_id for o in self._pending('buy')}
             within_limit = self.max_trades_per_episode is None or len(self.episode_trades) < self.max_trades_per_episode
@@ -380,7 +395,8 @@ class GRPOScalpingEnv(gym.Env):
             # Exactly one outcome per BUY decision; guards retain their original priority.
             self.buy_action_outcomes[outcome] += 1
         elif action == 2 and self.stages and not self._pending('sell'):
-            self.simulator.submit('sell', self.stages[0]['quantity'], now)
+            self._signal_exit_order_id = self.stages[0]['order_id']
+            self._request_stage_exit(now)
         # A holding deadline is a timer event, even when no market tick arrives then.
         if self.stages:
             deadline = min(s['entry_time_seconds'] + self.max_holding_seconds for s in self.stages)
@@ -407,6 +423,9 @@ class GRPOScalpingEnv(gym.Env):
             self.simulator.cancel_all(self.current_time_seconds, end_of_replay=True)
         elif self._exit_requested and not self.stages and not self._pending('buy'):
             self._exit_requested = False
+        if (self._signal_exit_order_id is not None and not self._pending('buy')
+                and not any(stage['order_id'] == self._signal_exit_order_id for stage in self.stages)):
+            self._signal_exit_order_id = None
         info = {'position': self.position, 'position_steps': self.position_steps,
                 'current_price': self.current_price, 'current_time': self.current_time,
                 'cash': self.cash, 'equity': self.equity, 'fills': [fill.__dict__ for fill in fills],

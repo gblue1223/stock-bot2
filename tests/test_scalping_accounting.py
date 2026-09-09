@@ -113,3 +113,52 @@ def test_backwards_time_fails_instead_of_hiding_bad_data():
     env = ReplayFixture([100, 100, 100], seconds=[0, 2, 1])
     with pytest.raises(ValueError, match='monotonic'):
         env.reset()
+
+
+def test_signal_sell_cancels_partial_buy_before_remaining_quantity_can_fill():
+    n = 5
+    execution = {'bid_prices': np.full((n, 1), 99.), 'ask_prices': np.full((n, 1), 100.),
+                 'bid_sizes': np.full((n, 1), 100.), 'ask_sizes': np.array([[1], [1], [100], [100], [100]])}
+    env = ReplayFixture([100] * n, seconds=[0, .1, .2, .3, .4], execution=execution,
+                        max_stages=1, initial_cash=1000)
+    env.reset()
+    env.step(1)
+    assert env.quantity == 1 and env._pending('buy')[0].remaining == 9
+    env.step(2)
+    assert env.quantity == 0 and not env._pending('buy')
+    assert env.simulator.orders[0].status == 'cancelled'
+    assert env._signal_exit_order_id is None
+
+
+def test_signal_sell_retries_late_buy_fills_until_single_stage_is_flat():
+    n = 6
+    execution = {'bid_prices': np.full((n, 1), 99.), 'ask_prices': np.full((n, 1), 100.),
+                 'bid_sizes': np.full((n, 1), 100.),
+                 'ask_sizes': np.array([[1], [1], [100], [100], [100], [100]])}
+    env = ReplayFixture([100] * n, seconds=[0, .1, .11, .2, .3, .4], execution=execution,
+                        max_stages=1, initial_cash=1000)
+    env.reset()
+    env.step(1)
+    env.step(2)  # Another fill arrives before the 50 ms cancel acknowledgement.
+    assert env.quantity == 9 and env._signal_exit_order_id is not None
+    env.step(0)  # The sell intent survives the policy's next HOLD.
+    assert env.quantity == 0 and env._signal_exit_order_id is None
+    assert sum(trade['quantity'] for trade in env.episode_trades) == 10
+
+
+def test_signal_sell_keeps_later_fifo_stages_when_partial_first_stage_exits():
+    n = 7
+    execution = {'bid_prices': np.full((n, 1), 99.), 'ask_prices': np.full((n, 1), 100.),
+                 'bid_sizes': np.array([[1], [1], [1], [1], [2], [2], [2]]),
+                 'ask_sizes': np.full((n, 1), 100.)}
+    env = ReplayFixture([100] * n, execution=execution, max_stages=5, initial_cash=1000)
+    env.reset()
+    env.step(1)
+    env.step(1)
+    assert [stage['quantity'] for stage in env.stages] == [2, 2]
+    later_id = env.stages[1]['order_id']
+    env.step(2)
+    assert [stage['quantity'] for stage in env.stages] == [1, 2]
+    env.step(0)
+    assert len(env.stages) == 1 and env.stages[0]['order_id'] == later_id
+    assert env.stages[0]['quantity'] == 2 and env._signal_exit_order_id is None

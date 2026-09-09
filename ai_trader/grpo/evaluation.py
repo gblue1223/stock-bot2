@@ -237,6 +237,7 @@ def evaluation_signature(config: dict, date_splits: dict, observation_schema: di
     """Settings that must match before inheriting another checkpoint's best."""
     defaults = {
         'episode_steps': 600, 'evaluation_episodes': 8, 'evaluation_seed': 42,
+        'selection_require_liquidation': False,  # Historical checkpoints used marked NAV without this filter.
         'transaction_cost_rate': .00015, 'buy_tax_rate': 0.0, 'sell_tax_rate': .0018,
         'initial_cash': 1_000_000.0, 'stop_loss_pct': 2.0,
         'max_trades_per_episode': None, 'base_price': 100000.0, 'price_scale': 1.0,

@@ -218,7 +218,7 @@ def test_training_cli_end_to_end_with_three_date_holdout(tmp_path, workers):
               'num_epochs': 1, 'cnn_channels': 4, 'rnn_hidden_dim': 4, 'hidden_dim': 8,
               'checkpoint_segments': 2, 'evaluation_episodes': 1, 'evaluation_interval': 1,
               'rolling_window_size': 8, 'rolling_min_samples': 1, 'max_holding_seconds': 2,
-              'use_gae': True}
+              'use_gae': True, 'execution_config': {'require_order_book': False}}
     expected_stages = 1 if workers == 1 else 5
     if workers == 2:
         config['max_stages'] = 2  # CLI must override this JSON value.

@@ -72,6 +72,7 @@ class GRPOTrainer:
         observation_schema: Optional[Dict[str, Any]] = None,
         evaluation_callback: Optional[Callable[[nn.Module], Dict[str, Any]]] = None,
         evaluation_interval: int = 1,
+        selection_require_liquidation: bool = False,
     ):
         self.policy = policy
         
@@ -105,6 +106,9 @@ class GRPOTrainer:
         self.observation_schema = observation_schema
         self.evaluation_callback = evaluation_callback
         self.evaluation_interval = max(1, evaluation_interval)
+        self.selection_require_liquidation = selection_require_liquidation
+        if selection_require_liquidation and evaluation_callback is None:
+            raise ValueError("Liquidation-aware selection requires a validation callback")
         logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}")
         
         # Optimizer 초기화
@@ -876,19 +880,32 @@ class GRPOTrainer:
         
         return advantages.astype(np.float32), returns.astype(np.float32)
     
-    def _seed_resume_best(self, checkpoint_path, start_iteration, candidates):
-        """Protect a resumed model's validated baseline before any new update."""
-        if self.evaluation_callback is None:
-            raise ValueError("Resume best preservation requires a validation callback")
+    def _validation_selection_score(self, metrics):
+        """Rank realized validation returns; incomplete liquidation is ineligible."""
+        value = float(metrics['mean_net_return'])
+        if not np.isfinite(value):
+            raise ValueError("Validation mean_net_return must be finite")
+        if self.selection_require_liquidation:
+            try:
+                incomplete = float(metrics['incomplete_liquidation_episodes'])
+                residual = float(metrics['max_open_quantity'])
+            except (KeyError, TypeError, ValueError):
+                logger.warning("Validation candidate excluded: missing/invalid liquidation diagnostics")
+                return None
+            if not (np.isfinite(incomplete) and np.isfinite(residual)
+                    and incomplete == 0 and residual == 0):
+                logger.warning("Validation candidate excluded: incomplete_liquidation_episodes=%s, "
+                               "max_open_quantity=%s", incomplete, residual)
+                return None
+        return value
 
-        def score(metrics):
-            value = float(metrics['mean_net_return'])
-            if not np.isfinite(value):
-                raise ValueError("Validation mean_net_return must be finite")
-            return value
+    def _seed_resume_best(self, checkpoint_path, start_iteration, candidates):
+        """Protect imported weights' validated baseline before any new update."""
+        if self.evaluation_callback is None:
+            raise ValueError("Initial best preservation requires a validation callback")
 
         best_metrics = self.evaluation_callback(self.policy)
-        best_score = score(best_metrics)
+        best_score = self._validation_selection_score(best_metrics)
         best_checkpoint = None
         if candidates:
             import copy
@@ -899,26 +916,30 @@ class GRPOTrainer:
                         raise ValueError("Resume best checkpoint observation schema mismatch")
                     self.policy.load_state_dict(candidate['policy_state_dict'], strict=True)
                     metrics = self.evaluation_callback(self.policy)
-                    value = score(metrics)
-                    if value >= best_score:
+                    value = self._validation_selection_score(metrics)
+                    if value is not None and (best_score is None or value >= best_score):
                         best_score, best_metrics, best_checkpoint = value, metrics, candidate
             finally:
                 # Training still continues from the requested source checkpoint,
                 # including its optimizer state, regardless of which best wins.
                 self.policy.load_state_dict(original_state, strict=True)
+        if best_score is None:
+            logger.warning("No imported checkpoint satisfies validation liquidation requirements")
+            return float('-inf')
         if checkpoint_path:
             destination = os.path.join(os.path.dirname(checkpoint_path.format(0)), 'checkpoint_best.pt')
             extra = dict(self.extra_checkpoint_state)
             extra.update({'best_validation_return': best_score,
                           'validation_metrics': best_metrics,
-                          'selection_metric': 'validation.mean_net_return'})
+                          'selection_metric': 'validation.mean_net_return',
+                          'selection_require_liquidation': self.selection_require_liquidation})
             if best_checkpoint is None:
                 self.save_checkpoint(destination, start_iteration, extra_state=extra)
             else:
                 selected = dict(best_checkpoint)
                 selected['extra_state'] = extra
                 torch.save(selected, destination)
-        logger.info("Preserved resume validation baseline: %.6f%%", best_score)
+        logger.info("Preserved initial validation baseline: %.6f%%", best_score)
         return best_score
 
     def train(
@@ -932,17 +953,19 @@ class GRPOTrainer:
         revert_to_best_patience: int = 0,
         resume: bool = False,
         resume_best_checkpoints: Optional[List[Dict[str, Any]]] = None,
+        preserve_initial_policy: bool = False,
     ) -> Dict[str, Any]:
         """
         GRPO 훈련 실행
         
         Args:
-            total_episodes: 총 훈련 에피소드 수
+            total_episodes: Episode count, or initial estimate when max_timesteps is set.
             checkpoint_interval: 체크포인트 저장 간격
             checkpoint_path: 체크포인트 저장 경로 (format string with {} for iteration)
             on_iteration_end: 매 반복 종료 시 호출될 콜백 함수 (iteration, metrics) -> None
             start_iteration: 시작 반복 횟수 (재개 시 사용)
             max_timesteps: 최대 훈련 타임스텝 수 (실제 누적 타임스텝 기준 조기 종료)
+            preserve_initial_policy: Validate loaded fine-tuning weights before updating.
             
         Returns:
             훈련 메트릭 딕셔너리
@@ -953,6 +976,8 @@ class GRPOTrainer:
         
         if total_episodes <= 0:
             raise ValueError("total_episodes must be positive")
+        if max_timesteps is not None and max_timesteps <= 0:
+            raise ValueError("max_timesteps must be positive")
         episodes_per_iteration = self.episodes_per_group * self.num_groups
         num_iterations = start_iteration + int(np.ceil(total_episodes / episodes_per_iteration))
         logger.info(f"Total iterations: {num_iterations} (Starting from {start_iteration})")
@@ -962,20 +987,46 @@ class GRPOTrainer:
         
         # Model selection uses the current weights on validation paths only.
         best_validation_return = float('-inf')
-        if resume:
+        if resume or preserve_initial_policy:
             best_validation_return = self._seed_resume_best(
-                checkpoint_path, start_iteration, resume_best_checkpoints or [])
+                checkpoint_path, start_iteration,
+                (resume_best_checkpoints or []) if resume else [])
         no_improve_count = 0
         validation_metrics = None
 
-        for iteration in range(start_iteration, num_iterations):
+        iteration = start_iteration
+        last_completed_iteration = start_iteration
+        episodes_trained = 0
+        budget_start_timesteps = self.total_timesteps
+        while True:
             iteration_start_time = time.time()
-            # 1. 롤아웃 수집
-            if max_timesteps and self.total_timesteps >= max_timesteps:
-                break
-            num_episodes = min(episodes_per_iteration,
-                               total_episodes - (iteration - start_iteration) * episodes_per_iteration)
+            # Episode lengths can be shorter than the configured maximum. A
+            # timestep budget must use observed steps, not a fixed episode cap.
+            if max_timesteps is not None:
+                remaining_steps = max_timesteps - self.total_timesteps
+                if remaining_steps <= 0:
+                    break
+                if episodes_trained:
+                    mean_steps = (self.total_timesteps - budget_start_timesteps) / episodes_trained
+                    remaining_episodes = int(np.ceil(remaining_steps / mean_steps))
+                else:
+                    remaining_episodes = total_episodes
+            else:
+                remaining_episodes = total_episodes - episodes_trained
+                if remaining_episodes <= 0:
+                    break
+            num_episodes = min(episodes_per_iteration, remaining_episodes)
+            previous_timesteps = self.total_timesteps
             episodes = self.collect_rollouts(num_episodes)
+            if not episodes:
+                raise RuntimeError("Rollout collection returned no completed episodes")
+            if max_timesteps is not None and self.total_timesteps <= previous_timesteps:
+                raise RuntimeError("Rollout collection made no timestep progress")
+            episodes_trained += len(episodes)
+            if max_timesteps is not None:
+                mean_steps = (self.total_timesteps - budget_start_timesteps) / episodes_trained
+                remaining_episodes = int(np.ceil(max(0, max_timesteps - self.total_timesteps) / mean_steps))
+                num_iterations = iteration + 1 + int(np.ceil(remaining_episodes / episodes_per_iteration))
             
             # 2. 에피소드 그룹화
             grouped_episodes = self.group_episodes(episodes)
@@ -992,6 +1043,7 @@ class GRPOTrainer:
                 all_advantages.extend(group_advantages[group_id])
             
             update_metrics = self.update_policy(all_episodes, all_advantages)
+            last_completed_iteration = iteration + 1
             
             # 5. 메트릭 로깅
             if self.writer:
@@ -1021,13 +1073,14 @@ class GRPOTrainer:
                      iteration + 1 == num_iterations or
                      (max_timesteps and self.total_timesteps >= max_timesteps))):
                 validation_metrics = self.evaluation_callback(self.policy)
-                score = float(validation_metrics['mean_net_return'])
-                if not np.isfinite(score):
-                    raise ValueError("Validation mean_net_return must be finite")
+                score = self._validation_selection_score(validation_metrics)
+                reported_return = float(validation_metrics['mean_net_return'])
                 if self.writer:
-                    self.writer.add_scalar('validation/mean_net_return', score, iteration)
-                logger.info("Validation net return: %.6f%% (current weights)", score)
-                if score > best_validation_return:
+                    self.writer.add_scalar('validation/mean_net_return', reported_return, iteration)
+                    self.writer.add_scalar('validation/selection_eligible', int(score is not None), iteration)
+                logger.info("Validation net return: %.6f%% (current weights; selection eligible=%s)",
+                            reported_return, score is not None)
+                if score is not None and score > best_validation_return:
                     best_validation_return = score
                     no_improve_count = 0
                     if checkpoint_path:
@@ -1036,11 +1089,12 @@ class GRPOTrainer:
                         extra = dict(self.extra_checkpoint_state)
                         extra.update({'best_validation_return': score,
                                       'validation_metrics': validation_metrics,
-                                      'selection_metric': 'validation.mean_net_return'})
+                                      'selection_metric': 'validation.mean_net_return',
+                                      'selection_require_liquidation': self.selection_require_liquidation})
                         self.save_checkpoint(selected_path, iteration + 1, extra_state=extra)
                 else:
                     no_improve_count += 1
-                if (checkpoint_path and revert_to_best_patience > 0 and
+                if (checkpoint_path and np.isfinite(best_validation_return) and revert_to_best_patience > 0 and
                         no_improve_count >= revert_to_best_patience):
                     selected_path = os.path.join(
                         os.path.dirname(checkpoint_path.format(0)), 'checkpoint_best.pt')
@@ -1075,7 +1129,8 @@ class GRPOTrainer:
             estimated_remaining_time = avg_iteration_time * remaining_iterations
             
             # 진행률 계산
-            progress_pct = (iteration + 1) / num_iterations * 100
+            progress_pct = (min(100.0, self.total_timesteps / max_timesteps * 100)
+                            if max_timesteps is not None else (iteration + 1) / num_iterations * 100)
             
             # 시간 포맷팅
             elapsed_time = time.time() - start_time
@@ -1103,6 +1158,16 @@ class GRPOTrainer:
                         extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
                     )
                 break
+            iteration += 1
+
+        if self.selection_require_liquidation and not np.isfinite(best_validation_return):
+            if checkpoint_path and last_completed_iteration > start_iteration:
+                self.save_checkpoint(checkpoint_path.format(last_completed_iteration), last_completed_iteration,
+                                     extra_state=self.extra_checkpoint_state or None)
+            raise RuntimeError(
+                "No eligible validation checkpoint: every candidate has incomplete liquidation, "
+                "open inventory, or missing liquidation diagnostics. Iteration checkpoints are retained "
+                "for diagnosis; an existing best checkpoint is not selected.")
         
         logger.info("GRPO training completed!")
         
@@ -1292,6 +1357,7 @@ class GRPOTrainer:
                 'entropy_coef': self.entropy_coef,
                 'value_coef': self.value_coef,
                 'max_grad_norm': self.max_grad_norm,
+                'selection_require_liquidation': self.selection_require_liquidation,
                 **policy_config  # 정책 설정 병합
             }
         }

@@ -54,18 +54,33 @@ import sys
 from pathlib import Path
 
 run_dir = Path('/content/drive/MyDrive/ColabData/stockbot/models/scalping_v3_a100_astral_depth_run01')
+repo_path = Path(globals().get('REPO_PATH', Path.cwd())).resolve()
 diagnostic_path = run_dir / 'validation_diagnostics.json'
-subprocess.run([
-    sys.executable, '-m', 'ai_trader.grpo.diagnose_xlstm',
+command = [
+    sys.executable, '-u', '-m', 'ai_trader.grpo.diagnose_xlstm',
     '--checkpoint', str(run_dir / 'checkpoints' / 'checkpoint_best.pt'),
     '--split', 'validation', '--episodes', '8', '--seed', '42', '--device', 'cuda',
     '--output', str(diagnostic_path),
-], check=True)
-report = json.loads(diagnostic_path.read_text(encoding='utf-8'))
-diagnostics = report['metrics']['diagnostics']
-print(json.dumps({key: value for key, value in diagnostics.items() if key != 'episodes'},
-                 ensure_ascii=False, indent=2))
+]
+print('Python:', sys.executable)
+print('프로젝트 경로:', repo_path)
+print('진단 모듈 존재:', (repo_path / 'ai_trader/grpo/diagnose_xlstm.py').is_file())
+# Colab 셀에 하위 프로세스의 실제 traceback도 표시합니다.
+with subprocess.Popen(command, cwd=repo_path, stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                      errors='replace', bufsize=1) as process:
+    for line in process.stdout:
+        print(line, end='', flush=True)
+    return_code = process.wait()
+print('종료 코드:', return_code)
+if return_code == 0:
+    report = json.loads(diagnostic_path.read_text(encoding='utf-8'))
+    diagnostics = report['metrics']['diagnostics']
+    print(json.dumps({key: value for key, value in diagnostics.items() if key != 'episodes'},
+                     ensure_ascii=False, indent=2))
 ```
+
+`CalledProcessError: ... exit status 1`은 하위 명령이 실패했다는 결과만 알려줍니다. 위 셀은 stdout·stderr를 합쳐 실제 오류를 표시하고, 성공한 경우에만 결과 JSON을 읽습니다. `진단 모듈 존재: False`이면 먼저 `REPO_PATH`가 수정된 프로젝트를 가리키는지 확인합니다. Colab 소스 준비 셀은 기존 폴더가 있고 `REVISION`이 비어 있으면 코드를 갱신하지 않습니다. 이전 커밋으로 고정해 checkout한 경우에도 원격의 새 코드가 자동 반영되지 않습니다. 진단 기능이 포함된 `REVISION='dev-tf-rl'` 또는 커밋 `64dde09f6c6c9db59c4379ca55b11d8711896655`로 소스 준비 셀을 다시 실행합니다. 학습 셀을 다시 실행할 필요는 없습니다.
 
 런타임 재시작으로 추출 데이터 경로가 바뀌었다면 같은 데이터의 새 위치를 `--extracted-dir /content/현재_추출_폴더`로 지정합니다. DB 기반 데이터는 `--db-path`를 사용합니다. 동일한 경로 재현에는 원래 데이터 내용과 에피소드 목록 순서도 같아야 합니다. 새 출력 파일명을 사용하며, 기존 파일이나 `evaluation_report.json`은 덮어쓰지 않습니다.
 
@@ -233,3 +248,18 @@ python -m ai_trader.grpo.pretrain_behavior_cloning --teacher_policy models/teach
 회귀 검사는 시간 역행·미래 변경 불변성·원본 가격·마지막 틱 정산·보상/NAV 일치·지연/잔량/취소/만료·리스크 청산·관측 호환성·정책 확률 재현·날짜 분할·best 저장·BC 역전파·작은 CPU 학습/검증/백테스트를 포함합니다.
 
 기존 NPZ 3개에서도 정렬된 관측값과 원화 환산을 확인했습니다. 전체 기존 데이터 재생성, 장시간 모델 재학습, 실거래 수익성 또는 현재 xLSTM의 2.87ms 추론은 이번 변경으로 검증한 항목이 아닙니다.
+
+
+## 수익률 우선 학습 기본값 (2026-09-10)
+
+현재 CLI와 A100 노트북(`colab_train_xlstm_astral.ipynb` 포함)은 비용을 반영한 검증 순수익률을 우선합니다. 기본 모델은 CNN 256 / xLSTM 512 / FC 512, `seq_len=1024`, `max_stages=1`, `total_timesteps=1000000`, `gamma=1.0`, 검증 64회입니다. 큰 모델이 더 높은 수익률을 보장하지는 않으며 기존 모델과 같은 검증 조건으로 비교해야 합니다. 모델 폭은 메모리 부족 때문에 자동 축소하지 않고 GPU 점검에서 미니배치를 줄입니다.
+
+```powershell
+python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --output_dir models/scalping_return_priority --max_stages 1
+```
+
+새 학습은 실제 호가가 있는 데이터를 요구합니다. 거래 보너스나 무매매 페널티로 거래를 강요하지 않고, 수수료·세금·슬리피지를 그대로 반영합니다. 최고 모델은 `validation.mean_net_return`로 고르되 기본 `selection_require_liquidation=True`에 따라 검증 중 미청산 물량이 남은 후보는 제외합니다. 적격 후보가 없으면 최종 모델 확정을 실패로 보고하고 반복별 체크포인트는 진단용으로 남깁니다. 수익률 0%인 무매매보다 낮은 모델도 후보 중 최고일 수 있으므로 양의 순수익 여부를 별도로 확인해야 합니다.
+
+`TOTAL_TIMESTEPS`는 실제 수집한 학습 스텝 목표이며 완성된 에피소드 경계 때문에 조금 초과할 수 있습니다. 에피소드가 짧아도 목표에 도달하기 전 조기 종료하지 않습니다. 기존 가중치로 미세조정할 때는 업데이트 전에 검증해 더 나은 시작 모델을 보존합니다. `resume`/`finetune`은 기존 모델 크기·학습 설정을 복원하므로 새 기본값 전체를 적용하려면 `MODE='new'`와 새 실험 폴더를 사용하세요. 데이터 재추출은 필요 없습니다.
+
+추론 래퍼의 기본 추가 익절·트레일링·정체 청산은 꺼져 있고 손절률은 체크포인트를 따릅니다. 실전과 리플레이의 호가·주문 연결은 여전히 별도로 검증해야 합니다. 재리뷰 결과와 남은 한계는 [수익률 우선 재리뷰](SCALPING_RETURN_REVIEW_2026-09-10.md)를 참고하세요.

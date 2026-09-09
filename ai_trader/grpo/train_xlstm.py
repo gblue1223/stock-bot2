@@ -66,33 +66,33 @@ class TrainingConfig:
         self.env = 'scalping'
         self.policy = 'xlstm'
         self.db_path = None
-        self.extracted_dir = 'data/extracted_episodes'  # ✅ 기본값 추가
+        self.extracted_dir = 'data/extracted_episodes_v2'
         self.table_name = 'datasets'
-        self.seq_len = 3000
+        self.seq_len = 1024
         self.features = 27
-        self.episode_steps = 600
+        self.episode_steps = 300
         
-        self.hidden_dim = 128
-        self.cnn_channels = 64
-        self.rnn_hidden_dim = 128
+        self.hidden_dim = 512
+        self.cnn_channels = 256
+        self.rnn_hidden_dim = 512
         self.action_dim = 3
         
-        self.episodes_per_group = 16
+        self.episodes_per_group = 4
         self.num_groups = 4
-        self.lr = 5e-4
-        self.gamma = 0.99
+        self.lr = 3e-5
+        self.gamma = 1.0  # Finite-episode net NAV: do not discount delayed profits.
         self.clip = 0.1
         self.kl_target = 0.01
-        self.entropy_coef = 0.15
+        self.entropy_coef = 0.01
         self.value_coef = 0.5
         self.max_grad_norm = 0.5
-        self.batch_size = 64
+        self.batch_size = 16
         
         self.use_raw_data = True
-        self.rolling_window_size = 1000
-        self.rolling_min_samples = 100
+        self.rolling_window_size = 512
+        self.rolling_min_samples = 64
         
-        self.total_timesteps = 10000
+        self.total_timesteps = 1_000_000
         self.checkpoint_interval = 10
         self.output_dir = 'models/grpo_xlstm'
         self.load_policy = None
@@ -100,16 +100,17 @@ class TrainingConfig:
         self.revert_patience = 0
         self.num_workers = 4
         self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
-        self.num_epochs = 4            # Number of epochs per policy update
-        self.use_gae = False           # Whether to use GAE (default False for GRPO mode)
+        self.num_epochs = 2            # Number of epochs per policy update
+        self.use_gae = True
         self.train_end_date = None
         self.validation_end_date = None
         self.validation_fraction = 0.2
         self.test_fraction = 0.2
         self.embargo_dates = 0
-        self.evaluation_episodes = 8
-        self.evaluation_interval = 1
+        self.evaluation_episodes = 64
+        self.evaluation_interval = 5
         self.evaluation_seed = 42
+        self.selection_require_liquidation = True
         self.cache_max_bytes = 256 * 1024 * 1024
         self.initial_cash = 1_000_000.0
         self.max_stages = 1
@@ -118,7 +119,7 @@ class TrainingConfig:
         self.execution_config = {
             'order_latency_ms': 100, 'cancel_latency_ms': 50,
             'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
-            'fallback_depth': 100, 'require_order_book': False,
+            'fallback_depth': 100, 'require_order_book': True,
         }
         
         self.base_price = 100000.0
@@ -162,6 +163,10 @@ class TrainingConfig:
     def validate(self):
         errors = []
         validate_max_stages(self.max_stages)
+        if not isinstance(self.selection_require_liquidation, bool):
+            errors.append("selection_require_liquidation must be a boolean")
+        if not 0 < self.gamma <= 1:
+            errors.append("gamma must be in (0, 1]")
         if not isinstance(self.resume, bool):
             errors.append("resume must be a boolean")
         if self.resume and not self.load_policy:
@@ -301,6 +306,8 @@ def main():
     parser.add_argument('--evaluation_episodes', type=int, default=None)
     parser.add_argument('--evaluation_interval', type=int, default=None)
     parser.add_argument('--evaluation_seed', type=int, default=None)
+    parser.add_argument('--selection_require_liquidation', action=argparse.BooleanOptionalAction, default=None,
+                        help='Only select validation checkpoints with no residual inventory (default: enabled)')
     parser.add_argument('--max_stages', '--max-stages', type=int, choices=range(1, 6), default=None,
                         help='Maximum position entries (1-5; default: 1, no split entries)')
     parser.add_argument('--max_holding_seconds', type=float, default=None)
@@ -548,6 +555,7 @@ def main():
                 current_policy, validation_env, config.evaluation_episodes,
                 config.evaluation_seed, device),
             evaluation_interval=config.evaluation_interval,
+            selection_require_liquidation=config.selection_require_liquidation,
         )
         trainer.extra_checkpoint_state = {'date_splits': date_splits,
                                           'training_config': dict(config.__dict__)}
@@ -606,6 +614,7 @@ def main():
             revert_to_best_patience=config.revert_patience,
             resume=config.resume,
             resume_best_checkpoints=resume_best_checkpoints,
+            preserve_initial_policy=(checkpoint is not None and not config.resume),
         )
         
         training_time = time.time() - start_time

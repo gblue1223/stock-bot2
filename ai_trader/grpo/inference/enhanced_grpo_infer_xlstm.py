@@ -56,6 +56,8 @@ class GRPOInferenceE2EXLSTM:
         checkpoint = torch.load(policy_path, map_location=self.device, weights_only=True)
         if not isinstance(checkpoint, dict) or "policy_state_dict" not in checkpoint:
             raise ValueError("Expected a versioned policy checkpoint, not bare or legacy weights")
+        extra_state = checkpoint.get("extra_state") or {}
+        self.training_config = dict(extra_state.get("training_config") or {})
         self.observation_builder = ObservationBuilder.from_schema(checkpoint.get("observation_schema"))
         self.observation_schema = self.observation_builder.schema
         state = checkpoint["policy_state_dict"]
@@ -111,17 +113,21 @@ class GRPOInferenceE2EXLSTM:
 
 
 class EnhancedGRPOInferenceXLSTM:
+    """Apply the training risk limits by default; extra exits require opt-in."""
+
     def __init__(self, base_inference: GRPOInferenceE2EXLSTM,
                  min_buy_confidence: float = 0.0, min_sell_confidence: float = 0.0,
-                 stop_loss_rate: float = -2.0, take_profit_rate: float = 5.0,
-                 trailing_stop_activation_rate: float = 3.0,
+                 stop_loss_rate: Optional[float] = None, take_profit_rate: Optional[float] = None,
+                 trailing_stop_activation_rate: Optional[float] = None,
                  trailing_stop_callback_rate: float = 1.0,
-                 stagnation_exit_seconds: float = 2.0, stagnation_threshold: float = 0.5,
+                 stagnation_exit_seconds: float = 0.0, stagnation_threshold: float = 0.5,
                  enable_auto_exit: bool = True, max_holding_seconds: Optional[float] = None):
         self.base_inference = base_inference
         self.min_buy_confidence = min_buy_confidence
         self.min_sell_confidence = min_sell_confidence
-        self.stop_loss_rate = stop_loss_rate
+        training_config = getattr(base_inference, "training_config", {})
+        self.stop_loss_rate = (-float(training_config.get("stop_loss_pct", 2.0))
+                               if stop_loss_rate is None else stop_loss_rate)
         self.take_profit_rate = take_profit_rate
         self.trailing_stop_activation_rate = trailing_stop_activation_rate
         self.trailing_stop_callback_rate = trailing_stop_callback_rate
@@ -134,7 +140,15 @@ class EnhancedGRPOInferenceXLSTM:
             raise ValueError("max_holding_seconds must be positive and finite")
         if not 0 <= min_buy_confidence <= 1 or not 0 <= min_sell_confidence <= 1:
             raise ValueError("Confidence thresholds must be in [0, 1]")
-        if trailing_stop_callback_rate <= 0 or stagnation_exit_seconds < 0:
+        if not np.isfinite(self.stop_loss_rate) or self.stop_loss_rate >= 0:
+            raise ValueError("stop_loss_rate must be finite and negative")
+        for name, threshold in (("take_profit_rate", take_profit_rate),
+                                ("trailing_stop_activation_rate", trailing_stop_activation_rate)):
+            if threshold is not None and (not np.isfinite(threshold) or threshold <= 0):
+                raise ValueError(f"{name} must be None or finite and positive")
+        if (not np.isfinite(trailing_stop_callback_rate) or trailing_stop_callback_rate <= 0
+                or not np.isfinite(stagnation_exit_seconds) or stagnation_exit_seconds < 0
+                or not np.isfinite(stagnation_threshold)):
             raise ValueError("Invalid trailing or stagnation threshold")
         self.stats = dict.fromkeys(("total_predictions", "buy_signals", "buy_filtered",
                                    "sell_signals", "auto_exits", "stop_losses", "take_profits",
@@ -168,7 +182,8 @@ class EnhancedGRPOInferenceXLSTM:
             position.cumulative_return = current_price / position.entry_price - 1.0
             position.max_price = max(position.entry_price, position.max_price, current_price)
             peak_profit = (position.max_price / position.entry_price - 1.0) * 100.0
-            position.trailing_activated |= peak_profit >= self.trailing_stop_activation_rate
+            position.trailing_activated |= (self.trailing_stop_activation_rate is not None
+                                            and peak_profit >= self.trailing_stop_activation_rate)
             stages.append({"entry_price": position.entry_price, "entry_time_seconds": position.entry_time})
         if self.enable_auto_exit:
             for position in positions:
@@ -178,9 +193,9 @@ class EnhancedGRPOInferenceXLSTM:
                     reason, counter = "Maximum Holding Time", "max_holding_exits"
                 elif pct <= self.stop_loss_rate:
                     reason, counter = "Stop Loss Hit", "stop_losses"
-                elif pct >= self.take_profit_rate:
+                elif self.take_profit_rate is not None and pct >= self.take_profit_rate:
                     reason, counter = "Take Profit Hit", "take_profits"
-                elif (position.trailing_activated and
+                elif (self.trailing_stop_activation_rate is not None and position.trailing_activated and
                       (position.max_price / position.entry_price - 1.0) * 100.0 - pct >= self.trailing_stop_callback_rate):
                     reason, counter = "Trailing Stop Hit", "trailing_exits"
                 elif (self.stagnation_exit_seconds > 0 and

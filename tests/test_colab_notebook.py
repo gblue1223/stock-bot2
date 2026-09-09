@@ -56,11 +56,11 @@ def test_notebook_and_embedded_runner_are_valid_python():
 
 
 @pytest.mark.parametrize('vram,free,ram,cpus,batch,max_workers,episodes', [
-    (40, 38, 50, 12, 64, 4, 16),
-    (80, 75, 70, 12, 128, 8, 16),
-    (80, 75, 12, 12, 128, 2, 8),
-    (40, 10, 26, 2, 32, 1, 16),
-    (40, 38, 6, 12, 64, 1, 8),
+    (40, 38, 50, 12, 16, 4, 16),
+    (80, 75, 70, 12, 32, 8, 16),
+    (80, 75, 12, 12, 32, 2, 8),
+    (40, 10, 26, 2, 8, 1, 16),
+    (40, 38, 6, 12, 16, 1, 8),
 ])
 def test_profile_respects_host_ram_and_cpu(vram, free, ram, cpus, batch, max_workers, episodes):
     namespace = helpers()
@@ -69,7 +69,7 @@ def test_profile_respects_host_ram_and_cpu(vram, free, ram, cpus, batch, max_wor
     assert 1 <= profile['num_workers'] <= max_workers
     assert profile['episodes_per_group'] * profile['num_groups'] == episodes
     assert namespace['estimated_host_gib'](profile) <= .70 * ram
-    assert profile['seq_len'] == 1024 and profile['rnn_hidden_dim'] == 128
+    assert profile['seq_len'] == 1024 and profile['rnn_hidden_dim'] == 512
 
 
 @pytest.mark.parametrize('hardware', [(10, 9, 50, 4), (40, 2, 50, 4), (40, 38, 3, 4)])
@@ -94,9 +94,14 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     assert not set(config) - set(TrainingConfig().__dict__)
     assert config['device'] == 'cuda' and config['load_policy'] is None
     assert config['use_raw_data'] and config['use_gae']
-    assert config['batch_size'] == 64 and config['num_workers'] <= 4
+    assert config['batch_size'] == 16 and config['num_workers'] <= 4
     assert config['max_trades_per_episode'] is None
     assert config['max_stages'] == 1
+    assert config['total_timesteps'] == 1_000_000 and config['gamma'] == 1.0
+    assert config['evaluation_episodes'] == 64
+    assert config['selection_require_liquidation'] is True
+    assert config['execution_config']['require_order_book'] is True
+    assert (config['cnn_channels'], config['rnn_hidden_dim'], config['hidden_dim']) == (256, 512, 512)
     for field in ('win_bonus', 'loss_penalty', 'buy_signal_bonus', 'no_trade_penalty'):
         assert config[field] == 0
     assert config['max_holding_seconds'] == 300
@@ -130,7 +135,7 @@ def test_restore_preserves_training_schema_and_costs_but_adapts_resource_setting
     assert result['seq_len'] == 2048 and result['rnn_hidden_dim'] == 256
     assert result['max_holding_seconds'] == 120 and result['rolling_window_size'] == 256
     assert result['sell_tax_rate'] == .003 and result['execution_config']['slippage_bps'] == 7
-    assert result['batch_size'] == 64 and result['num_workers'] == 4
+    assert result['batch_size'] == 16 and result['num_workers'] == 4
     assert result['total_timesteps'] == base['total_timesteps']
     assert result['resume'] == (mode == 'resume')
     assert result['lr'] == (.000123 if mode == 'resume' else base['lr'])
@@ -154,3 +159,11 @@ def test_legacy_five_stage_notebook_resume_restores_recorded_limit():
     checkpoint['extra_state']['training_config'].pop('max_stages')
     restored = helpers()['restore_run_config'](base, checkpoint, 'resume')
     assert base['max_stages'] == 1 and restored['max_stages'] == 5
+
+
+@pytest.mark.parametrize('name', ['colab_train_xlstm_astral.ipynb', 'colab_train_xlstm_5splits_astral.ipynb'])
+def test_astral_notebooks_share_return_priority_defaults(name, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
+    test_default_settings_are_supported_and_use_current_reward_and_execution()
+    for source in sources().values():
+        ast.parse(source)

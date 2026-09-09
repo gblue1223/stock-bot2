@@ -125,7 +125,8 @@ def test_risk_uses_actual_price_not_stale_return_and_hard_time_limit():
 
 def test_trailing_activation_latches_below_original_activation_threshold():
     risk = EnhancedGRPOInferenceXLSTM(make_base(), stagnation_exit_seconds=0,
-                                      take_profit_rate=10, max_holding_seconds=60)
+                                      take_profit_rate=10, trailing_stop_activation_rate=3,
+                                      max_holding_seconds=60)
     position = Position(100, 0, 100, 0)
     assert risk.predict(np.ones((8, 3)), position, 104, current_time_seconds=1)[0] == 0
     assert position.trailing_activated
@@ -134,7 +135,7 @@ def test_trailing_activation_latches_below_original_activation_threshold():
 
 
 def test_stagnation_and_inventory_action_masks():
-    risk = EnhancedGRPOInferenceXLSTM(make_base(action=2))
+    risk = EnhancedGRPOInferenceXLSTM(make_base(action=2), stagnation_exit_seconds=2)
     assert risk.predict(np.ones((8, 3)))[0] == 0  # cannot sell flat
     position = Position(100, 0, 100, 0)
     action, _, info = risk.predict(np.ones((8, 3)), position, 100.1, current_time_seconds=3)
@@ -142,6 +143,48 @@ def test_stagnation_and_inventory_action_masks():
     risk = EnhancedGRPOInferenceXLSTM(make_base(action=1), enable_auto_exit=False)
     positions = [Position(100, 0, 100, 0) for _ in range(5)]
     assert risk.predict(np.ones((8, 3)), positions, 100, current_time_seconds=1)[0] == 0
+
+
+def test_default_inference_does_not_add_untrained_profit_or_stagnation_exits():
+    risk = EnhancedGRPOInferenceXLSTM(make_base(), max_holding_seconds=60)
+    position = Position(100, 0, 100, 0)
+    assert risk.predict(np.ones((8, 3)), position, 100.1, current_time_seconds=3)[0] == 0
+    assert risk.predict(np.ones((8, 3)), position, 106, current_time_seconds=4)[0] == 0
+    assert risk.predict(np.ones((8, 3)), position, 102, current_time_seconds=5)[0] == 0
+    assert not position.trailing_activated
+    # Trained holding/stop limits remain active even though optional exits are off.
+    assert risk.predict(np.ones((8, 3)), position, 97, current_time_seconds=6)[2]["reason"] == "Stop Loss Hit"
+
+
+def test_inference_loads_training_stop_loss_and_allows_explicit_override(tmp_path):
+    spec = builder()
+    policy = GRPOPolicyE2EXLSTM(obs_dim=spec.obs_dim, cnn_channels=4,
+                               rnn_hidden_dim=4, fc_hidden_dim=8, max_stages=spec.max_stages)
+    path = tmp_path / "risk_policy.pt"
+    torch.save({"policy_state_dict": policy.state_dict(), "observation_schema": spec.schema,
+                "extra_state": {"training_config": {"stop_loss_pct": 4.0}}}, path)
+    base = GRPOInferenceE2EXLSTM(path, device="cpu")
+    base.predict = lambda *args, **kwargs: (0, 0.99)
+    risk = EnhancedGRPOInferenceXLSTM(base)
+    position = Position(100, 0, 100, 0)
+    assert risk.stop_loss_rate == -4.0
+    assert risk.predict(np.ones((8, 3)), position, 97, current_time_seconds=1)[0] == 0
+    assert risk.predict(np.ones((8, 3)), position, 95, current_time_seconds=2)[2]["reason"] == "Stop Loss Hit"
+    explicit = EnhancedGRPOInferenceXLSTM(base, stop_loss_rate=-2.0, take_profit_rate=5.0)
+    assert explicit.predict(np.ones((8, 3)), Position(100, 0, 100, 0), 97,
+                            current_time_seconds=1)[2]["reason"] == "Stop Loss Hit"
+    assert explicit.predict(np.ones((8, 3)), Position(100, 0, 100, 0), 106,
+                            current_time_seconds=1)[2]["reason"] == "Take Profit Hit"
+
+
+@pytest.mark.parametrize("settings", [
+    {"stop_loss_rate": np.nan}, {"stop_loss_rate": 2},
+    {"take_profit_rate": np.inf}, {"trailing_stop_activation_rate": 0},
+    {"trailing_stop_callback_rate": np.nan}, {"stagnation_exit_seconds": np.nan},
+])
+def test_invalid_inference_risk_thresholds_are_rejected(settings):
+    with pytest.raises(ValueError):
+        EnhancedGRPOInferenceXLSTM(make_base(), **settings)
 
 
 def test_strict_policy_load_and_masked_prediction(tmp_path):
