@@ -37,6 +37,55 @@ python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
 
 Drive에 `colab_config.json`, 소스·manifest 해시와 GPU 점검 결과가 담긴 `colab_run.json`, 학습 로그와 회당 체크포인트를 저장합니다. 끝의 평가 셀에서 순수익·실현손익·합성 체결·미청산 수량을 확인할 수 있고, 선택적인 체결 스트레스 검사는 validation에만 적용합니다. 실제 A100의 최대 메모리와 학습 속도는 Colab 사전 점검 및 실제 학습에서 확인해야 합니다.
 
+## 무거래 원인 진단
+
+검증 수익률과 거래 수가 모두 0이면 기존 체크포인트를 같은 검증 경로에서 다시 실행합니다. 재학습은 필요하지 않습니다. 진단 명령은 체크포인트의 관측 규격·날짜 분할·비용·체결 설정을 복원하며, 기본 에피소드 수와 시드도 저장된 값을 사용합니다.
+
+```powershell
+python -m ai_trader.grpo.diagnose_xlstm --checkpoint models/scalping_v3/checkpoints/checkpoint_best.pt --split validation --device auto --output models/scalping_v3/validation_diagnostics.json
+```
+
+Colab에서는 수정된 프로젝트 소스를 반영한 뒤 프로젝트 루트에서 실행합니다. 예를 들어 이 실행의 선택 모델은 다음 셀로 진단할 수 있습니다.
+
+```python
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+run_dir = Path('/content/drive/MyDrive/ColabData/stockbot/models/scalping_v3_a100_astral_depth_run01')
+diagnostic_path = run_dir / 'validation_diagnostics.json'
+subprocess.run([
+    sys.executable, '-m', 'ai_trader.grpo.diagnose_xlstm',
+    '--checkpoint', str(run_dir / 'checkpoints' / 'checkpoint_best.pt'),
+    '--split', 'validation', '--episodes', '8', '--seed', '42', '--device', 'cuda',
+    '--output', str(diagnostic_path),
+], check=True)
+report = json.loads(diagnostic_path.read_text(encoding='utf-8'))
+diagnostics = report['metrics']['diagnostics']
+print(json.dumps({key: value for key, value in diagnostics.items() if key != 'episodes'},
+                 ensure_ascii=False, indent=2))
+```
+
+런타임 재시작으로 추출 데이터 경로가 바뀌었다면 같은 데이터의 새 위치를 `--extracted-dir /content/현재_추출_폴더`로 지정합니다. DB 기반 데이터는 `--db-path`를 사용합니다. 동일한 경로 재현에는 원래 데이터 내용과 에피소드 목록 순서도 같아야 합니다. 새 출력 파일명을 사용하며, 기존 파일이나 `evaluation_report.json`은 덮어쓰지 않습니다.
+
+`metrics.diagnostics`를 다음 순서로 읽습니다. 일반 학습의 새 `evaluation_report.json`에도 검증·테스트 각각 `diagnostics`가 추가됩니다.
+
+| 확인할 값 | 해석 |
+| --- | --- |
+| `action_counts.buy == 0` | 평가 경로에서 정책이 매수를 선택하지 않음. `hold`, `sell` 횟수와 함께 확인 |
+| `action_counts.buy > 0`, `submitted_orders == 0` | 매수는 선택했지만 주문 생성 조건에서 차단됨. `buy_action_outcomes` 확인 |
+| `submitted_orders > 0`, `filled_quantity == 0` | 주문을 제출했으나 체결되지 않음. `expired_orders`, `cancelled_orders`, `execution_blocked_checks` 확인 |
+| `filled_quantity > 0`, `mean_num_trades == 0` | 체결은 있었지만 매도 청산 기록이 없음. `metrics.max_open_quantity`, 미청산 에피소드 확인 |
+
+`mean_action_probabilities`와 `max_action_probabilities`는 행동 마스크 적용 후 확률입니다. xLSTM은 실제 행동 선택과 같은 한 번의 forward에서 이를 수집합니다. 예를 들어 관망 확률이 항상 매수 확률보다 조금만 높아도 deterministic 평가에서는 매수가 0회일 수 있습니다. 이 확률은 수익을 낼 확률이 아닙니다. 확률 수집을 지원하지 않는 정책이나 통계가 없는 환경은 해당 값을 `null`로 표시합니다.
+
+`buy_action_outcomes`는 매수 선택마다 한 가지 결과를 기록합니다. `insufficient_budget_for_one_share`는 가용 현금과 단계별 배정 한도로 한 주도 주문할 수 없는 경우, `risk_exit_active`는 손절·보유시간·에피소드 종료 청산 중인 경우입니다. `max_stages`, `max_trades`, `pending_buy`는 각각 진입 단계 한도·거래 수 한도·기존 매수 주문에 의한 차단입니다. 기존 조건 검사 순서를 따르므로 미체결 매수 주문이 한도를 채우면 `max_stages`로 집계될 수 있습니다.
+
+`execution_blocked_checks`는 오래된 호가(`stale_quote`), 주문 지연(`order_latency`), 호가 부족(`no_displayed_depth`, `displayed_depth_exhausted`), 현금/재고 부족 등의 검사 횟수입니다. 주문별·이벤트별 횟수이므로 같은 주문이 반복 집계될 수 있으며, 만료·취소가 먼저 처리된 이벤트는 차단 검사에 포함되지 않습니다. `fill_ratio`는 전체 체결 수량 / 전체 제출 수량이고, 매수와 매도를 모두 포함합니다.
+
+`diagnostics.episodes`에는 에피소드별 시드, 종목·날짜·시작 인덱스, 행동·주문 통계가 남습니다. `checkpoint_iteration`과 `checkpoint_total_timesteps`로 실제 진단한 모델 시점도 확인합니다. 무거래의 원인을 좁힐 때는 우선 저장된 validation 경로를 사용합니다.
+
 ## 체결 시뮬레이터
 
 `ai_trader/grpo/environments/execution.py`가 주문과 체결을 담당하고, 환경이 현금·수량·FIFO 포지션·수수료를 정산합니다.

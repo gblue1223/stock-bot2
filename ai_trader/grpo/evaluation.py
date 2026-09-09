@@ -2,10 +2,81 @@
 
 from datetime import datetime
 from copy import deepcopy
+from collections import Counter
 from typing import Iterable, Optional
 
 import numpy as np
 import torch
+
+
+_ORDER_METRICS = ('submitted_orders', 'submitted_quantity', 'filled_quantity',
+                  'partial_orders', 'cancelled_orders', 'expired_orders')
+
+
+def _action_name(index):
+    return ('hold', 'buy', 'sell')[index] if 0 <= index < 3 else f'action_{index}'
+
+
+class _ActionDiagnostics:
+    def __init__(self):
+        self.counts = Counter(dict.fromkeys(('hold', 'buy', 'sell'), 0))
+        self.probability_steps = 0
+        self.probability_sum = self.probability_max = None
+
+    def record(self, action, probabilities):
+        self.counts[_action_name(action)] += 1
+        if probabilities is not None:
+            if self.probability_sum is None:
+                self.probability_sum = np.zeros_like(probabilities, dtype=np.float64)
+                self.probability_max = np.zeros_like(probabilities, dtype=np.float64)
+            self.probability_sum += probabilities
+            self.probability_max = np.maximum(self.probability_max, probabilities)
+            self.probability_steps += 1
+
+    def summary(self):
+        steps = sum(self.counts.values())
+        return {
+            'steps': steps,
+            'action_counts': dict(self.counts),
+            'action_rates': {key: value / steps if steps else 0.0
+                             for key, value in self.counts.items()},
+            'probability_steps': self.probability_steps,
+            'mean_action_probabilities': (
+                {_action_name(i): float(value / self.probability_steps)
+                 for i, value in enumerate(self.probability_sum)}
+                if self.probability_steps else None),
+            'max_action_probabilities': (
+                {_action_name(i): float(value) for i, value in enumerate(self.probability_max)}
+                if self.probability_steps else None),
+        }
+
+
+def _execution_diagnostics(episode):
+    # Missing counters are unknown, never evidence that no order was submitted.
+    metrics = {key: int(episode[key]) if key in episode else None for key in _ORDER_METRICS}
+    submitted, filled = metrics['submitted_quantity'], metrics['filled_quantity']
+    metrics['fill_ratio'] = (filled / submitted if submitted else 0.0
+                             ) if submitted is not None and filled is not None else None
+    for name in ('buy_action_outcomes', 'execution_blocked_checks'):
+        metrics[name] = dict(episode[name]) if name in episode else None
+    return metrics
+
+
+def _sum_execution_diagnostics(episodes):
+    metrics = {}
+    for key in _ORDER_METRICS:
+        values = [episode[key] for episode in episodes]
+        metrics[key] = sum(values) if all(value is not None for value in values) else None
+    for name in ('buy_action_outcomes', 'execution_blocked_checks'):
+        values = [episode[name] for episode in episodes]
+        if any(value is None for value in values):
+            metrics[name] = None
+        else:
+            counts = Counter()
+            for value in values:
+                counts.update(value)
+            metrics[name] = dict(counts)
+    return _execution_diagnostics({key: value for key, value in metrics.items() if value is not None})
 
 
 def normalize_date(value) -> str:
@@ -55,11 +126,14 @@ def chronological_date_split(
 
 
 def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
-                    device: str = "cpu", max_steps: int = 100000) -> dict:
+                    device: str = "cpu", max_steps: int = 100000,
+                    collect_diagnostics: bool = True) -> dict:
     """Evaluate exactly these weights on a repeatable set of held-out paths.
 
     Only environment-reported cost-inclusive NAV returns determine performance.
     The evaluator never updates parameters or uses shaped reward as a fallback.
+    Diagnostics record decisions and execution outcomes on these same paths;
+    they do not change actions, cost settings, or the selection metric.
     """
     if num_episodes <= 0:
         raise ValueError("num_episodes must be positive")
@@ -69,14 +143,27 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
     incomplete_liquidations = 0
     residual_quantities, realized_pnls = [], []
     execution_models = {}
+    total_actions = _ActionDiagnostics()
+    diagnostic_episodes = []
+    probability_action = getattr(policy, 'get_action_with_probabilities', None)
     try:
         with torch.no_grad():
             for index in range(num_episodes):
                 obs, _ = env.reset(seed=seed + index)
+                episode_actions = _ActionDiagnostics()
                 for _ in range(max_steps):
                     tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    action, _ = policy.get_action(tensor, deterministic=True)
-                    obs, _, terminated, truncated, info = env.step(int(action.item()))
+                    probabilities = None
+                    if collect_diagnostics and callable(probability_action):
+                        action, _, probabilities = probability_action(tensor, deterministic=True)
+                        probabilities = probabilities.detach().cpu().numpy().reshape(-1)
+                    else:
+                        action, _ = policy.get_action(tensor, deterministic=True)
+                    action_index = int(action.item())
+                    if collect_diagnostics:
+                        episode_actions.record(action_index, probabilities)
+                        total_actions.record(action_index, probabilities)
+                    obs, _, terminated, truncated, info = env.step(action_index)
                     if terminated or truncated:
                         episode = info.get("episode", {})
                         value = episode.get("net_return", episode.get("total_return"))
@@ -91,12 +178,20 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                         realized_pnls.append(float(episode.get("realized_net_pnl", 0.0)))
                         execution_model = str(episode.get("execution_model", "unknown"))
                         execution_models[execution_model] = execution_models.get(execution_model, 0) + 1
+                        if collect_diagnostics:
+                            diagnostic_episodes.append({
+                                'episode_index': index, 'seed': seed + index,
+                                'episode_key': deepcopy(episode.get('episode_key', {})),
+                                'net_return': float(value), 'num_trades': trades[-1],
+                                'open_quantity': residual_quantities[-1],
+                                **episode_actions.summary(), **_execution_diagnostics(episode),
+                            })
                         break
                 else:
                     raise RuntimeError("Evaluation episode exceeded max_steps")
     finally:
         policy.train(was_training)
-    return {
+    result = {
         "mean_net_return": float(np.mean(returns)),
         "std_net_return": float(np.std(returns)),
         "min_net_return": float(np.min(returns)),
@@ -113,6 +208,13 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
         "synthetic_execution_episodes": sum(
             count for name, count in execution_models.items() if 'synthetic' in name),
     }
+    if collect_diagnostics:
+        result['diagnostics'] = {
+            **total_actions.summary(), **_sum_execution_diagnostics(diagnostic_episodes),
+            'execution_blocked_checks_unit': 'order/event checks, not distinct orders',
+            'episodes': diagnostic_episodes,
+        }
+    return result
 
 
 def validate_checkpoint_dates(checkpoint: dict, date_splits: dict) -> None:

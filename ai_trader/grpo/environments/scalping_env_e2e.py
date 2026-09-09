@@ -207,6 +207,9 @@ class GRPOScalpingEnv(gym.Env):
         self.stages, self.episode_trades, self.episode_rewards = [], [], []
         self.cash, self.realized_net_pnl = self.initial_cash, 0.0
         self.loss_holding_violations = 0
+        self.buy_action_outcomes = dict.fromkeys((
+            'submitted', 'risk_exit_active', 'max_stages', 'max_trades',
+            'pending_buy', 'insufficient_budget_for_one_share'), 0)
         self._exit_requested, self._done = False, False
         self.simulator.reset()
         self._update_market_fields()
@@ -354,15 +357,28 @@ class GRPOScalpingEnv(gym.Env):
             self._request_exit('episode_end', now)
         if self._exit_requested:
             self._request_exit('risk_exit_retry', now)
+            if action == 1:
+                self.buy_action_outcomes['risk_exit_active'] += 1
         elif action == 1:
             open_order_ids = {st['order_id'] for st in self.stages} | {o.order_id for o in self._pending('buy')}
             within_limit = self.max_trades_per_episode is None or len(self.episode_trades) < self.max_trades_per_episode
-            if len(open_order_ids) < self.max_stages and within_limit and not self._pending('buy'):
+            if len(open_order_ids) >= self.max_stages:
+                outcome = 'max_stages'
+            elif not within_limit:
+                outcome = 'max_trades'
+            elif self._pending('buy'):
+                outcome = 'pending_buy'
+            else:
                 ask = self.simulator.snapshot.asks[0][0] if self.simulator.snapshot.asks else self.current_price
                 expected = self.simulator.execution_price(ask, 'buy') * (1 + self.buy_fee_rate)
                 qty = int(min(self.cash, self.initial_cash / self.max_stages) / expected)
                 if qty > 0:
                     self.simulator.submit('buy', qty, now)
+                    outcome = 'submitted'
+                else:
+                    outcome = 'insufficient_budget_for_one_share'
+            # Exactly one outcome per BUY decision; guards retain their original priority.
+            self.buy_action_outcomes[outcome] += 1
         elif action == 2 and self.stages and not self._pending('sell'):
             self.simulator.submit('sell', self.stages[0]['quantity'], now)
         # A holding deadline is a timer event, even when no market tick arrives then.
@@ -419,6 +435,7 @@ class GRPOScalpingEnv(gym.Env):
             'max_drawdown': float(drawdowns.max() * 100),
             'sharpe_ratio': sharpe, 'sharpe_ratio_kind': 'unannualized_event_nav_changes',
             'loss_holding_violations': self.loss_holding_violations,
+            'buy_action_outcomes': self.buy_action_outcomes.copy(),
             'open_quantity': self.quantity,
             'max_open_holding_seconds': max((self.current_time_seconds - s['entry_time_seconds'] for s in self.stages), default=0.0),
             'liquidation_complete': self.quantity == 0,

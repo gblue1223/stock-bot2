@@ -93,6 +93,10 @@ class ExecutionSimulator:
         self._real_events = 0
         self._displayed = {'buy': {}, 'sell': {}}
         self._remaining = {'buy': {}, 'sell': {}}
+        self._execution_blocked_checks = dict.fromkeys((
+            'stale_quote', 'not_next_event', 'order_latency', 'no_displayed_depth',
+            'displayed_depth_exhausted', 'insufficient_cash', 'insufficient_inventory',
+            'limit_price_not_marketable'), 0)
 
     def submit(self, side, quantity, timestamp, *, limit_price=None, time_in_force='GTC', reason='signal'):
         if side not in ('buy', 'sell') or time_in_force not in ('GTC', 'IOC'):
@@ -207,13 +211,24 @@ class ExecutionSimulator:
                 order.status = 'expired'
                 continue
             # Even zero-latency orders cannot consume the already observed event.
-            if stale or self.event_index <= order.submitted_event or snapshot.timestamp < order.eligible_at:
+            if stale:
+                self._execution_blocked_checks['stale_quote'] += 1
+                continue
+            if self.event_index <= order.submitted_event:
+                self._execution_blocked_checks['not_next_event'] += 1
+                continue
+            if snapshot.timestamp < order.eligible_at:
+                self._execution_blocked_checks['order_latency'] += 1
                 continue
             levels = snapshot.asks if order.side == 'buy' else snapshot.bids
+            blocked_reasons = set()
+            if not levels:
+                blocked_reasons.add('no_displayed_depth')
             for book_price, _ in levels:
                 price = self.execution_price(book_price, order.side)
                 if order.limit_price is not None:
                     if (order.side == 'buy' and price > order.limit_price) or (order.side == 'sell' and price < order.limit_price):
+                        blocked_reasons.add('limit_price_not_marketable')
                         break
                 available = self._remaining[order.side].get(book_price, 0)
                 qty = min(order.remaining, available)
@@ -222,6 +237,12 @@ class ExecutionSimulator:
                 if order.side == 'sell' and math.isfinite(sell_available):
                     qty = min(qty, max(0, int(sell_available)))
                 if qty <= 0:
+                    if available <= 0:
+                        blocked_reasons.add('displayed_depth_exhausted')
+                    elif order.side == 'buy':
+                        blocked_reasons.add('insufficient_cash')
+                    else:
+                        blocked_reasons.add('insufficient_inventory')
                     continue
                 fill = Fill(order.order_id, order.side, qty, price, snapshot.timestamp, order.reason)
                 order.filled_quantity += qty
@@ -236,12 +257,20 @@ class ExecutionSimulator:
                 order.status = 'filled' if order.remaining == 0 else 'partial'
                 if not order.active:
                     break
+            for reason in blocked_reasons:
+                self._execution_blocked_checks[reason] += 1
             if order.active and order.time_in_force == 'IOC':
                 order.status = 'cancelled'
         self.fills.extend(new_fills)
         return new_fills
 
     def summary(self):
+        """Include blocked checks counted once per reason per active-order/event.
+
+        These are not distinct order totals: repeated events may count the same
+        order again, and a partial-fill event may encounter multiple reasons.
+        Expiry/cancellation and earlier eligibility guards take precedence.
+        """
         submitted = sum(o.quantity for o in self.orders)
         filled = sum(o.filled_quantity for o in self.orders)
         return {
@@ -250,6 +279,7 @@ class ExecutionSimulator:
             'partial_orders': sum(0 < o.filled_quantity < o.quantity for o in self.orders),
             'cancelled_orders': sum(o.status == 'cancelled' for o in self.orders),
             'expired_orders': sum(o.status == 'expired' for o in self.orders),
+            'execution_blocked_checks': self._execution_blocked_checks.copy(),
             'execution_model': ('mixed' if self._synthetic_events and self._real_events else
                                 'synthetic_spread' if self._synthetic_events else 'displayed_depth'),
             'synthetic_book_events': self._synthetic_events,

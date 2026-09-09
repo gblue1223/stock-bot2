@@ -341,6 +341,15 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         """
         정책에서 행동 샘플링 (GRPO 호환)
         """
+        action, dist = self._select_action(obs, deterministic)
+        return action, dist.log_prob(action)
+
+    def get_action_with_probabilities(self, obs: torch.Tensor, deterministic: bool = False):
+        """Return the same action plus masked probabilities in one forward pass."""
+        action, dist = self._select_action(obs, deterministic)
+        return action, dist.log_prob(action), dist.probs
+
+    def _select_action(self, obs: torch.Tensor, deterministic: bool):
         action_logits, _ = self.forward(obs)
         dist = Categorical(logits=action_logits)
         
@@ -349,9 +358,7 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         else:
             action = dist.sample()
             
-        log_prob = dist.log_prob(action)
-        
-        return action, log_prob
+        return action, dist
         
     def evaluate_actions(
         self,
