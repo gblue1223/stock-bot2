@@ -31,7 +31,8 @@ class GRPOScalpingEnv(gym.Env):
                  step_reward_scale=1.0, win_bonus=0.0, loss_penalty=0.0,
                  buy_signal_bonus=0.0, initial_cash=1000000.0,
                  max_holding_seconds=300.0, stop_loss_pct=2.0,
-                 execution_config=None, allowed_dates=None, price_scale=1.0, max_stages=1):
+                 execution_config=None, allowed_dates=None, price_scale=1.0, max_stages=1,
+                 account_observations=False, liquidation_max_steps=0):
         super().__init__()
         self.max_stages = validate_max_stages(max_stages)
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table_name):
@@ -46,6 +47,12 @@ class GRPOScalpingEnv(gym.Env):
             raise ValueError('raw features/prices required; normalized databases cannot supply execution prices')
         if max_episode_steps is not None and max_episode_steps < 1:
             raise ValueError('max_episode_steps must be positive')
+        if (isinstance(liquidation_max_steps, (bool, np.bool_))
+                or not isinstance(liquidation_max_steps, (int, np.integer))
+                or liquidation_max_steps < 0):
+            raise ValueError('liquidation_max_steps must be a nonnegative integer')
+        self.liquidation_max_steps = int(liquidation_max_steps)
+        self.account_observations = account_observations
         if max_trades_per_episode is not None and max_trades_per_episode < 1:
             raise ValueError('max_trades_per_episode must be positive')
         if price_scale <= 0 or not np.isfinite(price_scale) or base_price <= 0:
@@ -86,8 +93,9 @@ class GRPOScalpingEnv(gym.Env):
             rolling_window_size=self.rolling_window_size,
             rolling_min_samples=self.rolling_min_samples,
             max_holding_seconds=self.max_holding_seconds,
-            feature_price_unit=self.price_unit, max_stages=self.max_stages)
-        self.obs_dim = self.expected_features + self.MAX_STAGES * 3
+            feature_price_unit=self.price_unit, max_stages=self.max_stages,
+            account_observations=self.account_observations)
+        self.obs_dim = self.observation_builder.obs_dim
         self.observation_space = spaces.Box(-np.inf, np.inf, (self.seq_len, self.obs_dim), np.float32)
         self.action_space = spaces.Discrete(3)
 
@@ -171,7 +179,8 @@ class GRPOScalpingEnv(gym.Env):
         for key in ('last_price', 'bid_prices', 'ask_prices'):
             if key in execution:
                 execution[key] = execution[key] * self.price_scale
-        needed = len(features) if self.max_episode_steps is None else min(len(features), self.seq_len + self.max_episode_steps)
+        needed = len(features) if self.max_episode_steps is None else min(
+            len(features), self.seq_len + self.max_episode_steps + self.liquidation_max_steps)
         start = self._reset_options.get('start_index')
         start = int(self.np_random.integers(len(features) - needed + 1)) if start is None else int(start)
         if start < 0 or start + self.seq_len >= len(features):
@@ -204,8 +213,15 @@ class GRPOScalpingEnv(gym.Env):
                 raise ValueError(f'execution array is not aligned: {key}')
         self._compute_prices()
         self.current_step = self.seq_len - 1
+        self.decision_steps = min(self.episode_length - self.seq_len,
+                                  self.max_episode_steps or self.episode_length)
+        self.decision_end_index = self.current_step + self.decision_steps
+        self.liquidation_steps = 0
+        self.liquidation_seconds = 0.0
+        self.liquidation_stop_reason = 'disabled' if not self.liquidation_max_steps else 'not_started'
         self.stages, self.episode_trades, self.episode_rewards = [], [], []
         self.cash, self.realized_net_pnl = self.initial_cash, 0.0
+        self.total_entry_fees = self.total_exit_fees = 0.0
         self.loss_holding_violations = 0
         self.buy_action_outcomes = dict.fromkeys((
             'submitted', 'risk_exit_active', 'signal_exit_active', 'max_stages', 'max_trades',
@@ -270,7 +286,31 @@ class GRPOScalpingEnv(gym.Env):
         start = max(0, self.current_step - self.seq_len + 1)
         return self.observation_builder.build(
             self.episode_data[start:self.current_step + 1], self.stages,
-            current_price=self.current_price, current_time_seconds=self.current_time_seconds)
+            current_price=self.current_price, current_time_seconds=self.current_time_seconds,
+            account_state=self._account_state() if self.account_observations else None)
+
+    def _account_state(self):
+        """Account values known now; remaining time describes decisions, not replay tail."""
+        mark = self.simulator.liquidation_mark()
+        ask = self.simulator.snapshot.asks[0][0] if self.simulator.snapshot.asks else self.current_price
+        buy_price = self.simulator.execution_price(ask, 'buy')
+        cash_ratio = self.cash / self.initial_cash
+        # Multiplying fees before/after quantity can differ at machine precision.
+        # Preserve meaningful overdraws for schema validation instead of hiding them.
+        if -1e-12 < cash_ratio < 0:
+            cash_ratio = 0.0
+        state = {
+            'cash_ratio': cash_ratio,
+            'position_value_ratio': self.quantity * mark / self.initial_cash,
+            'pending_buy_value_ratio': sum(o.remaining for o in self._pending('buy')) * buy_price / self.initial_cash,
+            'pending_sell_value_ratio': sum(o.remaining for o in self._pending('sell')) * mark / self.initial_cash,
+            'exit_pending': float(self._exit_requested or self._signal_exit_order_id is not None),
+            'remaining_steps_ratio': max(0, self.decision_end_index - self.current_step) / self.decision_steps,
+        }
+        for index in range(self.MAX_STAGES):
+            quantity = self.stages[index]['quantity'] if index < len(self.stages) else 0
+            state[f'stage_{index + 1}_value_ratio'] = quantity * mark / self.initial_cash
+        return state
 
     def _calculate_seconds_diff(self, start_time_val, end_time_val):
         difference = parse_time_seconds(end_time_val) - parse_time_seconds(start_time_val)
@@ -289,37 +329,45 @@ class GRPOScalpingEnv(gym.Env):
         if fill.side == 'buy':
             fee = value * self.buy_fee_rate
             self.cash -= value + fee
+            self.total_entry_fees += fee
             stage = next((s for s in self.stages if s['order_id'] == fill.order_id), None)
             if stage is None:
                 self.stages.append({'order_id': fill.order_id, 'quantity': fill.quantity,
                     'entry_price': fill.price, 'entry_time_seconds': fill.timestamp,
-                    'entry_time': self.current_time, 'entry_fees': fee})
+                    'entry_time': self.current_time, 'entry_fees': fee,
+                    'entry_time_sum': fill.quantity * fill.timestamp})
             else:
                 qty = stage['quantity'] + fill.quantity
                 stage['entry_price'] = (stage['entry_price'] * stage['quantity'] + value) / qty
                 stage['quantity'] = qty
                 stage['entry_fees'] += fee
+                stage['entry_time_sum'] += fill.quantity * fill.timestamp
         else:
             self.cash += value * (1 - self.sell_fee_rate)
+            self.total_exit_fees += value * self.sell_fee_rate
             remaining = fill.quantity
             while remaining:
                 stage = self.stages[0]
                 qty = min(remaining, stage['quantity'])
                 entry_fee = stage['entry_fees'] * qty / stage['quantity']
                 exit_fee = qty * fill.price * self.sell_fee_rate
+                mean_entry_time = stage['entry_time_sum'] / stage['quantity']
                 pnl = qty * (fill.price - stage['entry_price']) - entry_fee - exit_fee
                 self.realized_net_pnl += pnl
                 self.episode_trades.append({
                     'entry_price': stage['entry_price'], 'exit_price': fill.price,
                     'quantity': qty, 'entry_fee': entry_fee, 'exit_fee': exit_fee,
                     'holding_time': fill.timestamp - stage['entry_time_seconds'],
+                    'holding_share_seconds': qty * (fill.timestamp - mean_entry_time),
                     'profit_rate': fill.price / stage['entry_price'] - 1,
                     'net_pnl': pnl, 'net_return': pnl / self.initial_cash * 100,
                     'reward': pnl / self.initial_cash * 100,
                     'weight': qty * stage['entry_price'] / self.initial_cash,
-                    'exit_reason': fill.reason, 'order_id': fill.order_id})
+                    'exit_reason': fill.reason, 'order_id': fill.order_id,
+                    'entry_order_id': stage['order_id']})
                 stage['quantity'] -= qty
                 stage['entry_fees'] -= entry_fee
+                stage['entry_time_sum'] -= qty * mean_entry_time
                 remaining -= qty
                 if stage['quantity'] == 0:
                     self.stages.pop(0)
@@ -348,6 +396,39 @@ class GRPOScalpingEnv(gym.Env):
     def _equity(self):
         return self.cash + self.quantity * self.simulator.liquidation_mark() * (1 - self.sell_fee_rate)
 
+    def _advance_market(self, index):
+        self.current_step = index
+        self._update_market_fields()
+        fills = self.simulator.process(
+            self._snapshot(index), cash_available=self.cash, sell_available=self.quantity,
+            buy_fee_rate=self.buy_fee_rate, sell_fee_rate=self.sell_fee_rate)
+        for fill in fills:
+            self._apply_fill(fill)
+        self.equity = self._equity()
+        self.equity_history.append(self.equity)
+        return fills
+
+    def _liquidate_after_decisions(self):
+        """Replay a bounded real market suffix without any more policy decisions."""
+        started = self.current_time_seconds
+        fills = []
+        self._request_exit('episode_end', started)
+        while (self.quantity or self._pending('buy')):
+            if self.current_step >= self.episode_length - 1:
+                self.liquidation_stop_reason = 'end_of_data'
+                break
+            if self.liquidation_steps >= self.liquidation_max_steps:
+                self.liquidation_stop_reason = 'step_limit'
+                break
+            # Include buy fills racing cancellation and retry expired/partial sells.
+            self._request_exit('episode_end_retry', self.current_time_seconds)
+            fills.extend(self._advance_market(self.current_step + 1))
+            self.liquidation_steps += 1
+        else:
+            self.liquidation_stop_reason = 'flat'
+        self.liquidation_seconds = self.current_time_seconds - started
+        return fills
+
     def step(self, action):
         if self._done:
             raise RuntimeError('reset() required after episode end')
@@ -355,16 +436,15 @@ class GRPOScalpingEnv(gym.Env):
             raise ValueError('invalid action')
         now = self.current_time_seconds
         next_index = self.current_step + 1
-        horizon = next_index >= self.episode_length - 1
-        if self.max_episode_steps is not None:
-            horizon |= next_index - (self.seq_len - 1) >= self.max_episode_steps
+        horizon = next_index >= self.decision_end_index
+        equity_before = self.equity
         # Risk decisions use only the latest available quote and already known deadlines.
         stop = any((self.simulator.liquidation_mark() / st['entry_price'] - 1) * 100 <= -self.stop_loss_pct for st in self.stages)
         overdue = any(now - st['entry_time_seconds'] >= self.max_holding_seconds for st in self.stages)
         if stop or overdue:
             self.loss_holding_violations += int(stop)
             self._request_exit('stop_loss' if stop else 'max_holding', now)
-        if horizon:
+        if horizon and not self.liquidation_max_steps:
             self._request_exit('episode_end', now)
         if self._exit_requested:
             self._request_exit('risk_exit_retry', now)
@@ -402,20 +482,16 @@ class GRPOScalpingEnv(gym.Env):
             deadline = min(s['entry_time_seconds'] + self.max_holding_seconds for s in self.stages)
             if now < deadline <= self.timestamps[next_index]:
                 self._request_exit('max_holding', deadline)
-        self.current_step = next_index
-        self._update_market_fields()
-        fills = self.simulator.process(
-            self._snapshot(next_index), cash_available=self.cash, sell_available=self.quantity,
-            buy_fee_rate=self.buy_fee_rate, sell_fee_rate=self.sell_fee_rate)
-        for fill in fills:
-            self._apply_fill(fill)
-        self.equity = self._equity()
-        reward = (self.equity - self.equity_history[-1]) / self.initial_cash * 100
-        self.episode_rewards.append(float(reward))
-        self.equity_history.append(self.equity)
+        fills = self._advance_market(next_index)
         terminated = self.current_step >= self.episode_length - 1
         if self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode and not self.stages:
             terminated = True
+        if self.liquidation_max_steps and (horizon or terminated):
+            fills.extend(self._liquidate_after_decisions())
+            # This is a completed finite trading task, including its closeout outcome.
+            terminated = True
+        reward = (self.equity - equity_before) / self.initial_cash * 100
+        self.episode_rewards.append(float(reward))
         truncated = bool(horizon and not terminated)
         self._done = bool(terminated or truncated)
         if self._done:
@@ -439,25 +515,58 @@ class GRPOScalpingEnv(gym.Env):
         net_return = (self.equity - self.initial_cash) / self.initial_cash * 100
         trades = self.episode_trades
         net_trades = [t['net_return'] for t in trades]
+        fragments_by_entry = {}
+        for trade in trades:
+            fragments_by_entry.setdefault(trade['entry_order_id'], []).append(trade)
+        round_trips = []
+        for order in self.simulator.orders:
+            fragments = fragments_by_entry.get(order.order_id, [])
+            sold = sum(t['quantity'] for t in fragments)
+            if order.side != 'buy' or order.active or sold == 0 or sold != order.filled_quantity:
+                continue
+            pnl = sum(t['net_pnl'] for t in fragments)
+            round_trips.append({
+                'entry_order_id': order.order_id, 'quantity': sold,
+                'net_pnl': pnl, 'net_return': pnl / self.initial_cash * 100,
+                'fill_count': len(fragments),
+                'quantity_weighted_holding_time': sum(t['holding_share_seconds'] for t in fragments) / sold,
+            })
+        sold_quantity = sum(t['quantity'] for t in trades)
+        fill_holding = float(np.mean([t['holding_time'] for t in trades])) if trades else 0.0
+        fill_win_rate = float(np.mean([t['net_pnl'] > 0 for t in trades])) if trades else 0.0
         eq = np.asarray(self.equity_history)
         drawdowns = 1 - eq / np.maximum.accumulate(eq)
-        rewards = np.asarray(self.episode_rewards)
-        sharpe = float(rewards.mean() / rewards.std()) if len(rewards) > 1 and rewards.std() > 1e-12 else 0.0
+        event_returns = np.diff(eq) / self.initial_cash * 100
+        sharpe = (float(event_returns.mean() / event_returns.std())
+                  if len(event_returns) > 1 and event_returns.std() > 1e-12 else 0.0)
         return {
             'total_return': float(net_return), 'net_return': float(net_return),
             'realized_net_pnl': float(self.realized_net_pnl),
+            'gross_realized_pnl': float(sum(t['quantity'] * (t['exit_price'] - t['entry_price']) for t in trades)),
             'unrealized_net_pnl': float(self.equity - self.initial_cash - self.realized_net_pnl),
             'num_trades': len(trades), 'trades': trades,
-            'avg_holding_time': float(np.mean([t['holding_time'] for t in trades])) if trades else 0.0,
-            'win_rate': float(np.mean([t['net_pnl'] > 0 for t in trades])) if trades else 0.0,
+            # Legacy fields/caps count FIFO sell fragments; do not silently reinterpret them.
+            'avg_holding_time': fill_holding, 'win_rate': fill_win_rate,
+            'fill_count': len(trades), 'fill_avg_holding_time': fill_holding,
+            'fill_win_rate': fill_win_rate,
+            'round_trip_count': len(round_trips), 'round_trips': round_trips,
+            'round_trip_win_rate': float(np.mean([t['net_pnl'] > 0 for t in round_trips])) if round_trips else 0.0,
+            'quantity_weighted_holding_time': sum(t['holding_share_seconds'] for t in trades) / sold_quantity if sold_quantity else 0.0,
+            'total_entry_fees': self.total_entry_fees, 'total_exit_fees': self.total_exit_fees,
+            'total_fees': self.total_entry_fees + self.total_exit_fees,
             'avg_profit_per_trade': float(np.mean(net_trades)) if net_trades else 0.0,
             'max_drawdown': float(drawdowns.max() * 100),
-            'sharpe_ratio': sharpe, 'sharpe_ratio_kind': 'unannualized_event_nav_changes',
+            'sharpe_ratio': sharpe,
+            'sharpe_ratio_kind': 'unannualized_event_nav_changes',
             'loss_holding_violations': self.loss_holding_violations,
             'buy_action_outcomes': self.buy_action_outcomes.copy(),
             'open_quantity': self.quantity,
             'max_open_holding_seconds': max((self.current_time_seconds - s['entry_time_seconds'] for s in self.stages), default=0.0),
             'liquidation_complete': self.quantity == 0,
+            'liquidation_steps': self.liquidation_steps,
+            'liquidation_seconds': self.liquidation_seconds,
+            'liquidation_stop_reason': self.liquidation_stop_reason,
+            'market_steps_taken': self.current_step - (self.seq_len - 1),
             'episode_length': self.episode_length, 'steps_taken': len(self.episode_rewards),
             'market_context': self.market_context, 'episode_key': getattr(self, 'episode_key', {}),
             'price_source': self.price_source, **self.simulator.summary()}

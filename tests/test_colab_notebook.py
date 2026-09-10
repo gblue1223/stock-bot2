@@ -11,12 +11,14 @@ from types import SimpleNamespace
 import pytest
 
 from ai_trader.grpo.train_xlstm import TrainingConfig
-from lib.observations import ObservationBuilder
+from lib.observations import ACCOUNT_FIELDS, ObservationBuilder
 
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTEBOOK = ROOT / 'ai_trader/grpo/colab_train_xlstm.ipynb'
 GIB = 1024 ** 3
+NOTEBOOK_NAMES = ('colab_train_xlstm.ipynb', 'colab_train_xlstm_astral.ipynb',
+                  'colab_train_xlstm_5splits_astral.ipynb', 'colab_train_xlstm_return_priority.ipynb')
 
 
 def sources():
@@ -31,7 +33,9 @@ def helpers():
     return namespace
 
 
-def test_notebook_and_embedded_runner_are_valid_python():
+@pytest.mark.parametrize('name', NOTEBOOK_NAMES)
+def test_notebook_and_embedded_runner_are_valid_python(name, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
     notebook = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
     for cell in notebook['cells']:
         if cell['cell_type'] == 'code':
@@ -107,6 +111,8 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     assert config['max_holding_seconds'] == 300
     assert config['execution_config']['order_latency_ms'] > 0
     assert config['validation_fraction'] == config['test_fraction'] == .2
+    assert config['account_observations'] is False and config['liquidation_max_steps'] == 0
+    assert config['evaluation_workers'] == 1
 
 
 def checkpoint_and_base():
@@ -167,3 +173,57 @@ def test_astral_notebooks_share_return_priority_defaults(name, monkeypatch):
     test_default_settings_are_supported_and_use_current_reward_and_execution()
     for source in sources().values():
         ast.parse(source)
+
+
+@pytest.mark.parametrize('name', NOTEBOOK_NAMES)
+@pytest.mark.parametrize('account_observations', [False, True])
+def test_notebook_resume_uses_checkpoint_schema_and_tail_not_current_defaults(
+        name, account_observations, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
+    checkpoint, base = checkpoint_and_base()
+    saved = checkpoint['extra_state']['training_config']
+    schema = ObservationBuilder(['현재가', '등락률'], seq_len=2048,
+        rolling_window_size=256, rolling_min_samples=64, max_holding_seconds=120,
+        account_observations=account_observations).schema
+    checkpoint['observation_schema'] = schema
+    saved['features'] = len(schema['feature_columns'])
+    # Old configuration never recorded these fields; v3 restores its saved tail.
+    saved.pop('account_observations', None)
+    saved.pop('liquidation_max_steps', None)
+    if account_observations:
+        saved['liquidation_max_steps'] = 37
+    scope = helpers()
+    restored = scope['restore_run_config'](base, checkpoint, 'resume')
+    assert restored['account_observations'] is account_observations
+    assert restored['liquidation_max_steps'] == (37 if account_observations else 0)
+    assert restored['evaluation_workers'] == base['evaluation_workers']
+    expected_dim = len(schema['feature_columns']) + 15 + (len(ACCOUNT_FIELDS) if account_observations else 0)
+    assert scope['model_obs_dim'](restored) == expected_dim
+    constructor = next(node for node in ast.walk(ast.parse(sources()['gpu-probe']))
+                       if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                       and node.func.id == 'GRPOPolicyE2EXLSTM')
+    dimension = next(keyword.value for keyword in constructor.keywords if keyword.arg == 'obs_dim')
+    probe_scope = {**scope, 'config': restored, 'observation': SimpleNamespace(shape=(2048, expected_dim))}
+    assert eval(compile(ast.Expression(dimension), '<gpu-probe-dimension>', 'eval'), probe_scope) == expected_dim
+    assert any("(CONFIG['seq_len'], model_obs_dim(CONFIG))" in source for source in sources().values())
+
+
+@pytest.mark.parametrize('name', NOTEBOOK_NAMES)
+def test_notebook_memory_estimate_counts_account_fields(name, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
+    scope = helpers()
+    profile = scope['a100_profile'](40, 38, 50, 12)
+    old = {**profile, 'account_observations': False}
+    new = {**profile, 'account_observations': True}
+    expected_extra = (3 * profile['episodes_per_group'] * profile['num_groups']
+                      * profile['episode_steps'] * profile['seq_len'] * len(ACCOUNT_FIELDS) * 4 / GIB)
+    assert scope['estimated_host_gib'](new) - scope['estimated_host_gib'](old) >= expected_extra - 1e-9
+
+
+def test_return_priority_notebook_enables_new_observations_and_liquidation_tail(monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
+    config = default_config_namespace()['CONFIG']
+    assert config['account_observations'] is True
+    assert config['liquidation_max_steps'] == 300
+    assert 1 < config['evaluation_workers'] <= config['num_workers']
+    assert config['lambda_gae'] == .95

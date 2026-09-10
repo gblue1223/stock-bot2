@@ -85,6 +85,9 @@ def run_diagnostics(checkpoint_path, *, split='validation', episodes=None, seed=
     for name, value in deepcopy(saved_config).items():
         if not name.startswith('_'):
             setattr(config, name, value)
+    # New training defaults must not change the replay of a legacy checkpoint.
+    config.account_observations = schema.get('version') == 3
+    config.liquidation_max_steps = saved_config.get('liquidation_max_steps', 0)
     overrides = {}
     if extracted_dir is not None:
         config.extracted_dir = str(Path(extracted_dir).resolve())

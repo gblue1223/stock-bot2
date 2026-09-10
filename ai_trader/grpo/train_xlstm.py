@@ -71,6 +71,8 @@ class TrainingConfig:
         self.seq_len = 1024
         self.features = 27
         self.episode_steps = 300
+        self.account_observations = True
+        self.liquidation_max_steps = 300
         
         self.hidden_dim = 512
         self.cnn_channels = 256
@@ -81,6 +83,7 @@ class TrainingConfig:
         self.num_groups = 4
         self.lr = 3e-5
         self.gamma = 1.0  # Finite-episode net NAV: do not discount delayed profits.
+        self.lambda_gae = 0.95
         self.clip = 0.1
         self.kl_target = 0.01
         self.entropy_coef = 0.01
@@ -109,7 +112,10 @@ class TrainingConfig:
         self.embargo_dates = 0
         self.evaluation_episodes = 64
         self.evaluation_interval = 5
+        self.evaluation_workers = 8
         self.evaluation_seed = 42
+        self.diagnostics_interval = 5
+        self.diagnostics_max_samples = 256
         self.selection_require_liquidation = True
         self.cache_max_bytes = 256 * 1024 * 1024
         self.initial_cash = 1_000_000.0
@@ -167,13 +173,21 @@ class TrainingConfig:
             errors.append("selection_require_liquidation must be a boolean")
         if not 0 < self.gamma <= 1:
             errors.append("gamma must be in (0, 1]")
+        if not 0 <= self.lambda_gae <= 1:
+            errors.append('lambda_gae must be in [0, 1]')
+        if not isinstance(self.account_observations, bool):
+            errors.append('account_observations must be a boolean')
+        if (isinstance(self.liquidation_max_steps, bool) or
+                not isinstance(self.liquidation_max_steps, int) or self.liquidation_max_steps < 0):
+            errors.append('liquidation_max_steps must be a nonnegative integer')
         if not isinstance(self.resume, bool):
             errors.append("resume must be a boolean")
         if self.resume and not self.load_policy:
             errors.append("--resume requires --load_policy")
         for name in ('seq_len', 'episode_steps', 'num_workers', 'episodes_per_group',
                      'num_groups', 'batch_size', 'num_epochs', 'total_timesteps',
-                     'evaluation_episodes', 'evaluation_interval'):
+                     'evaluation_episodes', 'evaluation_interval', 'evaluation_workers',
+                     'diagnostics_interval', 'diagnostics_max_samples'):
             if getattr(self, name) <= 0:
                 errors.append(f"{name} must be positive")
         # cache 디렉토리나 DB 파일 둘 중 하나는 존재해야 함
@@ -206,6 +220,8 @@ def create_environment(config: TrainingConfig, device: str, allowed_dates=None):
             buy_tax_rate=config.buy_tax_rate,
             sell_tax_rate=config.sell_tax_rate,
             max_episode_steps=config.episode_steps,
+            account_observations=config.account_observations,
+            liquidation_max_steps=config.liquidation_max_steps,
             base_price=config.base_price,
             price_scale=config.price_scale,
             no_trade_penalty=config.no_trade_penalty,
@@ -373,6 +389,12 @@ def main():
     parser.add_argument('--num_groups', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--gamma', type=float, default=None)
+    parser.add_argument('--lambda_gae', type=float, default=None)
+    parser.add_argument('--account_observations', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--liquidation_max_steps', type=int, default=None)
+    parser.add_argument('--evaluation_workers', type=int, default=None)
+    parser.add_argument('--diagnostics_interval', type=int, default=None)
+    parser.add_argument('--diagnostics_max_samples', type=int, default=None)
     parser.add_argument('--clip', type=float, default=None)
     parser.add_argument('--kl_target', type=float, default=None)
     parser.add_argument('--entropy_coef', type=float, default=None)
@@ -399,6 +421,7 @@ def main():
     
     device = "cpu"
     vec_env = ref_env = validation_env = test_env = trainer = None
+    validation_envs = []
     try:
         config = TrainingConfig(args.config)
         
@@ -426,6 +449,14 @@ def main():
                 # GPU OOM을 방지하기 위해 CPU에서 임시로 로드하여 검사
                 checkpoint = torch.load(config.load_policy, map_location='cpu', weights_only=False)
                 state_dict = checkpoint.get('policy_state_dict', checkpoint.get('state_dict', checkpoint))
+                saved_schema = checkpoint.get('observation_schema', {})
+                saved_config = checkpoint.get('extra_state', {}).get('training_config', {})
+                if args.account_observations is None:
+                    config.account_observations = saved_schema.get('version') == 3
+                if args.liquidation_max_steps is None:
+                    config.liquidation_max_steps = saved_config.get('liquidation_max_steps', 0)
+                if args.lambda_gae is None:
+                    config.lambda_gae = saved_config.get('lambda_gae', 0.95)
                 
                 has_gru = any('gru' in k for k in state_dict.keys())
                 
@@ -486,7 +517,8 @@ def main():
             
         ref_env = (vec_env.envs[0] if config.num_workers <= 1
                    else create_environment(config, device, date_splits['train']))
-        validation_env = create_environment(config, device, date_splits['validation'])
+        for _ in range(min(config.evaluation_workers, config.evaluation_episodes)):
+            validation_envs.append(create_environment(config, device, date_splits['validation']))
         
         # 정책 모델 생성
         logger.info("[STEP 3/6] Creating policy...")
@@ -540,6 +572,7 @@ def main():
             num_groups=config.num_groups,
             learning_rate=config.lr,
             gamma=config.gamma,
+            lambda_gae=config.lambda_gae,
             clip_epsilon=config.clip,
             kl_target=config.kl_target,
             entropy_coef=config.entropy_coef,
@@ -552,10 +585,12 @@ def main():
             num_epochs=config.num_epochs,
             observation_schema=ref_env.observation_schema,
             evaluation_callback=lambda current_policy: evaluate_policy(
-                current_policy, validation_env, config.evaluation_episodes,
+                current_policy, validation_envs, config.evaluation_episodes,
                 config.evaluation_seed, device),
             evaluation_interval=config.evaluation_interval,
             selection_require_liquidation=config.selection_require_liquidation,
+            diagnostics_interval=config.diagnostics_interval,
+            diagnostics_max_samples=config.diagnostics_max_samples,
         )
         trainer.extra_checkpoint_state = {'date_splits': date_splits,
                                           'training_config': dict(config.__dict__)}
@@ -649,7 +684,7 @@ def main():
             trainer.writer.close()
         if vec_env is not None:
             vec_env.close()
-        for environment in (validation_env, test_env):
+        for environment in (*validation_envs, test_env):
             if environment is not None:
                 environment.close()
         if ref_env is not None and not (vec_env is not None and hasattr(vec_env, 'envs')

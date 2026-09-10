@@ -7,6 +7,8 @@ GRPO (Group Relative Policy Optimization) 알고리즘 구현
 import logging
 from typing import Dict, List, Optional, Tuple, Any, Callable
 import os
+import json
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -73,6 +75,8 @@ class GRPOTrainer:
         evaluation_callback: Optional[Callable[[nn.Module], Dict[str, Any]]] = None,
         evaluation_interval: int = 1,
         selection_require_liquidation: bool = False,
+        diagnostics_interval: int = 5,
+        diagnostics_max_samples: int = 256,
     ):
         self.policy = policy
         
@@ -107,6 +111,8 @@ class GRPOTrainer:
         self.evaluation_callback = evaluation_callback
         self.evaluation_interval = max(1, evaluation_interval)
         self.selection_require_liquidation = selection_require_liquidation
+        self.diagnostics_interval = max(1, int(diagnostics_interval))
+        self.diagnostics_max_samples = max(1, int(diagnostics_max_samples))
         if selection_require_liquidation and evaluation_callback is None:
             raise ValueError("Liquidation-aware selection requires a validation callback")
         logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}")
@@ -153,6 +159,7 @@ class GRPOTrainer:
         current_rewards = [[] for _ in range(num_envs)]
         current_dones = [[] for _ in range(num_envs)]
         current_log_probs = [[] for _ in range(num_envs)]
+        current_values = [[] for _ in range(num_envs)]
         
         # 최초 Reset
         obs, infos = vec_env.reset()
@@ -176,7 +183,14 @@ class GRPOTrainer:
                 # DataParallel 클래스 등으로 래핑된 경우 unwrap
                 base_policy = getattr(self.policy, 'module', self.policy)
                 
-                if hasattr(base_policy, 'get_action'):
+                rollout_values = None
+                if hasattr(base_policy, 'get_action_with_value'):
+                    actions, log_probs, rollout_values = base_policy.get_action_with_value(
+                        states_tensor, deterministic=False)
+                    actions = actions.detach().cpu().numpy()
+                    log_probs = log_probs.detach().cpu().numpy()
+                    rollout_values = rollout_values.detach().cpu().numpy().reshape(-1)
+                elif hasattr(base_policy, 'get_action'):
                     try:
                         actions, log_probs = base_policy.get_action(states_tensor, deterministic=False)
                         if isinstance(actions, torch.Tensor):
@@ -220,6 +234,8 @@ class GRPOTrainer:
                 
                 current_dones[i].append(dones[i])
                 current_log_probs[i].append(log_probs[i])
+                if rollout_values is not None:
+                    current_values[i].append(rollout_values[i])
                 
                 if dones[i]:
                     # 에피소드 종료
@@ -249,6 +265,8 @@ class GRPOTrainer:
                         'log_probs': np.array(current_log_probs[i]),
                         'metadata': ep_info
                     }
+                    if len(current_values[i]) == ep_steps:
+                        episode_data['values'] = np.asarray(current_values[i], dtype=np.float32)
                     episodes_collected.append(episode_data)
                     episodes_done += 1
                     
@@ -260,6 +278,7 @@ class GRPOTrainer:
                     current_rewards[i] = []
                     current_dones[i] = []
                     current_log_probs[i] = []
+                    current_values[i] = []
                     start_infos[i] = dict(step_infos[i].get('reset_info', {}))
                     start_market[i] = np.asarray(start_infos[i].get(
                         'market_context', self._initial_market_indicators(next_obs[i])))
@@ -586,6 +605,8 @@ class GRPOTrainer:
         all_old_log_probs = []
         all_advantages = []
         all_returns = []
+        all_old_values = []
+        gae_started = time.perf_counter()
         
         if self.use_gae:
             # 에피소드별로 값 함수 추정 후 GAE 계산 및 그룹 상대 어드밴티지 결합
@@ -596,15 +617,20 @@ class GRPOTrainer:
                 rewards = episode['rewards']
                 dones = episode['dones']
                 
-                with torch.no_grad():
+                if 'values' in episode:
+                    values_ep = np.asarray(episode['values'], dtype=np.float32)
+                    if values_ep.shape != (len(rewards),) or not np.isfinite(values_ep).all():
+                        raise ValueError('Invalid cached rollout values')
+                else:
                     # Both device transfer and forward are bounded by batch_size.
                     # Keep value estimates on CPU as well; do not retain an entire
                     # episode's observation tensor during the later PPO update.
-                    values_ep_list = []
-                    for batch_s, batch_a in self._episode_tensor_batches(states, actions):
-                        _, _, v = self.policy.evaluate_actions(batch_s, batch_a)
-                        values_ep_list.append(v.reshape(-1).cpu().numpy())
-                    values_ep = np.concatenate(values_ep_list)
+                    with torch.no_grad():
+                        values_ep_list = []
+                        for batch_s, batch_a in self._episode_tensor_batches(states, actions):
+                            _, _, v = self.policy.evaluate_actions(batch_s, batch_a)
+                            values_ep_list.append(v.reshape(-1).cpu().numpy())
+                        values_ep = np.concatenate(values_ep_list)
                 
                 # GAE 계산 (타임스텝별 세부 기여도 평가)
                 adv_ep, ret_ep = self._compute_gae(rewards, dones, values_ep)
@@ -626,6 +652,7 @@ class GRPOTrainer:
                 all_old_log_probs.append(old_log_probs)
                 all_advantages.append(adv_hybrid)
                 all_returns.append(ret_ep)
+                all_old_values.append(values_ep)
         else:
             for episode, advantage in zip(episodes, advantages):
                 states = episode['states']
@@ -660,32 +687,11 @@ class GRPOTrainer:
         advantages_tensor = torch.from_numpy(all_advantages).float()
         returns_tensor = torch.from_numpy(all_returns).float()
         
-        # 2. 참조 정책 저장 (KL 발산 계산용)
-        if self.reference_policy is None:
-            # 첫 업데이트 시 참조 정책 초기화
-            # 정책 클래스에 따라 다른 초기화 방법 사용
-            policy_class = type(self.policy)
-            
-            # 정책 클래스별 초기화 파라미터 결정
-            # 순서 중요: 더 구체적인 속성부터 체크
-            if hasattr(self.policy, 'embedding_dim'):
-                # 기존 GRPOPolicy (마지막에 체크)
-                self.reference_policy = policy_class(
-                    embedding_dim=self.policy.embedding_dim,
-                    hidden_dim=self.policy.hidden_dim,
-                    action_dim=self.policy.action_dim
-                ).to(self.device)
-            else:
-                # 기본값으로 현재 정책을 복사
-                import copy
-                self.reference_policy = copy.deepcopy(self.policy)
-        
-        # 현재 정책을 참조 정책으로 복사
-        self.reference_policy.load_state_dict(self.policy.state_dict())
-        # GRU 가중치를 연속 메모리 블록으로 재정렬 (cuDNN 역전파 안정성)
-        if hasattr(self.reference_policy, 'gru'):
-            self.reference_policy.gru.flatten_parameters()
-        self.reference_policy.eval()
+        # The frozen rollout likelihood is already stored with every action.
+        # No second model or reference forward is needed for sampled KL.
+        self.reference_policy = None
+        preparation_seconds = time.perf_counter() - gae_started
+        optimization_started = time.perf_counter()
         
         # 3. 여러 에포크 동안 정책 업데이트 (PPO의 multiple epochs)
         num_epochs = self.num_epochs
@@ -697,7 +703,10 @@ class GRPOTrainer:
         total_entropy = 0.0
         total_kl_divergence = 0.0
         total_clip_fraction = 0.0
+        total_grad_norm = 0.0
         num_batches = 0
+        early_stopped = False
+        checked_kl = 0.0
         
         for epoch in range(num_epochs):
             # 데이터 셔플
@@ -722,6 +731,18 @@ class GRPOTrainer:
                 # 5. PPO 클리핑 목적 함수 계산
                 # 확률 비율: r_t = π_θ(a|s) / π_θ_old(a|s)
                 ratio = torch.exp(log_probs - batch_old_log_probs)
+                log_ratio = log_probs - batch_old_log_probs
+                kl_divergence = ((ratio - 1) - log_ratio).mean()
+                checked_kl = float(kl_divergence.detach())
+                if not np.isfinite(checked_kl):
+                    raise FloatingPointError('Nonfinite policy KL; update aborted')
+                # Test the policy that would receive this step, without diluting
+                # a recent jump with earlier epochs' near-zero KL estimates.
+                if checked_kl > self.kl_target * 1.5:
+                    early_stopped = True
+                    logger.warning('KL guard stopped before optimizer step: %.6f > %.6f',
+                                   checked_kl, self.kl_target * 1.5)
+                    break
                 
                 # 클리핑되지 않은 목적 함수
                 surr1 = ratio * batch_advantages
@@ -761,13 +782,15 @@ class GRPOTrainer:
                     )
                 
                 # 9. 그래디언트 업데이트
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Nonfinite training loss; update aborted')
                 self.optimizer.zero_grad()
                 loss.backward()
                 
                 # 그래디언트 클리핑
-                torch.nn.utils.clip_grad_norm_(
+                grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.policy.parameters(),
-                    self.max_grad_norm
+                    self.max_grad_norm, error_if_nonfinite=True
                 )
                 
                 self.optimizer.step()
@@ -792,23 +815,40 @@ class GRPOTrainer:
                 total_entropy += entropy.mean().item()
                 total_kl_divergence += kl_divergence.item()
                 total_clip_fraction += clip_fraction.item()
+                total_grad_norm += float(grad_norm)
                 num_batches += 1
             
             # KL 발산이 목표값을 초과하면 조기 종료
-            avg_kl = total_kl_divergence / num_batches
-            if avg_kl > self.kl_target * 1.5:
-                logger.warning(f"Early stopping at epoch {epoch + 1}/{num_epochs} "
-                             f"due to high KL divergence: {avg_kl:.6f} > {self.kl_target * 1.5:.6f}")
+            if early_stopped:
                 break
         
         # 평균 메트릭 계산
         update_metrics = {
-            'policy_loss': total_policy_loss / num_batches,
-            'value_loss': total_value_loss / num_batches,
-            'entropy': total_entropy / num_batches,
-            'kl_divergence': total_kl_divergence / num_batches,
-            'clip_fraction': total_clip_fraction / num_batches
+            'policy_loss': total_policy_loss / max(1, num_batches),
+            'value_loss': total_value_loss / max(1, num_batches),
+            'entropy': total_entropy / max(1, num_batches),
+            'kl_divergence': total_kl_divergence / max(1, num_batches),
+            'clip_fraction': total_clip_fraction / max(1, num_batches),
+            'grad_norm_before_clip': total_grad_norm / max(1, num_batches),
+            'optimizer_steps': num_batches,
+            'kl_early_stopped': int(early_stopped),
+            'last_checked_kl': checked_kl,
+            'preparation_seconds': preparation_seconds,
+            'optimization_seconds': time.perf_counter() - optimization_started,
+            'return_target_mean': float(all_returns.mean()),
+            'return_target_std': float(all_returns.std()),
         }
+        if all_old_values:
+            old_values = np.concatenate(all_old_values)
+            variance = float(all_returns.var())
+            update_metrics.update({
+                'rollout_value_mean': float(old_values.mean()),
+                'rollout_value_std': float(old_values.std()),
+                'explained_variance_available': int(variance > 1e-12),
+                'explained_variance_rollout': (
+                    float(1 - (all_returns - old_values).var() / variance)
+                    if variance > 1e-12 else 0.0),
+            })
         
         self.num_updates += 1
         
@@ -880,6 +920,31 @@ class GRPOTrainer:
         
         return advantages.astype(np.float32), returns.astype(np.float32)
     
+    def _record_validation_metrics(self, metrics, iteration, checkpoint_path=None, label=None):
+        """Persist the current evaluation even when it ties or loses to best."""
+        if checkpoint_path:
+            directory = os.path.join(os.path.dirname(checkpoint_path.format(iteration)), 'validation')
+            os.makedirs(directory, exist_ok=True)
+            suffix = f'_{label}' if label else ''
+            path = os.path.join(directory, f'iteration_{iteration:06d}{suffix}.json')
+            payload = {'iteration': iteration, 'total_timesteps': self.total_timesteps,
+                       'metrics': metrics}
+            temporary = path + '.tmp'
+            with open(temporary, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False,
+                          default=lambda value: value.tolist() if isinstance(value, np.ndarray)
+                          else value.item() if isinstance(value, np.generic) else str(value))
+            os.replace(temporary, path)
+        if self.writer:
+            def scalars(prefix, values):
+                for name, value in values.items():
+                    if isinstance(value, dict):
+                        scalars(f'{prefix}/{name}', value)
+                    elif isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
+                        self.writer.add_scalar(f'{prefix}/{name}', float(value), max(0, iteration - 1))
+            scalars(f'validation_{label}' if label else 'validation', metrics)
+            self.writer.flush()
+
     def _validation_selection_score(self, metrics):
         """Rank realized validation returns; incomplete liquidation is ineligible."""
         value = float(metrics['mean_net_return'])
@@ -906,17 +971,20 @@ class GRPOTrainer:
 
         best_metrics = self.evaluation_callback(self.policy)
         best_score = self._validation_selection_score(best_metrics)
+        self._record_validation_metrics(best_metrics, start_iteration, checkpoint_path, 'initial_source')
         best_checkpoint = None
         if candidates:
             import copy
             original_state = copy.deepcopy(self.policy.state_dict())
             try:
-                for candidate in candidates:
+                for candidate_index, candidate in enumerate(candidates):
                     if candidate.get('observation_schema') != self.observation_schema:
                         raise ValueError("Resume best checkpoint observation schema mismatch")
                     self.policy.load_state_dict(candidate['policy_state_dict'], strict=True)
                     metrics = self.evaluation_callback(self.policy)
                     value = self._validation_selection_score(metrics)
+                    self._record_validation_metrics(metrics, start_iteration, checkpoint_path,
+                                                    f'initial_candidate_{candidate_index}')
                     if value is not None and (best_score is None or value >= best_score):
                         best_score, best_metrics, best_checkpoint = value, metrics, candidate
             finally:
@@ -1000,6 +1068,8 @@ class GRPOTrainer:
         budget_start_timesteps = self.total_timesteps
         while True:
             iteration_start_time = time.time()
+            phase_started = time.perf_counter()
+            phase_seconds = {}
             # Episode lengths can be shorter than the configured maximum. A
             # timestep budget must use observed steps, not a fixed episode cap.
             if max_timesteps is not None:
@@ -1018,6 +1088,7 @@ class GRPOTrainer:
             num_episodes = min(episodes_per_iteration, remaining_episodes)
             previous_timesteps = self.total_timesteps
             episodes = self.collect_rollouts(num_episodes)
+            phase_seconds['rollout'] = time.perf_counter() - phase_started
             if not episodes:
                 raise RuntimeError("Rollout collection returned no completed episodes")
             if max_timesteps is not None and self.total_timesteps <= previous_timesteps:
@@ -1029,6 +1100,7 @@ class GRPOTrainer:
                 num_iterations = iteration + 1 + int(np.ceil(remaining_episodes / episodes_per_iteration))
             
             # 2. 에피소드 그룹화
+            phase_started = time.perf_counter()
             grouped_episodes = self.group_episodes(episodes)
             
             # 3. 그룹 상대 어드밴티지 계산
@@ -1042,14 +1114,20 @@ class GRPOTrainer:
                 all_episodes.extend(grouped_episodes[group_id])
                 all_advantages.extend(group_advantages[group_id])
             
+            phase_seconds['grouping'] = time.perf_counter() - phase_started
+            phase_started = time.perf_counter()
             update_metrics = self.update_policy(all_episodes, all_advantages)
+            phase_seconds['update'] = time.perf_counter() - phase_started
             last_completed_iteration = iteration + 1
             
             # 5. 메트릭 로깅
+            phase_started = time.perf_counter()
             if self.writer:
                 self._log_metrics(iteration, episodes, grouped_episodes, update_metrics)
+            phase_seconds['diagnostics'] = time.perf_counter() - phase_started
             
             # 6. 체크포인트 저장
+            phase_started = time.perf_counter()
             if checkpoint_path and (iteration + 1) % checkpoint_interval == 0:
                 # Format checkpoint path with iteration number
                 formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
@@ -1057,6 +1135,7 @@ class GRPOTrainer:
                     formatted_checkpoint_path, iteration + 1,
                     extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
                 )
+            phase_seconds['checkpoint'] = time.perf_counter() - phase_started
             
             # 평균 보상 및 추가 메트릭 계산
             mean_reward = np.mean([ep['metadata']['episode_reward'] for ep in episodes])
@@ -1072,8 +1151,11 @@ class GRPOTrainer:
                     ((iteration + 1) % self.evaluation_interval == 0 or
                      iteration + 1 == num_iterations or
                      (max_timesteps and self.total_timesteps >= max_timesteps))):
+                phase_started = time.perf_counter()
+                logger.info('Starting validation for iteration %d...', iteration + 1)
                 validation_metrics = self.evaluation_callback(self.policy)
                 score = self._validation_selection_score(validation_metrics)
+                self._record_validation_metrics(validation_metrics, iteration + 1, checkpoint_path)
                 reported_return = float(validation_metrics['mean_net_return'])
                 if self.writer:
                     self.writer.add_scalar('validation/mean_net_return', reported_return, iteration)
@@ -1104,7 +1186,14 @@ class GRPOTrainer:
                         self.load_checkpoint(selected_path)
                         self.total_timesteps, self.num_updates = steps, updates
                         no_improve_count = 0
+                phase_seconds['validation'] = time.perf_counter() - phase_started
 
+            if self.writer:
+                for name, seconds in phase_seconds.items():
+                    self.writer.add_scalar(f'timing/{name}_seconds', seconds, iteration)
+                self.writer.flush()
+            logger.info('Phase seconds: %s', ', '.join(
+                f'{name}={seconds:.1f}' for name, seconds in phase_seconds.items()))
             if on_iteration_end:
                 metrics_summary = {
                     'mean_reward': mean_reward,
@@ -1140,10 +1229,10 @@ class GRPOTrainer:
             logger.info(f"Iteration {iteration + 1}/{num_iterations} ({progress_pct:.1f}%) | "
                        f"Timesteps: {self.total_timesteps} | "
                        f"Mean Reward: {mean_reward:.4f} | "
-                       f"Win Rate: {mean_win_rate:.1%} | "
-                       f"Trades: {mean_trades:.0f} | "
+                       f"FillWin: {mean_win_rate:.1%} | "
+                       f"SellFills: {mean_trades:.1f} | "
                        f"Sharpe: {mean_sharpe:.2f} | "
-                       f"AvgHold: {mean_holding_time:.1f}s | "
+                       f"FillHold: {mean_holding_time:.1f}s | "
                        f"Policy Loss: {update_metrics['policy_loss']:.4f} | "
                        f"Elapsed: {elapsed_str} | "
                        f"ETA: {remaining_str}")
@@ -1238,11 +1327,38 @@ class GRPOTrainer:
         self.writer.add_scalar('train/quick_exit_violations_mean', mean_violations, iteration)
         self.writer.add_scalar('train/mean_trades', mean_trades, iteration)
         self.writer.add_scalar('train/mean_sharpe_ratio', mean_sharpe, iteration)
+        # Legacy num_trades counts FIFO sell-fill fragments, not round trips.
+        for name in ('round_trip_count', 'round_trip_win_rate', 'quantity_weighted_holding_time',
+                     'fill_count', 'fill_win_rate', 'fill_avg_holding_time',
+                     'total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl',
+                     'realized_net_pnl', 'liquidation_steps', 'liquidation_seconds',
+                     'open_quantity'):
+            values = [ep['metadata'][name] for ep in episodes if name in ep['metadata']]
+            if values:
+                self.writer.add_scalar(f'train/{name}', float(np.mean(values)), iteration)
+        liquidation = [ep['metadata']['liquidation_complete'] for ep in episodes
+                       if 'liquidation_complete' in ep['metadata']]
+        if liquidation:
+            self.writer.add_scalar('train/incomplete_liquidation_fraction',
+                                   float(np.mean(np.logical_not(liquidation))), iteration)
         
         # 정책 업데이트 메트릭 (정책 엔트로피, KL 발산 포함)
         for key, value in update_metrics.items():
             self.writer.add_scalar(f'train/{key}', value, iteration)
         
+        # One deterministic sample over the full rollout, bounded even when
+        # there are more episodes than the diagnostic sample budget.
+        diagnostic_indices = {}
+        lengths = [len(ep['states']) for ep in episodes]
+        total_states = sum(lengths)
+        positions = (np.linspace(0, total_states - 1,
+                                 min(self.diagnostics_max_samples, total_states), dtype=int)
+                     if total_states else np.array([], dtype=int))
+        offset = 0
+        for ep, length in zip(episodes, lengths):
+            diagnostic_indices[id(ep)] = positions[(positions >= offset) & (positions < offset + length)] - offset
+            offset += length
+
         # ===== 그룹 수준 메트릭 =====
         for group_id, group_episodes in grouped_episodes.items():
             # 그룹 평균 수익
@@ -1274,13 +1390,23 @@ class GRPOTrainer:
             # limiting logging transfers/forwards to the training mini-batch size.
             group_entropies = []
             group_kl_divergences = []
+            diagnostic_samples = 0
+            run_policy_diagnostics = (iteration == 0 or
+                                      (iteration + 1) % self.diagnostics_interval == 0)
             with torch.no_grad():
-                for ep in group_episodes:
+                for ep in group_episodes if run_policy_diagnostics else []:
                     entropy_sum = 0.0
                     kl_sum = 0.0
                     sample_count = 0
+                    indices = diagnostic_indices[id(ep)]
+                    if not len(indices):
+                        continue
+                    selected_states = ep['states'][indices]
+                    selected_actions = ep['actions'][indices]
+                    selected_old_logs = ep['log_probs'][indices]
+                    offset = 0
                     for states_batch, actions_batch in self._episode_tensor_batches(
-                            ep['states'], ep['actions']):
+                            selected_states, selected_actions):
                         current_log_probs, entropy, _ = self.policy.evaluate_actions(
                             states_batch, actions_batch)
                         entropy_sum += entropy.sum().item()
@@ -1289,10 +1415,17 @@ class GRPOTrainer:
                             ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
                                 states_batch, actions_batch)
                             kl_sum += (ref_log_probs - current_log_probs).sum().item()
+                        else:
+                            old_logs = torch.as_tensor(
+                                selected_old_logs[offset:offset + len(states_batch)],
+                                dtype=current_log_probs.dtype, device=current_log_probs.device)
+                            log_ratio = current_log_probs - old_logs
+                            kl_sum += (torch.expm1(log_ratio) - log_ratio).sum().item()
+                        offset += len(states_batch)
                     if sample_count:
                         group_entropies.append(entropy_sum / sample_count)
-                        if self.reference_policy is not None:
-                            group_kl_divergences.append(kl_sum / sample_count)
+                        group_kl_divergences.append(kl_sum / sample_count)
+                        diagnostic_samples += sample_count
             group_mean_entropy = np.mean(group_entropies) if group_entropies else 0.0
             group_mean_kl = np.mean(group_kl_divergences) if group_kl_divergences else 0.0
 
@@ -1304,8 +1437,12 @@ class GRPOTrainer:
             self.writer.add_scalar(f'group_{group_id}/quick_exit_violations', group_total_violations, iteration)
             self.writer.add_scalar(f'group_{group_id}/mean_trades', group_mean_trades, iteration)
             self.writer.add_scalar(f'group_{group_id}/sharpe_ratio', group_mean_sharpe, iteration)
-            self.writer.add_scalar(f'group_{group_id}/policy_entropy', group_mean_entropy, iteration)
-            self.writer.add_scalar(f'group_{group_id}/kl_divergence', group_mean_kl, iteration)
+            if run_policy_diagnostics and diagnostic_samples:
+                self.writer.add_scalar(f'group_{group_id}/policy_entropy', group_mean_entropy, iteration)
+                self.writer.add_scalar(f'group_{group_id}/kl_divergence', group_mean_kl, iteration)
+                self.writer.add_scalar(f'group_{group_id}/diagnostic_samples', diagnostic_samples, iteration)
+                self.writer.add_scalar(f'group_{group_id}/diagnostic_sampling_fraction',
+                                       diagnostic_samples / sum(len(ep['states']) for ep in group_episodes), iteration)
             
             # 그룹 크기
             self.writer.add_scalar(f'group_{group_id}/size', len(group_episodes), iteration)
@@ -1352,6 +1489,7 @@ class GRPOTrainer:
                 'num_groups': self.num_groups,
                 'learning_rate': self.learning_rate,
                 'gamma': self.gamma,
+                'lambda_gae': self.lambda_gae,
                 'clip_epsilon': self.clip_epsilon,
                 'kl_target': self.kl_target,
                 'entropy_coef': self.entropy_coef,
@@ -1369,7 +1507,7 @@ class GRPOTrainer:
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved to {checkpoint_path}")
         if extra_state:
-            logger.info(f"  Extra state saved: {extra_state}")
+            logger.debug(f"  Extra state saved: {extra_state}")
     
     def restore_training_progress(self, checkpoint: Dict[str, Any]) -> int:
         """Restore optimizer/counters only for an explicitly requested resume."""

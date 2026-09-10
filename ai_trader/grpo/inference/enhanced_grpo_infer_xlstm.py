@@ -82,22 +82,24 @@ class GRPOInferenceE2EXLSTM:
 
     def build_observation(self, raw_window, *, stages=(), current_price=None,
                           current_time_seconds=None, feature_columns=None,
-                          feature_price_unit=None) -> np.ndarray:
+                          feature_price_unit=None, account_state=None) -> np.ndarray:
         if feature_columns is not None and list(feature_columns) != self.observation_builder.feature_columns:
             raise ValueError("Live feature order does not match the checkpoint")
         if feature_price_unit is not None and feature_price_unit != self.observation_builder.feature_price_unit:
             raise ValueError("Live feature price unit does not match the checkpoint")
         if isinstance(raw_window, torch.Tensor):
             raw_window = raw_window.detach().cpu().numpy()
-        return self.observation_builder.build(raw_window, stages, current_price, current_time_seconds)
+        return self.observation_builder.build(raw_window, stages, current_price, current_time_seconds,
+                                              account_state=account_state)
 
     def predict(self, obs: Union[np.ndarray, torch.Tensor], deterministic: bool = True, *,
                 stages=(), current_price=None, current_time_seconds=None,
-                feature_columns=None, feature_price_unit=None) -> Tuple[int, float]:
+                feature_columns=None, feature_price_unit=None, account_state=None) -> Tuple[int, float]:
         """Predict from raw rows; already-normalized full observations are rejected."""
         state = self.build_observation(obs, stages=stages, current_price=current_price,
                                        current_time_seconds=current_time_seconds,
-                                       feature_columns=feature_columns, feature_price_unit=feature_price_unit)
+                                       feature_columns=feature_columns, feature_price_unit=feature_price_unit,
+                                       account_state=account_state)
         inputs = torch.from_numpy(state).unsqueeze(0).to(self.device)
         valid = torch.as_tensor(action_mask(len(stages), self.observation_builder.max_stages), device=self.device)
         with torch.inference_mode():
@@ -158,7 +160,7 @@ class EnhancedGRPOInferenceXLSTM:
                 current_position: Optional[Union[Position, Sequence[Position]]] = None,
                 current_price: float = 0.0, deterministic: bool = True, *,
                 current_time_seconds: Optional[float] = None, feature_columns=None,
-                feature_price_unit=None) -> Tuple[int, float, Dict]:
+                feature_price_unit=None, account_state=None) -> Tuple[int, float, Dict]:
         self.stats["total_predictions"] += 1
         positions = ([] if current_position is None else
                      [current_position] if isinstance(current_position, Position) else list(current_position))
@@ -185,6 +187,8 @@ class EnhancedGRPOInferenceXLSTM:
             position.trailing_activated |= (self.trailing_stop_activation_rate is not None
                                             and peak_profit >= self.trailing_stop_activation_rate)
             stages.append({"entry_price": position.entry_price, "entry_time_seconds": position.entry_time})
+        if self.base_inference.observation_builder.account_observations:
+            self.base_inference.observation_builder.validate_account_state(account_state, len(stages))
         if self.enable_auto_exit:
             for position in positions:
                 pct = position.profit_rate
@@ -212,7 +216,7 @@ class EnhancedGRPOInferenceXLSTM:
         action, confidence = self.base_inference.predict(
             sequence, deterministic, stages=stages, current_price=current_price,
             current_time_seconds=current_time_seconds, feature_columns=feature_columns,
-            feature_price_unit=feature_price_unit)
+            feature_price_unit=feature_price_unit, account_state=account_state)
         info = {"raw_action": action, "confidence": confidence}
         if not action_mask(len(stages), self.base_inference.observation_builder.max_stages)[action]:
             info.update(filtered=True, filter_reason="Invalid action for filled inventory")

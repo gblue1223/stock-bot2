@@ -171,7 +171,7 @@ class mLSTMLayer(nn.Module):
             else:
                 C, n = raw_state
 
-            if self.training and seq_len > 1:
+            if self.training and torch.is_grad_enabled() and seq_len > 1:
                 # --- Gradient Checkpointing 모드 ---
                 num_segs = min(self.checkpoint_segments, seq_len)
                 seg_size = max(1, (seq_len + num_segs - 1) // num_segs)
@@ -291,8 +291,8 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         """
         정책 네트워크 forward pass
         """
-        if torch.isnan(state).any() or torch.isinf(state).any():
-            state = torch.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
+        if not torch.isfinite(state).all():
+            raise ValueError("xLSTM policy observation contains nonfinite values")
             
         if state.dim() == 2:
             state = state.unsqueeze(0)
@@ -320,6 +320,11 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         
         # 정책 및 가치 헤드
         action_logits = self.policy_head(fc_out)
+        state_value = self.value_head(fc_out)
+        if not torch.isfinite(action_logits).all():
+            raise FloatingPointError("xLSTM policy produced nonfinite action logits")
+        if not torch.isfinite(state_value).all():
+            raise FloatingPointError("xLSTM policy produced nonfinite value predictions")
         if self.obs_dim > 15 and self.action_dim == 3:
             active_stages = (state[:, -1, -15::3] > 0.5).sum(dim=-1)
             valid_actions = torch.stack([
@@ -329,8 +334,6 @@ class GRPOPolicyE2EXLSTM(nn.Module):
             ], dim=-1)
             action_logits = action_logits.masked_fill(
                 ~valid_actions, torch.finfo(action_logits.dtype).min)
-        state_value = self.value_head(fc_out)
-        
         return action_logits, state_value
         
     def get_action(
@@ -341,16 +344,21 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         """
         정책에서 행동 샘플링 (GRPO 호환)
         """
-        action, dist = self._select_action(obs, deterministic)
+        action, dist, _ = self._select_action(obs, deterministic)
         return action, dist.log_prob(action)
+
+    def get_action_with_value(self, obs: torch.Tensor, deterministic: bool = False):
+        """Return action, behavior log probability and critic value in one pass."""
+        action, dist, values = self._select_action(obs, deterministic)
+        return action, dist.log_prob(action), values.squeeze(-1)
 
     def get_action_with_probabilities(self, obs: torch.Tensor, deterministic: bool = False):
         """Return the same action plus masked probabilities in one forward pass."""
-        action, dist = self._select_action(obs, deterministic)
+        action, dist, _ = self._select_action(obs, deterministic)
         return action, dist.log_prob(action), dist.probs
 
     def _select_action(self, obs: torch.Tensor, deterministic: bool):
-        action_logits, _ = self.forward(obs)
+        action_logits, values = self.forward(obs)
         dist = Categorical(logits=action_logits)
         
         if deterministic:
@@ -358,7 +366,7 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         else:
             action = dist.sample()
             
-        return action, dist
+        return action, dist, values
         
     def evaluate_actions(
         self,
@@ -370,15 +378,11 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         """
         action_logits, state_values = self.forward(states)
         
-        if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
-            action_logits = torch.nan_to_num(action_logits, nan=0.0, posinf=1.0, neginf=-1.0)
-        if torch.isnan(state_values).any() or torch.isinf(state_values).any():
-            state_values = torch.nan_to_num(state_values, nan=0.0, posinf=1.0, neginf=-1.0)
-            
         dist = Categorical(logits=action_logits)
-        
-        actions_safe = torch.clamp(actions.long(), 0, self.action_dim - 1)
-        log_probs = dist.log_prob(actions_safe)
+        if (not torch.isfinite(actions).all() or torch.any(actions != actions.long())
+                or torch.any(actions < 0) or torch.any(actions >= self.action_dim)):
+            raise ValueError("xLSTM policy actions must be integer indices within the action space")
+        log_probs = dist.log_prob(actions.long())
         entropy = dist.entropy()
         values = state_values.squeeze(-1)
         

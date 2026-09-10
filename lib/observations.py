@@ -11,8 +11,13 @@ import numpy as np
 from lib.normalization import LOGSTD_FEATURES
 
 SCHEMA_VERSION = 2
+ACCOUNT_SCHEMA_VERSION = 3
 MAX_STAGES = 5  # Fixed observation capacity; unused slots stay zero.
 STAGE_FIELDS = ("is_active", "profit_rate", "holding_fraction")
+ACCOUNT_FIELDS = ("cash_ratio", "position_value_ratio", "pending_buy_value_ratio",
+                  "pending_sell_value_ratio", "exit_pending", "remaining_steps_ratio",
+                  *(f"stage_{index}_value_ratio" for index in range(1, MAX_STAGES + 1)))
+ACCOUNT_NORMALIZATION = "initial_cash_marked_value_v1"
 NORMALIZATION = "causal_window_log_zscore_v1"
 
 
@@ -34,7 +39,10 @@ class ObservationBuilder:
     def __init__(self, feature_columns: Sequence[str], seq_len: int = 3000,
                  rolling_window_size: int = 1000, rolling_min_samples: int = 100,
                  max_holding_seconds: float = 300.0, feature_price_unit: str = "krw",
-                 max_stages: int = 1):
+                 max_stages: int = 1, account_observations: bool = False):
+        if not isinstance(account_observations, (bool, np.bool_)):
+            raise ValueError("account_observations must be a boolean")
+        self.account_observations = bool(account_observations)
         self.max_stages = validate_max_stages(max_stages)
         self.feature_columns = list(feature_columns)
         if (not self.feature_columns or any(not isinstance(x, str) or not x for x in self.feature_columns)
@@ -55,17 +63,22 @@ class ObservationBuilder:
         self.rolling_window_size = int(rolling_window_size)
         self.rolling_min_samples = int(rolling_min_samples)
         self.max_holding_seconds = float(max_holding_seconds)
-        self.obs_dim = len(self.feature_columns) + MAX_STAGES * len(STAGE_FIELDS)
+        self.obs_dim = (len(self.feature_columns) + MAX_STAGES * len(STAGE_FIELDS)
+                        + (len(ACCOUNT_FIELDS) if self.account_observations else 0))
         self.log_indices = [i for i, name in enumerate(self.feature_columns) if name in LOGSTD_FEATURES]
 
     @property
     def schema(self) -> dict:
-        return {"version": SCHEMA_VERSION, "feature_columns": list(self.feature_columns),
+        schema = {"version": ACCOUNT_SCHEMA_VERSION if self.account_observations else SCHEMA_VERSION,
+                "feature_columns": list(self.feature_columns),
                 "seq_len": self.seq_len, "rolling_window_size": self.rolling_window_size,
                 "rolling_min_samples": self.rolling_min_samples,
                 "max_holding_seconds": self.max_holding_seconds, "max_stages": self.max_stages,
                 "stage_fields": list(STAGE_FIELDS), "normalization": NORMALIZATION,
                 "feature_price_unit": self.feature_price_unit}
+        if self.account_observations:
+            schema.update(account_fields=list(ACCOUNT_FIELDS), account_normalization=ACCOUNT_NORMALIZATION)
+        return schema
 
     @classmethod
     def from_schema(cls, schema: Mapping) -> "ObservationBuilder":
@@ -75,7 +88,8 @@ class ObservationBuilder:
                     "rolling_min_samples", "max_holding_seconds", "feature_price_unit", "max_stages")
         if any(key not in schema for key in required):
             raise ValueError("Incomplete observation_schema; retrain using the current pipeline")
-        builder = cls(**{key: schema[key] for key in required})
+        builder = cls(**{key: schema[key] for key in required},
+                      account_observations=schema.get("version") == ACCOUNT_SCHEMA_VERSION)
         builder.validate_schema(schema)
         return builder
 
@@ -111,7 +125,8 @@ class ObservationBuilder:
 
     def build(self, raw_window: np.ndarray, stages: Sequence[Mapping] = (),
               current_price: float | None = None,
-              current_time_seconds: float | None = None) -> np.ndarray:
+              current_time_seconds: float | None = None,
+              account_state: Mapping | None = None) -> np.ndarray:
         """Build market history plus five FIFO stages, with timestamps in seconds."""
         if len(stages) > self.max_stages:
             raise ValueError("Filled stages exceed configured max_stages")
@@ -135,5 +150,42 @@ class ObservationBuilder:
             profit = np.clip((current_price - entry_price) / entry_price, -1.0, 1.0)
             holding = min((current_time_seconds - entry_time) / self.max_holding_seconds, 1.0)
             stage_meta[index] = (1.0, profit, holding)
-        state[:, len(self.feature_columns):] = stage_meta.reshape(-1)
+        if self.account_observations:
+            account_values = self.validate_account_state(account_state, len(stages))
+            state[:, len(self.feature_columns):-MAX_STAGES * len(STAGE_FIELDS)] = account_values
+        state[:, -MAX_STAGES * len(STAGE_FIELDS):] = stage_meta.reshape(-1)
         return state
+
+    def validate_account_state(self, account_state: Mapping | None, stage_count: int) -> np.ndarray:
+        """Validate explicit current account data; never infer a flat portfolio.
+
+        Monetary ratios use the episode/account initial cash as denominator.
+        Filled inventory and FIFO stage values share the current liquidation
+        mark. Pending ratios use remaining order quantities and executable side
+        prices. The horizon is remaining decision steps / initial decision steps,
+        excluding any subsequent liquidation tail. These are current features,
+        broadcast across the available market window like the stage metadata.
+        """
+        if not isinstance(account_state, Mapping):
+            raise ValueError("Schema v3 requires an explicit account_state mapping from the current account")
+        missing = [field for field in ACCOUNT_FIELDS if field not in account_state]
+        if missing:
+            raise ValueError(f"account_state is missing required fields: {', '.join(missing)}")
+        try:
+            values = np.asarray([account_state[field] for field in ACCOUNT_FIELDS], dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("account_state fields must be finite numeric scalars") from exc
+        if values.shape != (len(ACCOUNT_FIELDS),) or not np.isfinite(values).all():
+            raise ValueError("account_state fields must be finite numeric scalars")
+        if (values < 0).any():
+            raise ValueError("account_state ratios cannot be negative")
+        if values[4] not in (0.0, 1.0) or not 0.0 <= values[5] <= 1.0:
+            raise ValueError("account_state exit_pending must be 0/1 and remaining_steps_ratio must be in [0, 1]")
+        stage_values = values[6:]
+        if (stage_values[stage_count:] != 0).any() or (stage_values[:stage_count] <= 0).any():
+            raise ValueError("account_state stage exposures must match the filled FIFO stages")
+        if not np.isclose(stage_values.sum(), values[1], rtol=1e-6, atol=1e-8):
+            raise ValueError("account_state position_value_ratio must equal the sum of filled stage values")
+        if (values > np.finfo(np.float32).max).any():
+            raise ValueError("account_state exceeds finite float32 range")
+        return values.astype(np.float32)

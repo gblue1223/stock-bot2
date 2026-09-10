@@ -34,6 +34,8 @@ def run_backtest(policy_path, *, extracted_dir=None, partition='test', episodes=
         seq_len=schema['seq_len'], max_episode_steps=config['episode_steps'],
         rolling_window_size=schema['rolling_window_size'], rolling_min_samples=schema['rolling_min_samples'],
         max_stages=schema['max_stages'],
+        account_observations=schema.get('version') == 3,
+        liquidation_max_steps=config.get('liquidation_max_steps', 0),
         max_holding_seconds=schema['max_holding_seconds'], initial_cash=config['initial_cash'],
         transaction_cost_rate=config['transaction_cost_rate'], buy_tax_rate=config['buy_tax_rate'],
         sell_tax_rate=config['sell_tax_rate'], stop_loss_pct=config['stop_loss_pct'],

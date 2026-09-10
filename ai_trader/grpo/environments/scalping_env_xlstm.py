@@ -134,7 +134,8 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                 idx = int(options["episode_index"]) if "episode_index" in options else int(self.np_random.integers(len(self.valid_keys)))
                 file_name, stock, date, _ = self.valid_keys[idx]
                 features, metadata, execution = self._load_cached_episode(self.extracted_dir / file_name)
-                needed = self.seq_len + self.max_episode_steps if self.max_episode_steps is not None else len(features)
+                needed = (self.seq_len + self.max_episode_steps + self.liquidation_max_steps
+                          if self.max_episode_steps is not None else len(features))
                 if len(features) < self.seq_len + 1:
                     raise ValueError("Episode is shorter than the observation window plus one step")
                 max_start = max(0, len(features) - needed)

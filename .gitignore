@@ -141,3 +141,5 @@ scripts/gcp/config.sh
 *.npz
 extracted_episodes/
 data/extracted_episodes_v2/
+data/extracted_episodes_v2.tar
+data/extracted_episodes_v2.tar.part

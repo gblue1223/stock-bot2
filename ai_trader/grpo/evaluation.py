@@ -11,6 +11,11 @@ import torch
 
 _ORDER_METRICS = ('submitted_orders', 'submitted_quantity', 'filled_quantity',
                   'partial_orders', 'cancelled_orders', 'expired_orders')
+_TRADE_DIAGNOSTICS = ('round_trip_count', 'round_trip_win_rate',
+                      'quantity_weighted_holding_time', 'fill_count', 'fill_win_rate',
+                      'fill_avg_holding_time', 'round_trips', 'liquidation_steps',
+                      'liquidation_seconds', 'liquidation_stop_reason', 'market_steps_taken',
+                      'total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl')
 
 
 def _action_name(index):
@@ -32,6 +37,17 @@ class _ActionDiagnostics:
             self.probability_sum += probabilities
             self.probability_max = np.maximum(self.probability_max, probabilities)
             self.probability_steps += 1
+
+    def merge(self, other):
+        self.counts.update(other.counts)
+        if other.probability_steps:
+            if self.probability_sum is None:
+                self.probability_sum = other.probability_sum.copy()
+                self.probability_max = other.probability_max.copy()
+            else:
+                self.probability_sum += other.probability_sum
+                self.probability_max = np.maximum(self.probability_max, other.probability_max)
+            self.probability_steps += other.probability_steps
 
     def summary(self):
         steps = sum(self.counts.values())
@@ -77,6 +93,38 @@ def _sum_execution_diagnostics(episodes):
                 counts.update(value)
             metrics[name] = dict(counts)
     return _execution_diagnostics({key: value for key, value in metrics.items() if value is not None})
+
+
+def _additional_metrics(episodes):
+    """Keep missing legacy trade/tail diagnostics unknown, not apparent zeros."""
+    def values(key):
+        result = [episode.get(key) for episode in episodes]
+        return result if all(value is not None for value in result) else None
+
+    result = {}
+    for count_key, rate_key in (('round_trip_count', 'round_trip_win_rate'),
+                                ('fill_count', 'fill_win_rate')):
+        counts, rates = values(count_key), values(rate_key)
+        total = sum(counts) if counts is not None else None
+        result[count_key] = int(total) if total is not None else None
+        result[f'mean_{count_key}'] = float(np.mean(counts)) if counts is not None else None
+        result[rate_key] = (float(np.dot(counts, rates) / total) if total else 0.0
+                            ) if counts is not None and rates is not None else None
+    for key in ('quantity_weighted_holding_time', 'fill_avg_holding_time',
+                'liquidation_steps', 'liquidation_seconds'):
+        observations = values(key)
+        result[f'mean_{key}'] = float(np.mean(observations)) if observations is not None else None
+    for key in ('total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl'):
+        observations = values(key)
+        result[key] = float(sum(observations)) if observations is not None else None
+        result[f'mean_{key}'] = float(np.mean(observations)) if observations is not None else None
+    stops = values('liquidation_stop_reason')
+    result['liquidation_stop_reasons'] = dict(Counter(stops)) if stops is not None else None
+    # A bought but unliquidated position is still trading, even with zero exits.
+    filled = values('filled_quantity')
+    result['no_trade_episode_fraction'] = (
+        float(np.mean(np.asarray(filled) == 0)) if filled is not None else None)
+    return result
 
 
 def normalize_date(value) -> str:
@@ -130,6 +178,10 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                     collect_diagnostics: bool = True) -> dict:
     """Evaluate exactly these weights on a repeatable set of held-out paths.
 
+    ``env`` may be one environment or a list/tuple of independent environments.
+    Episodes always use seed + episode_index, regardless of batch size or their
+    completion order. The caller owns and closes the environments.
+
     Only environment-reported cost-inclusive NAV returns determine performance.
     The evaluator never updates parameters or uses shaped reward as a fallback.
     Diagnostics record decisions and execution outcomes on these same paths;
@@ -137,60 +189,88 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
     """
     if num_episodes <= 0:
         raise ValueError("num_episodes must be positive")
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+    environments = list(env) if isinstance(env, (list, tuple)) else [env]
+    if not environments or len({id(item) for item in environments}) != len(environments):
+        raise ValueError("Evaluation requires independent, nonempty environments")
+    environments = environments[:num_episodes]
     was_training = policy.training
     policy.eval()
-    returns, trades, drawdowns, holding = [], [], [], []
-    incomplete_liquidations = 0
-    residual_quantities, realized_pnls = [], []
-    execution_models = {}
-    total_actions = _ActionDiagnostics()
-    diagnostic_episodes = []
+    completed = [None] * num_episodes
     probability_action = getattr(policy, 'get_action_with_probabilities', None)
+
+    def start_episode(environment, index):
+        obs, _ = environment.reset(seed=seed + index)
+        return {'environment': environment, 'index': index, 'obs': obs,
+                'steps': 0, 'actions': _ActionDiagnostics()}
+
     try:
         with torch.no_grad():
-            for index in range(num_episodes):
-                obs, _ = env.reset(seed=seed + index)
-                episode_actions = _ActionDiagnostics()
-                for _ in range(max_steps):
-                    tensor = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-                    probabilities = None
-                    if collect_diagnostics and callable(probability_action):
-                        action, _, probabilities = probability_action(tensor, deterministic=True)
-                        probabilities = probabilities.detach().cpu().numpy().reshape(-1)
-                    else:
-                        action, _ = policy.get_action(tensor, deterministic=True)
-                    action_index = int(action.item())
-                    if collect_diagnostics:
-                        episode_actions.record(action_index, probabilities)
-                        total_actions.record(action_index, probabilities)
-                    obs, _, terminated, truncated, info = env.step(action_index)
-                    if terminated or truncated:
-                        episode = info.get("episode", {})
-                        value = episode.get("net_return", episode.get("total_return"))
-                        if value is None or not np.isfinite(value):
-                            raise ValueError("Evaluation requires finite episode net_return (%)")
-                        returns.append(float(value))
-                        trades.append(int(episode.get("num_trades", 0)))
-                        drawdowns.append(float(episode.get("max_drawdown", 0.0)))
-                        holding.append(float(episode.get("avg_holding_time", 0.0)))
-                        incomplete_liquidations += int(not episode.get("liquidation_complete", True))
-                        residual_quantities.append(float(episode.get("open_quantity", 0.0)))
-                        realized_pnls.append(float(episode.get("realized_net_pnl", 0.0)))
-                        execution_model = str(episode.get("execution_model", "unknown"))
-                        execution_models[execution_model] = execution_models.get(execution_model, 0) + 1
-                        if collect_diagnostics:
-                            diagnostic_episodes.append({
-                                'episode_index': index, 'seed': seed + index,
-                                'episode_key': deepcopy(episode.get('episode_key', {})),
-                                'net_return': float(value), 'num_trades': trades[-1],
-                                'open_quantity': residual_quantities[-1],
-                                **episode_actions.summary(), **_execution_diagnostics(episode),
-                            })
-                        break
+            slots = [start_episode(environment, index)
+                     for index, environment in enumerate(environments)]
+            next_index = len(slots)
+            while any(slot is not None for slot in slots):
+                active = [(index, slot) for index, slot in enumerate(slots) if slot is not None]
+                tensor = torch.as_tensor(np.stack([slot['obs'] for _, slot in active]),
+                                         dtype=torch.float32, device=device)
+                probabilities = None
+                if collect_diagnostics and callable(probability_action):
+                    actions, _, probabilities = probability_action(tensor, deterministic=True)
+                    probabilities = probabilities.detach().cpu().numpy()
+                    if probabilities.ndim == 1 and len(active) == 1:
+                        probabilities = probabilities[None, :]
+                    if (probabilities.ndim != 2 or len(probabilities) != len(active)
+                            or not np.isfinite(probabilities).all()):
+                        raise ValueError("Evaluation requires finite batched action probabilities")
                 else:
-                    raise RuntimeError("Evaluation episode exceeded max_steps")
+                    actions, _ = policy.get_action(tensor, deterministic=True)
+                if isinstance(actions, torch.Tensor):
+                    actions = actions.detach().cpu().numpy()
+                actions = np.asarray(actions).reshape(-1)
+                if (len(actions) != len(active) or not np.isfinite(actions).all()
+                        or (actions != np.floor(actions)).any()):
+                    raise ValueError("Evaluation requires one finite integer action per environment")
+                for row, (slot_index, slot) in enumerate(active):
+                    action_index = int(actions[row])
+                    if collect_diagnostics:
+                        slot['actions'].record(action_index, None if probabilities is None else probabilities[row])
+                    obs, _, terminated, truncated, info = slot['environment'].step(action_index)
+                    slot['steps'] += 1
+                    if not (terminated or truncated):
+                        if slot['steps'] >= max_steps:
+                            raise RuntimeError("Evaluation episode exceeded max_steps")
+                        slot['obs'] = obs
+                        continue
+                    episode = deepcopy(info.get('episode', {}))
+                    value = episode.get('net_return', episode.get('total_return'))
+                    if value is None or not np.isfinite(value):
+                        raise ValueError("Evaluation requires finite episode net_return (%)")
+                    for key in ('num_trades', 'max_drawdown', 'avg_holding_time',
+                                'open_quantity', 'realized_net_pnl', *_ORDER_METRICS,
+                                *[name for name in _TRADE_DIAGNOSTICS
+                                  if name not in ('round_trips', 'liquidation_stop_reason')]):
+                        if episode.get(key) is not None and not np.isfinite(episode[key]):
+                            raise ValueError(f"Evaluation requires finite episode {key}")
+                    episode['net_return'] = float(value)
+                    completed[slot['index']] = (episode, slot['actions'])
+                    slots[slot_index] = (start_episode(slot['environment'], next_index)
+                                         if next_index < num_episodes else None)
+                    if slots[slot_index] is not None:
+                        next_index += 1
     finally:
         policy.train(was_training)
+    # Aggregate in episode order so unequal lengths or batch sizes cannot change
+    # the path order, mean-of-episodes weighting, or diagnostic summation order.
+    episodes = [episode for episode, _ in completed]
+    returns = [episode['net_return'] for episode in episodes]
+    trades = [int(episode.get('num_trades', 0)) for episode in episodes]
+    drawdowns = [float(episode.get('max_drawdown', 0.0)) for episode in episodes]
+    holding = [float(episode.get('avg_holding_time', 0.0)) for episode in episodes]
+    residual_quantities = [float(episode.get('open_quantity', 0.0)) for episode in episodes]
+    realized_pnls = [float(episode.get('realized_net_pnl', 0.0)) for episode in episodes]
+    incomplete_liquidations = sum(not episode.get('liquidation_complete', True) for episode in episodes)
+    execution_models = dict(Counter(str(episode.get('execution_model', 'unknown')) for episode in episodes))
     result = {
         "mean_net_return": float(np.mean(returns)),
         "std_net_return": float(np.std(returns)),
@@ -207,8 +287,21 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
         "execution_models": execution_models,
         "synthetic_execution_episodes": sum(
             count for name, count in execution_models.items() if 'synthetic' in name),
+        **_additional_metrics(episodes),
     }
     if collect_diagnostics:
+        total_actions = _ActionDiagnostics()
+        diagnostic_episodes = []
+        for index, (episode, actions) in enumerate(completed):
+            total_actions.merge(actions)
+            diagnostic_episodes.append({
+                'episode_index': index, 'seed': seed + index,
+                'episode_key': deepcopy(episode.get('episode_key', {})),
+                'net_return': returns[index], 'num_trades': trades[index],
+                'open_quantity': residual_quantities[index],
+                **actions.summary(), **_execution_diagnostics(episode),
+                **{key: deepcopy(episode.get(key)) for key in _TRADE_DIAGNOSTICS},
+            })
         result['diagnostics'] = {
             **total_actions.summary(), **_sum_execution_diagnostics(diagnostic_episodes),
             'execution_blocked_checks_unit': 'order/event checks, not distinct orders',
@@ -240,6 +333,7 @@ def evaluation_signature(config: dict, date_splits: dict, observation_schema: di
         'selection_require_liquidation': False,  # Historical checkpoints used marked NAV without this filter.
         'transaction_cost_rate': .00015, 'buy_tax_rate': 0.0, 'sell_tax_rate': .0018,
         'initial_cash': 1_000_000.0, 'stop_loss_pct': 2.0,
+        'liquidation_max_steps': 0,  # Historical checkpoints had no liquidation tail.
         'max_trades_per_episode': None, 'base_price': 100000.0, 'price_scale': 1.0,
         'execution_config': {'order_latency_ms': 100, 'cancel_latency_ms': 50,
                              'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
@@ -286,7 +380,15 @@ def compatible_resume_best(candidate: dict, source: dict, current_signature: dic
             return False
         if splits != source_extra.get('date_splits'):
             return False
-        signature = extra.get('evaluation_signature') or evaluation_signature(config, splits, schema)
+        signature = deepcopy(extra.get('evaluation_signature')) or evaluation_signature(config, splits, schema)
+        if not isinstance(signature, dict):
+            return False
+        # Before liquidation tails existed, version-1 signatures omitted the
+        # setting. They remain compatible only with the historical disabled tail.
+        if (signature.get('version') == 1 and isinstance(signature.get('settings'), dict)
+                and 'liquidation_max_steps' not in signature['settings']
+                and config.get('liquidation_max_steps', 0) == 0):
+            signature['settings']['liquidation_max_steps'] = 0
         if signature != current_signature:
             return False
         expected_settings = evaluation_signature(config, signature['date_splits'], schema)['settings']

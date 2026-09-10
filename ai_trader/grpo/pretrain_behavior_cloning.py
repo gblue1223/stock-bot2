@@ -52,6 +52,9 @@ class OfflineEpisodeDataset(Dataset):
         price_unit = resolve_feature_price_unit(metadata, columns)
         self.observation_builder = (ObservationBuilder(columns, seq_len=seq_len, feature_price_unit=price_unit)
                                     if observation_schema is None else ObservationBuilder.from_schema(observation_schema))
+        if self.observation_builder.account_observations:
+            raise ValueError("Schema v3 distillation requires recorded account states; raw market episodes "
+                             "and synthetic stage examples do not provide cash, exposure or pending orders")
         if list(columns or []) != self.observation_builder.feature_columns or seq_len != self.observation_builder.seq_len:
             raise ValueError("Dataset feature order/sequence length does not match the teacher observation schema")
         if price_unit != self.observation_builder.feature_price_unit:
@@ -131,7 +134,7 @@ def distillation_loss(teacher_logits, teacher_values, student_logits, student_va
     if temperature <= 0:
         raise ValueError("temperature must be positive")
     max_stages = validate_max_stages(max_stages)
-    inventory = states[:, -1, feature_count::3].sum(dim=-1)
+    inventory = (states[:, -1, -15::3] > 0.5).sum(dim=-1)
     valid = torch.stack((torch.ones_like(inventory, dtype=torch.bool),
                          inventory < max_stages, inventory > 0), dim=-1)
     # Finite sentinel avoids KL's 0 * infinity when an action is invalid.
