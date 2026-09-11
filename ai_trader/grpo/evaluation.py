@@ -19,6 +19,7 @@ _TIME_DIAGNOSTICS = ('episode_start_time_seconds', 'episode_end_time_seconds',
                      'decision_interval_seconds', 'configured_episode_duration_seconds')
 _TRADE_DIAGNOSTICS = ('round_trip_count', 'round_trip_win_rate',
                       'quantity_weighted_holding_time', 'fill_count', 'fill_win_rate',
+                      'liquidation_complete',
                       'fill_avg_holding_time', 'round_trips', 'liquidation_steps',
                       'liquidation_seconds', 'liquidation_stop_reason', 'market_steps_taken',
                       'total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl',
@@ -244,9 +245,17 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                 active = [(index, slot) for index, slot in enumerate(slots) if slot is not None]
                 tensor = torch.as_tensor(np.stack([slot['obs'] for _, slot in active]),
                                          dtype=torch.float32, device=device)
+                mask_kwargs = {}
+                if getattr(policy, 'execution_action_mask', False):
+                    if not all(getattr(slot['environment'], 'execution_action_mask', False)
+                               for _, slot in active):
+                        raise ValueError('Masked policy evaluation requires enabled environment action masks')
+                    mask_kwargs['action_masks'] = torch.as_tensor(
+                        np.stack([slot['environment'].action_masks() for _, slot in active]),
+                        dtype=torch.bool, device=device)
                 probabilities = None
                 if collect_diagnostics and callable(probability_action):
-                    actions, _, probabilities = probability_action(tensor, deterministic=True)
+                    actions, _, probabilities = probability_action(tensor, deterministic=True, **mask_kwargs)
                     probabilities = probabilities.detach().cpu().numpy()
                     if probabilities.ndim == 1 and len(active) == 1:
                         probabilities = probabilities[None, :]
@@ -254,7 +263,7 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                             or not np.isfinite(probabilities).all()):
                         raise ValueError("Evaluation requires finite batched action probabilities")
                 else:
-                    actions, _ = policy.get_action(tensor, deterministic=True)
+                    actions, _ = policy.get_action(tensor, deterministic=True, **mask_kwargs)
                 if isinstance(actions, torch.Tensor):
                     actions = actions.detach().cpu().numpy()
                 actions = np.asarray(actions).reshape(-1)
@@ -374,6 +383,7 @@ def evaluation_signature(config: dict, date_splits: dict, observation_schema: di
         'initial_cash': 1_000_000.0, 'stop_loss_pct': 2.0,
         'liquidation_max_steps': 0,  # Historical checkpoints had no liquidation tail.
         'decision_interval_seconds': 0.0, 'episode_duration_seconds': 0.0,
+        'execution_action_mask': False,
         'max_trades_per_episode': None, 'base_price': 100000.0, 'price_scale': 1.0,
         'execution_config': {'order_latency_ms': 100, 'cancel_latency_ms': 50,
                              'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
@@ -426,7 +436,8 @@ def compatible_resume_best(candidate: dict, source: dict, current_signature: dic
         # Before liquidation tails existed, version-1 signatures omitted the
         # setting. They remain compatible only with the historical disabled tail.
         if signature.get('version') == 1 and isinstance(signature.get('settings'), dict):
-            for name in ('liquidation_max_steps', 'decision_interval_seconds', 'episode_duration_seconds'):
+            for name in ('liquidation_max_steps', 'decision_interval_seconds', 'episode_duration_seconds',
+                         'execution_action_mask'):
                 if name not in signature['settings'] and config.get(name, 0) == 0:
                     signature['settings'][name] = 0
         if signature != current_signature:

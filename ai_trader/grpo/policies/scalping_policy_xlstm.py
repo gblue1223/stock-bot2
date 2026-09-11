@@ -239,10 +239,14 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         fc_hidden_dim: int = 256,
         action_dim: int = 3,
         checkpoint_segments: int = 16,
-        max_stages: int = 1
+        max_stages: int = 1,
+        execution_action_mask: bool = False
     ):
         super().__init__()
         self.max_stages = validate_max_stages(max_stages)
+        if not isinstance(execution_action_mask, bool):
+            raise ValueError('execution_action_mask must be a boolean')
+        self.execution_action_mask = execution_action_mask
         self.obs_dim = obs_dim
         self.action_dim = action_dim
         self.cnn_channels = cnn_channels
@@ -287,7 +291,7 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         self.xlstm.dropout.eval()
         return self
 
-    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, state: torch.Tensor, action_masks=None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         정책 네트워크 forward pass
         """
@@ -298,6 +302,14 @@ class GRPOPolicyE2EXLSTM(nn.Module):
             state = state.unsqueeze(0)
             
         batch_size = state.size(0)
+        if self.execution_action_mask and action_masks is None:
+            raise ValueError('execution_action_mask policy requires explicit action_masks')
+        if action_masks is not None:
+            action_masks = torch.as_tensor(action_masks, device=state.device)
+            if action_masks.dtype != torch.bool or action_masks.shape != (batch_size, self.action_dim):
+                raise ValueError('action_masks must be boolean with shape (batch, action_dim)')
+            if not action_masks[:, 0].all():
+                raise ValueError('HOLD must always be permitted by action_masks')
         
         # CNN 입력 형태: (batch_size, channels, seq_len)
         x = state.transpose(1, 2).contiguous()
@@ -325,7 +337,10 @@ class GRPOPolicyE2EXLSTM(nn.Module):
             raise FloatingPointError("xLSTM policy produced nonfinite action logits")
         if not torch.isfinite(state_value).all():
             raise FloatingPointError("xLSTM policy produced nonfinite value predictions")
-        if self.obs_dim > 15 and self.action_dim == 3:
+        if action_masks is not None:
+            action_logits = action_logits.masked_fill(
+                ~action_masks, torch.finfo(action_logits.dtype).min)
+        elif self.obs_dim > 15 and self.action_dim == 3:
             active_stages = (state[:, -1, -15::3] > 0.5).sum(dim=-1)
             valid_actions = torch.stack([
                 torch.ones_like(active_stages, dtype=torch.bool),
@@ -339,26 +354,27 @@ class GRPOPolicyE2EXLSTM(nn.Module):
     def get_action(
         self,
         obs: torch.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False,
+        action_masks=None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         정책에서 행동 샘플링 (GRPO 호환)
         """
-        action, dist, _ = self._select_action(obs, deterministic)
+        action, dist, _ = self._select_action(obs, deterministic, action_masks)
         return action, dist.log_prob(action)
 
-    def get_action_with_value(self, obs: torch.Tensor, deterministic: bool = False):
+    def get_action_with_value(self, obs: torch.Tensor, deterministic: bool = False, action_masks=None):
         """Return action, behavior log probability and critic value in one pass."""
-        action, dist, values = self._select_action(obs, deterministic)
+        action, dist, values = self._select_action(obs, deterministic, action_masks)
         return action, dist.log_prob(action), values.squeeze(-1)
 
-    def get_action_with_probabilities(self, obs: torch.Tensor, deterministic: bool = False):
+    def get_action_with_probabilities(self, obs: torch.Tensor, deterministic: bool = False, action_masks=None):
         """Return the same action plus masked probabilities in one forward pass."""
-        action, dist, _ = self._select_action(obs, deterministic)
+        action, dist, _ = self._select_action(obs, deterministic, action_masks)
         return action, dist.log_prob(action), dist.probs
 
-    def _select_action(self, obs: torch.Tensor, deterministic: bool):
-        action_logits, values = self.forward(obs)
+    def _select_action(self, obs: torch.Tensor, deterministic: bool, action_masks=None):
+        action_logits, values = self.forward(obs, action_masks=action_masks)
         dist = Categorical(logits=action_logits)
         
         if deterministic:
@@ -371,18 +387,23 @@ class GRPOPolicyE2EXLSTM(nn.Module):
     def evaluate_actions(
         self,
         states: torch.Tensor,
-        actions: torch.Tensor
+        actions: torch.Tensor,
+        action_masks=None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         주어진 상태와 행동에 대한 로그 확률, 엔트로피, 가치 계산
         """
-        action_logits, state_values = self.forward(states)
+        action_logits, state_values = self.forward(states, action_masks=action_masks)
         
         dist = Categorical(logits=action_logits)
         if (not torch.isfinite(actions).all() or torch.any(actions != actions.long())
                 or torch.any(actions < 0) or torch.any(actions >= self.action_dim)):
             raise ValueError("xLSTM policy actions must be integer indices within the action space")
         log_probs = dist.log_prob(actions.long())
+        if action_masks is not None:
+            valid = torch.as_tensor(action_masks, device=actions.device)
+            if not valid.gather(1, actions.long().reshape(-1, 1)).all():
+                raise ValueError('Recorded action is forbidden by its cached action_masks')
         entropy = dist.entropy()
         values = state_values.squeeze(-1)
         

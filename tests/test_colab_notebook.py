@@ -125,6 +125,10 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     assert config['account_observations'] is False and config['liquidation_max_steps'] == 0
     assert config['execution_observations'] is False
     assert config['decision_interval_seconds'] == config['episode_duration_seconds'] == 0.
+    assert config['execution_action_mask'] is False
+    assert config['no_trade_patience'] == 0
+    assert config['profitable_min_round_trips'] == 20
+    assert config['profitable_min_traded_dates'] == 3
     assert config['group_advantage_coef'] == 1. and config['training_seed'] == 42
     assert config['evaluation_workers'] == 1
 
@@ -256,7 +260,12 @@ def test_return_priority_notebook_enables_new_observations_and_liquidation_tail(
     assert config['liquidation_max_steps'] == 300
     assert 1 < config['evaluation_workers'] <= config['num_workers']
     assert config['lambda_gae'] == .95
-    assert config['decision_interval_seconds'] == config['episode_duration_seconds'] == 0.
+    assert config['decision_interval_seconds'] == 1.
+    assert config['episode_duration_seconds'] == 300.
+    assert config['execution_action_mask'] is True
+    assert config['no_trade_patience'] == 3
+    assert config['profitable_min_round_trips'] == 20
+    assert config['profitable_min_traded_dates'] == 3
     assert config['group_advantage_coef'] == 1. and config['training_seed'] == 42
 
 
@@ -279,6 +288,12 @@ def test_notebook_memory_estimate_counts_all_ten_execution_channels(name, monkey
     ('gae_only', {'group_advantage_coef': 0.}),
     ('long_credit', {'lambda_gae': .99}),
     ('monte_carlo_credit', {'lambda_gae': 1.}),
+    ('timed_gae_only', {'decision_interval_seconds': 1., 'episode_duration_seconds': 300.,
+                        'group_advantage_coef': 0.}),
+    ('timed_long_credit', {'decision_interval_seconds': 1., 'episode_duration_seconds': 300.,
+                           'group_advantage_coef': 0., 'lambda_gae': .99}),
+    ('timed_monte_carlo_credit', {'decision_interval_seconds': 1., 'episode_duration_seconds': 300.,
+                                  'group_advantage_coef': 0., 'lambda_gae': 1.}),
 ])
 def test_return_priority_experiments_change_only_the_declared_comparison(experiment, expected, monkeypatch):
     monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')

@@ -88,6 +88,7 @@ def run_diagnostics(checkpoint_path, *, split='validation', episodes=None, seed=
     # New training defaults must not change the replay of a legacy checkpoint.
     config.account_observations = schema.get('version') in (3, 4)
     config.execution_observations = schema.get('version') == 4
+    config.execution_action_mask = saved_config.get('execution_action_mask', False)
     config.liquidation_max_steps = saved_config.get('liquidation_max_steps', 0)
     config.decision_interval_seconds = saved_config.get('decision_interval_seconds', 0.0)
     config.episode_duration_seconds = saved_config.get('episode_duration_seconds', 0.0)

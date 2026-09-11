@@ -9,6 +9,8 @@ import pytest
 import torch
 
 import ai_trader.grpo.train_xlstm as training
+from ai_trader.grpo.grpo import GRPOTrainer
+from ai_trader.grpo.training_control import TrainingControlState
 from ai_trader.grpo.evaluation import compatible_resume_best, evaluation_signature
 from lib.observations import ObservationBuilder
 
@@ -27,6 +29,8 @@ def test_training_defaults_enable_cost_observations_without_combining_other_expe
     assert config.decision_interval_seconds == config.episode_duration_seconds == 0.
     assert config.group_advantage_coef == 1. and config.lambda_gae == .95
     assert config.training_seed == 42
+    assert config.execution_action_mask is True
+    assert config.no_trade_patience == 0
     builder = ObservationBuilder([f'feature_{i}' for i in range(config.features)],
                                  account_observations=config.account_observations,
                                  execution_observations=config.execution_observations)
@@ -109,6 +113,37 @@ def test_cli_can_explicitly_select_legacy_observations(monkeypatch):
     assert result['execution_observations'] is result['account_observations'] is False
 
 
+@pytest.mark.parametrize('field,values', [
+    ('execution_action_mask', [0, 1, 'true', None]),
+    ('no_trade_patience', [-1, True, 1.5, '3', None]),
+    ('profitable_min_round_trips', [0, -1, True, 2.5, None]),
+    ('profitable_min_traded_dates', [0, -1, False, 2.5, None]),
+])
+def test_profit_controls_validate_types_and_bounds(tmp_path, field, values):
+    for value in values:
+        with pytest.raises(ValueError, match=field):
+            valid_config(tmp_path, **{field: value}).validate()
+
+
+def test_profit_controls_cli_and_checkpoint_precedence(tmp_path, monkeypatch):
+    path = tmp_path / 'controlled.pt'
+    saved = {'execution_action_mask': True, 'no_trade_patience': 3,
+             'profitable_min_round_trips': 20, 'profitable_min_traded_dates': 3}
+    torch.save({'policy_state_dict': {},
+                'observation_schema': ObservationBuilder(['price']).schema,
+                'config': saved}, path)
+    restored = capture_cli_config(monkeypatch, ['--load_policy', str(path)])
+    for field, value in saved.items():
+        assert restored[field] == value
+    overridden = capture_cli_config(monkeypatch, [
+        '--load_policy', str(path), '--no-execution_action_mask', '--no_trade_patience', '0',
+        '--profitable_min_round_trips', '40', '--profitable_min_traded_dates', '5'])
+    assert overridden['execution_action_mask'] is False
+    assert overridden['no_trade_patience'] == 0
+    assert overridden['profitable_min_round_trips'] == 40
+    assert overridden['profitable_min_traded_dates'] == 5
+
+
 @pytest.mark.parametrize('version', [2, 3, 4])
 def test_cli_checkpoint_restores_schema_and_recorded_experiment_conditions(tmp_path, monkeypatch, version):
     schema = ObservationBuilder(['price'], account_observations=version >= 3,
@@ -128,6 +163,8 @@ def test_cli_checkpoint_restores_schema_and_recorded_experiment_conditions(tmp_p
     assert result['training_seed'] == saved.get('training_seed', 42)
     assert result['lambda_gae'] == saved.get('lambda_gae', .95)
     assert result['liquidation_max_steps'] == saved.get('liquidation_max_steps', 0)
+    assert result['execution_action_mask'] is False
+    assert result['no_trade_patience'] == 0
 
 
 def test_explicit_cli_experiment_overrides_are_not_lost_during_checkpoint_loading(tmp_path, monkeypatch):
@@ -161,6 +198,7 @@ def test_environment_factory_preserves_execution_timing_costs_and_seed(tmp_path,
     second = training.create_environment(config, 'cpu', ['20260101'], seed=123)
     settings = calls[0]
     assert settings['execution_observations'] and settings['account_observations']
+    assert settings['execution_action_mask'] is True
     assert settings['decision_interval_seconds'] == .75 and settings['episode_duration_seconds'] == 120.
     assert settings['liquidation_max_steps'] == 37
     assert settings['max_episode_steps'] == config.episode_steps
@@ -170,6 +208,58 @@ def test_environment_factory_preserves_execution_timing_costs_and_seed(tmp_path,
     assert settings['allowed_dates'] == ['20260101']
     np.testing.assert_array_equal(first.np_random.integers(10000, size=8),
                                   second.np_random.integers(10000, size=8))
+
+
+def test_no_trade_early_stop_does_not_open_test_data(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Early-stopped experiment must not open held-out test data')
+
+    monkeypatch.setattr(training, 'create_environment', forbidden)
+    metrics, reason = training.evaluate_final_test(None, None, None, 'cpu',
+                                                   {'early_stop_reason': 'persistent_no_trade'})
+    assert metrics is None and reason == 'persistent_no_trade'
+
+
+def test_final_test_environment_is_closed_on_evaluation_error(monkeypatch):
+    closed = []
+    environment = SimpleNamespace(close=lambda: closed.append(True))
+    monkeypatch.setattr(training, 'create_environment', lambda *args: environment)
+    def fail(*args):
+        raise RuntimeError('evaluation failed')
+    monkeypatch.setattr(training, 'evaluate_policy', fail)
+    config = SimpleNamespace(evaluation_episodes=64, evaluation_seed=42)
+    with pytest.raises(RuntimeError, match='evaluation failed'):
+        training.evaluate_final_test(None, config, {'test': ['20250901']}, 'cpu', {})
+    assert closed == [True]
+
+
+@pytest.mark.parametrize('override,changed_signature', [(None, False), (0, False), (None, True)])
+def test_actual_resume_controls_match_config_and_reset_only_changed_history(tmp_path, override, changed_signature):
+    callback = lambda policy: {'mean_net_return': 0.}
+    original = GRPOTrainer(torch.nn.Linear(1, 1), object(), evaluation_callback=callback,
+                           no_trade_patience=3, profitable_min_round_trips=25,
+                           profitable_min_traded_dates=4)
+    original.training_control_state = TrainingControlState(
+        validation_count=2, no_trade_evidence_count=2, no_trade_streak=1,
+        previous_buy_probability=.3, last_validation_iteration=10)
+    signature = {'settings': {'execution_action_mask': False}}
+    path = tmp_path / 'checkpoint.pt'
+    original.save_checkpoint(str(path), 10, extra_state={'evaluation_signature': signature})
+    checkpoint = torch.load(path, weights_only=True)
+    restored = GRPOTrainer(torch.nn.Linear(1, 1), object(), evaluation_callback=callback,
+                           no_trade_patience=99, profitable_min_round_trips=1,
+                           profitable_min_traded_dates=1)
+    config = valid_config(tmp_path, no_trade_patience=99,
+                          profitable_min_round_trips=1, profitable_min_traded_dates=1)
+    current_signature = {'settings': {'execution_action_mask': changed_signature}}
+    iteration = training.restore_resume_progress(restored, config, checkpoint,
+                    {} if override is None else {'no_trade_patience': override}, current_signature)
+    assert iteration == 10
+    assert config.no_trade_patience == restored.no_trade_patience == (3 if override is None else override)
+    assert config.profitable_min_round_trips == restored.profitable_min_round_trips == 25
+    assert config.profitable_min_traded_dates == restored.profitable_min_traded_dates == 4
+    assert restored.training_control_state.no_trade_streak == (1 if override is None and not changed_signature else 0)
+    assert config.lr == restored.learning_rate
 
 
 def legacy_best_checkpoint():

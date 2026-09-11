@@ -43,6 +43,20 @@ class WorseningTrainer(GRPOTrainer):
         return {'policy_loss': 0.0}
 
 
+def test_resume_loader_preserves_compatible_profitable_candidate(tmp_path):
+    folder = tmp_path / 'checkpoints'
+    folder.mkdir()
+    config = {'output_dir': str(tmp_path), 'extracted_dir': '/data/episodes'}
+    source = checkpoint(2, 10, config)
+    source_path = folder / 'checkpoint_iter10.pt'
+    torch.save(source, source_path)
+    for name, weight in [('checkpoint_best.pt', 4), ('checkpoint_best_profitable.pt', 3)]:
+        torch.save(checkpoint(weight, 8, config), folder / name)
+    candidates = load_resume_best_candidates(source, source_path, tmp_path,
+                                             evaluation_signature(config, SPLITS, SCHEMA))
+    assert sorted(float(item['policy_state_dict']['weight'].item()) for item in candidates) == [3., 4.]
+
+
 @pytest.mark.parametrize('new_output', [False, True])
 def test_resume_preserves_revalidated_prior_best_after_worse_update(tmp_path, new_output):
     source_dir = tmp_path / 'source'

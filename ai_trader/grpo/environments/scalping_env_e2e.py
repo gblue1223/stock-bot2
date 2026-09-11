@@ -13,6 +13,7 @@ from gymnasium import spaces
 
 from lib.market_data import parse_time_seconds, times_to_seconds
 from lib.observations import ObservationBuilder, validate_max_stages
+from lib.action_masks import executable_action_mask
 from .execution import ExecutionSimulator
 
 logger = logging.getLogger(__name__)
@@ -34,9 +35,12 @@ class GRPOScalpingEnv(gym.Env):
                  execution_config=None, allowed_dates=None, price_scale=1.0, max_stages=1,
                  account_observations=False, liquidation_max_steps=0,
                  execution_observations=False, decision_interval_seconds=0.0,
-                 episode_duration_seconds=0.0):
+                 episode_duration_seconds=0.0, execution_action_mask=False):
         super().__init__()
         self.max_stages = validate_max_stages(max_stages)
+        if not isinstance(execution_action_mask, (bool, np.bool_)):
+            raise ValueError('execution_action_mask must be a boolean')
+        self.execution_action_mask = bool(execution_action_mask)
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table_name):
             raise ValueError('table_name must be a simple SQL identifier')
         if seq_len < 1 or expected_features < 1 or initial_cash <= 0 or not np.isfinite(initial_cash):
@@ -301,7 +305,8 @@ class GRPOScalpingEnv(gym.Env):
         return self._get_current_observation(), {
             'episode_key': getattr(self, 'episode_key', {}),
             'market_context': self.market_context, 'observation_schema': self.observation_schema,
-            'execution_model': self.simulator.summary()['execution_model']}
+            'execution_model': self.simulator.summary()['execution_model'],
+            **({'action_mask': self.action_masks()} if self.execution_action_mask else {})}
 
     def _compute_prices(self):
         if 'last_price' in self.episode_execution:
@@ -505,6 +510,37 @@ class GRPOScalpingEnv(gym.Env):
     def _pending(self, side):
         return [o for o in self.simulator.orders if o.active and o.side == side]
 
+    def _buy_budget_and_unit_cost(self):
+        ask = self.simulator.snapshot.asks[0][0] if self.simulator.snapshot.asks else self.current_price
+        cash = self.cash
+        # Match account observation tolerance without hiding material overdrafts.
+        if -1e-12 < cash / self.initial_cash < 0:
+            cash = 0.0
+        return (min(cash, self.initial_cash / self.max_stages),
+                self.simulator.execution_price(ask, 'buy') * (1 + self.buy_fee_rate))
+
+    def action_mask_state(self):
+        """Read current eligibility without submitting/cancelling any orders."""
+        pending_buy, pending_sell = self._pending('buy'), self._pending('sell')
+        occupied = {stage['order_id'] for stage in self.stages} | {order.order_id for order in pending_buy}
+        budget, unit_cost = self._buy_budget_and_unit_cost()
+        stop, overdue = self._risk_exit_due(self.current_time_seconds)
+        legacy_horizon = (not self.liquidation_max_steps and not self.decision_interval_seconds
+                          and len(self.episode_rewards) + 1 >= self.decision_steps)
+        return {
+            'filled_stages': len(self.stages), 'occupied_stages': len(occupied),
+            'pending_buy': bool(pending_buy), 'pending_sell': bool(pending_sell),
+            'exit_active': bool(self._done or self._exit_requested or self._signal_exit_order_id is not None
+                                or stop or overdue or legacy_horizon),
+            'within_trade_limit': (self.max_trades_per_episode is None
+                                   or len(self.episode_trades) < self.max_trades_per_episode),
+            'buy_budget': budget, 'buy_unit_cost': unit_cost,
+        }
+
+    def action_masks(self):
+        """Return authoritative policy eligibility at the current decision."""
+        return executable_action_mask(self.action_mask_state(), self.max_stages)
+
     def _request_exit(self, reason, timestamp):
         if self._exit_reason is None:
             self._exit_reason = reason
@@ -565,10 +601,14 @@ class GRPOScalpingEnv(gym.Env):
         self.liquidation_seconds = self.current_time_seconds - started
         return fills
 
-    def _check_risk(self, now):
+    def _risk_exit_due(self, now):
         stop = any((self.simulator.liquidation_mark() / st['entry_price'] - 1) * 100 <= -self.stop_loss_pct
                    for st in self.stages)
         overdue = any(now - st['entry_time_seconds'] >= self.max_holding_seconds for st in self.stages)
+        return stop, overdue
+
+    def _check_risk(self, now):
+        stop, overdue = self._risk_exit_due(now)
         if stop or overdue:
             self.loss_holding_violations += int(stop)
             self._request_exit('stop_loss' if stop else 'max_holding', now)
@@ -612,9 +652,8 @@ class GRPOScalpingEnv(gym.Env):
             elif self._pending('buy'):
                 outcome = 'pending_buy'
             else:
-                ask = self.simulator.snapshot.asks[0][0] if self.simulator.snapshot.asks else self.current_price
-                expected = self.simulator.execution_price(ask, 'buy') * (1 + self.buy_fee_rate)
-                qty = int(min(self.cash, self.initial_cash / self.max_stages) / expected)
+                budget, expected = self._buy_budget_and_unit_cost()
+                qty = int(budget / expected)
                 if qty > 0:
                     self.simulator.submit('buy', qty, now)
                     outcome = 'submitted'
@@ -678,6 +717,8 @@ class GRPOScalpingEnv(gym.Env):
                 'loss_holding_violations': self.loss_holding_violations}
         if self._done:
             info['episode'] = self._calculate_episode_metadata()
+        if self.execution_action_mask:
+            info['action_mask'] = self.action_masks()
         observation = np.zeros(self.observation_space.shape, np.float32) if self._done else self._get_current_observation()
         return observation, float(reward), bool(terminated), bool(truncated), info
 

@@ -36,6 +36,7 @@ def run_backtest(policy_path, *, extracted_dir=None, partition='test', episodes=
         max_stages=schema['max_stages'],
         account_observations=schema.get('version') in (3, 4),
         execution_observations=schema.get('version') == 4,
+        execution_action_mask=config.get('execution_action_mask', False),
         liquidation_max_steps=config.get('liquidation_max_steps', 0),
         decision_interval_seconds=config.get('decision_interval_seconds', 0.0),
         episode_duration_seconds=config.get('episode_duration_seconds', 0.0),

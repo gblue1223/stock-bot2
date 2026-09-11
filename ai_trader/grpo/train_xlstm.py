@@ -76,6 +76,7 @@ class TrainingConfig:
         self.episode_steps = 300
         self.account_observations = True
         self.execution_observations = True
+        self.execution_action_mask = True
         self.liquidation_max_steps = 300
         self.decision_interval_seconds = 0.0
         self.episode_duration_seconds = 0.0
@@ -125,6 +126,9 @@ class TrainingConfig:
         self.diagnostics_interval = 5
         self.diagnostics_max_samples = 256
         self.selection_require_liquidation = True
+        self.no_trade_patience = 0
+        self.profitable_min_round_trips = 20
+        self.profitable_min_traded_dates = 3
         self.cache_max_bytes = 256 * 1024 * 1024
         self.initial_cash = 1_000_000.0
         self.max_stages = 1
@@ -179,6 +183,13 @@ class TrainingConfig:
         validate_max_stages(self.max_stages)
         if not isinstance(self.selection_require_liquidation, bool):
             errors.append("selection_require_liquidation must be a boolean")
+        if not isinstance(self.execution_action_mask, bool):
+            errors.append('execution_action_mask must be a boolean')
+        for name, minimum in (('no_trade_patience', 0), ('profitable_min_round_trips', 1),
+                              ('profitable_min_traded_dates', 1)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+                errors.append(f'{name} must be an integer >= {minimum}')
         if not 0 < self.gamma <= 1:
             errors.append("gamma must be in (0, 1]")
         if not 0 <= self.lambda_gae <= 1:
@@ -242,6 +253,7 @@ def create_environment(config: TrainingConfig, device: str, allowed_dates=None, 
             max_episode_steps=config.episode_steps,
             account_observations=config.account_observations,
             execution_observations=config.execution_observations,
+            execution_action_mask=config.execution_action_mask,
             liquidation_max_steps=config.liquidation_max_steps,
             decision_interval_seconds=config.decision_interval_seconds,
             episode_duration_seconds=config.episode_duration_seconds,
@@ -283,6 +295,7 @@ def create_policy(config: TrainingConfig, env, device: str):
             rnn_hidden_dim=config.rnn_hidden_dim,
             fc_hidden_dim=config.hidden_dim,
             action_dim=config.action_dim,
+            execution_action_mask=config.execution_action_mask,
             max_stages=config.max_stages,
             checkpoint_segments=config.checkpoint_segments
         )
@@ -310,9 +323,10 @@ def prepare_date_splits(config):
 def load_resume_best_candidates(source, source_path, output_dir, signature):
     """Only inspect named best checkpoints beside the source or in the output."""
     source_path = Path(source_path).resolve()
-    paths = [source_path.parent / 'checkpoint_best.pt',
-             source_path.parent / 'checkpoints' / 'checkpoint_best.pt',
-             Path(output_dir).resolve() / 'checkpoints' / 'checkpoint_best.pt']
+    directories = (source_path.parent, source_path.parent / 'checkpoints',
+                   Path(output_dir).resolve() / 'checkpoints')
+    paths = [directory / name for directory in directories
+             for name in ('checkpoint_best.pt', 'checkpoint_best_profitable.pt')]
     candidates, seen = [], {source_path}
     for path in paths:
         path = path.resolve()
@@ -329,6 +343,38 @@ def load_resume_best_candidates(source, source_path, output_dir, signature):
         except Exception as exc:
             logger.warning("Cannot inherit resume best %s: %s", path, exc)
     return candidates
+
+
+def restore_resume_progress(trainer, config, checkpoint, control_overrides, signature):
+    """Restore counters, then explicitly override controls without mixing their history."""
+    iteration = trainer.restore_training_progress(checkpoint)
+    changed_controls = False
+    for name in ('no_trade_patience', 'profitable_min_round_trips', 'profitable_min_traded_dates'):
+        if name in control_overrides:
+            value = control_overrides[name]
+            changed_controls |= value != getattr(trainer, name)
+            setattr(trainer, name, value)
+        setattr(config, name, getattr(trainer, name))
+    if changed_controls or checkpoint.get('extra_state', {}).get('evaluation_signature') != signature:
+        trainer.training_control_state = type(trainer.training_control_state)()
+        logger.info('Reset no-trade validation history because evaluation conditions or controls changed')
+    config.lr = trainer.learning_rate
+    config.group_advantage_coef = trainer.group_advantage_coef
+    return iteration
+
+
+def evaluate_final_test(policy, config, date_splits, device, final_metrics):
+    """Keep the test partition sealed when a training experiment stops early."""
+    reason = final_metrics.get('early_stop_reason')
+    if reason:
+        logger.info('Test evaluation skipped after early stop: %s', reason)
+        return None, str(reason)
+    environment = create_environment(config, device, date_splits['test'])
+    try:
+        return evaluate_policy(policy, environment, config.evaluation_episodes,
+                               config.evaluation_seed, device), None
+    finally:
+        environment.close()
 
 
 def main():
@@ -350,6 +396,12 @@ def main():
     parser.add_argument('--evaluation_seed', type=int, default=None)
     parser.add_argument('--selection_require_liquidation', action=argparse.BooleanOptionalAction, default=None,
                         help='Only select validation checkpoints with no residual inventory (default: enabled)')
+    parser.add_argument('--execution_action_mask', action=argparse.BooleanOptionalAction, default=None,
+                        help='Use executable order-state masks in rollout, update and evaluation')
+    parser.add_argument('--no_trade_patience', type=int, default=None,
+                        help='Stop after this many stagnant no-trade validations; 0 disables')
+    parser.add_argument('--profitable_min_round_trips', type=int, default=None)
+    parser.add_argument('--profitable_min_traded_dates', type=int, default=None)
     parser.add_argument('--max_stages', '--max-stages', type=int, choices=range(1, 6), default=None,
                         help='Maximum position entries (1-5; default: 1, no split entries)')
     parser.add_argument('--max_holding_seconds', type=float, default=None)
@@ -481,7 +533,8 @@ def main():
                 checkpoint = torch.load(config.load_policy, map_location='cpu', weights_only=False)
                 state_dict = checkpoint.get('policy_state_dict', checkpoint.get('state_dict', checkpoint))
                 saved_schema = checkpoint.get('observation_schema', {})
-                saved_config = checkpoint.get('extra_state', {}).get('training_config', {})
+                saved_config = {**checkpoint.get('config', {}),
+                                **checkpoint.get('extra_state', {}).get('training_config', {})}
                 if args.account_observations is None:
                     config.account_observations = saved_schema.get('version') in (3, 4)
                 if args.execution_observations is None:
@@ -492,6 +545,8 @@ def main():
                     config.lambda_gae = saved_config.get('lambda_gae', 0.95)
                 for name, default in (('decision_interval_seconds', 0.0),
                                       ('episode_duration_seconds', 0.0),
+                                      ('execution_action_mask', False), ('no_trade_patience', 0),
+                                      ('profitable_min_round_trips', 20), ('profitable_min_traded_dates', 3),
                                       ('group_advantage_coef', 1.0), ('training_seed', 42)):
                     if getattr(args, name) is None:
                         setattr(config, name, saved_config.get(name, default))
@@ -544,6 +599,9 @@ def main():
                     config.execution_observations, config.decision_interval_seconds,
                     config.episode_duration_seconds, config.group_advantage_coef,
                     config.lambda_gae, config.training_seed)
+        logger.info('Execution action mask=%s; no-trade patience=%s; profitable candidate minimum=%s round trips / %s traded dates',
+                    config.execution_action_mask, config.no_trade_patience,
+                    config.profitable_min_round_trips, config.profitable_min_traded_dates)
         
         # 환경 생성 (extracted_dir 캐시 활용 시 Windows의 SubprocVecEnv도 안정 작동)
         logger.info(f"[STEP 2/6] Creating environments (Workers: {config.num_workers})...")
@@ -639,6 +697,9 @@ def main():
                 config.evaluation_seed, device),
             evaluation_interval=config.evaluation_interval,
             selection_require_liquidation=config.selection_require_liquidation,
+            no_trade_patience=config.no_trade_patience,
+            profitable_min_round_trips=config.profitable_min_round_trips,
+            profitable_min_traded_dates=config.profitable_min_traded_dates,
             diagnostics_interval=config.diagnostics_interval,
             diagnostics_max_samples=config.diagnostics_max_samples,
         )
@@ -652,16 +713,17 @@ def main():
                 'train': sorted(set(date_splits['train']) | {normalize_date(day) for day in lineage.get('train', [])}),
                 'validation': sorted(set(date_splits['validation']) | {normalize_date(day) for day in lineage.get('validation', [])}),
             }
+        signature = evaluation_signature(dict(config.__dict__), date_splits, ref_env.observation_schema)
         if config.resume:
-            start_iteration = trainer.restore_training_progress(checkpoint)
+            control_overrides = {name: getattr(args, name) for name in
+                                 ('no_trade_patience', 'profitable_min_round_trips', 'profitable_min_traded_dates')
+                                 if getattr(args, name) is not None}
+            start_iteration = restore_resume_progress(trainer, config, checkpoint, control_overrides, signature)
             if config.total_timesteps <= trainer.total_timesteps:
                 raise ValueError("For --resume, total_timesteps must exceed the saved cumulative timesteps")
-            config.lr = trainer.learning_rate
-            config.group_advantage_coef = trainer.group_advantage_coef
             trainer.extra_checkpoint_state['training_config'] = dict(config.__dict__)
             logger.info("Resuming iteration=%s, timesteps=%s, updates=%s with saved optimizer",
                         start_iteration, trainer.total_timesteps, trainer.num_updates)
-        signature = evaluation_signature(dict(config.__dict__), date_splits, ref_env.observation_schema)
         trainer.extra_checkpoint_state['evaluation_signature'] = signature
         resume_best_checkpoints = (load_resume_best_candidates(
             checkpoint, config.load_policy, config.output_dir, signature) if config.resume else [])
@@ -713,12 +775,12 @@ def main():
             raise RuntimeError("Training produced no validated checkpoint")
         selected = torch.load(selected_path, map_location=device, weights_only=False)
         policy.load_state_dict(selected['policy_state_dict'], strict=True)
-        test_env = create_environment(config, device, date_splits['test'])
-        test_metrics = evaluate_policy(policy, test_env, config.evaluation_episodes,
-                                       config.evaluation_seed, device)
+        test_metrics, test_skip_reason = evaluate_final_test(
+            policy, config, date_splits, device, final_metrics)
         report = {'date_splits': date_splits, 'training': final_metrics,
                   'validation': selected['extra_state']['validation_metrics'],
-                  'test': test_metrics, 'test_used_for_model_selection': False}
+                  'test': test_metrics, 'test_skip_reason': test_skip_reason,
+                  'test_used_for_model_selection': False}
         with open(Path(config.output_dir) / 'evaluation_report.json', 'w', encoding='utf-8') as handle:
             json.dump(report, handle, ensure_ascii=False, indent=2)
         final_model_path = os.path.join(config.output_dir, f'{config.env}_{config.policy}_model.pt')

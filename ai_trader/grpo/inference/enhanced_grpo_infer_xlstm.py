@@ -10,6 +10,7 @@ import torch
 
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
 from lib.observations import ObservationBuilder, action_mask
+from lib.action_masks import executable_action_mask
 
 
 class Action(Enum):
@@ -71,7 +72,9 @@ class GRPOInferenceE2EXLSTM:
             obs_dim=obs_dim, cnn_channels=int(state["conv1.weight"].shape[0]),
             rnn_hidden_dim=int(state["xlstm.cells.0.w_q.weight"].shape[0]),
             fc_hidden_dim=int(state["fc1.weight"].shape[0]), action_dim=3,
-            max_stages=self.observation_builder.max_stages)
+            max_stages=self.observation_builder.max_stages,
+            execution_action_mask=checkpoint.get('config', {}).get('execution_action_mask',
+                                   self.training_config.get('execution_action_mask', False)))
         policy.load_state_dict(state, strict=True)
         policy.to(self.device)
         policy.eval()
@@ -93,19 +96,28 @@ class GRPOInferenceE2EXLSTM:
         return self.observation_builder.build(raw_window, stages, current_price, current_time_seconds,
                                               account_state=account_state, execution_state=execution_state)
 
+    def build_action_mask(self, stages=(), action_mask_state=None):
+        if getattr(self.policy, 'execution_action_mask', False):
+            valid = executable_action_mask(action_mask_state, self.observation_builder.max_stages)
+            if action_mask_state['filled_stages'] != len(stages):
+                raise ValueError('action_mask_state filled_stages disagrees with confirmed positions')
+            return valid
+        return action_mask(len(stages), self.observation_builder.max_stages)
+
     def predict(self, obs: Union[np.ndarray, torch.Tensor], deterministic: bool = True, *,
                 stages=(), current_price=None, current_time_seconds=None,
                 feature_columns=None, feature_price_unit=None, account_state=None,
-                execution_state=None) -> Tuple[int, float]:
+                execution_state=None, action_mask_state=None) -> Tuple[int, float]:
         """Predict from raw rows; already-normalized full observations are rejected."""
         state = self.build_observation(obs, stages=stages, current_price=current_price,
                                        current_time_seconds=current_time_seconds,
                                        feature_columns=feature_columns, feature_price_unit=feature_price_unit,
                                        account_state=account_state, execution_state=execution_state)
         inputs = torch.from_numpy(state).unsqueeze(0).to(self.device)
-        valid = torch.as_tensor(action_mask(len(stages), self.observation_builder.max_stages), device=self.device)
+        valid = torch.as_tensor(self.build_action_mask(stages, action_mask_state), device=self.device)
         with torch.inference_mode():
-            logits, _ = self.policy(inputs)
+            kwargs = {'action_masks': valid.unsqueeze(0)} if getattr(self.policy, 'execution_action_mask', False) else {}
+            logits, _ = self.policy(inputs, **kwargs)
             logits = logits.masked_fill(~valid.unsqueeze(0), -torch.inf)
             if not torch.isfinite(logits[:, valid]).all():
                 raise ValueError("Policy produced nonfinite action logits")
@@ -163,7 +175,7 @@ class EnhancedGRPOInferenceXLSTM:
                 current_price: float = 0.0, deterministic: bool = True, *,
                 current_time_seconds: Optional[float] = None, feature_columns=None,
                 feature_price_unit=None, account_state=None,
-                execution_state=None) -> Tuple[int, float, Dict]:
+                execution_state=None, action_mask_state=None) -> Tuple[int, float, Dict]:
         self.stats["total_predictions"] += 1
         positions = ([] if current_position is None else
                      [current_position] if isinstance(current_position, Position) else list(current_position))
@@ -194,6 +206,8 @@ class EnhancedGRPOInferenceXLSTM:
             self.base_inference.observation_builder.validate_account_state(account_state, len(stages))
         if self.base_inference.observation_builder.execution_observations:
             self.base_inference.observation_builder.validate_execution_state(execution_state)
+        if getattr(getattr(self.base_inference, 'policy', None), 'execution_action_mask', False):
+            self.base_inference.build_action_mask(stages, action_mask_state)
         if self.enable_auto_exit:
             for position in positions:
                 pct = position.profit_rate
@@ -218,10 +232,13 @@ class EnhancedGRPOInferenceXLSTM:
                     return Action.SELL.value, 1.0, {"reason": reason, "profit_rate": pct,
                                                    "holding_seconds": position.holding_period,
                                                    "risk_exit_all": True, "stage_count": len(stages)}
+        mask_kwargs = ({'action_mask_state': action_mask_state}
+                       if action_mask_state is not None else {})
         action, confidence = self.base_inference.predict(
             sequence, deterministic, stages=stages, current_price=current_price,
             current_time_seconds=current_time_seconds, feature_columns=feature_columns,
-            feature_price_unit=feature_price_unit, account_state=account_state, execution_state=execution_state)
+            feature_price_unit=feature_price_unit, account_state=account_state, execution_state=execution_state,
+            **mask_kwargs)
         info = {"raw_action": action, "confidence": confidence}
         if not action_mask(len(stages), self.base_inference.observation_builder.max_stages)[action]:
             info.update(filtered=True, filter_reason="Invalid action for filled inventory")

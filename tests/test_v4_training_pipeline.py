@@ -61,7 +61,9 @@ def test_v4_timed_rollout_update_and_batched_validation(tmp_path, device):
             assert ep['metadata']['pnl_attribution_residual'] == pytest.approx(0., abs=1e-8)
             with torch.no_grad():
                 logs, _, values = policy.evaluate_actions(torch.from_numpy(ep['states']).to(device),
-                                                         torch.from_numpy(ep['actions']).to(device))
+                                                         torch.from_numpy(ep['actions']).to(device),
+                                                         **({'action_masks': ep['action_masks']}
+                                                            if policy.execution_action_mask else {}))
             np.testing.assert_allclose(logs.cpu().numpy(), ep['log_probs'], rtol=1e-5, atol=1e-6)
             np.testing.assert_allclose(values.cpu().numpy(), ep['values'], rtol=1e-5, atol=1e-6)
         before = policy.policy_head.bias.detach().clone()

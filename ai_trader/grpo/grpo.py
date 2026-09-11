@@ -18,6 +18,8 @@ from torch.utils.tensorboard import SummaryWriter
 from sklearn.cluster import KMeans
 
 from .environments import GRPOScalpingEnv
+from .training_control import (TrainingControlState, finite_number, nonnegative_count,
+                               integer_setting, profitable_candidate_evidence)
 import concurrent.futures  # ✅ 병렬 처리용 추가
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,9 @@ class GRPOTrainer:
         diagnostics_interval: int = 5,
         diagnostics_max_samples: int = 256,
         group_advantage_coef: float = 1.0,
+        no_trade_patience: int = 0,
+        profitable_min_round_trips: int = 20,
+        profitable_min_traded_dates: int = 3,
     ):
         self.policy = policy
         
@@ -115,8 +120,15 @@ class GRPOTrainer:
         self.selection_require_liquidation = selection_require_liquidation
         self.diagnostics_interval = max(1, int(diagnostics_interval))
         self.diagnostics_max_samples = max(1, int(diagnostics_max_samples))
+        self.no_trade_patience = integer_setting('no_trade_patience', no_trade_patience)
+        self.profitable_min_round_trips = integer_setting('profitable_min_round_trips', profitable_min_round_trips, 1)
+        self.profitable_min_traded_dates = integer_setting('profitable_min_traded_dates', profitable_min_traded_dates, 1)
+        self.training_control_state = TrainingControlState()
+        self.best_profitable_validation_return = float('-inf')
         if selection_require_liquidation and evaluation_callback is None:
             raise ValueError("Liquidation-aware selection requires a validation callback")
+        if self.no_trade_patience and evaluation_callback is None:
+            raise ValueError('No-trade early stopping requires a validation callback')
         logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}, group_advantage_coef={self.group_advantage_coef}")
         
         # Optimizer 초기화
@@ -187,6 +199,7 @@ class GRPOTrainer:
         current_dones = [[] for _ in range(num_envs)]
         current_log_probs = [[] for _ in range(num_envs)]
         current_values = [[] for _ in range(num_envs)]
+        current_action_masks = [[] for _ in range(num_envs)]
         
         # 최초 Reset
         obs, infos = vec_env.reset()
@@ -195,6 +208,8 @@ class GRPOTrainer:
                         for state, info in zip(obs, infos)]
         
         episodes_done = 0
+        base_policy = getattr(self.policy, 'module', self.policy)
+        masked_policy = getattr(base_policy, 'execution_action_mask', False)
         
         while episodes_done < num_episodes:
             # 1. 상태를 하나의 텐서로 배치화 (N, obs_dim)
@@ -209,22 +224,31 @@ class GRPOTrainer:
                 # 2. 정책에서 행동 샘플링 (Batched Inference)
                 # DataParallel 클래스 등으로 래핑된 경우 unwrap
                 base_policy = getattr(self.policy, 'module', self.policy)
+                mask_kwargs = {}
+                rollout_masks = None
+                if masked_policy:
+                    if any('action_mask' not in info for info in infos):
+                        raise ValueError('Masked rollout requires environment action_mask in reset/step info')
+                    rollout_masks = np.stack([info['action_mask'] for info in infos])
+                    mask_kwargs['action_masks'] = torch.as_tensor(rollout_masks, device=self.device)
                 
                 rollout_values = None
                 if hasattr(base_policy, 'get_action_with_value'):
                     actions, log_probs, rollout_values = base_policy.get_action_with_value(
-                        states_tensor, deterministic=False)
+                        states_tensor, deterministic=False, **mask_kwargs)
                     actions = actions.detach().cpu().numpy()
                     log_probs = log_probs.detach().cpu().numpy()
                     rollout_values = rollout_values.detach().cpu().numpy().reshape(-1)
                 elif hasattr(base_policy, 'get_action'):
                     try:
-                        actions, log_probs = base_policy.get_action(states_tensor, deterministic=False)
+                        actions, log_probs = base_policy.get_action(states_tensor, deterministic=False, **mask_kwargs)
                         if isinstance(actions, torch.Tensor):
                             actions = actions.cpu().numpy()
                         if isinstance(log_probs, torch.Tensor):
                             log_probs = log_probs.cpu().numpy()
                     except Exception as e:
+                        if masked_policy:
+                            raise
                         # Fallback: Loop if policy doesn't support batched get_action yet
                         actions_list = []
                         log_probs_list = []
@@ -261,6 +285,8 @@ class GRPOTrainer:
                 
                 current_dones[i].append(dones[i])
                 current_log_probs[i].append(log_probs[i])
+                if rollout_masks is not None:
+                    current_action_masks[i].append(rollout_masks[i].copy())
                 if rollout_values is not None:
                     current_values[i].append(rollout_values[i])
                 
@@ -294,6 +320,8 @@ class GRPOTrainer:
                     }
                     if len(current_values[i]) == ep_steps:
                         episode_data['values'] = np.asarray(current_values[i], dtype=np.float32)
+                    if masked_policy:
+                        episode_data['action_masks'] = np.asarray(current_action_masks[i], dtype=np.bool_)
                     episodes_collected.append(episode_data)
                     episodes_done += 1
                     
@@ -306,16 +334,18 @@ class GRPOTrainer:
                     current_dones[i] = []
                     current_log_probs[i] = []
                     current_values[i] = []
+                    current_action_masks[i] = []
                     start_infos[i] = dict(step_infos[i].get('reset_info', {}))
                     start_market[i] = np.asarray(start_infos[i].get(
                         'market_context', self._initial_market_indicators(next_obs[i])))
             
             obs = next_obs
+            infos = [info.get('reset_info', {}) if done else info for info, done in zip(step_infos, dones)]
             
         logger.info(f"Collected {len(episodes_collected)} rollouts (Vectorized), total timesteps: {self.total_timesteps}")
         return episodes_collected
     
-    def _sample_action(self, state: torch.Tensor) -> Tuple[int, float]:
+    def _sample_action(self, state: torch.Tensor, action_masks=None) -> Tuple[int, float]:
         """
         정책에서 행동 샘플링
         
@@ -329,7 +359,8 @@ class GRPOTrainer:
         # 정책이 get_action 메서드를 가지고 있는지 확인
         if hasattr(self.policy, 'get_action'):
             # 정책의 get_action 메서드 사용 (stochastic mode)
-            action, log_prob = self.policy.get_action(state, deterministic=False)
+            kwargs = {'action_masks': action_masks} if action_masks is not None else {}
+            action, log_prob = self.policy.get_action(state, deterministic=False, **kwargs)
             
             # 텐서를 스칼라로 변환
             if isinstance(action, torch.Tensor):
@@ -585,6 +616,26 @@ class GRPOTrainer:
         
         return group_advantages
     
+    def _cached_action_masks(self, episode):
+        """Keep the behavior distribution fixed across PPO and diagnostics."""
+        enabled = getattr(getattr(self.policy, 'module', self.policy), 'execution_action_mask', False)
+        if not enabled:
+            return None
+        masks = np.asarray(episode.get('action_masks'))
+        actions = np.asarray(episode['actions'])
+        if (masks.dtype != np.bool_ or masks.shape != (len(actions), 3)
+                or not masks[:, 0].all()):
+            raise ValueError('Masked policy requires cached boolean rollout action_masks with shape (steps, 3)')
+        if (not np.isfinite(actions).all() or (actions != actions.astype(np.int64)).any()
+                or (actions < 0).any() or (actions >= 3).any()
+                or not masks[np.arange(len(actions)), actions.astype(np.int64)].all()):
+            raise ValueError('Cached action_masks forbid a recorded rollout action')
+        return masks
+
+    def _mask_kwargs(self, masks):
+        return ({'action_masks': torch.as_tensor(masks, dtype=torch.bool, device=self.device)}
+                if masks is not None else {})
+
     def _episode_tensor_batches(self, states: np.ndarray, actions: np.ndarray):
         """Slice the CPU replay before moving each bounded batch to the device."""
         if len(states) != len(actions):
@@ -635,6 +686,8 @@ class GRPOTrainer:
         all_old_values = []
         all_raw_gae = []
         all_group_components = []
+        episode_masks = [self._cached_action_masks(ep) for ep in episodes]
+        all_action_masks = (np.concatenate(episode_masks) if episode_masks and episode_masks[0] is not None else None)
         gae_started = time.perf_counter()
         if not episodes or len(episodes) != len(advantages):
             raise ValueError('Expected one nonempty advantage array per rollout episode')
@@ -663,9 +716,14 @@ class GRPOTrainer:
                     # episode's observation tensor during the later PPO update.
                     with torch.no_grad():
                         values_ep_list = []
+                        masks = self._cached_action_masks(episode)
+                        value_offset = 0
                         for batch_s, batch_a in self._episode_tensor_batches(states, actions):
-                            _, _, v = self.policy.evaluate_actions(batch_s, batch_a)
+                            kwargs = self._mask_kwargs(masks[value_offset:value_offset + len(batch_s)]
+                                                       if masks is not None else None)
+                            _, _, v = self.policy.evaluate_actions(batch_s, batch_a, **kwargs)
                             values_ep_list.append(v.reshape(-1).cpu().numpy())
+                            value_offset += len(batch_s)
                         values_ep = np.concatenate(values_ep_list)
                 
                 # GAE 계산 (타임스텝별 세부 기여도 평가)
@@ -774,7 +832,8 @@ class GRPOTrainer:
                 
                 # 4. 정책 평가
                 log_probs, entropy, values = self.policy.evaluate_actions(
-                    batch_states, batch_actions
+                    batch_states, batch_actions,
+                    **self._mask_kwargs(all_action_masks[batch_indices] if all_action_masks is not None else None)
                 )
                 
                 # 5. PPO 클리핑 목적 함수 계산
@@ -1064,22 +1123,79 @@ class GRPOTrainer:
 
     def _validation_selection_score(self, metrics):
         """Rank realized validation returns; incomplete liquidation is ineligible."""
-        value = float(metrics['mean_net_return'])
-        if not np.isfinite(value):
+        value = finite_number(metrics.get('mean_net_return'))
+        if value is None:
             raise ValueError("Validation mean_net_return must be finite")
         if self.selection_require_liquidation:
-            try:
-                incomplete = float(metrics['incomplete_liquidation_episodes'])
-                residual = float(metrics['max_open_quantity'])
-            except (KeyError, TypeError, ValueError):
+            incomplete = nonnegative_count(metrics.get('incomplete_liquidation_episodes'))
+            residual = finite_number(metrics.get('max_open_quantity'))
+            if incomplete is None or residual is None:
                 logger.warning("Validation candidate excluded: missing/invalid liquidation diagnostics")
                 return None
-            if not (np.isfinite(incomplete) and np.isfinite(residual)
-                    and incomplete == 0 and residual == 0):
+            if incomplete != 0 or residual != 0:
                 logger.warning("Validation candidate excluded: incomplete_liquidation_episodes=%s, "
                                "max_open_quantity=%s", incomplete, residual)
                 return None
         return value
+
+    def _consider_profitable_checkpoint(self, metrics, iteration, checkpoint_path, candidate=None):
+        evidence = profitable_candidate_evidence(
+            metrics, self.profitable_min_round_trips, self.profitable_min_traded_dates)
+        metrics['profitable_candidate_evidence'] = evidence
+        metrics['profitable_candidate_eligible'] = evidence['eligible']
+        if not evidence['eligible']:
+            return False
+        score = evidence['mean_net_return']
+        if score <= self.best_profitable_validation_return:
+            return False
+        self.best_profitable_validation_return = score
+        if checkpoint_path:
+            destination = os.path.join(os.path.dirname(checkpoint_path.format(iteration)),
+                                       'checkpoint_best_profitable.pt')
+            extra = dict(self.extra_checkpoint_state)
+            extra.update(best_profitable_validation_return=score, validation_metrics=metrics,
+                         selection_metric='validation.mean_net_return_with_trade_evidence',
+                         profitable_candidate_evidence=evidence)
+            if candidate is None:
+                self.save_checkpoint(destination, iteration, extra_state=extra)
+            else:
+                selected = dict(candidate)
+                selected['extra_state'] = extra
+                torch.save(selected, destination)
+        logger.info('Profitable validation candidate: %.6f%%, round_trips=%d, traded_dates=%d '
+                    '(validation evidence; independent deployment evaluation still required)',
+                    score, evidence['round_trip_count'], evidence['traded_date_count'])
+        return True
+
+    def _archive_unqualified_profitable_checkpoint(self, checkpoint_path, iteration):
+        """Retain an unqualified prior artifact without advertising it as current best."""
+        if not checkpoint_path or np.isfinite(self.best_profitable_validation_return):
+            return
+        directory = os.path.realpath(os.path.dirname(os.path.abspath(checkpoint_path.format(iteration))))
+        source = os.path.join(directory, 'checkpoint_best_profitable.pt')
+        if not os.path.lexists(source):
+            return
+        if os.path.dirname(os.path.realpath(source)) != directory or not os.path.isfile(source):
+            raise ValueError('Prior profitable checkpoint must resolve to a file inside the checkpoint directory')
+        suffix = 0
+        while True:
+            numbered = f'_{suffix}' if suffix else ''
+            destination = os.path.join(directory, f'checkpoint_unqualified_profitable_{iteration}{numbered}.pt')
+            try:
+                # Reserve our own empty destination atomically. Replacing it can
+                # never overwrite a user's existing checkpoint, even on POSIX.
+                descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(descriptor)
+                break
+            except FileExistsError:
+                suffix += 1
+        try:
+            os.replace(source, destination)
+        except Exception:
+            os.unlink(destination)  # Only the empty path exclusively created above.
+            raise
+        logger.warning('Prior profitable checkpoint is not qualified by current validation evidence; '
+                       'preserved at %s', destination)
 
     def _seed_resume_best(self, checkpoint_path, start_iteration, candidates):
         """Protect imported weights' validated baseline before any new update."""
@@ -1088,6 +1204,7 @@ class GRPOTrainer:
 
         best_metrics = self.evaluation_callback(self.policy)
         best_score = self._validation_selection_score(best_metrics)
+        self._consider_profitable_checkpoint(best_metrics, start_iteration, checkpoint_path)
         self._record_validation_metrics(best_metrics, start_iteration, checkpoint_path, 'initial_source')
         best_checkpoint = None
         if candidates:
@@ -1097,9 +1214,11 @@ class GRPOTrainer:
                 for candidate_index, candidate in enumerate(candidates):
                     if candidate.get('observation_schema') != self.observation_schema:
                         raise ValueError("Resume best checkpoint observation schema mismatch")
+                    self._validate_checkpoint_action_mask(candidate.get('config', {}))
                     self.policy.load_state_dict(candidate['policy_state_dict'], strict=True)
                     metrics = self.evaluation_callback(self.policy)
                     value = self._validation_selection_score(metrics)
+                    self._consider_profitable_checkpoint(metrics, start_iteration, checkpoint_path, candidate)
                     self._record_validation_metrics(metrics, start_iteration, checkpoint_path,
                                                     f'initial_candidate_{candidate_index}')
                     if value is not None and (best_score is None or value >= best_score):
@@ -1172,12 +1291,24 @@ class GRPOTrainer:
         
         # Model selection uses the current weights on validation paths only.
         best_validation_return = float('-inf')
+        self.best_profitable_validation_return = float('-inf')
+        if not resume:
+            self.training_control_state = TrainingControlState()
+        elif self.training_control_state.no_trade_streak:
+            logger.info('Resuming with no_trade_streak=%d; the next qualifying validation may stop '
+                        'again unless new trading, improving return, or increasing buy probability resets it',
+                        self.training_control_state.no_trade_streak)
+        # An explicit resume may continue a stopped run, but keeps its observed
+        # streak until a new validation supplies evidence to reset or extend it.
+        self.training_control_state.stop_reason = None
         if resume or preserve_initial_policy:
             best_validation_return = self._seed_resume_best(
                 checkpoint_path, start_iteration,
                 (resume_best_checkpoints or []) if resume else [])
+        self._archive_unqualified_profitable_checkpoint(checkpoint_path, start_iteration)
         no_improve_count = 0
         validation_metrics = None
+        early_stop_reason = None
 
         iteration = start_iteration
         last_completed_iteration = start_iteration
@@ -1243,15 +1374,13 @@ class GRPOTrainer:
                 self._log_metrics(iteration, episodes, grouped_episodes, update_metrics)
             phase_seconds['diagnostics'] = time.perf_counter() - phase_started
             
-            # 6. 체크포인트 저장
+            # Preserve updated weights before a potentially long validation.
+            # Refresh this file afterwards with the completed control evidence.
             phase_started = time.perf_counter()
-            if checkpoint_path and (iteration + 1) % checkpoint_interval == 0:
-                # Format checkpoint path with iteration number
-                formatted_checkpoint_path = checkpoint_path.format(iteration + 1)
-                self.save_checkpoint(
-                    formatted_checkpoint_path, iteration + 1,
-                    extra_state=self.extra_checkpoint_state if self.extra_checkpoint_state else None
-                )
+            checkpoint_due = checkpoint_path and (iteration + 1) % checkpoint_interval == 0
+            if checkpoint_due:
+                self.save_checkpoint(checkpoint_path.format(iteration + 1), iteration + 1,
+                                     extra_state=self.extra_checkpoint_state or None)
             phase_seconds['checkpoint'] = time.perf_counter() - phase_started
             
             # 평균 보상 및 추가 메트릭 계산
@@ -1272,6 +1401,14 @@ class GRPOTrainer:
                 logger.info('Starting validation for iteration %d...', iteration + 1)
                 validation_metrics = self.evaluation_callback(self.policy)
                 score = self._validation_selection_score(validation_metrics)
+                improved = score is not None and score > best_validation_return
+                stop_for_no_trade = self.training_control_state.observe(
+                    validation_metrics if score is not None else {}, iteration=iteration + 1,
+                    score_improved=improved, patience=self.no_trade_patience)
+                validation_metrics['training_control'] = self.training_control_state.to_dict()
+                if stop_for_no_trade:
+                    early_stop_reason = self.training_control_state.stop_reason
+                self._consider_profitable_checkpoint(validation_metrics, iteration + 1, checkpoint_path)
                 self._record_validation_metrics(validation_metrics, iteration + 1, checkpoint_path)
                 reported_return = float(validation_metrics['mean_net_return'])
                 if self.writer:
@@ -1283,7 +1420,7 @@ class GRPOTrainer:
                             validation_metrics.get('round_trip_count', 'unknown'),
                             validation_metrics.get('no_trade_episode_fraction', 'unknown'),
                             validation_metrics.get('profitable_with_trades', 'unknown'), score is not None)
-                if score is not None and score > best_validation_return:
+                if improved:
                     best_validation_return = score
                     no_improve_count = 0
                     if checkpoint_path:
@@ -1297,17 +1434,29 @@ class GRPOTrainer:
                         self.save_checkpoint(selected_path, iteration + 1, extra_state=extra)
                 else:
                     no_improve_count += 1
-                if (checkpoint_path and np.isfinite(best_validation_return) and revert_to_best_patience > 0 and
+                if (not stop_for_no_trade and checkpoint_path and np.isfinite(best_validation_return) and revert_to_best_patience > 0 and
                         no_improve_count >= revert_to_best_patience):
                     selected_path = os.path.join(
                         os.path.dirname(checkpoint_path.format(0)), 'checkpoint_best.pt')
                     if os.path.exists(selected_path):
                         # Reverting parameters must not rewind the actual training budget.
                         steps, updates = self.total_timesteps, self.num_updates
+                        control_state = self.training_control_state
+                        control_settings = (self.no_trade_patience, self.profitable_min_round_trips,
+                                            self.profitable_min_traded_dates)
                         self.load_checkpoint(selected_path)
                         self.total_timesteps, self.num_updates = steps, updates
+                        self.training_control_state = control_state
+                        (self.no_trade_patience, self.profitable_min_round_trips,
+                         self.profitable_min_traded_dates) = control_settings
                         no_improve_count = 0
                 phase_seconds['validation'] = time.perf_counter() - phase_started
+
+            phase_started = time.perf_counter()
+            if checkpoint_path and ((checkpoint_due and validation_metrics is not None) or early_stop_reason):
+                self.save_checkpoint(checkpoint_path.format(iteration + 1), iteration + 1,
+                                     extra_state=self.extra_checkpoint_state or None)
+            phase_seconds['checkpoint'] += time.perf_counter() - phase_started
 
             if self.writer:
                 for name, seconds in phase_seconds.items():
@@ -1326,6 +1475,8 @@ class GRPOTrainer:
                     'iteration': iteration + 1,
                     'total_iterations': num_iterations
                 }
+                if early_stop_reason:
+                    metrics_summary['early_stop_reason'] = early_stop_reason
                 on_iteration_end(iteration + 1, metrics_summary)
             
             # 7. 진행률 및 예상 시간 계산
@@ -1358,6 +1509,13 @@ class GRPOTrainer:
                        f"Elapsed: {elapsed_str} | "
                        f"ETA: {remaining_str}")
             self._log_trading_diagnostics(episodes)
+
+            if early_stop_reason:
+                logger.info('[EARLY STOP] reason=%s; %d consecutive non-improving no-trade validations '
+                            'with nonincreasing mean buy probability (verified validations=%d)',
+                            early_stop_reason, self.training_control_state.no_trade_streak,
+                            self.training_control_state.no_trade_evidence_count)
+                break
             
             # 조기 종료 체크: 실제 경과 타임스텝 수 기준
             if max_timesteps and self.total_timesteps >= max_timesteps:
@@ -1387,6 +1545,11 @@ class GRPOTrainer:
             'total_timesteps': self.total_timesteps,
             'num_updates': self.num_updates
         }
+        if early_stop_reason:
+            final_metrics['early_stop_reason'] = early_stop_reason
+            final_metrics['training_control'] = self.training_control_state.to_dict()
+            final_metrics['last_completed_iteration'] = last_completed_iteration
+            final_metrics['iterations_completed'] = last_completed_iteration - start_iteration
         
         return final_metrics
     
@@ -1562,16 +1725,22 @@ class GRPOTrainer:
                     selected_states = ep['states'][indices]
                     selected_actions = ep['actions'][indices]
                     selected_old_logs = ep['log_probs'][indices]
+                    masks = self._cached_action_masks(ep)
+                    selected_masks = masks[indices] if masks is not None else None
                     offset = 0
                     for states_batch, actions_batch in self._episode_tensor_batches(
                             selected_states, selected_actions):
                         current_log_probs, entropy, _ = self.policy.evaluate_actions(
-                            states_batch, actions_batch)
+                            states_batch, actions_batch,
+                            **self._mask_kwargs(selected_masks[offset:offset + len(states_batch)]
+                                                if selected_masks is not None else None))
                         entropy_sum += entropy.sum().item()
                         sample_count += len(states_batch)
                         if self.reference_policy is not None:
                             ref_log_probs, _, _ = self.reference_policy.evaluate_actions(
-                                states_batch, actions_batch)
+                                states_batch, actions_batch,
+                                **self._mask_kwargs(selected_masks[offset:offset + len(states_batch)]
+                                                    if selected_masks is not None else None))
                             kl_sum += (ref_log_probs - current_log_probs).sum().item()
                         else:
                             old_logs = torch.as_tensor(
@@ -1622,6 +1791,10 @@ class GRPOTrainer:
         """
         # 정책 타입 및 설정 정보 추출
         policy_class_name = self.policy.__class__.__name__
+        base_policy = getattr(self.policy, 'module', self.policy)
+        execution_action_mask = getattr(base_policy, 'execution_action_mask', False)
+        if not isinstance(execution_action_mask, bool):
+            raise ValueError('Policy execution_action_mask must be a bool')
         policy_config = {
             'policy_type': policy_class_name,
             'action_dim': self.policy.action_dim if hasattr(self.policy, 'action_dim') else 3,
@@ -1629,6 +1802,7 @@ class GRPOTrainer:
             'obs_dim': getattr(self.policy, 'obs_dim', None),
             'cnn_channels': getattr(self.policy, 'cnn_channels', None),
             'rnn_hidden_dim': getattr(self.policy, 'rnn_hidden_dim', None),
+            'execution_action_mask': execution_action_mask,
         }
         
         # GRPOPolicy의 경우 embedding_dim 저장
@@ -1642,6 +1816,7 @@ class GRPOTrainer:
             'policy_state_dict': self.policy.state_dict(),
             'observation_schema': self.observation_schema,
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'training_control_state': self.training_control_state.to_dict(),
             'config': {
                 'episodes_per_group': self.episodes_per_group,
                 'num_groups': self.num_groups,
@@ -1656,6 +1831,9 @@ class GRPOTrainer:
                 'value_coef': self.value_coef,
                 'max_grad_norm': self.max_grad_norm,
                 'selection_require_liquidation': self.selection_require_liquidation,
+                'no_trade_patience': self.no_trade_patience,
+                'profitable_min_round_trips': self.profitable_min_round_trips,
+                'profitable_min_traded_dates': self.profitable_min_traded_dates,
                 **policy_config  # 정책 설정 병합
             }
         }
@@ -1679,10 +1857,25 @@ class GRPOTrainer:
             value = checkpoint[name]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Invalid checkpoint {name}: expected a nonnegative integer")
-        coefficient = self._validate_group_advantage_coef(
-            checkpoint.get('config', {}).get('group_advantage_coef', 1.0))
+        settings = checkpoint.get('config', {})
+        if not isinstance(settings, dict):
+            raise ValueError('Invalid checkpoint config')
+        self._validate_checkpoint_action_mask(settings)
+        coefficient = self._validate_group_advantage_coef(settings.get('group_advantage_coef', 1.0))
+        no_trade_patience = integer_setting('no_trade_patience', settings.get('no_trade_patience', 0))
+        min_round_trips = integer_setting('profitable_min_round_trips', settings.get('profitable_min_round_trips', 20), 1)
+        min_traded_dates = integer_setting('profitable_min_traded_dates', settings.get('profitable_min_traded_dates', 3), 1)
+        control_state = TrainingControlState.from_dict(checkpoint.get('training_control_state'))
+        if control_state.last_validation_iteration > checkpoint['iteration']:
+            raise ValueError('Checkpoint validation control state exceeds its completed iteration')
+        if no_trade_patience and self.evaluation_callback is None:
+            raise ValueError('Restoring no-trade early stopping requires a validation callback')
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.group_advantage_coef = coefficient
+        self.no_trade_patience = no_trade_patience
+        self.profitable_min_round_trips = min_round_trips
+        self.profitable_min_traded_dates = min_traded_dates
+        self.training_control_state = control_state
         self.total_timesteps = checkpoint['total_timesteps']
         self.num_updates = checkpoint['num_updates']
         self.learning_rate = self.optimizer.param_groups[0]['lr']
@@ -1702,6 +1895,7 @@ class GRPOTrainer:
         
         if checkpoint.get('observation_schema') != self.observation_schema:
             raise ValueError('Checkpoint observation schema does not match the training environment')
+        self._validate_checkpoint_action_mask(checkpoint.get('config', {}))
         self.policy.load_state_dict(checkpoint['policy_state_dict'])
         self.restore_training_progress(checkpoint)
         
@@ -1713,6 +1907,15 @@ class GRPOTrainer:
             logger.info(f"  Extra state restored: {extra_state}")
         
         return extra_state
+
+    def _validate_checkpoint_action_mask(self, settings):
+        if not isinstance(settings, dict):
+            raise ValueError('Invalid checkpoint config')
+        checkpoint_mask = settings.get('execution_action_mask', False)
+        base_policy = getattr(self.policy, 'module', self.policy)
+        if (not isinstance(checkpoint_mask, bool)
+                or checkpoint_mask != getattr(base_policy, 'execution_action_mask', False)):
+            raise ValueError('Checkpoint execution_action_mask does not match the current policy')
     
     def _format_time(self, seconds: float) -> str:
         """
