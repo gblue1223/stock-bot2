@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ai_trader.grpo.train_xlstm import TrainingConfig
-from lib.observations import ACCOUNT_FIELDS, ObservationBuilder
+from lib.observations import ACCOUNT_FIELDS, EXECUTION_FIELDS, ObservationBuilder
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +57,10 @@ def test_notebook_and_embedded_runner_are_valid_python(name, monkeypatch):
                             capture_output=True, text=True, encoding='utf-8', timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert '--resume' in result.stdout and '--config' in result.stdout
+    for option in ('--execution_observations', '--no-execution_observations',
+                   '--decision_interval_seconds', '--episode_duration_seconds',
+                   '--group_advantage_coef', '--training_seed', '--lambda_gae'):
+        assert option in result.stdout
 
 
 @pytest.mark.parametrize('vram,free,ram,cpus,batch,max_workers,episodes', [
@@ -82,14 +86,21 @@ def test_profile_rejects_insufficient_memory(hardware):
         helpers()['a100_profile'](*hardware)
 
 
-def default_config_namespace():
+def default_config_namespace(**settings):
     scope = helpers()
     scope.update(Path=Path, json=json, TrainingConfig=TrainingConfig,
                  torch=SimpleNamespace(cuda=SimpleNamespace(mem_get_info=lambda: (38 * GIB, 40 * GIB))),
                  VRAM_GIB=40, CPU_COUNT=12, available_ram_gib=lambda: 50,
-                 LOCAL_DATA_DIR=Path('/unused/data'), MANIFEST_SHA256='test')
+                 LOCAL_DATA_DIR=Path('/unused/data'), MANIFEST_SHA256='test',
+                 manifest={'episodes': [{'length': 10000}]})
     # This cell checks paths and constructs settings; it writes no files or GPU tensors.
-    exec(compile(sources()['config'], str(NOTEBOOK), 'exec'), scope)
+    tree = ast.parse(sources()['config'])
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            name = node.targets[0].id
+            if name in settings:
+                node.value = ast.Constant(settings[name])
+    exec(compile(ast.fix_missing_locations(tree), str(NOTEBOOK), 'exec'), scope)
     return scope
 
 
@@ -112,6 +123,9 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     assert config['execution_config']['order_latency_ms'] > 0
     assert config['validation_fraction'] == config['test_fraction'] == .2
     assert config['account_observations'] is False and config['liquidation_max_steps'] == 0
+    assert config['execution_observations'] is False
+    assert config['decision_interval_seconds'] == config['episode_duration_seconds'] == 0.
+    assert config['group_advantage_coef'] == 1. and config['training_seed'] == 42
     assert config['evaluation_workers'] == 1
 
 
@@ -176,28 +190,41 @@ def test_astral_notebooks_share_return_priority_defaults(name, monkeypatch):
 
 
 @pytest.mark.parametrize('name', NOTEBOOK_NAMES)
-@pytest.mark.parametrize('account_observations', [False, True])
+@pytest.mark.parametrize('version', [2, 3, 4])
+@pytest.mark.parametrize('mode', ['resume', 'finetune'])
 def test_notebook_resume_uses_checkpoint_schema_and_tail_not_current_defaults(
-        name, account_observations, monkeypatch):
+        name, version, mode, monkeypatch):
     monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
     checkpoint, base = checkpoint_and_base()
     saved = checkpoint['extra_state']['training_config']
     schema = ObservationBuilder(['현재가', '등락률'], seq_len=2048,
         rolling_window_size=256, rolling_min_samples=64, max_holding_seconds=120,
-        account_observations=account_observations).schema
+        account_observations=version >= 3, execution_observations=version == 4).schema
     checkpoint['observation_schema'] = schema
     saved['features'] = len(schema['feature_columns'])
     # Old configuration never recorded these fields; v3 restores its saved tail.
     saved.pop('account_observations', None)
+    saved.pop('execution_observations', None)
     saved.pop('liquidation_max_steps', None)
-    if account_observations:
+    for key in ('decision_interval_seconds', 'episode_duration_seconds', 'group_advantage_coef', 'training_seed'):
+        saved.pop(key, None)
+    if version >= 3:
         saved['liquidation_max_steps'] = 37
+    if version == 4:
+        saved.update(decision_interval_seconds=1.25, episode_duration_seconds=120.,
+                     group_advantage_coef=0., training_seed=1234)
     scope = helpers()
-    restored = scope['restore_run_config'](base, checkpoint, 'resume')
-    assert restored['account_observations'] is account_observations
-    assert restored['liquidation_max_steps'] == (37 if account_observations else 0)
+    restored = scope['restore_run_config'](base, checkpoint, mode)
+    assert restored['account_observations'] is (version >= 3)
+    assert restored['execution_observations'] is (version == 4)
+    assert restored['liquidation_max_steps'] == (37 if version >= 3 else 0)
+    assert restored['decision_interval_seconds'] == (1.25 if version == 4 else 0.)
+    assert restored['episode_duration_seconds'] == (120. if version == 4 else 0.)
+    assert restored['group_advantage_coef'] == (0. if version == 4 else 1.)
+    assert restored['training_seed'] == (1234 if version == 4 else 42)
     assert restored['evaluation_workers'] == base['evaluation_workers']
-    expected_dim = len(schema['feature_columns']) + 15 + (len(ACCOUNT_FIELDS) if account_observations else 0)
+    expected_dim = (len(schema['feature_columns']) + 15 + (len(ACCOUNT_FIELDS) if version >= 3 else 0)
+                    + (len(EXECUTION_FIELDS) if version == 4 else 0))
     assert scope['model_obs_dim'](restored) == expected_dim
     constructor = next(node for node in ast.walk(ast.parse(sources()['gpu-probe']))
                        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -213,8 +240,8 @@ def test_notebook_memory_estimate_counts_account_fields(name, monkeypatch):
     monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
     scope = helpers()
     profile = scope['a100_profile'](40, 38, 50, 12)
-    old = {**profile, 'account_observations': False}
-    new = {**profile, 'account_observations': True}
+    old = {**profile, 'account_observations': False, 'execution_observations': False}
+    new = {**profile, 'account_observations': True, 'execution_observations': False}
     expected_extra = (3 * profile['episodes_per_group'] * profile['num_groups']
                       * profile['episode_steps'] * profile['seq_len'] * len(ACCOUNT_FIELDS) * 4 / GIB)
     assert scope['estimated_host_gib'](new) - scope['estimated_host_gib'](old) >= expected_extra - 1e-9
@@ -224,6 +251,50 @@ def test_return_priority_notebook_enables_new_observations_and_liquidation_tail(
     monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
     config = default_config_namespace()['CONFIG']
     assert config['account_observations'] is True
+    assert config['execution_observations'] is True
+    assert helpers()['model_obs_dim'](config) == 63
     assert config['liquidation_max_steps'] == 300
     assert 1 < config['evaluation_workers'] <= config['num_workers']
     assert config['lambda_gae'] == .95
+    assert config['decision_interval_seconds'] == config['episode_duration_seconds'] == 0.
+    assert config['group_advantage_coef'] == 1. and config['training_seed'] == 42
+
+
+@pytest.mark.parametrize('name', NOTEBOOK_NAMES)
+def test_notebook_memory_estimate_counts_all_ten_execution_channels(name, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
+    scope = helpers()
+    profile = scope['a100_profile'](40, 38, 50, 12)
+    old = {**profile, 'account_observations': True, 'execution_observations': False, 'evaluation_workers': 8}
+    new = {**old, 'execution_observations': True}
+    expected_extra = (3 * profile['episodes_per_group'] * profile['num_groups']
+                      * profile['episode_steps'] * profile['seq_len'] * len(EXECUTION_FIELDS) * 4 / GIB)
+    assert scope['model_obs_dim'](new) - scope['model_obs_dim'](old) == 10
+    assert scope['estimated_host_gib'](new) - scope['estimated_host_gib'](old) >= expected_extra
+
+
+@pytest.mark.parametrize('experiment,expected', [
+    ('cost_observations', {}),
+    ('timed_decisions', {'decision_interval_seconds': 1., 'episode_duration_seconds': 300.}),
+    ('gae_only', {'group_advantage_coef': 0.}),
+    ('long_credit', {'lambda_gae': .99}),
+    ('monte_carlo_credit', {'lambda_gae': 1.}),
+])
+def test_return_priority_experiments_change_only_the_declared_comparison(experiment, expected, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
+    baseline = default_config_namespace(EXPERIMENT='cost_observations')['CONFIG']
+    config = default_config_namespace(EXPERIMENT=experiment)['CONFIG']
+    assert config == {**baseline, **expected}
+
+
+def test_return_priority_rejects_unknown_experiment(monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
+    with pytest.raises(ValueError, match='EXPERIMENT'):
+        default_config_namespace(EXPERIMENT='unrecorded_variant')
+
+
+def test_timed_notebook_memory_estimate_accounts_for_replaying_full_market_rows(monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
+    scope = helpers()
+    config = default_config_namespace(EXPERIMENT='timed_decisions')['CONFIG']
+    assert scope['estimated_host_gib'](config, episode_rows=100000) > scope['estimated_host_gib'](config)

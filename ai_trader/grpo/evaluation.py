@@ -11,11 +11,22 @@ import torch
 
 _ORDER_METRICS = ('submitted_orders', 'submitted_quantity', 'filled_quantity',
                   'partial_orders', 'cancelled_orders', 'expired_orders')
+_EXIT_REASONS = ('signal', 'stop_loss', 'max_holding', 'episode_end')
+_PNL_COMPONENTS = ('mid_price_pnl', 'spread_cost', 'depth_cost', 'slippage_cost',
+                   'matched_fees', 'pnl_attribution_residual')
+_TIME_DIAGNOSTICS = ('episode_start_time_seconds', 'episode_end_time_seconds',
+                     'episode_duration_seconds', 'policy_duration_seconds',
+                     'decision_interval_seconds', 'configured_episode_duration_seconds')
 _TRADE_DIAGNOSTICS = ('round_trip_count', 'round_trip_win_rate',
                       'quantity_weighted_holding_time', 'fill_count', 'fill_win_rate',
                       'fill_avg_holding_time', 'round_trips', 'liquidation_steps',
                       'liquidation_seconds', 'liquidation_stop_reason', 'market_steps_taken',
-                      'total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl')
+                      'total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl',
+                      *_PNL_COMPONENTS, *_TIME_DIAGNOSTICS,
+                      'subsecond_exit_quantity_ratio', 'subsecond_round_trip_ratio',
+                      'attribution_reference_kind',
+                      *(f'exit_{reason}_{metric}' for reason in _EXIT_REASONS
+                        for metric in ('round_trip_count', 'quantity', 'net_pnl', 'holding_seconds')))
 
 
 def _action_name(index):
@@ -111,15 +122,34 @@ def _additional_metrics(episodes):
         result[rate_key] = (float(np.dot(counts, rates) / total) if total else 0.0
                             ) if counts is not None and rates is not None else None
     for key in ('quantity_weighted_holding_time', 'fill_avg_holding_time',
-                'liquidation_steps', 'liquidation_seconds'):
+                'liquidation_steps', 'liquidation_seconds',
+                'episode_duration_seconds', 'policy_duration_seconds',
+                'subsecond_exit_quantity_ratio', 'subsecond_round_trip_ratio'):
         observations = values(key)
         result[f'mean_{key}'] = float(np.mean(observations)) if observations is not None else None
-    for key in ('total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl'):
+    for key in ('total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl', *_PNL_COMPONENTS):
         observations = values(key)
         result[key] = float(sum(observations)) if observations is not None else None
         result[f'mean_{key}'] = float(np.mean(observations)) if observations is not None else None
+    result['exit_reasons'] = {}
+    for reason in _EXIT_REASONS:
+        counts = values(f'exit_{reason}_round_trip_count')
+        quantities = values(f'exit_{reason}_quantity')
+        pnls = values(f'exit_{reason}_net_pnl')
+        holding = values(f'exit_{reason}_holding_seconds')
+        total = sum(counts) if counts is not None else None
+        quantity = sum(quantities) if quantities is not None else None
+        result['exit_reasons'][reason] = {
+            'round_trip_count': int(total) if total is not None else None,
+            'quantity': float(quantity) if quantity is not None else None,
+            'net_pnl': float(sum(pnls)) if pnls is not None else None,
+            'quantity_weighted_holding_seconds': (float(np.dot(quantities, holding) / quantity) if quantity else 0.0
+                                                  ) if quantities is not None and holding is not None else None,
+        }
     stops = values('liquidation_stop_reason')
     result['liquidation_stop_reasons'] = dict(Counter(stops)) if stops is not None else None
+    references = values('attribution_reference_kind')
+    result['attribution_reference_kinds'] = dict(Counter(references)) if references is not None else None
     # A bought but unliquidated position is still trading, even with zero exits.
     filled = values('filled_quantity')
     result['no_trade_episode_fraction'] = (
@@ -249,7 +279,7 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                     for key in ('num_trades', 'max_drawdown', 'avg_holding_time',
                                 'open_quantity', 'realized_net_pnl', *_ORDER_METRICS,
                                 *[name for name in _TRADE_DIAGNOSTICS
-                                  if name not in ('round_trips', 'liquidation_stop_reason')]):
+                                  if name not in ('round_trips', 'liquidation_stop_reason', 'attribution_reference_kind')]):
                         if episode.get(key) is not None and not np.isfinite(episode[key]):
                             raise ValueError(f"Evaluation requires finite episode {key}")
                     episode['net_return'] = float(value)
@@ -289,6 +319,15 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
             count for name, count in execution_models.items() if 'synthetic' in name),
         **_additional_metrics(episodes),
     }
+    no_trade = result['no_trade_episode_fraction']
+    result['no_trade_reference_net_return'] = 0.0
+    result['profitable_with_trades'] = (bool(result['mean_net_return'] > 0
+                                           and no_trade < 1 and incomplete_liquidations == 0)
+                                      if no_trade is not None else None)
+    result['evaluation_outcome'] = ('incomplete_liquidation' if incomplete_liquidations else
+                                    'unknown_execution' if no_trade is None else
+                                    'no_trade' if no_trade == 1 else
+                                    'profitable' if result['mean_net_return'] > 0 else 'nonprofitable')
     if collect_diagnostics:
         total_actions = _ActionDiagnostics()
         diagnostic_episodes = []
@@ -334,6 +373,7 @@ def evaluation_signature(config: dict, date_splits: dict, observation_schema: di
         'transaction_cost_rate': .00015, 'buy_tax_rate': 0.0, 'sell_tax_rate': .0018,
         'initial_cash': 1_000_000.0, 'stop_loss_pct': 2.0,
         'liquidation_max_steps': 0,  # Historical checkpoints had no liquidation tail.
+        'decision_interval_seconds': 0.0, 'episode_duration_seconds': 0.0,
         'max_trades_per_episode': None, 'base_price': 100000.0, 'price_scale': 1.0,
         'execution_config': {'order_latency_ms': 100, 'cancel_latency_ms': 50,
                              'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
@@ -385,10 +425,10 @@ def compatible_resume_best(candidate: dict, source: dict, current_signature: dic
             return False
         # Before liquidation tails existed, version-1 signatures omitted the
         # setting. They remain compatible only with the historical disabled tail.
-        if (signature.get('version') == 1 and isinstance(signature.get('settings'), dict)
-                and 'liquidation_max_steps' not in signature['settings']
-                and config.get('liquidation_max_steps', 0) == 0):
-            signature['settings']['liquidation_max_steps'] = 0
+        if signature.get('version') == 1 and isinstance(signature.get('settings'), dict):
+            for name in ('liquidation_max_steps', 'decision_interval_seconds', 'episode_duration_seconds'):
+                if name not in signature['settings'] and config.get(name, 0) == 0:
+                    signature['settings'][name] = 0
         if signature != current_signature:
             return False
         expected_settings = evaluation_signature(config, signature['date_splits'], schema)['settings']

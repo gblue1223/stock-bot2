@@ -66,6 +66,9 @@ class Fill:
     price: float
     timestamp: float
     reason: str
+    mid_price: Optional[float] = None
+    book_price: Optional[float] = None
+    top_quote: Optional[float] = None
 
 
 @dataclass
@@ -244,7 +247,10 @@ class ExecutionSimulator:
                     else:
                         blocked_reasons.add('insufficient_inventory')
                     continue
-                fill = Fill(order.order_id, order.side, qty, price, snapshot.timestamp, order.reason)
+                mid = ((snapshot.bids[0][0] + snapshot.asks[0][0]) / 2
+                       if snapshot.bids and snapshot.asks else snapshot.last_price)
+                fill = Fill(order.order_id, order.side, qty, price, snapshot.timestamp,
+                            order.reason, mid, book_price, levels[0][0])
                 order.filled_quantity += qty
                 self._remaining[order.side][book_price] -= qty
                 if order.side == 'buy':

@@ -86,8 +86,12 @@ def run_diagnostics(checkpoint_path, *, split='validation', episodes=None, seed=
         if not name.startswith('_'):
             setattr(config, name, value)
     # New training defaults must not change the replay of a legacy checkpoint.
-    config.account_observations = schema.get('version') == 3
+    config.account_observations = schema.get('version') in (3, 4)
+    config.execution_observations = schema.get('version') == 4
     config.liquidation_max_steps = saved_config.get('liquidation_max_steps', 0)
+    config.decision_interval_seconds = saved_config.get('decision_interval_seconds', 0.0)
+    config.episode_duration_seconds = saved_config.get('episode_duration_seconds', 0.0)
+    config.group_advantage_coef = saved_config.get('group_advantage_coef', 1.0)
     overrides = {}
     if extracted_dir is not None:
         config.extracted_dir = str(Path(extracted_dir).resolve())

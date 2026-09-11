@@ -10,7 +10,10 @@ import os
 import sys
 import json
 import logging
+import math
 import argparse
+import random
+import numpy as np
 import torch
 import time
 from pathlib import Path
@@ -72,7 +75,10 @@ class TrainingConfig:
         self.features = 27
         self.episode_steps = 300
         self.account_observations = True
+        self.execution_observations = True
         self.liquidation_max_steps = 300
+        self.decision_interval_seconds = 0.0
+        self.episode_duration_seconds = 0.0
         
         self.hidden_dim = 512
         self.cnn_channels = 256
@@ -84,6 +90,8 @@ class TrainingConfig:
         self.lr = 3e-5
         self.gamma = 1.0  # Finite-episode net NAV: do not discount delayed profits.
         self.lambda_gae = 0.95
+        self.group_advantage_coef = 1.0
+        self.training_seed = 42
         self.clip = 0.1
         self.kl_target = 0.01
         self.entropy_coef = 0.01
@@ -177,6 +185,18 @@ class TrainingConfig:
             errors.append('lambda_gae must be in [0, 1]')
         if not isinstance(self.account_observations, bool):
             errors.append('account_observations must be a boolean')
+        if not isinstance(self.execution_observations, bool):
+            errors.append('execution_observations must be a boolean')
+        if self.execution_observations and not self.account_observations:
+            errors.append('execution_observations requires account_observations')
+        for name in ('decision_interval_seconds', 'episode_duration_seconds', 'group_advantage_coef'):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                errors.append(f'{name} must be finite and nonnegative')
+        if not self.use_gae and self.group_advantage_coef == 0:
+            errors.append('group_advantage_coef=0 requires use_gae')
+        if isinstance(self.training_seed, bool) or not isinstance(self.training_seed, int) or not 0 <= self.training_seed < 2**32:
+            errors.append('training_seed must be an integer in [0, 2**32)')
         if (isinstance(self.liquidation_max_steps, bool) or
                 not isinstance(self.liquidation_max_steps, int) or self.liquidation_max_steps < 0):
             errors.append('liquidation_max_steps must be a nonnegative integer')
@@ -208,10 +228,10 @@ class TrainingConfig:
         logger.info("[OK] Configuration validated")
 
 
-def create_environment(config: TrainingConfig, device: str, allowed_dates=None):
+def create_environment(config: TrainingConfig, device: str, allowed_dates=None, seed=None):
     """환경 인스턴스 생성"""
     try:
-        return GRPOScalpingEnvXLSTM(
+        environment = GRPOScalpingEnvXLSTM(
             db_path=config.db_path,
             table_name=config.table_name,
             seq_len=config.seq_len,
@@ -221,7 +241,10 @@ def create_environment(config: TrainingConfig, device: str, allowed_dates=None):
             sell_tax_rate=config.sell_tax_rate,
             max_episode_steps=config.episode_steps,
             account_observations=config.account_observations,
+            execution_observations=config.execution_observations,
             liquidation_max_steps=config.liquidation_max_steps,
+            decision_interval_seconds=config.decision_interval_seconds,
+            episode_duration_seconds=config.episode_duration_seconds,
             base_price=config.base_price,
             price_scale=config.price_scale,
             no_trade_penalty=config.no_trade_penalty,
@@ -242,6 +265,9 @@ def create_environment(config: TrainingConfig, device: str, allowed_dates=None):
             stop_loss_pct=config.stop_loss_pct,
             execution_config=config.execution_config,
         )
+        if seed is not None:
+            environment.np_random = np.random.default_rng(seed)
+        return environment
     except Exception as e:
         logger.error(f"Failed to create environment: {e}", exc_info=True)
         raise
@@ -390,8 +416,13 @@ def main():
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--gamma', type=float, default=None)
     parser.add_argument('--lambda_gae', type=float, default=None)
+    parser.add_argument('--group_advantage_coef', type=float, default=None)
+    parser.add_argument('--training_seed', type=int, default=None)
     parser.add_argument('--account_observations', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument('--execution_observations', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument('--liquidation_max_steps', type=int, default=None)
+    parser.add_argument('--decision_interval_seconds', type=float, default=None)
+    parser.add_argument('--episode_duration_seconds', type=float, default=None)
     parser.add_argument('--evaluation_workers', type=int, default=None)
     parser.add_argument('--diagnostics_interval', type=int, default=None)
     parser.add_argument('--diagnostics_max_samples', type=int, default=None)
@@ -452,11 +483,18 @@ def main():
                 saved_schema = checkpoint.get('observation_schema', {})
                 saved_config = checkpoint.get('extra_state', {}).get('training_config', {})
                 if args.account_observations is None:
-                    config.account_observations = saved_schema.get('version') == 3
+                    config.account_observations = saved_schema.get('version') in (3, 4)
+                if args.execution_observations is None:
+                    config.execution_observations = saved_schema.get('version') == 4
                 if args.liquidation_max_steps is None:
                     config.liquidation_max_steps = saved_config.get('liquidation_max_steps', 0)
                 if args.lambda_gae is None:
                     config.lambda_gae = saved_config.get('lambda_gae', 0.95)
+                for name, default in (('decision_interval_seconds', 0.0),
+                                      ('episode_duration_seconds', 0.0),
+                                      ('group_advantage_coef', 1.0), ('training_seed', 42)):
+                    if getattr(args, name) is None:
+                        setattr(config, name, saved_config.get(name, default))
                 
                 has_gru = any('gru' in k for k in state_dict.keys())
                 
@@ -496,6 +534,16 @@ def main():
             config.device = device
             
         logger.info(f"[OK] Using device: {device}")
+        random.seed(config.training_seed)
+        np.random.seed(config.training_seed)
+        torch.manual_seed(config.training_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.training_seed)
+        logger.info('Training settings: execution_observations=%s, decision_interval_seconds=%s, '
+                    'episode_duration_seconds=%s, group_advantage_coef=%s, lambda_gae=%s, training_seed=%s',
+                    config.execution_observations, config.decision_interval_seconds,
+                    config.episode_duration_seconds, config.group_advantage_coef,
+                    config.lambda_gae, config.training_seed)
         
         # 환경 생성 (extracted_dir 캐시 활용 시 Windows의 SubprocVecEnv도 안정 작동)
         logger.info(f"[STEP 2/6] Creating environments (Workers: {config.num_workers})...")
@@ -507,8 +555,9 @@ def main():
              logger.warning("No extracted_dir provided, fallback to single process to prevent IPC crash on Windows.")
              config.num_workers = 1
              
-        env_fns = [functools.partial(create_environment, config, device, date_splits['train'])
-                   for _ in range(config.num_workers)]
+        env_fns = [functools.partial(create_environment, config, device, date_splits['train'],
+                                     config.training_seed + worker)
+                   for worker in range(config.num_workers)]
         
         if config.num_workers > 1:
             vec_env = SubprocVecEnv(env_fns)
@@ -573,6 +622,7 @@ def main():
             learning_rate=config.lr,
             gamma=config.gamma,
             lambda_gae=config.lambda_gae,
+            group_advantage_coef=config.group_advantage_coef,
             clip_epsilon=config.clip,
             kl_target=config.kl_target,
             entropy_coef=config.entropy_coef,
@@ -607,6 +657,7 @@ def main():
             if config.total_timesteps <= trainer.total_timesteps:
                 raise ValueError("For --resume, total_timesteps must exceed the saved cumulative timesteps")
             config.lr = trainer.learning_rate
+            config.group_advantage_coef = trainer.group_advantage_coef
             trainer.extra_checkpoint_state['training_config'] = dict(config.__dict__)
             logger.info("Resuming iteration=%s, timesteps=%s, updates=%s with saved optimizer",
                         start_iteration, trainer.total_timesteps, trainer.num_updates)

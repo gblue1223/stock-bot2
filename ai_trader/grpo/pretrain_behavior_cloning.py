@@ -52,6 +52,10 @@ class OfflineEpisodeDataset(Dataset):
         price_unit = resolve_feature_price_unit(metadata, columns)
         self.observation_builder = (ObservationBuilder(columns, seq_len=seq_len, feature_price_unit=price_unit)
                                     if observation_schema is None else ObservationBuilder.from_schema(observation_schema))
+        if self.observation_builder.execution_observations:
+            raise ValueError("Schema v4 distillation requires recorded account states and execution states; "
+                             "raw market episodes and synthetic stages cannot supply historical net "
+                             "liquidation costs, pending orders or episode timing")
         if self.observation_builder.account_observations:
             raise ValueError("Schema v3 distillation requires recorded account states; raw market episodes "
                              "and synthetic stage examples do not provide cash, exposure or pending orders")

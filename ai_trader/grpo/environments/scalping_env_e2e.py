@@ -32,7 +32,9 @@ class GRPOScalpingEnv(gym.Env):
                  buy_signal_bonus=0.0, initial_cash=1000000.0,
                  max_holding_seconds=300.0, stop_loss_pct=2.0,
                  execution_config=None, allowed_dates=None, price_scale=1.0, max_stages=1,
-                 account_observations=False, liquidation_max_steps=0):
+                 account_observations=False, liquidation_max_steps=0,
+                 execution_observations=False, decision_interval_seconds=0.0,
+                 episode_duration_seconds=0.0):
         super().__init__()
         self.max_stages = validate_max_stages(max_stages)
         if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', table_name):
@@ -53,6 +55,12 @@ class GRPOScalpingEnv(gym.Env):
             raise ValueError('liquidation_max_steps must be a nonnegative integer')
         self.liquidation_max_steps = int(liquidation_max_steps)
         self.account_observations = account_observations
+        self.execution_observations = execution_observations
+        for name, value in (('decision_interval_seconds', decision_interval_seconds),
+                            ('episode_duration_seconds', episode_duration_seconds)):
+            if isinstance(value, (bool, np.bool_)) or not np.isfinite(value) or value < 0:
+                raise ValueError(f'{name} must be finite and nonnegative')
+            setattr(self, name, float(value))
         if max_trades_per_episode is not None and max_trades_per_episode < 1:
             raise ValueError('max_trades_per_episode must be positive')
         if price_scale <= 0 or not np.isfinite(price_scale) or base_price <= 0:
@@ -94,7 +102,8 @@ class GRPOScalpingEnv(gym.Env):
             rolling_min_samples=self.rolling_min_samples,
             max_holding_seconds=self.max_holding_seconds,
             feature_price_unit=self.price_unit, max_stages=self.max_stages,
-            account_observations=self.account_observations)
+            account_observations=self.account_observations,
+            execution_observations=self.execution_observations)
         self.obs_dim = self.observation_builder.obs_dim
         self.observation_space = spaces.Box(-np.inf, np.inf, (self.seq_len, self.obs_dim), np.float32)
         self.action_space = spaces.Discrete(3)
@@ -179,16 +188,58 @@ class GRPOScalpingEnv(gym.Env):
         for key in ('last_price', 'bid_prices', 'ask_prices'):
             if key in execution:
                 execution[key] = execution[key] * self.price_scale
-        needed = len(features) if self.max_episode_steps is None else min(
-            len(features), self.seq_len + self.max_episode_steps + self.liquidation_max_steps)
-        start = self._reset_options.get('start_index')
-        start = int(self.np_random.integers(len(features) - needed + 1)) if start is None else int(start)
-        if start < 0 or start + self.seq_len >= len(features):
-            raise ValueError('start_index does not leave history and a future event')
-        end = min(start + needed, len(features))
+        start, end = self._episode_slice_bounds(metadata)
         self.episode_execution = {key: value[start:end] for key, value in execution.items()}
         self.episode_key = {'stock_code': str(stock), 'date': str(date), 'start_index': start}
         return features[start:end], metadata[start:end]
+
+    def _episode_slice_bounds(self, metadata):
+        """Reserve policy time and a raw-event liquidation suffix, without leaking it."""
+        length = len(metadata)
+        if length < self.seq_len + 1:
+            raise ValueError('Episode is shorter than the observation window plus one step')
+        options = self._reset_options
+        if not (self.decision_interval_seconds or self.episode_duration_seconds):
+            needed = (self.seq_len + self.max_episode_steps + self.liquidation_max_steps
+                      if self.max_episode_steps is not None else length)
+            max_start = max(0, length - needed)
+            start = int(options['start_index']) if 'start_index' in options else int(self.np_random.integers(max_start + 1))
+            if not 0 <= start <= max_start:
+                raise ValueError('Requested start_index is outside the episode')
+            return start, min(length, start + needed)
+        timestamps = times_to_seconds(metadata[:, 2])
+        if np.any(np.diff(timestamps) < 0) or not np.isfinite(timestamps).all():
+            raise ValueError('episode timestamps must be finite and monotonic')
+        def decision_end(start_index):
+            index = start_index + self.seq_len - 1
+            deadline = timestamps[index] + self.episode_duration_seconds if self.episode_duration_seconds else np.inf
+            for _ in range(self.max_episode_steps or length):
+                target = min(timestamps[index] + self.decision_interval_seconds, deadline)
+                index = max(index + 1, int(np.searchsorted(timestamps, target, side='left')))
+                if index >= length - 1:
+                    return length - 1
+                if timestamps[index] >= deadline:
+                    break
+            return index
+
+        # Each policy observation rounds up to a real event. Repeated gaps can
+        # accumulate, so nominal interval * decision count cannot reserve the tail.
+        # The actual final index is monotonic in the start, allowing a bounded search.
+        last_policy = length - 1 - self.liquidation_max_steps
+        lo, hi = 0, length - self.seq_len - 1
+        while lo < hi:
+            candidate = (lo + hi + 1) // 2
+            if decision_end(candidate) <= last_policy:
+                lo = candidate
+            else:
+                hi = candidate - 1
+        max_start = lo
+        start = int(options['start_index']) if 'start_index' in options else int(self.np_random.integers(max_start + 1))
+        if not 0 <= start <= max_start:
+            raise ValueError('Requested start_index leaves insufficient policy time/history and liquidation tail')
+        index = decision_end(start)
+        end = min(length, index + self.liquidation_max_steps + 1)
+        return start, end
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -216,6 +267,10 @@ class GRPOScalpingEnv(gym.Env):
         self.decision_steps = min(self.episode_length - self.seq_len,
                                   self.max_episode_steps or self.episode_length)
         self.decision_end_index = self.current_step + self.decision_steps
+        self.episode_start_time_seconds = float(self.timestamps[self.current_step])
+        self.__dict__.pop('policy_end_time_seconds', None)
+        self.episode_deadline = (self.episode_start_time_seconds + self.episode_duration_seconds
+                                 if self.episode_duration_seconds else np.inf)
         self.liquidation_steps = 0
         self.liquidation_seconds = 0.0
         self.liquidation_stop_reason = 'disabled' if not self.liquidation_max_steps else 'not_started'
@@ -227,6 +282,8 @@ class GRPOScalpingEnv(gym.Env):
             'submitted', 'risk_exit_active', 'signal_exit_active', 'max_stages', 'max_trades',
             'pending_buy', 'insufficient_budget_for_one_share'), 0)
         self._exit_requested, self._done = False, False
+        self._exit_reason = None
+        self._entry_exit_reasons = {}
         self._signal_exit_order_id = None
         self.simulator.reset()
         self._update_market_fields()
@@ -287,7 +344,8 @@ class GRPOScalpingEnv(gym.Env):
         return self.observation_builder.build(
             self.episode_data[start:self.current_step + 1], self.stages,
             current_price=self.current_price, current_time_seconds=self.current_time_seconds,
-            account_state=self._account_state() if self.account_observations else None)
+            account_state=self._account_state() if self.account_observations else None,
+            execution_state=self._execution_state() if self.execution_observations else None)
 
     def _account_state(self):
         """Account values known now; remaining time describes decisions, not replay tail."""
@@ -305,12 +363,51 @@ class GRPOScalpingEnv(gym.Env):
             'pending_buy_value_ratio': sum(o.remaining for o in self._pending('buy')) * buy_price / self.initial_cash,
             'pending_sell_value_ratio': sum(o.remaining for o in self._pending('sell')) * mark / self.initial_cash,
             'exit_pending': float(self._exit_requested or self._signal_exit_order_id is not None),
-            'remaining_steps_ratio': max(0, self.decision_end_index - self.current_step) / self.decision_steps,
+            'remaining_steps_ratio': max(0, self.decision_steps - len(self.episode_rewards)) / self.decision_steps,
         }
         for index in range(self.MAX_STAGES):
             quantity = self.stages[index]['quantity'] if index < len(self.stages) else 0
             state[f'stage_{index + 1}_value_ratio'] = quantity * mark / self.initial_cash
         return state
+
+    def _execution_state(self):
+        """Current quotes and cost basis only; estimates do not promise a future fill."""
+        snapshot = self.simulator.snapshot
+        half = self.simulator.config.spread_bps / 20000
+        bid = snapshot.bids[0][0] if snapshot.bids else snapshot.last_price * (1 - half)
+        ask = snapshot.asks[0][0] if snapshot.asks else snapshot.last_price * (1 + half)
+        if not snapshot.bids:
+            bid = min(bid, ask)
+        if not snapshot.asks:
+            ask = max(ask, bid)
+        mid = (bid + ask) / 2
+        buy = self.simulator.execution_price(ask, 'buy') * (1 + self.buy_fee_rate)
+        sell = self.simulator.execution_price(bid, 'sell') * (1 - self.sell_fee_rate)
+        basis = sum(st['quantity'] * st['entry_price'] + st['entry_fees'] for st in self.stages)
+        proceeds = self.quantity * sell
+        budget = min(self.cash, self.initial_cash / self.max_stages)
+        known = snapshot.quote_timestamp is not None
+        age = snapshot.timestamp - snapshot.quote_timestamp if known else 0.0
+        max_age = self.simulator.config.max_quote_age_seconds
+        stale = known and age > max_age
+        available = self.simulator._remaining
+        buy_depth = sum(q * self.simulator.execution_price(p, 'buy') * (1 + self.buy_fee_rate)
+                        for p, q in available['buy'].items()) if not stale else 0.0
+        sell_depth = sum(available['sell'].values()) if not stale else 0.0
+        elapsed = max(0.0, self.current_time_seconds - self.episode_start_time_seconds)
+        scale = self.episode_duration_seconds or self.max_holding_seconds
+        return {
+            'spread_bps': (ask - bid) / mid * 10000,
+            'quoted_round_trip_cost_bps': (1 - sell / buy) * 10000,
+            'liquidation_return': proceeds / basis - 1 if basis > 0 else 0.0,
+            'breakeven_return': basis / proceeds - 1 if proceeds > 0 else 0.0,
+            'buy_depth_ratio': float(np.clip(buy_depth / budget, 0, 1)) if budget > 0 else 0.0,
+            'sell_depth_ratio': float(np.clip(sell_depth / self.quantity, 0, 1)) if self.quantity else 0.0,
+            'quote_age_fraction': age / max_age if max_age else float(age > 0),
+            'quote_timestamp_known': float(known),
+            'episode_elapsed_fraction': elapsed / scale,
+            'remaining_time_fraction': max(0.0, 1 - elapsed / scale) if self.episode_duration_seconds else 0.0,
+        }
 
     def _calculate_seconds_diff(self, start_time_val, end_time_val):
         difference = parse_time_seconds(end_time_val) - parse_time_seconds(start_time_val)
@@ -326,6 +423,9 @@ class GRPOScalpingEnv(gym.Env):
 
     def _apply_fill(self, fill):
         value = fill.quantity * fill.price
+        mid = fill.mid_price if fill.mid_price is not None else fill.price
+        book = fill.book_price if fill.book_price is not None else fill.price
+        top = fill.top_quote if fill.top_quote is not None else book
         if fill.side == 'buy':
             fee = value * self.buy_fee_rate
             self.cash -= value + fee
@@ -335,13 +435,25 @@ class GRPOScalpingEnv(gym.Env):
                 self.stages.append({'order_id': fill.order_id, 'quantity': fill.quantity,
                     'entry_price': fill.price, 'entry_time_seconds': fill.timestamp,
                     'entry_time': self.current_time, 'entry_fees': fee,
-                    'entry_time_sum': fill.quantity * fill.timestamp})
+                    'entry_time_sum': fill.quantity * fill.timestamp,
+                    'entry_mid_value': fill.quantity * mid,
+                    'entry_spread_cost': fill.quantity * (top - mid),
+                    'entry_depth_cost': fill.quantity * (book - top),
+                    'entry_slippage_cost': fill.quantity * (fill.price - book),
+                    'entry_lots': [[fill.quantity, fill.timestamp]]})
             else:
                 qty = stage['quantity'] + fill.quantity
                 stage['entry_price'] = (stage['entry_price'] * stage['quantity'] + value) / qty
                 stage['quantity'] = qty
                 stage['entry_fees'] += fee
                 stage['entry_time_sum'] += fill.quantity * fill.timestamp
+                stage['entry_mid_value'] += fill.quantity * mid
+                stage['entry_spread_cost'] += fill.quantity * (top - mid)
+                stage['entry_depth_cost'] += fill.quantity * (book - top)
+                stage['entry_slippage_cost'] += fill.quantity * (fill.price - book)
+                stage['entry_lots'].append([fill.quantity, fill.timestamp])
+            if self._exit_reason or self._signal_exit_order_id == fill.order_id:
+                self._entry_exit_reasons.setdefault(fill.order_id, self._exit_reason or 'signal')
         else:
             self.cash += value * (1 - self.sell_fee_rate)
             self.total_exit_fees += value * self.sell_fee_rate
@@ -352,6 +464,16 @@ class GRPOScalpingEnv(gym.Env):
                 entry_fee = stage['entry_fees'] * qty / stage['quantity']
                 exit_fee = qty * fill.price * self.sell_fee_rate
                 mean_entry_time = stage['entry_time_sum'] / stage['quantity']
+                ratio = qty / stage['quantity']
+                entry_mid = stage['entry_mid_value'] * ratio
+                spread_cost = stage['entry_spread_cost'] * ratio + qty * (mid - top)
+                depth_cost = stage['entry_depth_cost'] * ratio + qty * (top - book)
+                slippage_cost = stage['entry_slippage_cost'] * ratio + qty * (book - fill.price)
+                # Average-cost inventory allocates each acquisition lot pro rata.
+                # This reports actual <=1s exposure without classifying by a mean.
+                fast_quantity = sum(lot_qty * ratio for lot_qty, timestamp in stage['entry_lots']
+                                    if fill.timestamp - timestamp <= 1.0 + 1e-9)
+                reason = self._entry_exit_reasons.setdefault(stage['order_id'], fill.reason)
                 pnl = qty * (fill.price - stage['entry_price']) - entry_fee - exit_fee
                 self.realized_net_pnl += pnl
                 self.episode_trades.append({
@@ -363,11 +485,19 @@ class GRPOScalpingEnv(gym.Env):
                     'net_pnl': pnl, 'net_return': pnl / self.initial_cash * 100,
                     'reward': pnl / self.initial_cash * 100,
                     'weight': qty * stage['entry_price'] / self.initial_cash,
-                    'exit_reason': fill.reason, 'order_id': fill.order_id,
+                    'exit_reason': reason, 'order_id': fill.order_id,
+                    'mid_price_pnl': qty * mid - entry_mid,
+                    'spread_cost': spread_cost, 'depth_cost': depth_cost,
+                    'slippage_cost': slippage_cost,
+                    'subsecond_exit_quantity': fast_quantity,
                     'entry_order_id': stage['order_id']})
                 stage['quantity'] -= qty
                 stage['entry_fees'] -= entry_fee
                 stage['entry_time_sum'] -= qty * mean_entry_time
+                for name in ('entry_mid_value', 'entry_spread_cost', 'entry_depth_cost', 'entry_slippage_cost'):
+                    stage[name] *= 1 - ratio
+                stage['entry_lots'] = [[lot_qty * (1 - ratio), timestamp]
+                                       for lot_qty, timestamp in stage['entry_lots']]
                 remaining -= qty
                 if stage['quantity'] == 0:
                     self.stages.pop(0)
@@ -376,18 +506,24 @@ class GRPOScalpingEnv(gym.Env):
         return [o for o in self.simulator.orders if o.active and o.side == side]
 
     def _request_exit(self, reason, timestamp):
+        if self._exit_reason is None:
+            self._exit_reason = reason
         self._exit_requested = True
+        for stage in self.stages:
+            self._entry_exit_reasons.setdefault(stage['order_id'], self._exit_reason)
         self.simulator.cancel_all(timestamp, side='buy')
         pending_qty = sum(o.remaining for o in self._pending('sell'))
         qty = self.quantity - pending_qty
         if qty > 0:
-            self.simulator.submit('sell', qty, timestamp, reason=reason)
+            self.simulator.submit('sell', qty, timestamp, reason=self._exit_reason)
 
     def _request_stage_exit(self, timestamp):
         """Finish the selected FIFO stage, including fills racing its cancellation."""
         self.simulator.cancel_all(timestamp, side='buy')
         target = next((stage for stage in self.stages
                        if stage['order_id'] == self._signal_exit_order_id), None)
+        if self._signal_exit_order_id is not None:
+            self._entry_exit_reasons.setdefault(self._signal_exit_order_id, 'signal')
         pending_qty = sum(order.remaining for order in self._pending('sell'))
         qty = (target['quantity'] if target is not None else 0) - pending_qty
         if qty > 0:
@@ -429,6 +565,22 @@ class GRPOScalpingEnv(gym.Env):
         self.liquidation_seconds = self.current_time_seconds - started
         return fills
 
+    def _check_risk(self, now):
+        stop = any((self.simulator.liquidation_mark() / st['entry_price'] - 1) * 100 <= -self.stop_loss_pct
+                   for st in self.stages)
+        overdue = any(now - st['entry_time_seconds'] >= self.max_holding_seconds for st in self.stages)
+        if stop or overdue:
+            self.loss_holding_violations += int(stop)
+            self._request_exit('stop_loss' if stop else 'max_holding', now)
+
+    def _settle_exit_state(self):
+        if self._exit_requested and not self.stages and not self._pending('buy'):
+            self._exit_requested = False
+            self._exit_reason = None
+        if (self._signal_exit_order_id is not None and not self._pending('buy')
+                and not any(stage['order_id'] == self._signal_exit_order_id for stage in self.stages)):
+            self._signal_exit_order_id = None
+
     def step(self, action):
         if self._done:
             raise RuntimeError('reset() required after episode end')
@@ -436,15 +588,11 @@ class GRPOScalpingEnv(gym.Env):
             raise ValueError('invalid action')
         now = self.current_time_seconds
         next_index = self.current_step + 1
-        horizon = next_index >= self.decision_end_index
+        horizon = len(self.episode_rewards) + 1 >= self.decision_steps
         equity_before = self.equity
         # Risk decisions use only the latest available quote and already known deadlines.
-        stop = any((self.simulator.liquidation_mark() / st['entry_price'] - 1) * 100 <= -self.stop_loss_pct for st in self.stages)
-        overdue = any(now - st['entry_time_seconds'] >= self.max_holding_seconds for st in self.stages)
-        if stop or overdue:
-            self.loss_holding_violations += int(stop)
-            self._request_exit('stop_loss' if stop else 'max_holding', now)
-        if horizon and not self.liquidation_max_steps:
+        self._check_risk(now)
+        if horizon and not self.liquidation_max_steps and not self.decision_interval_seconds:
             self._request_exit('episode_end', now)
         if self._exit_requested:
             self._request_exit('risk_exit_retry', now)
@@ -477,15 +625,40 @@ class GRPOScalpingEnv(gym.Env):
         elif action == 2 and self.stages and not self._pending('sell'):
             self._signal_exit_order_id = self.stages[0]['order_id']
             self._request_stage_exit(now)
-        # A holding deadline is a timer event, even when no market tick arrives then.
-        if self.stages:
-            deadline = min(s['entry_time_seconds'] + self.max_holding_seconds for s in self.stages)
-            if now < deadline <= self.timestamps[next_index]:
-                self._request_exit('max_holding', deadline)
-        fills = self._advance_market(next_index)
-        terminated = self.current_step >= self.episode_length - 1
-        if self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode and not self.stages:
-            terminated = True
+        target_time = now + self.decision_interval_seconds
+        fills = []
+        while True:
+            current = self.current_time_seconds
+            next_index = self.current_step + 1
+            # Deadlines are timer events; market data is never inspected in advance.
+            timers = []
+            if self.stages:
+                deadline = min(s['entry_time_seconds'] + self.max_holding_seconds for s in self.stages)
+                if current < deadline <= self.timestamps[next_index]:
+                    timers.append((deadline, 'max_holding'))
+            if current < self.episode_deadline <= self.timestamps[next_index]:
+                timers.append((self.episode_deadline, 'episode_end'))
+            if (horizon and not self.liquidation_max_steps and self.decision_interval_seconds
+                    and current < target_time <= self.timestamps[next_index]):
+                timers.append((target_time, 'episode_end'))
+            for timestamp, reason in sorted(timers):
+                self._request_exit(reason, timestamp)
+            fills.extend(self._advance_market(next_index))
+            terminated = self.current_step >= self.episode_length - 1
+            if self.max_trades_per_episode is not None and len(self.episode_trades) >= self.max_trades_per_episode and not self.stages:
+                terminated = True
+            duration_end = self.current_time_seconds >= self.episode_deadline
+            if duration_end or terminated or not self.decision_interval_seconds or self.current_time_seconds >= target_time:
+                horizon = horizon or duration_end
+                break
+            self._settle_exit_state()
+            self._check_risk(self.current_time_seconds)
+            if self._exit_requested:
+                self._request_exit(self._exit_reason, self.current_time_seconds)
+            elif self._signal_exit_order_id is not None:
+                self._request_stage_exit(self.current_time_seconds)
+        if horizon or terminated:
+            self.policy_end_time_seconds = self.current_time_seconds
         if self.liquidation_max_steps and (horizon or terminated):
             fills.extend(self._liquidate_after_decisions())
             # This is a completed finite trading task, including its closeout outcome.
@@ -497,11 +670,8 @@ class GRPOScalpingEnv(gym.Env):
         if self._done:
             # Do not invent fills at the last price when latency/depth prevents liquidation.
             self.simulator.cancel_all(self.current_time_seconds, end_of_replay=True)
-        elif self._exit_requested and not self.stages and not self._pending('buy'):
-            self._exit_requested = False
-        if (self._signal_exit_order_id is not None and not self._pending('buy')
-                and not any(stage['order_id'] == self._signal_exit_order_id for stage in self.stages)):
-            self._signal_exit_order_id = None
+        else:
+            self._settle_exit_state()
         info = {'position': self.position, 'position_steps': self.position_steps,
                 'current_price': self.current_price, 'current_time': self.current_time,
                 'cash': self.cash, 'equity': self.equity, 'fills': [fill.__dict__ for fill in fills],
@@ -527,6 +697,7 @@ class GRPOScalpingEnv(gym.Env):
             pnl = sum(t['net_pnl'] for t in fragments)
             round_trips.append({
                 'entry_order_id': order.order_id, 'quantity': sold,
+                'exit_reason': self._entry_exit_reasons.get(order.order_id, fragments[0]['exit_reason']),
                 'net_pnl': pnl, 'net_return': pnl / self.initial_cash * 100,
                 'fill_count': len(fragments),
                 'quantity_weighted_holding_time': sum(t['holding_share_seconds'] for t in fragments) / sold,
@@ -539,6 +710,24 @@ class GRPOScalpingEnv(gym.Env):
         event_returns = np.diff(eq) / self.initial_cash * 100
         sharpe = (float(event_returns.mean() / event_returns.std())
                   if len(event_returns) > 1 and event_returns.std() > 1e-12 else 0.0)
+        attribution = {name: float(sum(t[name] for t in trades))
+                       for name in ('mid_price_pnl', 'spread_cost', 'depth_cost', 'slippage_cost')}
+        matched_fees = float(sum(t['entry_fee'] + t['exit_fee'] for t in trades))
+        attribution['matched_fees'] = matched_fees
+        attribution['pnl_attribution_residual'] = float(
+            self.realized_net_pnl - (attribution['mid_price_pnl'] - attribution['spread_cost']
+                                    - attribution['depth_cost'] - attribution['slippage_cost'] - matched_fees))
+        exit_metrics = {}
+        for reason in ('signal', 'stop_loss', 'max_holding', 'episode_end'):
+            matching = [trade for trade in round_trips if trade['exit_reason'] == reason]
+            reason_quantity = sum(trade['quantity'] for trade in matching)
+            exit_metrics.update({
+                f'exit_{reason}_round_trip_count': len(matching),
+                f'exit_{reason}_quantity': reason_quantity,
+                f'exit_{reason}_net_pnl': float(sum(trade['net_pnl'] for trade in matching)),
+                f'exit_{reason}_holding_seconds': (sum(trade['quantity'] * trade['quantity_weighted_holding_time']
+                                                     for trade in matching) / reason_quantity if reason_quantity else 0.0),
+            })
         return {
             'total_return': float(net_return), 'net_return': float(net_return),
             'realized_net_pnl': float(self.realized_net_pnl),
@@ -550,6 +739,8 @@ class GRPOScalpingEnv(gym.Env):
             'fill_count': len(trades), 'fill_avg_holding_time': fill_holding,
             'fill_win_rate': fill_win_rate,
             'round_trip_count': len(round_trips), 'round_trips': round_trips,
+            'subsecond_exit_quantity_ratio': sum(t['subsecond_exit_quantity'] for t in trades) / sold_quantity if sold_quantity else 0.0,
+            'subsecond_round_trip_ratio': float(np.mean([t['quantity_weighted_holding_time'] <= 1.0 + 1e-9 for t in round_trips])) if round_trips else 0.0,
             'round_trip_win_rate': float(np.mean([t['net_pnl'] > 0 for t in round_trips])) if round_trips else 0.0,
             'quantity_weighted_holding_time': sum(t['holding_share_seconds'] for t in trades) / sold_quantity if sold_quantity else 0.0,
             'total_entry_fees': self.total_entry_fees, 'total_exit_fees': self.total_exit_fees,
@@ -567,6 +758,14 @@ class GRPOScalpingEnv(gym.Env):
             'liquidation_seconds': self.liquidation_seconds,
             'liquidation_stop_reason': self.liquidation_stop_reason,
             'market_steps_taken': self.current_step - (self.seq_len - 1),
+            'episode_start_time_seconds': self.episode_start_time_seconds,
+            'episode_end_time_seconds': self.current_time_seconds,
+            'episode_duration_seconds': self.current_time_seconds - self.episode_start_time_seconds,
+            'policy_duration_seconds': getattr(self, 'policy_end_time_seconds', self.current_time_seconds) - self.episode_start_time_seconds,
+            'decision_interval_seconds': self.decision_interval_seconds,
+            'configured_episode_duration_seconds': self.episode_duration_seconds,
+            'attribution_reference_kind': 'quote_mid_or_last_price_if_one_side_missing',
+            **attribution, **exit_metrics,
             'episode_length': self.episode_length, 'steps_taken': len(self.episode_rewards),
             'market_context': self.market_context, 'episode_key': getattr(self, 'episode_key', {}),
             'price_source': self.price_source, **self.simulator.summary()}

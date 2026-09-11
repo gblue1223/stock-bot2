@@ -77,6 +77,7 @@ class GRPOTrainer:
         selection_require_liquidation: bool = False,
         diagnostics_interval: int = 5,
         diagnostics_max_samples: int = 256,
+        group_advantage_coef: float = 1.0,
     ):
         self.policy = policy
         
@@ -106,6 +107,7 @@ class GRPOTrainer:
         self.max_grad_norm = max_grad_norm
         self.batch_size = batch_size
         self.use_gae = use_gae
+        self.group_advantage_coef = self._validate_group_advantage_coef(group_advantage_coef)
         self.num_epochs = num_epochs
         self.observation_schema = observation_schema
         self.evaluation_callback = evaluation_callback
@@ -115,7 +117,7 @@ class GRPOTrainer:
         self.diagnostics_max_samples = max(1, int(diagnostics_max_samples))
         if selection_require_liquidation and evaluation_callback is None:
             raise ValueError("Liquidation-aware selection requires a validation callback")
-        logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}")
+        logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}, group_advantage_coef={self.group_advantage_coef}")
         
         # Optimizer 초기화
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
@@ -140,6 +142,31 @@ class GRPOTrainer:
                    f"num_groups={num_groups}, lr={learning_rate}, "
                    f"clip_epsilon={clip_epsilon}, device={device}")
     
+    def _validate_group_advantage_coef(self, value: float) -> float:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+            raise ValueError('group_advantage_coef must be a finite nonnegative number')
+        coefficient = float(value)
+        if not np.isfinite(coefficient) or coefficient < 0:
+            raise ValueError('group_advantage_coef must be a finite nonnegative number')
+        if not self.use_gae and coefficient == 0:
+            raise ValueError('group_advantage_coef=0 requires use_gae=True; otherwise there is no reward learning signal')
+        return coefficient
+
+    @staticmethod
+    def _numeric_metric_leaves(values, prefix=''):
+        """Flatten numeric diagnostics without interpreting strings or missing data as zero."""
+        for name, value in values.items():
+            path = f'{prefix}/{name}' if prefix else str(name)
+            if isinstance(value, dict):
+                yield from GRPOTrainer._numeric_metric_leaves(value, path)
+            elif isinstance(value, (int, float, np.integer, np.floating, np.bool_)) and np.isfinite(value):
+                yield path, float(value)
+
+    def _write_scalar_metrics(self, prefix, values, iteration):
+        if self.writer:
+            for name, value in self._numeric_metric_leaves(values):
+                self.writer.add_scalar(f'{prefix}/{name}', value, iteration)
+
     def collect_rollouts(self, num_episodes: int) -> List[Dict[str, Any]]:
         """
         벡터화된 환경(SubprocVecEnv)을 이용한 배치 롤아웃 수집 (GIL 우회 및 GPU Batch Inference)
@@ -606,7 +633,16 @@ class GRPOTrainer:
         all_advantages = []
         all_returns = []
         all_old_values = []
+        all_raw_gae = []
+        all_group_components = []
         gae_started = time.perf_counter()
+        if not episodes or len(episodes) != len(advantages):
+            raise ValueError('Expected one nonempty advantage array per rollout episode')
+        for episode, group_advantage in zip(episodes, advantages):
+            if not len(episode['rewards']) or np.shape(group_advantage) != (len(episode['rewards']),):
+                raise ValueError('Group advantages must match the nonempty rollout length')
+            if not np.isfinite(group_advantage).all():
+                raise ValueError('Group advantages must be finite')
         
         if self.use_gae:
             # 에피소드별로 값 함수 추정 후 GAE 계산 및 그룹 상대 어드밴티지 결합
@@ -637,11 +673,12 @@ class GRPOTrainer:
                 
                 # 하이브리드 어드밴티지 적용: GAE + 그룹 상대 어드밴티지 (A안)
                 # GAE 어드밴티지와 스케일을 맞추기 위해 그룹 상대 어드밴티지를 step 수로 나누어 per-step 스케일로 만듭니다.
-                # A_hybrid(t) = A_gae(t) + alpha * (relative_advantage / num_steps)
-                alpha = 1.0  # 기여도 조정 계수
+                # A_hybrid(t) = A_gae(t) + coefficient * (relative_advantage / num_steps).
+                # Zero is a controlled GAE-only comparison, with identical critic targets.
                 num_steps = len(rewards)
-                relative_adv_step = group_adv / num_steps
-                adv_hybrid = adv_ep + alpha * relative_adv_step
+                relative_adv_step = np.asarray(group_adv, dtype=np.float32) / num_steps
+                group_component = self.group_advantage_coef * relative_adv_step
+                adv_hybrid = adv_ep + group_component
                 
                 # The critic predicts actual discounted NAV rewards, not the
                 # group-relative policy baseline (which changes with the batch).
@@ -653,6 +690,8 @@ class GRPOTrainer:
                 all_advantages.append(adv_hybrid)
                 all_returns.append(ret_ep)
                 all_old_values.append(values_ep)
+                all_raw_gae.append(adv_ep)
+                all_group_components.append(group_component)
         else:
             for episode, advantage in zip(episodes, advantages):
                 states = episode['states']
@@ -667,7 +706,12 @@ class GRPOTrainer:
                 all_states.append(states)
                 all_actions.append(actions)
                 all_old_log_probs.append(old_log_probs)
-                all_advantages.append(advantage)
+                # Positive rescaling largely cancels during normalization in pure
+                # GRPO mode; this coefficient controls the GAE/group mixture only
+                # when GAE is enabled. Zero is rejected at configuration time.
+                group_component = self.group_advantage_coef * np.asarray(advantage, dtype=np.float32)
+                all_advantages.append(group_component)
+                all_group_components.append(group_component)
                 all_returns.append(returns)
         
         # 배열로 변환
@@ -678,7 +722,12 @@ class GRPOTrainer:
         all_returns = np.concatenate(all_returns, axis=0)
         
         # 어드밴티지 정규화
+        pre_normalized_advantages = all_advantages
         all_advantages = (all_advantages - all_advantages.mean()) / (all_advantages.std() + 1e-8)
+        learning_signal = self._learning_signal_metrics(
+            all_states, all_actions, np.concatenate(all_raw_gae) if all_raw_gae else None,
+            np.concatenate(all_group_components), pre_normalized_advantages, all_advantages,
+            all_returns, np.concatenate(all_old_values) if all_old_values else None)
         
         # VRAM 보호를 위해 전체 버퍼는 CPU 메모리에 유지합니다.
         states_tensor = torch.from_numpy(all_states).float()
@@ -849,6 +898,10 @@ class GRPOTrainer:
                     float(1 - (all_returns - old_values).var() / variance)
                     if variance > 1e-12 else 0.0),
             })
+        # Keep the public update metrics scalar-valued for existing consumers;
+        # slashes form the same TensorBoard hierarchy as nested diagnostics.
+        update_metrics.update({f'learning_signal/{key}': value
+                               for key, value in self._numeric_metric_leaves(learning_signal)})
         
         self.num_updates += 1
         
@@ -860,6 +913,75 @@ class GRPOTrainer:
         
         return update_metrics
     
+    def _learning_signal_metrics(self, states, actions, raw_gae, group_component,
+                                 pre_normalized, normalized, targets, rollout_values):
+        """Describe the frozen rollout's learning targets; no new model forward.
+
+        Position is read from the decision observation, before the chosen action.
+        Critic errors compare the rollout prediction with its training target,
+        rather than claiming to measure the subsequently updated critic.
+        """
+        actions = np.asarray(actions)
+        if not np.isin(actions, (0, 1, 2)).all():
+            raise ValueError('Learning diagnostics require HOLD=0, BUY=1, SELL=2 actions')
+        numeric_arrays = [group_component, pre_normalized, normalized, targets]
+        numeric_arrays.extend(value for value in (raw_gae, rollout_values) if value is not None)
+        if any(np.shape(value) != actions.shape or not np.isfinite(value).all() for value in numeric_arrays):
+            raise ValueError('Learning targets and advantages must be finite and match the rollout actions')
+
+        position_known = (isinstance(self.observation_schema, dict)
+                          and self.observation_schema.get('stage_fields') ==
+                          ['is_active', 'profit_rate', 'holding_fraction']
+                          and states.ndim == 3 and states.shape[-1] >= 15)
+        positions = np.full(len(actions), -1, dtype=np.int8)
+        if position_known:
+            activity = states[:, -1, -15::3]
+            if np.isfinite(activity).all() and np.isin(activity, (0., 1.)).all():
+                positions = (activity > .5).any(axis=1).astype(np.int8)
+            else:
+                position_known = False
+
+        def summarize(mask):
+            count = int(mask.sum())
+            gae_available = raw_gae is not None and count > 0
+            critic_available = rollout_values is not None and count > 0
+            result = {'sample_count': count, 'available': int(count > 0),
+                      'raw_gae_available': int(gae_available),
+                      'critic_available': int(critic_available)}
+            for name, values in (('raw_gae', raw_gae), ('group_component', group_component),
+                                 ('pre_normalized_advantage', pre_normalized),
+                                 ('normalized_advantage', normalized)):
+                selected = values[mask] if values is not None and count else np.array([])
+                result[f'{name}_mean'] = float(selected.mean()) if selected.size else 0.
+                result[f'{name}_std'] = float(selected.std()) if selected.size else 0.
+                result[f'{name}_positive_fraction'] = float((selected > 0).mean()) if selected.size else 0.
+            gae_std = result['raw_gae_std']
+            ratio_available = gae_available and gae_std > 1e-12
+            result['group_to_gae_std_ratio_available'] = int(ratio_available)
+            result['group_to_gae_std_ratio'] = (result['group_component_std'] / gae_std
+                                                if ratio_available else 0.)
+            result['critic_sample_count'] = count if critic_available else 0
+            errors = targets[mask] - rollout_values[mask] if critic_available else np.array([])
+            result['critic_target_error_mean'] = float(errors.mean()) if errors.size else 0.
+            result['critic_target_error_std'] = float(errors.std()) if errors.size else 0.
+            result['critic_target_error_mae'] = float(np.abs(errors).mean()) if errors.size else 0.
+            variance = float(targets[mask].var()) if critic_available else 0.
+            result['critic_explained_variance_available'] = int(critic_available and variance > 1e-12)
+            result['critic_explained_variance'] = float(1 - errors.var() / variance) if variance > 1e-12 else 0.
+            return result
+
+        action_names = {'hold': 0, 'buy': 1, 'sell': 2}
+        position_names = {'flat': 0, 'holding': 1, 'unknown': -1}
+        return {'group_advantage_coef': self.group_advantage_coef,
+                'position_available': int(position_known),
+                'all': summarize(np.ones(len(actions), dtype=bool)),
+                'action': {name: summarize(actions == value) for name, value in action_names.items()},
+                'position': {name: summarize(positions == value) for name, value in position_names.items()},
+                'action_position': {
+                    action: {position: summarize((actions == action_id) & (positions == position_id))
+                             for position, position_id in position_names.items()}
+                    for action, action_id in action_names.items()}}
+
     def _compute_returns(self, rewards: np.ndarray) -> np.ndarray:
         """
         할인된 누적 보상 계산
@@ -936,13 +1058,8 @@ class GRPOTrainer:
                           else value.item() if isinstance(value, np.generic) else str(value))
             os.replace(temporary, path)
         if self.writer:
-            def scalars(prefix, values):
-                for name, value in values.items():
-                    if isinstance(value, dict):
-                        scalars(f'{prefix}/{name}', value)
-                    elif isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(value):
-                        self.writer.add_scalar(f'{prefix}/{name}', float(value), max(0, iteration - 1))
-            scalars(f'validation_{label}' if label else 'validation', metrics)
+            self._write_scalar_metrics(f'validation_{label}' if label else 'validation',
+                                       metrics, max(0, iteration - 1))
             self.writer.flush()
 
     def _validation_selection_score(self, metrics):
@@ -1160,8 +1277,12 @@ class GRPOTrainer:
                 if self.writer:
                     self.writer.add_scalar('validation/mean_net_return', reported_return, iteration)
                     self.writer.add_scalar('validation/selection_eligible', int(score is not None), iteration)
-                logger.info("Validation net return: %.6f%% (current weights; selection eligible=%s)",
-                            reported_return, score is not None)
+                logger.info("Validation net return: %.6f%% | outcome=%s | round_trips=%s | "
+                            "no_trade_fraction=%s | profitable_with_trades=%s | selection eligible=%s",
+                            reported_return, validation_metrics.get('evaluation_outcome', 'unknown'),
+                            validation_metrics.get('round_trip_count', 'unknown'),
+                            validation_metrics.get('no_trade_episode_fraction', 'unknown'),
+                            validation_metrics.get('profitable_with_trades', 'unknown'), score is not None)
                 if score is not None and score > best_validation_return:
                     best_validation_return = score
                     no_improve_count = 0
@@ -1236,6 +1357,7 @@ class GRPOTrainer:
                        f"Policy Loss: {update_metrics['policy_loss']:.4f} | "
                        f"Elapsed: {elapsed_str} | "
                        f"ETA: {remaining_str}")
+            self._log_trading_diagnostics(episodes)
             
             # 조기 종료 체크: 실제 경과 타임스텝 수 기준
             if max_timesteps and self.total_timesteps >= max_timesteps:
@@ -1268,6 +1390,32 @@ class GRPOTrainer:
         
         return final_metrics
     
+    def _log_trading_diagnostics(self, episodes):
+        """Expose trade economics in console logs even when TensorBoard is absent."""
+        parts = []
+        for key, label in (('round_trip_count', 'RoundTrips/ep'), ('total_fees', 'Fees/ep'),
+                           ('gross_realized_pnl', 'GrossPnL/ep'), ('realized_net_pnl', 'NetPnL/ep')):
+            values = [ep['metadata'][key] for ep in episodes if key in ep['metadata']]
+            if values:
+                parts.append(f'{label}={np.mean(values):.2f}')
+        completed = [(ep['metadata']['round_trip_count'], ep['metadata']['round_trip_win_rate'])
+                     for ep in episodes if all(key in ep['metadata']
+                                               for key in ('round_trip_count', 'round_trip_win_rate'))]
+        count = sum(number for number, _ in completed)
+        if completed:
+            parts.append(f'RoundWin={sum(number * rate for number, rate in completed) / count:.1%}'
+                         if count else 'RoundWin=n/a (no completed round trips)')
+        reasons = []
+        for reason in ('signal', 'stop_loss', 'max_holding', 'episode_end'):
+            key = f'exit_{reason}_round_trip_count'
+            values = [ep['metadata'][key] for ep in episodes if key in ep['metadata']]
+            if values:
+                reasons.append(f'{reason}={np.mean(values):.2f}')
+        if reasons:
+            parts.append('Exits/ep: ' + ', '.join(reasons))
+        if parts:
+            logger.info('Trading diagnostics: %s', ' | '.join(parts))
+
     def _log_metrics(
         self,
         iteration: int,
@@ -1341,10 +1489,20 @@ class GRPOTrainer:
         if liquidation:
             self.writer.add_scalar('train/incomplete_liquidation_fraction',
                                    float(np.mean(np.logical_not(liquidation))), iteration)
+
+        # New environment diagnostics (including per-exit-reason dictionaries)
+        # are episode means. Availability counts distinguish omitted legacy data
+        # from measured zeroes; established top-level aliases remain unchanged.
+        episode_metrics = {}
+        for episode in episodes:
+            for name, value in self._numeric_metric_leaves(episode['metadata']):
+                episode_metrics.setdefault(name, []).append(value)
+        for name, values in episode_metrics.items():
+            self.writer.add_scalar(f'train/episode_diagnostics/{name}/mean', float(np.mean(values)), iteration)
+            self.writer.add_scalar(f'train/episode_diagnostics/{name}/available_episodes', len(values), iteration)
         
         # 정책 업데이트 메트릭 (정책 엔트로피, KL 발산 포함)
-        for key, value in update_metrics.items():
-            self.writer.add_scalar(f'train/{key}', value, iteration)
+        self._write_scalar_metrics('train', update_metrics, iteration)
         
         # One deterministic sample over the full rollout, bounded even when
         # there are more episodes than the diagnostic sample budget.
@@ -1490,6 +1648,8 @@ class GRPOTrainer:
                 'learning_rate': self.learning_rate,
                 'gamma': self.gamma,
                 'lambda_gae': self.lambda_gae,
+                'group_advantage_coef': self.group_advantage_coef,
+                'use_gae': self.use_gae,
                 'clip_epsilon': self.clip_epsilon,
                 'kl_target': self.kl_target,
                 'entropy_coef': self.entropy_coef,
@@ -1510,7 +1670,7 @@ class GRPOTrainer:
             logger.debug(f"  Extra state saved: {extra_state}")
     
     def restore_training_progress(self, checkpoint: Dict[str, Any]) -> int:
-        """Restore optimizer/counters only for an explicitly requested resume."""
+        """Restore progress and the saved reward mixture for an explicit resume."""
         required = ('optimizer_state_dict', 'total_timesteps', 'num_updates', 'iteration')
         missing = [name for name in required if name not in checkpoint]
         if missing:
@@ -1519,7 +1679,10 @@ class GRPOTrainer:
             value = checkpoint[name]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Invalid checkpoint {name}: expected a nonnegative integer")
+        coefficient = self._validate_group_advantage_coef(
+            checkpoint.get('config', {}).get('group_advantage_coef', 1.0))
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.group_advantage_coef = coefficient
         self.total_timesteps = checkpoint['total_timesteps']
         self.num_updates = checkpoint['num_updates']
         self.learning_rate = self.optimizer.param_groups[0]['lr']
