@@ -29,11 +29,13 @@ python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
 
 ## Colab A100 학습
 
-`ai_trader/grpo/colab_train_xlstm.ipynb`를 사용합니다. 수정된 프로젝트 코드가 포함된 Git revision 또는 업로드한 소스 폴더가 필요합니다. 노트북만 교체하고 이전 코드를 clone하면 수정된 학습기를 사용할 수 없습니다.
+[`ai_trader/grpo/colab_train_xlstm_return_priority.ipynb`](ai_trader/grpo/colab_train_xlstm_return_priority.ipynb)를 사용합니다. 수정된 프로젝트 코드가 포함된 Git revision 또는 업로드한 소스 폴더가 필요합니다. 노트북만 교체하고 이전 코드를 clone하면 수정된 학습기를 사용할 수 없습니다.
 
-관측 1024틱, 에피소드 300틱, CNN/mLSTM/FC 64/128/256으로 시작합니다. A100 40GB의 배치 상한은 64, 80GB는 128이며 실제 역전파 사전 점검에서 메모리가 부족하면 줄입니다. 회당 rollout은 16개이고 여유 RAM 16GiB 미만에서는 8개로 축소합니다. worker는 CPU와 RAM에 맞춰 최대 4/8개, 캐시는 worker당 128MiB로 제한합니다. GAE 및 TensorBoard 추론도 `batch_size` 이하로 나누어 GPU에 전송합니다.
+관측 길이 1024, CNN/mLSTM/FC 256/512/512로 시작합니다. 기본 `timed_gae_only` 실험은 1초 판단 간격, 에피소드 시간 상한 300초, `group_advantage_coef=0`, `lambda_gae=0.95`를 사용합니다. A100 40GB의 배치 상한은 16, 80GB는 32이며 실제 역전파 사전 점검에서 메모리가 부족하면 줄입니다. 회당 rollout은 16개이고 여유 RAM 16GiB 미만에서는 8개로 축소합니다. worker는 CPU와 RAM에 맞춰 최대 4/8개, 캐시는 worker당 128MiB로 제한합니다. GAE 및 TensorBoard 추론도 `batch_size` 이하로 나누어 GPU에 전송합니다.
 
-`MODE='new'`와 새 `RUN_NAME`이 기본입니다. 재개는 `MODE='resume'`와 `LOAD_POLICY`를 명시하며 관측·체결·학습 설정을 복원합니다. 초기 목표는 100,000틱이고 재개할 때는 누적 목표를 늘립니다. `ENABLE_TF32`는 사전 점검과 실제 학습 프로세스에 함께 적용하며 AMP/BF16은 사용하지 않습니다.
+`MODE='new'`와 새 `RUN_NAME`이 기본입니다. 재개는 `MODE='resume'`와 `LOAD_POLICY`를 명시하며 관측·체결·학습 설정을 복원합니다. 초기 목표는 1,000,000 정책 스텝이고 재개할 때는 누적 목표를 늘립니다. `ENABLE_TF32`는 사전 점검과 실제 학습 프로세스에 함께 적용하며 AMP/BF16은 사용하지 않습니다.
+
+기본 `policy_update_checks=True`는 수집·학습 확률 일치와 optimizer 실행 직후 전체 행동 KL을 검사하고, 한계를 넘은 단계의 가중치와 Adam 상태를 복원합니다. `no_trade_max_validations=4`는 매수 확률 변화와 무관하게 연속 무거래 검증을 제한합니다. 5번 설정 셀의 `DIAGNOSTIC_CHECKPOINT`에 기존 학습 가중치 경로를 입력하면 7번 GPU 점검 셀에서 별도로 검사합니다. 설정·재개 호환성과 실제 검증 범위는 [업데이트 검사 안내](SCALPING_UPDATE_CHECKS_2026-09-12.md)를 참고하세요.
 
 Drive에 `colab_config.json`, 소스·manifest 해시와 GPU 점검 결과가 담긴 `colab_run.json`, 학습 로그와 회당 체크포인트를 저장합니다. 끝의 평가 셀에서 순수익·실현손익·합성 체결·미청산 수량을 확인할 수 있고, 선택적인 체결 스트레스 검사는 validation에만 적용합니다. 실제 A100의 최대 메모리와 학습 속도는 Colab 사전 점검 및 실제 학습에서 확인해야 합니다.
 
@@ -252,7 +254,7 @@ python -m ai_trader.grpo.pretrain_behavior_cloning --teacher_policy models/teach
 
 ## 수익률 우선 학습 기본값 (2026-09-10)
 
-현재 CLI와 A100 노트북(`colab_train_xlstm_astral.ipynb` 포함)은 비용을 반영한 검증 순수익률을 우선합니다. 기본 모델은 CNN 256 / xLSTM 512 / FC 512, `seq_len=1024`, `max_stages=1`, `total_timesteps=1000000`, `gamma=1.0`, 검증 64회입니다. 큰 모델이 더 높은 수익률을 보장하지는 않으며 기존 모델과 같은 검증 조건으로 비교해야 합니다. 모델 폭은 메모리 부족 때문에 자동 축소하지 않고 GPU 점검에서 미니배치를 줄입니다.
+현재 CLI와 A100 노트북(`colab_train_xlstm_return_priority.ipynb`)은 비용을 반영한 검증 순수익률을 우선합니다. 기본 모델은 CNN 256 / xLSTM 512 / FC 512, `seq_len=1024`, `max_stages=1`, `total_timesteps=1000000`, `gamma=1.0`, 검증 64회입니다. 큰 모델이 더 높은 수익률을 보장하지는 않으며 기존 모델과 같은 검증 조건으로 비교해야 합니다. 모델 폭은 메모리 부족 때문에 자동 축소하지 않고 GPU 점검에서 미니배치를 줄입니다.
 
 ```powershell
 python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --output_dir models/scalping_return_priority --max_stages 1
@@ -260,6 +262,6 @@ python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 
 
 새 학습은 실제 호가가 있는 데이터를 요구합니다. 거래 보너스나 무매매 페널티로 거래를 강요하지 않고, 수수료·세금·슬리피지를 그대로 반영합니다. 최고 모델은 `validation.mean_net_return`로 고르되 기본 `selection_require_liquidation=True`에 따라 검증 중 미청산 물량이 남은 후보는 제외합니다. 적격 후보가 없으면 최종 모델 확정을 실패로 보고하고 반복별 체크포인트는 진단용으로 남깁니다. 수익률 0%인 무매매보다 낮은 모델도 후보 중 최고일 수 있으므로 양의 순수익 여부를 별도로 확인해야 합니다.
 
-`TOTAL_TIMESTEPS`는 실제 수집한 학습 스텝 목표이며 완성된 에피소드 경계 때문에 조금 초과할 수 있습니다. 에피소드가 짧아도 목표에 도달하기 전 조기 종료하지 않습니다. 기존 가중치로 미세조정할 때는 업데이트 전에 검증해 더 나은 시작 모델을 보존합니다. `resume`/`finetune`은 기존 모델 크기·학습 설정을 복원하므로 새 기본값 전체를 적용하려면 `MODE='new'`와 새 실험 폴더를 사용하세요. 데이터 재추출은 필요 없습니다.
+`TOTAL_TIMESTEPS`는 실제 수집한 학습 스텝 목표이며 완성된 에피소드 경계 때문에 조금 초과할 수 있습니다. 에피소드 길이만으로 조기 종료하지 않지만, 설정한 무거래 조건을 충족하면 목표 전에 종료하고 테스트 평가를 생략합니다. 기존 가중치로 미세조정할 때는 업데이트 전에 검증해 더 나은 시작 모델을 보존합니다. `resume`/`finetune`은 기존 모델 크기·학습 설정을 복원하므로 새 기본값 전체를 적용하려면 `MODE='new'`와 새 실험 폴더를 사용하세요. 데이터 재추출은 필요 없습니다.
 
 추론 래퍼의 기본 추가 익절·트레일링·정체 청산은 꺼져 있고 손절률은 체크포인트를 따릅니다. 실전과 리플레이의 호가·주문 연결은 여전히 별도로 검증해야 합니다. 재리뷰 결과와 남은 한계는 [수익률 우선 재리뷰](SCALPING_RETURN_REVIEW_2026-09-10.md)를 참고하세요.

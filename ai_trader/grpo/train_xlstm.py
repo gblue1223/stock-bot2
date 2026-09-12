@@ -125,8 +125,12 @@ class TrainingConfig:
         self.evaluation_seed = 42
         self.diagnostics_interval = 5
         self.diagnostics_max_samples = 256
+        self.policy_update_checks = True
+        self.rollout_logprob_tolerance = 1e-3
+        self.kl_probe_samples = 32
         self.selection_require_liquidation = True
         self.no_trade_patience = 0
+        self.no_trade_max_validations = 0
         self.profitable_min_round_trips = 20
         self.profitable_min_traded_dates = 3
         self.cache_max_bytes = 256 * 1024 * 1024
@@ -185,7 +189,10 @@ class TrainingConfig:
             errors.append("selection_require_liquidation must be a boolean")
         if not isinstance(self.execution_action_mask, bool):
             errors.append('execution_action_mask must be a boolean')
-        for name, minimum in (('no_trade_patience', 0), ('profitable_min_round_trips', 1),
+        if not isinstance(self.policy_update_checks, bool):
+            errors.append('policy_update_checks must be a boolean')
+        for name, minimum in (('no_trade_patience', 0), ('no_trade_max_validations', 0),
+                              ('kl_probe_samples', 1), ('profitable_min_round_trips', 1),
                               ('profitable_min_traded_dates', 1)):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
@@ -200,7 +207,8 @@ class TrainingConfig:
             errors.append('execution_observations must be a boolean')
         if self.execution_observations and not self.account_observations:
             errors.append('execution_observations requires account_observations')
-        for name in ('decision_interval_seconds', 'episode_duration_seconds', 'group_advantage_coef'):
+        for name in ('decision_interval_seconds', 'episode_duration_seconds', 'group_advantage_coef',
+                     'rollout_logprob_tolerance'):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 errors.append(f'{name} must be finite and nonnegative')
@@ -349,17 +357,26 @@ def restore_resume_progress(trainer, config, checkpoint, control_overrides, sign
     """Restore counters, then explicitly override controls without mixing their history."""
     iteration = trainer.restore_training_progress(checkpoint)
     changed_controls = False
-    for name in ('no_trade_patience', 'profitable_min_round_trips', 'profitable_min_traded_dates'):
+    for name in ('no_trade_patience', 'no_trade_max_validations',
+                 'profitable_min_round_trips', 'profitable_min_traded_dates'):
         if name in control_overrides:
             value = control_overrides[name]
             changed_controls |= value != getattr(trainer, name)
             setattr(trainer, name, value)
+        setattr(config, name, getattr(trainer, name))
+    for name in ('policy_update_checks', 'rollout_logprob_tolerance', 'kl_probe_samples'):
+        if name in control_overrides:
+            setattr(trainer, name, control_overrides[name])
         setattr(config, name, getattr(trainer, name))
     if changed_controls or checkpoint.get('extra_state', {}).get('evaluation_signature') != signature:
         trainer.training_control_state = type(trainer.training_control_state)()
         logger.info('Reset no-trade validation history because evaluation conditions or controls changed')
     config.lr = trainer.learning_rate
     config.group_advantage_coef = trainer.group_advantage_coef
+    logger.info('Effective resume safeguards: policy_update_checks=%s, rollout_logprob_tolerance=%s, '
+                'kl_probe_samples=%s, no_trade_patience=%s, no_trade_max_validations=%s',
+                config.policy_update_checks, config.rollout_logprob_tolerance, config.kl_probe_samples,
+                config.no_trade_patience, config.no_trade_max_validations)
     return iteration
 
 
@@ -400,6 +417,8 @@ def main():
                         help='Use executable order-state masks in rollout, update and evaluation')
     parser.add_argument('--no_trade_patience', type=int, default=None,
                         help='Stop after this many stagnant no-trade validations; 0 disables')
+    parser.add_argument('--no_trade_max_validations', type=int, default=None,
+                        help='Stop after this many consecutive verified no-trade validations, regardless of buy probability; 0 disables')
     parser.add_argument('--profitable_min_round_trips', type=int, default=None)
     parser.add_argument('--profitable_min_traded_dates', type=int, default=None)
     parser.add_argument('--max_stages', '--max-stages', type=int, choices=range(1, 6), default=None,
@@ -478,6 +497,10 @@ def main():
     parser.add_argument('--evaluation_workers', type=int, default=None)
     parser.add_argument('--diagnostics_interval', type=int, default=None)
     parser.add_argument('--diagnostics_max_samples', type=int, default=None)
+    parser.add_argument('--policy_update_checks', action=argparse.BooleanOptionalAction, default=None,
+                        help='Verify rollout likelihoods and guard each update using a fixed KL probe')
+    parser.add_argument('--rollout_logprob_tolerance', type=float, default=None)
+    parser.add_argument('--kl_probe_samples', type=int, default=None)
     parser.add_argument('--clip', type=float, default=None)
     parser.add_argument('--kl_target', type=float, default=None)
     parser.add_argument('--entropy_coef', type=float, default=None)
@@ -546,6 +569,8 @@ def main():
                 for name, default in (('decision_interval_seconds', 0.0),
                                       ('episode_duration_seconds', 0.0),
                                       ('execution_action_mask', False), ('no_trade_patience', 0),
+                                      ('no_trade_max_validations', 0), ('policy_update_checks', False),
+                                      ('rollout_logprob_tolerance', 1e-3), ('kl_probe_samples', 32),
                                       ('profitable_min_round_trips', 20), ('profitable_min_traded_dates', 3),
                                       ('group_advantage_coef', 1.0), ('training_seed', 42)):
                     if getattr(args, name) is None:
@@ -599,9 +624,12 @@ def main():
                     config.execution_observations, config.decision_interval_seconds,
                     config.episode_duration_seconds, config.group_advantage_coef,
                     config.lambda_gae, config.training_seed)
-        logger.info('Execution action mask=%s; no-trade patience=%s; profitable candidate minimum=%s round trips / %s traded dates',
-                    config.execution_action_mask, config.no_trade_patience,
+        logger.info('Execution action mask=%s; no-trade patience=%s; no-trade validation limit=%s; '
+                    'profitable candidate minimum=%s round trips / %s traded dates',
+                    config.execution_action_mask, config.no_trade_patience, config.no_trade_max_validations,
                     config.profitable_min_round_trips, config.profitable_min_traded_dates)
+        logger.info('Policy update checks=%s; rollout log-probability tolerance=%s; KL probe samples=%s',
+                    config.policy_update_checks, config.rollout_logprob_tolerance, config.kl_probe_samples)
         
         # 환경 생성 (extracted_dir 캐시 활용 시 Windows의 SubprocVecEnv도 안정 작동)
         logger.info(f"[STEP 2/6] Creating environments (Workers: {config.num_workers})...")
@@ -698,10 +726,14 @@ def main():
             evaluation_interval=config.evaluation_interval,
             selection_require_liquidation=config.selection_require_liquidation,
             no_trade_patience=config.no_trade_patience,
+            no_trade_max_validations=config.no_trade_max_validations,
             profitable_min_round_trips=config.profitable_min_round_trips,
             profitable_min_traded_dates=config.profitable_min_traded_dates,
             diagnostics_interval=config.diagnostics_interval,
             diagnostics_max_samples=config.diagnostics_max_samples,
+            policy_update_checks=config.policy_update_checks,
+            rollout_logprob_tolerance=config.rollout_logprob_tolerance,
+            kl_probe_samples=config.kl_probe_samples,
         )
         trainer.extra_checkpoint_state = {'date_splits': date_splits,
                                           'training_config': dict(config.__dict__)}
@@ -716,7 +748,9 @@ def main():
         signature = evaluation_signature(dict(config.__dict__), date_splits, ref_env.observation_schema)
         if config.resume:
             control_overrides = {name: getattr(args, name) for name in
-                                 ('no_trade_patience', 'profitable_min_round_trips', 'profitable_min_traded_dates')
+                                 ('no_trade_patience', 'no_trade_max_validations',
+                                  'profitable_min_round_trips', 'profitable_min_traded_dates',
+                                  'policy_update_checks', 'rollout_logprob_tolerance', 'kl_probe_samples')
                                  if getattr(args, name) is not None}
             start_iteration = restore_resume_progress(trainer, config, checkpoint, control_overrides, signature)
             if config.total_timesteps <= trainer.total_timesteps:

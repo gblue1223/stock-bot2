@@ -20,6 +20,9 @@ from sklearn.cluster import KMeans
 from .environments import GRPOScalpingEnv
 from .training_control import (TrainingControlState, finite_number, nonnegative_count,
                                integer_setting, profitable_candidate_evidence)
+from .policy_update_checks import (check_rollout_likelihood, exact_policy_kl,
+                                   evaluate_action_distribution, snapshot_optimizer_step,
+                                   restore_optimizer_step, validate_update_check_settings)
 import concurrent.futures  # ✅ 병렬 처리용 추가
 
 logger = logging.getLogger(__name__)
@@ -81,8 +84,12 @@ class GRPOTrainer:
         diagnostics_max_samples: int = 256,
         group_advantage_coef: float = 1.0,
         no_trade_patience: int = 0,
+        no_trade_max_validations: int = 0,
         profitable_min_round_trips: int = 20,
         profitable_min_traded_dates: int = 3,
+        policy_update_checks: bool = False,
+        rollout_logprob_tolerance: float = 1e-3,
+        kl_probe_samples: int = 32,
     ):
         self.policy = policy
         
@@ -121,13 +128,19 @@ class GRPOTrainer:
         self.diagnostics_interval = max(1, int(diagnostics_interval))
         self.diagnostics_max_samples = max(1, int(diagnostics_max_samples))
         self.no_trade_patience = integer_setting('no_trade_patience', no_trade_patience)
+        self.no_trade_max_validations = integer_setting('no_trade_max_validations', no_trade_max_validations)
         self.profitable_min_round_trips = integer_setting('profitable_min_round_trips', profitable_min_round_trips, 1)
         self.profitable_min_traded_dates = integer_setting('profitable_min_traded_dates', profitable_min_traded_dates, 1)
+        (self.policy_update_checks, self.rollout_logprob_tolerance,
+         self.kl_probe_samples) = validate_update_check_settings(
+             policy_update_checks, rollout_logprob_tolerance, kl_probe_samples)
+        if self.policy_update_checks and (finite_number(self.kl_target) is None or self.kl_target <= 0):
+            raise ValueError('policy_update_checks requires a finite positive kl_target')
         self.training_control_state = TrainingControlState()
         self.best_profitable_validation_return = float('-inf')
         if selection_require_liquidation and evaluation_callback is None:
             raise ValueError("Liquidation-aware selection requires a validation callback")
-        if self.no_trade_patience and evaluation_callback is None:
+        if (self.no_trade_patience or self.no_trade_max_validations) and evaluation_callback is None:
             raise ValueError('No-trade early stopping requires a validation callback')
         logger.info(f"🤖 GRPOTrainer initialized: use_gae={self.use_gae}, num_epochs={self.num_epochs}, batch_size={self.batch_size}, group_advantage_coef={self.group_advantage_coef}")
         
@@ -793,6 +806,21 @@ class GRPOTrainer:
         old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float()
         advantages_tensor = torch.from_numpy(all_advantages).float()
         returns_tensor = torch.from_numpy(all_returns).float()
+        likelihood_started = time.perf_counter()
+        likelihood = None
+        reference_log_probs = None
+        probe_indices = np.array([], dtype=np.int64)
+        if self.policy_update_checks:
+            likelihood = check_rollout_likelihood(
+                self.policy, states_tensor, actions_tensor, old_log_probs_tensor, all_action_masks,
+                batch_size=self.batch_size, tolerance=self.rollout_logprob_tolerance, device=self.device)
+            reference_log_probs = likelihood.pop('reference_log_probs')
+            probe_indices = np.linspace(0, len(all_states) - 1,
+                                         min(self.kl_probe_samples, len(all_states)), dtype=np.int64)
+            logger.info('Policy update %d likelihood check: samples=%d, max_abs_error=%.8g, tolerance=%.8g',
+                        self.num_updates + 1, likelihood['num_samples'], likelihood['max_abs_error'],
+                        self.rollout_logprob_tolerance)
+        likelihood_check_seconds = time.perf_counter() - likelihood_started
         
         # The frozen rollout likelihood is already stored with every action.
         # No second model or reference forward is needed for sampled KL.
@@ -814,6 +842,11 @@ class GRPOTrainer:
         num_batches = 0
         early_stopped = False
         checked_kl = 0.0
+        attempted_steps = rejected_steps = 0
+        post_update_stopped = False
+        last_probe_kl = last_minibatch_kl = last_post_max_kl = 0.0
+        accepted_probe_kl_sum = accepted_minibatch_kl_sum = 0.0
+        post_update_check_seconds = snapshot_seconds = 0.0
         
         for epoch in range(num_epochs):
             # 데이터 셔플
@@ -831,10 +864,14 @@ class GRPOTrainer:
                 batch_returns = returns_tensor[batch_indices].to(self.device)
                 
                 # 4. 정책 평가
-                log_probs, entropy, values = self.policy.evaluate_actions(
-                    batch_states, batch_actions,
-                    **self._mask_kwargs(all_action_masks[batch_indices] if all_action_masks is not None else None)
-                )
+                batch_mask_kwargs = self._mask_kwargs(all_action_masks[batch_indices] if all_action_masks is not None else None)
+                if self.policy_update_checks:
+                    log_probs, entropy, values, action_distribution = evaluate_action_distribution(
+                        self.policy, batch_states, batch_actions, batch_mask_kwargs.get('action_masks'))
+                    del action_distribution
+                else:
+                    log_probs, entropy, values = self.policy.evaluate_actions(
+                        batch_states, batch_actions, **batch_mask_kwargs)
                 
                 # 5. PPO 클리핑 목적 함수 계산
                 # 확률 비율: r_t = π_θ(a|s) / π_θ_old(a|s)
@@ -848,8 +885,8 @@ class GRPOTrainer:
                 # a recent jump with earlier epochs' near-zero KL estimates.
                 if checked_kl > self.kl_target * 1.5:
                     early_stopped = True
-                    logger.warning('KL guard stopped before optimizer step: %.6f > %.6f',
-                                   checked_kl, self.kl_target * 1.5)
+                    logger.warning('Policy update %d KL guard stopped before optimizer step: %.6f > %.6f',
+                                   self.num_updates + 1, checked_kl, self.kl_target * 1.5)
                     break
                 
                 # 클리핑되지 않은 목적 함수
@@ -901,7 +938,49 @@ class GRPOTrainer:
                     self.max_grad_norm, error_if_nonfinite=True
                 )
                 
-                self.optimizer.step()
+                step_snapshot = None
+                if self.policy_update_checks:
+                    snapshot_started = time.perf_counter()
+                    step_snapshot = snapshot_optimizer_step(self.policy, self.optimizer)
+                    snapshot_seconds += time.perf_counter() - snapshot_started
+                attempted_steps += 1
+                try:
+                    self.optimizer.step()
+                    if self.policy_update_checks:
+                        post_started = time.perf_counter()
+                        # Fixed rollout probe and this minibatch share a single
+                        # bounded pass when their observations overlap.
+                        combined_indices = np.union1d(probe_indices, batch_indices)
+                        post = exact_policy_kl(
+                            self.policy, states_tensor[combined_indices], actions_tensor[combined_indices],
+                            reference_log_probs[combined_indices],
+                            all_action_masks[combined_indices] if all_action_masks is not None else None,
+                            batch_size=self.batch_size, device=self.device)
+                        divergence = post['per_state_kl']
+                        last_probe_kl = float(divergence[np.searchsorted(combined_indices, probe_indices)].mean())
+                        last_minibatch_kl = float(divergence[np.searchsorted(combined_indices, batch_indices)].mean())
+                        last_post_max_kl = post['max_kl']
+                        post_update_check_seconds += time.perf_counter() - post_started
+                        if max(last_probe_kl, last_minibatch_kl) > self.kl_target * 1.5:
+                            restore_optimizer_step(self.policy, self.optimizer, step_snapshot)
+                            rejected_steps += 1
+                            early_stopped = post_update_stopped = True
+                            logger.warning('Policy update %d rejected optimizer step %d and restored policy/Adam: '
+                                           'exact KL fixed_probe=%.6f, minibatch=%.6f > limit=%.6f',
+                                           self.num_updates + 1, attempted_steps, last_probe_kl,
+                                           last_minibatch_kl, self.kl_target * 1.5)
+                except Exception:
+                    if step_snapshot is not None:
+                        restore_optimizer_step(self.policy, self.optimizer, step_snapshot)
+                        rejected_steps += 1
+                        logger.exception('Policy update %d failed after optimizer attempt %d; policy parameters, '
+                                         'buffers and Adam restored (accepted=%d, rejected=%d)',
+                                         self.num_updates + 1, attempted_steps, num_batches, rejected_steps)
+                    raise
+                finally:
+                    del step_snapshot
+                if post_update_stopped:
+                    break
                 
                 # GRU 가중치 연속 메모리 보장 (optimizer.step이 가중치를 비연속적으로 만들 수 있음)
                 if hasattr(self.policy, 'gru'):
@@ -924,6 +1003,8 @@ class GRPOTrainer:
                 total_kl_divergence += kl_divergence.item()
                 total_clip_fraction += clip_fraction.item()
                 total_grad_norm += float(grad_norm)
+                accepted_probe_kl_sum += last_probe_kl
+                accepted_minibatch_kl_sum += last_minibatch_kl
                 num_batches += 1
             
             # KL 발산이 목표값을 초과하면 조기 종료
@@ -939,6 +1020,23 @@ class GRPOTrainer:
             'clip_fraction': total_clip_fraction / max(1, num_batches),
             'grad_norm_before_clip': total_grad_norm / max(1, num_batches),
             'optimizer_steps': num_batches,
+            'optimizer_accepted_steps': num_batches,
+            'optimizer_attempted_steps': attempted_steps,
+            'optimizer_rejected_steps': rejected_steps,
+            'policy_update_checks_enabled': int(self.policy_update_checks),
+            'rollout_likelihood_max_abs_error': likelihood['max_abs_error'] if likelihood else 0.0,
+            'rollout_likelihood_mean_abs_error': likelihood['mean_abs_error'] if likelihood else 0.0,
+            'rollout_likelihood_samples': likelihood['num_samples'] if likelihood else 0,
+            'likelihood_check_seconds': likelihood_check_seconds,
+            'kl_probe_samples': len(probe_indices),
+            'post_update_kl_early_stopped': int(post_update_stopped),
+            'last_post_update_probe_kl': last_probe_kl,
+            'last_post_update_minibatch_kl': last_minibatch_kl,
+            'last_post_update_max_state_kl': last_post_max_kl,
+            'accepted_post_update_probe_kl_mean': accepted_probe_kl_sum / max(1, num_batches),
+            'accepted_post_update_minibatch_kl_mean': accepted_minibatch_kl_sum / max(1, num_batches),
+            'post_update_check_seconds': post_update_check_seconds,
+            'rollback_snapshot_seconds': snapshot_seconds,
             'kl_early_stopped': int(early_stopped),
             'last_checked_kl': checked_kl,
             'preparation_seconds': preparation_seconds,
@@ -963,6 +1061,12 @@ class GRPOTrainer:
                                for key, value in self._numeric_metric_leaves(learning_signal)})
         
         self.num_updates += 1
+        if self.policy_update_checks:
+            logger.info('Policy update %d checks: optimizer accepted=%d, attempted=%d, rejected=%d | '
+                        'likelihood_max_abs_error=%.8g | last_attempt exact KL fixed_probe=%.6f, minibatch=%.6f '
+                        '(limit=%.6f, fixed_samples=%d)', self.num_updates, num_batches, attempted_steps,
+                        rejected_steps, likelihood['max_abs_error'], last_probe_kl, last_minibatch_kl,
+                        self.kl_target * 1.5, len(probe_indices))
         
         logger.debug(f"Policy updated: policy_loss={update_metrics['policy_loss']:.4f}, "
                     f"value_loss={update_metrics['value_loss']:.4f}, "
@@ -1404,7 +1508,8 @@ class GRPOTrainer:
                 improved = score is not None and score > best_validation_return
                 stop_for_no_trade = self.training_control_state.observe(
                     validation_metrics if score is not None else {}, iteration=iteration + 1,
-                    score_improved=improved, patience=self.no_trade_patience)
+                    score_improved=improved, patience=self.no_trade_patience,
+                    max_validations=self.no_trade_max_validations)
                 validation_metrics['training_control'] = self.training_control_state.to_dict()
                 if stop_for_no_trade:
                     early_stop_reason = self.training_control_state.stop_reason
@@ -1442,13 +1547,15 @@ class GRPOTrainer:
                         # Reverting parameters must not rewind the actual training budget.
                         steps, updates = self.total_timesteps, self.num_updates
                         control_state = self.training_control_state
-                        control_settings = (self.no_trade_patience, self.profitable_min_round_trips,
-                                            self.profitable_min_traded_dates)
+                        control_settings = (self.no_trade_patience, self.no_trade_max_validations,
+                                            self.profitable_min_round_trips, self.profitable_min_traded_dates,
+                                            self.policy_update_checks, self.rollout_logprob_tolerance, self.kl_probe_samples)
                         self.load_checkpoint(selected_path)
                         self.total_timesteps, self.num_updates = steps, updates
                         self.training_control_state = control_state
-                        (self.no_trade_patience, self.profitable_min_round_trips,
-                         self.profitable_min_traded_dates) = control_settings
+                        (self.no_trade_patience, self.no_trade_max_validations,
+                         self.profitable_min_round_trips, self.profitable_min_traded_dates,
+                         self.policy_update_checks, self.rollout_logprob_tolerance, self.kl_probe_samples) = control_settings
                         no_improve_count = 0
                 phase_seconds['validation'] = time.perf_counter() - phase_started
 
@@ -1511,10 +1618,16 @@ class GRPOTrainer:
             self._log_trading_diagnostics(episodes)
 
             if early_stop_reason:
-                logger.info('[EARLY STOP] reason=%s; %d consecutive non-improving no-trade validations '
-                            'with nonincreasing mean buy probability (verified validations=%d)',
-                            early_stop_reason, self.training_control_state.no_trade_streak,
-                            self.training_control_state.no_trade_evidence_count)
+                if early_stop_reason == 'no_trade_limit':
+                    logger.info('[EARLY STOP] reason=%s; %d consecutive verified no-trade validations '
+                                'reached limit=%d independently of buy-probability trend', early_stop_reason,
+                                self.training_control_state.consecutive_no_trade_validations,
+                                self.no_trade_max_validations)
+                else:
+                    logger.info('[EARLY STOP] reason=%s; %d consecutive non-improving no-trade validations '
+                                'with nonincreasing mean buy probability (verified validations=%d)',
+                                early_stop_reason, self.training_control_state.no_trade_streak,
+                                self.training_control_state.no_trade_evidence_count)
                 break
             
             # 조기 종료 체크: 실제 경과 타임스텝 수 기준
@@ -1832,8 +1945,12 @@ class GRPOTrainer:
                 'max_grad_norm': self.max_grad_norm,
                 'selection_require_liquidation': self.selection_require_liquidation,
                 'no_trade_patience': self.no_trade_patience,
+                'no_trade_max_validations': self.no_trade_max_validations,
                 'profitable_min_round_trips': self.profitable_min_round_trips,
                 'profitable_min_traded_dates': self.profitable_min_traded_dates,
+                'policy_update_checks': self.policy_update_checks,
+                'rollout_logprob_tolerance': self.rollout_logprob_tolerance,
+                'kl_probe_samples': self.kl_probe_samples,
                 **policy_config  # 정책 설정 병합
             }
         }
@@ -1863,16 +1980,24 @@ class GRPOTrainer:
         self._validate_checkpoint_action_mask(settings)
         coefficient = self._validate_group_advantage_coef(settings.get('group_advantage_coef', 1.0))
         no_trade_patience = integer_setting('no_trade_patience', settings.get('no_trade_patience', 0))
+        no_trade_max_validations = integer_setting('no_trade_max_validations', settings.get('no_trade_max_validations', 0))
+        update_check_settings = validate_update_check_settings(
+            settings.get('policy_update_checks', False), settings.get('rollout_logprob_tolerance', 1e-3),
+            settings.get('kl_probe_samples', 32))
+        if update_check_settings[0] and (finite_number(self.kl_target) is None or self.kl_target <= 0):
+            raise ValueError('policy_update_checks requires a finite positive kl_target')
         min_round_trips = integer_setting('profitable_min_round_trips', settings.get('profitable_min_round_trips', 20), 1)
         min_traded_dates = integer_setting('profitable_min_traded_dates', settings.get('profitable_min_traded_dates', 3), 1)
         control_state = TrainingControlState.from_dict(checkpoint.get('training_control_state'))
         if control_state.last_validation_iteration > checkpoint['iteration']:
             raise ValueError('Checkpoint validation control state exceeds its completed iteration')
-        if no_trade_patience and self.evaluation_callback is None:
+        if (no_trade_patience or no_trade_max_validations) and self.evaluation_callback is None:
             raise ValueError('Restoring no-trade early stopping requires a validation callback')
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.group_advantage_coef = coefficient
         self.no_trade_patience = no_trade_patience
+        self.no_trade_max_validations = no_trade_max_validations
+        (self.policy_update_checks, self.rollout_logprob_tolerance, self.kl_probe_samples) = update_check_settings
         self.profitable_min_round_trips = min_round_trips
         self.profitable_min_traded_dates = min_traded_dates
         self.training_control_state = control_state

@@ -29,6 +29,7 @@ class TrainingControlState:
     validation_count: int = 0
     no_trade_evidence_count: int = 0
     no_trade_streak: int = 0
+    consecutive_no_trade_validations: int = 0
     previous_buy_probability: float | None = None
     last_validation_iteration: int = 0
     stop_reason: str | None = None
@@ -40,25 +41,30 @@ class TrainingControlState:
     def from_dict(cls, state):
         if state is None:
             return cls()  # Checkpoints preceding this feature.
-        if not isinstance(state, dict) or set(state) != set(cls.__dataclass_fields__):
+        fields = set(cls.__dataclass_fields__)
+        legacy_fields = fields - {'consecutive_no_trade_validations'}
+        if not isinstance(state, dict) or set(state) not in (fields, legacy_fields):
             raise ValueError('Invalid checkpoint training_control_state')
+        state = {**state, 'consecutive_no_trade_validations': state.get('consecutive_no_trade_validations', 0)}
         for key in ('validation_count', 'no_trade_evidence_count', 'no_trade_streak',
-                    'last_validation_iteration'):
+                    'consecutive_no_trade_validations', 'last_validation_iteration'):
             integer_setting(f'training_control_state.{key}', state[key])
         probability = state['previous_buy_probability']
         if probability is not None:
             probability = finite_number(probability)
             if probability is None or not 0 <= probability <= 1:
                 raise ValueError('Invalid checkpoint previous_buy_probability')
-        if state['stop_reason'] not in (None, 'no_trade_collapse'):
+        if state['stop_reason'] not in (None, 'no_trade_collapse', 'no_trade_limit'):
             raise ValueError('Invalid checkpoint training control stop_reason')
         if not state['no_trade_streak'] <= state['no_trade_evidence_count'] <= state['validation_count']:
             raise ValueError('Invalid checkpoint training control counters')
+        if state['consecutive_no_trade_validations'] > state['validation_count']:
+            raise ValueError('Invalid checkpoint consecutive no-trade validation counter')
         if state['no_trade_streak'] and probability is None:
             raise ValueError('A no-trade streak requires a prior buy probability')
         return cls(**{**state, 'previous_buy_probability': probability})
 
-    def observe(self, metrics, *, iteration, score_improved, patience):
+    def observe(self, metrics, *, iteration, score_improved, patience, max_validations=0):
         """Unknown evidence resets continuity; revalidating a resume is not a new step."""
         self.validation_count += 1
         self.last_validation_iteration = iteration
@@ -73,27 +79,38 @@ class TrainingControlState:
         episodes = nonnegative_count(metrics.get('num_episodes'))
         mean_return = finite_number(metrics.get('mean_net_return'))
         verified = (no_trade == 1 and filled == 0 and episodes is not None and episodes > 0
-                    and buy is not None and 0 <= buy <= 1 and mean_return == 0
+                    and mean_return == 0
+                    and ('round_trip_count' not in metrics or nonnegative_count(metrics['round_trip_count']) == 0)
                     and nonnegative_count(metrics.get('incomplete_liquidation_episodes')) == 0
                     and finite_number(metrics.get('max_open_quantity')) == 0)
         detailed = diagnostics.get('episodes')
         if verified and detailed is not None:
             verified = (isinstance(detailed, list) and len(detailed) == episodes
                         and all(isinstance(ep, dict) and nonnegative_count(ep.get('filled_quantity')) == 0
+                                and ('round_trip_count' not in ep or nonnegative_count(ep['round_trip_count']) == 0)
                                 and finite_number(ep.get('open_quantity')) == 0
                                 and isinstance(ep.get('liquidation_complete'), (bool, np.bool_))
                                 and ep['liquidation_complete']
                                 for ep in detailed))
         if not verified:
             self.no_trade_streak = 0
+            self.consecutive_no_trade_validations = 0
             self.previous_buy_probability = None
             return False
-        self.no_trade_evidence_count += 1
-        nonincreasing = self.previous_buy_probability is not None and buy <= self.previous_buy_probability + 1e-12
-        self.no_trade_streak = self.no_trade_streak + 1 if nonincreasing and not score_improved else 0
-        self.previous_buy_probability = buy
+        self.consecutive_no_trade_validations += 1
+        if buy is not None and 0 <= buy <= 1:
+            self.no_trade_evidence_count += 1
+            nonincreasing = self.previous_buy_probability is not None and buy <= self.previous_buy_probability + 1e-12
+            self.no_trade_streak = self.no_trade_streak + 1 if nonincreasing and not score_improved else 0
+            self.previous_buy_probability = buy
+        else:
+            self.no_trade_streak = 0
+            self.previous_buy_probability = None
+        # Preserve the existing collapse reason when both thresholds fire together.
         if patience and self.no_trade_streak >= patience:
             self.stop_reason = 'no_trade_collapse'
+        elif max_validations and self.consecutive_no_trade_validations >= max_validations:
+            self.stop_reason = 'no_trade_limit'
         return self.stop_reason is not None
 
 

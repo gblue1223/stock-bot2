@@ -46,11 +46,15 @@ def test_v4_timed_rollout_update_and_batched_validation(tmp_path, device):
         torch.manual_seed(19)
         policy = create_policy(config, vector.envs[0], device)
         with torch.no_grad():
-            policy.policy_head.weight.zero_()
+            # Retain input-dependent logits so batch/encoder differences remain
+            # visible to the likelihood check, while preserving trading coverage.
+            policy.policy_head.weight.mul_(0.1)
             policy.policy_head.bias.copy_(torch.tensor([0., 2., 1.], device=device))
+        assert torch.count_nonzero(policy.policy_head.weight) > 0
         trainer = GRPOTrainer(policy, vector, episodes_per_group=2, num_groups=1,
                               batch_size=4, num_epochs=1, group_advantage_coef=0.,
-                              device=device, observation_schema=vector.envs[0].observation_schema)
+                              device=device, observation_schema=vector.envs[0].observation_schema,
+                              policy_update_checks=True, kl_probe_samples=4)
         episodes = trainer.collect_rollouts(4)
         assert len(episodes) == 4
         assert all(ep['states'].shape == (4, 8, 63) for ep in episodes)

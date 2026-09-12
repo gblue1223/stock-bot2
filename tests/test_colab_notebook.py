@@ -15,10 +15,9 @@ from lib.observations import ACCOUNT_FIELDS, EXECUTION_FIELDS, ObservationBuilde
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NOTEBOOK = ROOT / 'ai_trader/grpo/colab_train_xlstm.ipynb'
+NOTEBOOK = ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb'
 GIB = 1024 ** 3
-NOTEBOOK_NAMES = ('colab_train_xlstm.ipynb', 'colab_train_xlstm_astral.ipynb',
-                  'colab_train_xlstm_5splits_astral.ipynb', 'colab_train_xlstm_return_priority.ipynb')
+NOTEBOOK_NAMES = ('colab_train_xlstm_return_priority.ipynb',)
 
 
 def sources():
@@ -29,7 +28,7 @@ def sources():
 
 def helpers():
     namespace = {'GiB': GIB, 'ObservationBuilder': ObservationBuilder}
-    exec(compile(sources()['profile-functions'], str(NOTEBOOK), 'exec'), namespace)
+    exec(compile(sources()['profile-functions'], '<notebook-profile-functions>', 'exec'), namespace)
     return namespace
 
 
@@ -68,7 +67,6 @@ def test_notebook_and_embedded_runner_are_valid_python(name, monkeypatch):
     (80, 75, 70, 12, 32, 8, 16),
     (80, 75, 12, 12, 32, 2, 8),
     (40, 10, 26, 2, 8, 1, 16),
-    (40, 38, 6, 12, 16, 1, 8),
 ])
 def test_profile_respects_host_ram_and_cpu(vram, free, ram, cpus, batch, max_workers, episodes):
     namespace = helpers()
@@ -80,7 +78,8 @@ def test_profile_respects_host_ram_and_cpu(vram, free, ram, cpus, batch, max_wor
     assert profile['seq_len'] == 1024 and profile['rnn_hidden_dim'] == 512
 
 
-@pytest.mark.parametrize('hardware', [(10, 9, 50, 4), (40, 2, 50, 4), (40, 38, 3, 4)])
+@pytest.mark.parametrize('hardware', [(10, 9, 50, 4), (40, 2, 50, 4), (40, 38, 3, 4),
+                                      (40, 38, 6, 12)])
 def test_profile_rejects_insufficient_memory(hardware):
     with pytest.raises(ValueError):
         helpers()['a100_profile'](*hardware)
@@ -122,15 +121,18 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     assert config['max_holding_seconds'] == 300
     assert config['execution_config']['order_latency_ms'] > 0
     assert config['validation_fraction'] == config['test_fraction'] == .2
-    assert config['account_observations'] is False and config['liquidation_max_steps'] == 0
-    assert config['execution_observations'] is False
-    assert config['decision_interval_seconds'] == config['episode_duration_seconds'] == 0.
-    assert config['execution_action_mask'] is False
-    assert config['no_trade_patience'] == 0
+    assert config['account_observations'] is True and config['liquidation_max_steps'] == 300
+    assert config['execution_observations'] is True
+    assert config['decision_interval_seconds'] == 1.
+    assert config['episode_duration_seconds'] == 300.
+    assert config['execution_action_mask'] is True
+    assert config['no_trade_patience'] == 3
+    assert config['no_trade_max_validations'] == 4
+    assert config['policy_update_checks'] is True
     assert config['profitable_min_round_trips'] == 20
     assert config['profitable_min_traded_dates'] == 3
-    assert config['group_advantage_coef'] == 1. and config['training_seed'] == 42
-    assert config['evaluation_workers'] == 1
+    assert config['group_advantage_coef'] == 0. and config['training_seed'] == 42
+    assert config['evaluation_workers'] == config['num_workers']
 
 
 def checkpoint_and_base():
@@ -177,20 +179,12 @@ def test_restore_rejects_old_checkpoint_and_exhausted_resume_budget():
     assert not helpers()['restore_run_config'](base, checkpoint, 'finetune')['resume']
 
 
-def test_legacy_five_stage_notebook_resume_restores_recorded_limit():
+def test_checkpoint_resume_restores_recorded_stage_limit():
     checkpoint, base = checkpoint_and_base()
     checkpoint['observation_schema']['max_stages'] = 5
     checkpoint['extra_state']['training_config'].pop('max_stages')
     restored = helpers()['restore_run_config'](base, checkpoint, 'resume')
     assert base['max_stages'] == 1 and restored['max_stages'] == 5
-
-
-@pytest.mark.parametrize('name', ['colab_train_xlstm_astral.ipynb', 'colab_train_xlstm_5splits_astral.ipynb'])
-def test_astral_notebooks_share_return_priority_defaults(name, monkeypatch):
-    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
-    test_default_settings_are_supported_and_use_current_reward_and_execution()
-    for source in sources().values():
-        ast.parse(source)
 
 
 @pytest.mark.parametrize('name', NOTEBOOK_NAMES)
@@ -264,9 +258,13 @@ def test_return_priority_notebook_enables_new_observations_and_liquidation_tail(
     assert config['episode_duration_seconds'] == 300.
     assert config['execution_action_mask'] is True
     assert config['no_trade_patience'] == 3
+    assert config['no_trade_max_validations'] == 4
+    assert config['policy_update_checks'] is True
+    assert config['rollout_logprob_tolerance'] == 1e-3
+    assert config['kl_probe_samples'] == 32
     assert config['profitable_min_round_trips'] == 20
     assert config['profitable_min_traded_dates'] == 3
-    assert config['group_advantage_coef'] == 1. and config['training_seed'] == 42
+    assert config['group_advantage_coef'] == 0. and config['training_seed'] == 42
 
 
 @pytest.mark.parametrize('name', NOTEBOOK_NAMES)
@@ -304,8 +302,177 @@ def test_return_priority_experiments_change_only_the_declared_comparison(experim
 
 def test_return_priority_rejects_unknown_experiment(monkeypatch):
     monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
-    with pytest.raises(ValueError, match='EXPERIMENT'):
+    with pytest.raises(ValueError, match='EXPERIMENT') as error:
         default_config_namespace(EXPERIMENT='unrecorded_variant')
+    assert "'unrecorded_variant'" in str(error.value)
+    assert 'timed_gae_only' in str(error.value)
+
+
+@pytest.mark.parametrize('name', NOTEBOOK_NAMES)
+@pytest.mark.parametrize('mode', ['resume', 'finetune'])
+def test_missing_checkpoint_update_checks_remain_disabled(name, mode, monkeypatch):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
+    checkpoint, base = checkpoint_and_base()
+    for key in ('policy_update_checks', 'rollout_logprob_tolerance', 'kl_probe_samples',
+                'no_trade_max_validations'):
+        checkpoint['extra_state']['training_config'].pop(key, None)
+    restored = helpers()['restore_run_config'](base, checkpoint, mode)
+    assert restored['policy_update_checks'] is False
+    assert restored['rollout_logprob_tolerance'] == 1e-3
+    assert restored['kl_probe_samples'] == 32
+    assert restored['no_trade_max_validations'] == 0
+
+
+def likelihood_notebook_helpers(monkeypatch, **extra):
+    import gc
+    import numpy as np
+    import torch
+    from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
+
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
+    tree = ast.parse(sources()['gpu-probe'])
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
+    scope = dict(np=np, torch=torch, json=json, Path=Path, gc=gc,
+                 TrainingConfig=TrainingConfig, ObservationBuilder=ObservationBuilder,
+                 GRPOPolicyE2EXLSTM=GRPOPolicyE2EXLSTM, **extra)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), '<notebook-likelihood>', 'exec'), scope)
+    return scope
+
+
+def test_likelihood_probe_collects_distinct_environment_states_and_valid_masks(monkeypatch):
+    import numpy as np
+
+    class Environment:
+        closed = False
+        cache_cleared = False
+        calls = 0
+
+        def reset(self, seed):
+            self.index = seed
+            return np.full((4, 3), seed, dtype=np.float32), {}
+
+        def action_masks(self):
+            return np.array([True, self.index % 2 == 0, self.index % 2 != 0])
+
+        def step(self, action):
+            assert self.action_masks()[action]
+            self.calls += 1
+            self.index += 1
+            return np.full((4, 3), self.index, dtype=np.float32), 0., False, False, {}
+
+        def close(self):
+            self.closed = True
+
+        @classmethod
+        def clear_episode_cache(cls):
+            cls.cache_cleared = True
+
+    environment = Environment()
+    scope = likelihood_notebook_helpers(monkeypatch, create_environment=lambda *args: environment)
+    states, masks = scope['collect_likelihood_observations']({'num_workers': 3}, ['20260101'], 8, 42)
+    assert states.shape == (8, 4, 3) and masks.shape == (8, 3)
+    assert len(np.unique(states[:, 0, 0])) > 1
+    assert masks[:, 0].all() and masks.dtype == bool
+    assert environment.calls == 8 and environment.closed and environment.cache_cleared
+
+
+@pytest.mark.parametrize('initial_training', [False, True])
+@pytest.mark.parametrize('mismatch', [False, True])
+def test_likelihood_probe_uses_rollout_and_update_batches_with_grad_path(
+        monkeypatch, initial_training, mismatch):
+    import numpy as np
+    import torch
+
+    class Policy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.head = torch.nn.Linear(4, 3)
+            self.calls = []
+
+        def distribution(self, states, masks):
+            logits = self.head(states[:, -1])
+            if mismatch and self.training:
+                logits = logits + torch.tensor([2., -2., 0.])
+            return torch.distributions.Categorical(logits=logits.masked_fill(~masks, -torch.inf))
+
+        def get_action_with_value(self, states, deterministic, action_masks):
+            self.calls.append(('rollout', len(states), self.training, torch.is_grad_enabled()))
+            dist = self.distribution(states, action_masks)
+            action = dist.sample()
+            return action, dist.log_prob(action), states[:, 0, 0]
+
+        def evaluate_actions_with_distribution(self, states, actions, action_masks):
+            self.calls.append(('update', len(states), self.training, torch.is_grad_enabled()))
+            dist = self.distribution(states, action_masks)
+            return dist.log_prob(actions), dist.entropy(), states[:, 0, 0], dist.logits
+
+    torch.manual_seed(42)
+    policy = Policy().train(initial_training)
+    states = np.random.default_rng(42).normal(size=(8, 3, 4)).astype(np.float32)
+    masks = np.tile([True, True, False], (8, 1))
+    config = dict(num_workers=3, batch_size=5, execution_action_mask=True, rollout_logprob_tolerance=1e-3)
+    scope = likelihood_notebook_helpers(monkeypatch)
+    if mismatch:
+        with pytest.raises(ValueError, match='likelihood mismatch'):
+            scope['check_policy_likelihood_batches'](policy, states, masks, config, device='cpu')
+    else:
+        result = scope['check_policy_likelihood_batches'](policy, states, masks, config, device='cpu')
+        assert result['num_samples'] == 8 and result['max_abs_error'] < 1e-3
+        assert 'reference_log_probs' not in result
+        assert [call[1] for call in policy.calls if call[0] == 'update'] == [5, 3]
+    assert [call[1] for call in policy.calls if call[0] == 'rollout'] == [3, 3, 2]
+    assert all(not training and not grad for kind, _, training, grad in policy.calls if kind == 'rollout')
+    assert all(training and grad for kind, _, training, grad in policy.calls if kind == 'update')
+    assert policy.training is initial_training
+
+
+def test_diagnostic_checkpoint_is_separate_from_training_weights(monkeypatch, tmp_path):
+    import numpy as np
+    import torch
+    from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
+
+    schema = ObservationBuilder(['현재가', '등락률'], seq_len=8).schema
+    config = dict(cnn_channels=4, rnn_hidden_dim=4, hidden_dim=8, max_stages=1,
+                  checkpoint_segments=2, execution_action_mask=True, num_workers=2, batch_size=4,
+                  rollout_logprob_tolerance=1e-3, load_policy='unused-training-policy.pt')
+    policy = GRPOPolicyE2EXLSTM(obs_dim=17, cnn_channels=4, rnn_hidden_dim=4,
+        fc_hidden_dim=8, max_stages=1, checkpoint_segments=2, execution_action_mask=True)
+    checkpoint_path = tmp_path / 'diagnostic.pt'
+    torch.save(dict(policy_state_dict=policy.state_dict(), observation_schema=schema,
+                    extra_state={'training_config': config}), checkpoint_path)
+    scope = likelihood_notebook_helpers(monkeypatch, OBSERVATION_SCHEMA=schema)
+    states = np.random.default_rng(7).normal(size=(4, 8, 17)).astype(np.float32)
+    masks = np.tile([True, True, False], (4, 1))
+    result = scope['run_likelihood_preflight'](config, states, masks, str(checkpoint_path), device='cpu')
+    assert result['source'] == str(checkpoint_path) and result['num_samples'] == 4
+    assert config['load_policy'] == 'unused-training-policy.pt'
+    fresh = scope['run_likelihood_preflight'](config, states, masks, device='cpu')
+    assert fresh['source'] == 'fresh_nonzero_policy_head' and fresh['policy_head_nonzero']
+
+
+def test_likelihood_fingerprint_changes_with_checks_checkpoint_or_tf32(monkeypatch):
+    scope = likelihood_notebook_helpers(monkeypatch)
+    fingerprint = scope['likelihood_probe_fingerprint']
+    original = fingerprint({'policy_update_checks': True}, '', True)
+    assert original != fingerprint({'policy_update_checks': False}, '', True)
+    assert original != fingerprint({'policy_update_checks': True}, 'checkpoint_iter18.pt', True)
+    assert original != fingerprint({'policy_update_checks': True}, '', False)
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_training_subprocess_explicitly_passes_checked_settings_for_resume(monkeypatch, enabled):
+    monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo/colab_train_xlstm_return_priority.ipynb')
+    config = default_config_namespace()['CONFIG']
+    config['policy_update_checks'] = enabled
+    tree = ast.parse(sources()['train'])
+    assignment = next(node for node in tree.body if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == 'command' for target in node.targets))
+    scope = dict(sys=sys, runner='diagnostic-runner', CONFIG_PATH=Path('/unused/colab_config.json'), CONFIG=config)
+    exec(compile(ast.Module(body=[assignment], type_ignores=[]), '<training-command>', 'exec'), scope)
+    command = scope['command']
+    assert ('--policy_update_checks' if enabled else '--no-policy_update_checks') in command
+    for name in ('rollout_logprob_tolerance', 'kl_probe_samples', 'no_trade_max_validations'):
+        assert command[command.index('--' + name) + 1] == str(config[name])
 
 
 def test_timed_notebook_memory_estimate_accounts_for_replaying_full_market_rows(monkeypatch):

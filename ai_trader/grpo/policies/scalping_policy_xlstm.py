@@ -393,6 +393,12 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         """
         주어진 상태와 행동에 대한 로그 확률, 엔트로피, 가치 계산
         """
+        log_probs, entropy, values, _ = self.evaluate_actions_with_distribution(
+            states, actions, action_masks=action_masks)
+        return log_probs, entropy, values
+
+    def evaluate_actions_with_distribution(self, states, actions, action_masks=None):
+        """Evaluate chosen actions and every masked action in the same forward."""
         action_logits, state_values = self.forward(states, action_masks=action_masks)
         
         dist = Categorical(logits=action_logits)
@@ -407,4 +413,4 @@ class GRPOPolicyE2EXLSTM(nn.Module):
         entropy = dist.entropy()
         values = state_values.squeeze(-1)
         
-        return log_probs, entropy, values
+        return log_probs, entropy, values, dist.logits
