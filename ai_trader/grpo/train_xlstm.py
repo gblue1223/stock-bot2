@@ -32,6 +32,7 @@ from ai_trader.grpo.evaluation import (
 )
 from lib.observations import ObservationBuilder, validate_max_stages
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
+from ai_trader.grpo.runtime_precision import precision_metadata
 
 
 
@@ -614,6 +615,7 @@ def main():
             config.device = device
             
         logger.info(f"[OK] Using device: {device}")
+        logger.info('Runtime precision: %s', json.dumps(precision_metadata(), sort_keys=True))
         random.seed(config.training_seed)
         np.random.seed(config.training_seed)
         torch.manual_seed(config.training_seed)

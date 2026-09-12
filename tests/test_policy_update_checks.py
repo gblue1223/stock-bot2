@@ -248,6 +248,90 @@ def test_exact_kl_uses_reference_direction_and_zero_probability_mask_support():
     assert result['mean_kl'] == pytest.approx(.8 * np.log(2) + .2 * np.log(1 / 3), abs=1e-7)
 
 
+def test_sampled_guard_reports_exact_kl_for_the_triggering_batch_without_an_extra_forward(monkeypatch, caplog):
+    monkeypatch.setattr(np.random, 'permutation', lambda n: np.arange(n))
+    policy = CheckedPolicy()
+    with torch.no_grad():
+        policy.actor.weight.zero_()
+        policy.actor.bias.copy_(torch.tensor([np.log(.99), np.log(.01), 0.]))
+    data = episode(policy, 2, np.tile([True, True, False], (2, 1)))
+    trainer = GRPOTrainer(policy, object(), policy_update_checks=True, batch_size=1,
+                          num_epochs=1, kl_probe_samples=2, kl_target=.01)
+    original_step = trainer.optimizer.step
+
+    def drift_rare_action(*args, **kwargs):
+        original_step(*args, **kwargs)
+        with torch.no_grad():
+            policy.actor.weight.zero_()
+            policy.actor.bias.copy_(torch.tensor([np.log(.988), np.log(.012), 0.]))
+
+    trainer.optimizer.step = drift_rare_action
+    policy.calls.clear()
+    metrics = trainer.update_policy([data], [np.zeros(2)])
+    expected = .99 * np.log(.99 / .988) + .01 * np.log(.01 / .012)
+    assert metrics['optimizer_steps'] == metrics['optimizer_attempted_steps'] == 1
+    assert metrics['optimizer_rejected_steps'] == 0
+    assert metrics['pre_update_kl_early_stopped'] == metrics['pre_update_exact_kl_checked'] == 1
+    assert metrics['post_update_kl_early_stopped'] == 0
+    assert metrics['last_checked_kl'] > .015
+    assert metrics['pre_update_minibatch_exact_kl'] == pytest.approx(expected, abs=1e-7)
+    assert metrics['pre_update_minibatch_max_state_kl'] == pytest.approx(expected, abs=1e-7)
+    assert metrics['pre_update_minibatch_samples'] == 1
+    # Two preflight, two optimizer forwards, two post-step probe forwards.
+    assert len(policy.calls) == 6
+    assert 'same_batch exact KL' in caplog.text
+
+
+def test_failure_bundle_io_error_preserves_original_mismatch_and_optimizer(monkeypatch, tmp_path, caplog):
+    from ai_trader.grpo import grpo
+    policy = CheckedPolicy()
+    data = episode(policy)
+    data['log_probs'][1] += .05
+    trainer = GRPOTrainer(policy, object(), policy_update_checks=True, batch_size=3)
+    trainer.extra_checkpoint_state = {'training_config': {'output_dir': str(tmp_path), 'training_seed': 42}}
+    before = snapshot_optimizer_step(policy, trainer.optimizer)
+
+    def cannot_write(*args, **kwargs):
+        raise OSError('diagnostic disk full')
+
+    monkeypatch.setattr(grpo, 'save_likelihood_failure', cannot_write)
+    with pytest.raises(ValueError, match='Rollout likelihood mismatch'):
+        trainer.update_policy([data], [np.zeros(len(data['states']))])
+    assert 'diagnostic disk full' in caplog.text and 'preserving original mismatch' in caplog.text
+    assert_state_equal(before, snapshot_optimizer_step(policy, trainer.optimizer))
+    assert not list(tmp_path.rglob('*.pt'))
+
+
+def test_trainer_saves_failed_batch_and_current_weights_before_raising(tmp_path):
+    from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
+    policy = GRPOPolicyE2EXLSTM(obs_dim=2, cnn_channels=4, rnn_hidden_dim=4,
+                                fc_hidden_dim=8, execution_action_mask=True)
+    data = episode(policy, 7)
+    # The first batch passes; capture the second batch, including the bad value.
+    data['log_probs'][4] += .05
+    trainer = GRPOTrainer(policy, object(), policy_update_checks=True, batch_size=3)
+    trainer.num_updates, trainer.total_timesteps = 19, 52484
+    trainer.extra_checkpoint_state = {'training_config': {
+        'output_dir': str(tmp_path), 'training_seed': 42, 'num_workers': 8}}
+    before = snapshot_optimizer_step(policy, trainer.optimizer)
+    with pytest.raises(ValueError, match='Rollout likelihood mismatch'):
+        trainer.update_policy([data], [np.zeros(7)])
+    paths = list((tmp_path / 'diagnostics').glob('likelihood_update_000020_*.pt'))
+    assert len(paths) == 1
+    bundle = torch.load(paths[0], map_location='cpu', weights_only=True)
+    assert bundle['failure']['offset'] == 3
+    assert bundle['failure']['saved_batch_size'] == 3
+    assert bundle['failure']['total_rollout_samples'] == 7
+    assert bundle['context']['iteration'] == 20 and bundle['context']['num_updates'] == 19
+    assert bundle['context']['rollout_batch_size'] == 8
+    torch.testing.assert_close(bundle['batch']['states'], torch.from_numpy(data['states'][3:6]))
+    torch.testing.assert_close(bundle['batch']['actions'], torch.from_numpy(data['actions'][3:6]).long())
+    torch.testing.assert_close(bundle['batch']['action_masks'], torch.from_numpy(data['action_masks'][3:6]))
+    assert_state_equal(before[0], bundle['policy_state_dict'])
+    assert_state_equal(before, snapshot_optimizer_step(policy, trainer.optimizer))
+    assert trainer.num_updates == 19
+
+
 def test_update_check_configuration_restores_and_legacy_remains_disabled(tmp_path):
     trainer = GRPOTrainer(CheckedPolicy(), object(), policy_update_checks=True,
                           rollout_logprob_tolerance=.002, kl_probe_samples=7)

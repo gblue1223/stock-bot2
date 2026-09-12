@@ -104,7 +104,9 @@ def default_config_namespace(**settings):
 
 
 def test_default_settings_are_supported_and_use_current_reward_and_execution():
-    config = default_config_namespace()['CONFIG']
+    scope = default_config_namespace()
+    config = scope['CONFIG']
+    assert scope['ENABLE_TF32'] is True
     assert not set(config) - set(TrainingConfig().__dict__)
     assert config['device'] == 'cuda' and config['load_policy'] is None
     assert config['use_raw_data'] and config['use_gae']
@@ -457,6 +459,67 @@ def test_likelihood_fingerprint_changes_with_checks_checkpoint_or_tf32(monkeypat
     assert original != fingerprint({'policy_update_checks': False}, '', True)
     assert original != fingerprint({'policy_update_checks': True}, 'checkpoint_iter18.pt', True)
     assert original != fingerprint({'policy_update_checks': True}, '', False)
+
+
+def test_likelihood_fingerprint_detects_runtime_precision_changes(monkeypatch):
+    from ai_trader.grpo import runtime_precision
+
+    actual = {'matmul_fp32_precision': 'tf32'}
+    monkeypatch.setattr(runtime_precision, 'precision_metadata', lambda: dict(actual))
+    fingerprint = likelihood_notebook_helpers(monkeypatch)['likelihood_probe_fingerprint']
+    original = fingerprint({'policy_update_checks': True}, '', True)
+    actual['matmul_fp32_precision'] = 'ieee'
+    assert original != fingerprint({'policy_update_checks': True}, '', True)
+
+
+@pytest.mark.parametrize('selected_tf32', [False, True])
+def test_resume_keeps_current_tf32_checkbox_instead_of_saved_value(tmp_path, selected_tf32, capsys):
+    checkpoint_path = tmp_path / 'prior_run/checkpoints/checkpoint_iter18.pt'
+    checkpoint_path.parent.mkdir(parents=True)
+    (checkpoint_path.parent.parent / 'colab_run.json').write_text(json.dumps({
+        'manifest_sha256': 'same-data', 'enable_tf32': not selected_tf32, 'seed': 321}), encoding='utf-8')
+    resume_block = next(node for node in ast.walk(ast.parse(sources()['config']))
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name) and node.test.left.id == 'MODE'
+        and isinstance(node.test.ops[0], ast.Eq)
+        and isinstance(node.test.comparators[0], ast.Constant) and node.test.comparators[0].value == 'resume')
+    scope = dict(MODE='resume', Path=Path, json=json, LOAD_POLICY=str(checkpoint_path),
+                 ENABLE_TF32=selected_tf32, MANIFEST_SHA256='same-data', SEED=42)
+    exec(compile(ast.Module(body=[resume_block], type_ignores=[]), '<notebook-resume-precision>', 'exec'), scope)
+    assert scope['ENABLE_TF32'] is selected_tf32
+    assert scope['SEED'] == 321
+    output = capsys.readouterr().out
+    assert repr(selected_tf32) in output and repr(not selected_tf32) in output
+
+
+@pytest.mark.parametrize('specified_output', [False, True])
+def test_failure_replay_cell_runs_without_training_or_gpu_probe_state(tmp_path, specified_output):
+    bundle_path = tmp_path / 'failure bundle.pt'
+    bundle_path.write_bytes(b'fixture')
+    expected_output = tmp_path / ('manual.json' if specified_output else 'failure bundle_tf32_replay_123.json')
+    calls = []
+
+    def replay(command, **kwargs):
+        calls.append(command)
+        assert command[command.index('--bundle') + 1] == str(bundle_path)
+        assert command[command.index('--output') + 1] == str(expected_output)
+        expected_output.write_text(json.dumps({'diagnostic_only': True}), encoding='utf-8')
+        return SimpleNamespace(returncode=0, stdout='replay complete')
+
+    tree = ast.parse(sources()['likelihood-replay'])
+    replacements = {'LIKELIHOOD_FAILURE_BUNDLE': str(bundle_path),
+                    'DIAGNOSTIC_OUTPUT': str(expected_output) if specified_output else ''}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            if node.targets[0].id in replacements:
+                node.value = ast.Constant(replacements[node.targets[0].id])
+    scope = dict(Path=Path, json=json, sys=sys, os=os, REPO_PATH=ROOT,
+                 time=SimpleNamespace(time_ns=lambda: 123), subprocess=SimpleNamespace(
+                     run=replay, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT))
+    exec(compile(ast.fix_missing_locations(tree), '<independent-failure-replay>', 'exec'), scope)
+    assert len(calls) == 1
+    assert 'ai_trader.grpo.diagnose_likelihood' in calls[0]
+    assert '--rollout_logprob_tolerance' not in calls[0]
 
 
 @pytest.mark.parametrize('enabled', [False, True])

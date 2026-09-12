@@ -39,6 +39,8 @@ python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
 
 Drive에 `colab_config.json`, 소스·manifest 해시와 GPU 점검 결과가 담긴 `colab_run.json`, 학습 로그와 회당 체크포인트를 저장합니다. 끝의 평가 셀에서 순수익·실현손익·합성 체결·미청산 수량을 확인할 수 있고, 선택적인 체결 스트레스 검사는 validation에만 적용합니다. 실제 A100의 최대 메모리와 학습 속도는 Colab 사전 점검 및 실제 학습에서 확인해야 합니다.
 
+5번 설정 셀의 `ENABLE_TF32`는 재개 시에도 현재 선택이 우선하며, 실제 정밀도 설정을 시작 로그에 기록합니다. 학습 중 확률 불일치가 발생하면 실패 미니배치와 당시 가중치를 `diagnostics/`에 저장합니다. Colab의 선택적 진단 셀 또는 `python -m ai_trader.grpo.diagnose_likelihood`로 동일 입력의 TF32 ON/OFF를 비교할 수 있습니다. [실패 자료 진단 안내](SCALPING_LIKELIHOOD_DIAGNOSTICS_2026-09-12.md)를 참고하세요.
+
 ## 무거래 원인 진단
 
 검증 수익률과 거래 수가 모두 0이면 기존 체크포인트를 같은 검증 경로에서 다시 실행합니다. 재학습은 필요하지 않습니다. 진단 명령은 체크포인트의 관측 규격·날짜 분할·비용·체결 설정을 복원하며, 기본 에피소드 수와 시드도 저장된 값을 사용합니다.

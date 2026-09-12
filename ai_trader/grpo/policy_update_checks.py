@@ -5,6 +5,28 @@ import numpy as np
 import torch
 
 
+class RolloutLikelihoodMismatch(ValueError):
+    """A bounded, detached copy of the first minibatch that violates likelihood parity."""
+
+    def __init__(self, *, states, actions, action_masks, old_log_probs, recomputed_log_probs,
+                 offset, update_batch_size, total_samples, tolerance, max_abs_error):
+        super().__init__(f'Rollout likelihood mismatch before optimizer: max_abs_error={max_abs_error:.8g} '
+                         f'> tolerance={tolerance:.8g}; check train/rollout modes, batches and cached masks')
+        self.batch = {
+            'states': states.detach().to(device='cpu', copy=True),
+            'actions': actions.detach().to(device='cpu', copy=True),
+            'action_masks': (action_masks.detach().to(device='cpu', copy=True)
+                             if action_masks is not None else None),
+            'old_log_probs': old_log_probs.detach().to(device='cpu', copy=True),
+            'recomputed_log_probs': recomputed_log_probs.detach().to(device='cpu', copy=True),
+        }
+        self.offset = int(offset)
+        self.update_batch_size = int(update_batch_size)
+        self.total_samples = int(total_samples)
+        self.tolerance = float(tolerance)
+        self.max_abs_error = float(max_abs_error)
+
+
 def validate_update_check_settings(enabled, tolerance, probe_samples):
     if not isinstance(enabled, bool):
         raise ValueError('policy_update_checks must be a bool')
@@ -120,8 +142,16 @@ def check_rollout_likelihood(policy, states, actions, old_log_probs, action_mask
                 references.append(distribution.detach().cpu())
                 maximum = float(difference.max())
                 if maximum > tolerance:
-                    raise ValueError(f'Rollout likelihood mismatch before optimizer: max_abs_error={maximum:.8g} '
-                                     f'> tolerance={tolerance:.8g}; check train/rollout modes, batches and cached masks')
+                    failure = RolloutLikelihoodMismatch(
+                        states=states[start:end], actions=actions[start:end],
+                        action_masks=masks[start:end] if masks is not None else None,
+                        old_log_probs=old[start:end], recomputed_log_probs=chosen,
+                        offset=start, update_batch_size=batch_size, total_samples=len(states),
+                        tolerance=tolerance, max_abs_error=maximum)
+                    # Retain only the failure's detached CPU batch, never a live
+                    # gradient graph or a second copy of the full rollout.
+                    del chosen, entropy, values, distribution
+                    raise failure
                 del chosen, entropy, values, distribution
         if any(not torch.equal(buffer.detach().cpu(), saved_buffers[name])
                for name, buffer in policy.named_buffers()):
@@ -134,6 +164,28 @@ def check_rollout_likelihood(policy, states, actions, old_log_probs, action_mask
     errors = torch.cat(differences)
     return {'max_abs_error': float(errors.max()), 'mean_abs_error': float(errors.mean()),
             'num_samples': len(states), 'reference_log_probs': torch.cat(references)}
+
+
+def exact_kl_from_log_probs(reference_log_probs, current_log_probs):
+    """Calculate KL(reference || current) from two existing all-action CPU tables."""
+    baseline = torch.as_tensor(reference_log_probs, device='cpu').detach().double()
+    current = torch.as_tensor(current_log_probs, device='cpu').detach().double()
+    if baseline.ndim != 2 or not len(baseline) or not baseline.shape[1] or current.shape != baseline.shape:
+        raise ValueError('Reference and current log probabilities require matching nonempty N-by-action tables')
+    for name, table in (('reference', baseline), ('current', current)):
+        if torch.isnan(table).any() or torch.isposinf(table).any():
+            raise ValueError(f'Invalid {name} log probabilities')
+        if not torch.allclose(table.exp().sum(-1), torch.ones(len(table), dtype=torch.float64),
+                              atol=1e-6, rtol=1e-6):
+            raise ValueError(f'{name.capitalize()} log probabilities must be normalized')
+    probability = baseline.exp()
+    terms = torch.where(probability > 0, probability * (baseline - current), 0.)
+    per_state = terms.sum(-1)
+    if not torch.isfinite(per_state).all():
+        raise FloatingPointError('Nonfinite exact policy KL; current policy lost reference action support')
+    per_state = per_state.clamp_min(0)
+    return {'mean_kl': float(per_state.mean()), 'max_kl': float(per_state.max()),
+            'num_samples': len(per_state), 'per_state_kl': per_state}
 
 
 def exact_policy_kl(policy, states, actions, reference_log_probs, action_masks=None, *, batch_size=32, device=None):
@@ -158,14 +210,7 @@ def exact_policy_kl(policy, states, actions, reference_log_probs, action_masks=N
                     masks[start:end].to(_device(policy, device)) if masks is not None else None)
                 current = distribution.detach().cpu().double()
                 baseline = reference[start:end]
-                if current.shape != baseline.shape:
-                    raise ValueError('Fixed reference and current action distributions differ in shape')
-                probability = baseline.exp()
-                terms = torch.where(probability > 0, probability * (baseline - current), 0.)
-                divergence = terms.sum(-1)
-                if not torch.isfinite(divergence).all():
-                    raise FloatingPointError('Nonfinite exact post-update KL')
-                rows.append(divergence.clamp_min(0))  # Remove floating-point roundoff below zero.
+                rows.append(exact_kl_from_log_probs(baseline, current)['per_state_kl'])
                 del chosen, entropy, values, distribution
     finally:
         policy.train(was_training)

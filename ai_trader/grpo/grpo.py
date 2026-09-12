@@ -22,7 +22,9 @@ from .training_control import (TrainingControlState, finite_number, nonnegative_
                                integer_setting, profitable_candidate_evidence)
 from .policy_update_checks import (check_rollout_likelihood, exact_policy_kl,
                                    evaluate_action_distribution, snapshot_optimizer_step,
-                                   restore_optimizer_step, validate_update_check_settings)
+                                   restore_optimizer_step, validate_update_check_settings,
+                                   RolloutLikelihoodMismatch, exact_kl_from_log_probs)
+from .likelihood_failure import save_likelihood_failure
 import concurrent.futures  # ✅ 병렬 처리용 추가
 
 logger = logging.getLogger(__name__)
@@ -191,6 +193,31 @@ class GRPOTrainer:
         if self.writer:
             for name, value in self._numeric_metric_leaves(values):
                 self.writer.add_scalar(f'{prefix}/{name}', value, iteration)
+
+    def _record_likelihood_failure(self, failure):
+        """Persist one failed batch; diagnostic I/O must not mask the training error."""
+        training_config = self.extra_checkpoint_state.get('training_config', {})
+        output_dir = training_config.get('output_dir')
+        if not output_dir and self.writer is not None:
+            output_dir = os.path.dirname(os.path.abspath(self.writer.log_dir))
+        if not output_dir:
+            logger.warning('Likelihood failure bundle not saved: no training output directory is configured')
+            return
+        path = os.path.join(output_dir, 'diagnostics',
+                            f'likelihood_update_{self.num_updates + 1:06d}_{time.time_ns()}.pt')
+        try:
+            saved_path = save_likelihood_failure(
+                path, policy=self.policy, failure=failure,
+                observation_schema=self.observation_schema, training_config=training_config,
+                context={'iteration': self.num_updates + 1, 'num_updates': self.num_updates,
+                         'total_timesteps': self.total_timesteps,
+                         'rollout_batch_size': getattr(self.env, 'num_envs', training_config.get('num_workers', 1)),
+                         'update_batch_size': self.batch_size,
+                         'training_seed': training_config.get('training_seed')})
+            logger.error('Likelihood failure bundle saved to %s; no optimizer step was executed for update %d',
+                         saved_path, self.num_updates + 1)
+        except Exception:
+            logger.exception('Could not save likelihood failure bundle to %s; preserving original mismatch', path)
 
     def collect_rollouts(self, num_episodes: int) -> List[Dict[str, Any]]:
         """
@@ -811,9 +838,13 @@ class GRPOTrainer:
         reference_log_probs = None
         probe_indices = np.array([], dtype=np.int64)
         if self.policy_update_checks:
-            likelihood = check_rollout_likelihood(
-                self.policy, states_tensor, actions_tensor, old_log_probs_tensor, all_action_masks,
-                batch_size=self.batch_size, tolerance=self.rollout_logprob_tolerance, device=self.device)
+            try:
+                likelihood = check_rollout_likelihood(
+                    self.policy, states_tensor, actions_tensor, old_log_probs_tensor, all_action_masks,
+                    batch_size=self.batch_size, tolerance=self.rollout_logprob_tolerance, device=self.device)
+            except RolloutLikelihoodMismatch as failure:
+                self._record_likelihood_failure(failure)
+                raise
             reference_log_probs = likelihood.pop('reference_log_probs')
             probe_indices = np.linspace(0, len(all_states) - 1,
                                          min(self.kl_probe_samples, len(all_states)), dtype=np.int64)
@@ -844,6 +875,9 @@ class GRPOTrainer:
         checked_kl = 0.0
         attempted_steps = rejected_steps = 0
         post_update_stopped = False
+        pre_update_stopped = pre_exact_checked = False
+        pre_exact_mean = pre_exact_max = 0.0
+        pre_exact_samples = 0
         last_probe_kl = last_minibatch_kl = last_post_max_kl = 0.0
         accepted_probe_kl_sum = accepted_minibatch_kl_sum = 0.0
         post_update_check_seconds = snapshot_seconds = 0.0
@@ -868,7 +902,6 @@ class GRPOTrainer:
                 if self.policy_update_checks:
                     log_probs, entropy, values, action_distribution = evaluate_action_distribution(
                         self.policy, batch_states, batch_actions, batch_mask_kwargs.get('action_masks'))
-                    del action_distribution
                 else:
                     log_probs, entropy, values = self.policy.evaluate_actions(
                         batch_states, batch_actions, **batch_mask_kwargs)
@@ -884,10 +917,27 @@ class GRPOTrainer:
                 # Test the policy that would receive this step, without diluting
                 # a recent jump with earlier epochs' near-zero KL estimates.
                 if checked_kl > self.kl_target * 1.5:
-                    early_stopped = True
-                    logger.warning('Policy update %d KL guard stopped before optimizer step: %.6f > %.6f',
-                                   self.num_updates + 1, checked_kl, self.kl_target * 1.5)
+                    early_stopped = pre_update_stopped = True
+                    if self.policy_update_checks:
+                        # Diagnose the exact batch and forward that triggered the
+                        # sampled guard; preserve its existing stopping decision.
+                        pre_exact = exact_kl_from_log_probs(
+                            reference_log_probs[batch_indices], action_distribution.detach())
+                        pre_exact_checked = True
+                        pre_exact_mean, pre_exact_max = pre_exact['mean_kl'], pre_exact['max_kl']
+                        pre_exact_samples = pre_exact['num_samples']
+                        del action_distribution
+                        logger.warning('Policy update %d KL guard stopped before optimizer step: sampled=%.6f '
+                                       '> limit=%.6f; same_batch exact KL mean=%.6f, max=%.6f, samples=%d '
+                                       '(optimizer accepted=%d)', self.num_updates + 1, checked_kl,
+                                       self.kl_target * 1.5, pre_exact_mean, pre_exact_max,
+                                       pre_exact_samples, num_batches)
+                    else:
+                        logger.warning('Policy update %d KL guard stopped before optimizer step: %.6f > %.6f',
+                                       self.num_updates + 1, checked_kl, self.kl_target * 1.5)
                     break
+                if self.policy_update_checks:
+                    del action_distribution
                 
                 # 클리핑되지 않은 목적 함수
                 surr1 = ratio * batch_advantages
@@ -1030,6 +1080,11 @@ class GRPOTrainer:
             'likelihood_check_seconds': likelihood_check_seconds,
             'kl_probe_samples': len(probe_indices),
             'post_update_kl_early_stopped': int(post_update_stopped),
+            'pre_update_kl_early_stopped': int(pre_update_stopped),
+            'pre_update_exact_kl_checked': int(pre_exact_checked),
+            'pre_update_minibatch_exact_kl': pre_exact_mean,
+            'pre_update_minibatch_max_state_kl': pre_exact_max,
+            'pre_update_minibatch_samples': pre_exact_samples,
             'last_post_update_probe_kl': last_probe_kl,
             'last_post_update_minibatch_kl': last_minibatch_kl,
             'last_post_update_max_state_kl': last_post_max_kl,
