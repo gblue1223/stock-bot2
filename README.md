@@ -41,6 +41,8 @@ Drive에 `colab_config.json`, 소스·manifest 해시와 GPU 점검 결과가 �
 
 5번 설정 셀의 `ENABLE_TF32`는 재개 시에도 현재 선택이 우선하며, 실제 정밀도 설정을 시작 로그에 기록합니다. 학습 중 확률 불일치가 발생하면 실패 미니배치와 당시 가중치를 `diagnostics/`에 저장합니다. Colab의 선택적 진단 셀 또는 `python -m ai_trader.grpo.diagnose_likelihood`로 동일 입력의 TF32 ON/OFF를 비교할 수 있습니다. [실패 자료 진단 안내](SCALPING_LIKELIHOOD_DIAGNOSTICS_2026-09-12.md)를 참고하세요.
 
+재개 학습률은 5번 셀의 `RESUME_LR`(0이면 저장된 LR 유지), CLI의 `--resume_lr`로 명시적으로 변경합니다. Adam 상태를 유지하며, 선택적 7-2번 셀은 같은 rollout·가중치·Adam·난수 상태에서 세 학습률을 비교하고 전체 rollout KL을 기록합니다. [학습률 비교 안내](SCALPING_LEARNING_RATE_DIAGNOSTICS_2026-09-12.md)를 참고하세요.
+
 ## 무거래 원인 진단
 
 검증 수익률과 거래 수가 모두 0이면 기존 체크포인트를 같은 검증 경로에서 다시 실행합니다. 재학습은 필요하지 않습니다. 진단 명령은 체크포인트의 관측 규격·날짜 분할·비용·체결 설정을 복원하며, 기본 에피소드 수와 시드도 저장된 값을 사용합니다.

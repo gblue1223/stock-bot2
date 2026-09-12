@@ -107,6 +107,8 @@ def test_default_settings_are_supported_and_use_current_reward_and_execution():
     scope = default_config_namespace()
     config = scope['CONFIG']
     assert scope['ENABLE_TF32'] is True
+    assert scope['RESUME_LR'] == 0.0
+    assert config['resume_lr'] is None and config['capture_update_bundle'] is None
     assert not set(config) - set(TrainingConfig().__dict__)
     assert config['device'] == 'cuda' and config['load_policy'] is None
     assert config['use_raw_data'] and config['use_gae']
@@ -168,6 +170,23 @@ def test_restore_preserves_training_schema_and_costs_but_adapts_resource_setting
     assert result['resume'] == (mode == 'resume')
     assert result['lr'] == (.000123 if mode == 'resume' else base['lr'])
     assert checkpoint['extra_state']['training_config']['batch_size'] == 256
+
+
+@pytest.mark.parametrize('requested_lr', [None, 1e-5])
+def test_notebook_resume_lr_uses_current_request_not_saved_request(requested_lr):
+    checkpoint, base = checkpoint_and_base()
+    checkpoint['extra_state']['training_config'].update(resume_lr=3e-6, capture_update_bundle='previous.pt')
+    base['resume_lr'] = requested_lr
+    restored = helpers()['restore_run_config'](base, checkpoint, 'resume')
+    assert restored['resume_lr'] == requested_lr
+    assert restored['lr'] == (requested_lr if requested_lr is not None else .000123)
+    assert restored['capture_update_bundle'] is None
+
+
+@pytest.mark.parametrize('value', [-1., True, '1e-5', float('nan'), float('inf'), 1e-5])
+def test_notebook_rejects_invalid_or_nonresume_lr(value):
+    with pytest.raises(ValueError, match='RESUME_LR'):
+        default_config_namespace(RESUME_LR=value)
 
 
 def test_restore_rejects_old_checkpoint_and_exhausted_resume_budget():
@@ -536,6 +555,53 @@ def test_training_subprocess_explicitly_passes_checked_settings_for_resume(monke
     assert ('--policy_update_checks' if enabled else '--no-policy_update_checks') in command
     for name in ('rollout_logprob_tolerance', 'kl_probe_samples', 'no_trade_max_validations'):
         assert command[command.index('--' + name) + 1] == str(config[name])
+
+
+@pytest.mark.parametrize('resume_lr', [None, 1e-5])
+def test_training_command_only_passes_an_explicit_resume_lr(resume_lr):
+    config = default_config_namespace()['CONFIG']
+    config['resume_lr'] = resume_lr
+    tree = ast.parse(sources()['train'])
+    nodes = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == 'command' for target in node.targets):
+            nodes.append(node)
+        if isinstance(node, ast.If) and 'resume_lr' in ast.unparse(node.test):
+            nodes.append(node)
+    scope = dict(sys=sys, runner='runner', CONFIG_PATH=Path('/unused/config.json'), CONFIG=config)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), '<resume-lr-command>', 'exec'), scope)
+    command = scope['command']
+    assert ('--resume_lr' in command) is (resume_lr is not None)
+    if resume_lr is not None:
+        assert command[command.index('--resume_lr') + 1] == str(resume_lr)
+
+
+def test_update_diagnostic_cell_streams_commands_without_training_state(tmp_path, capsys):
+    import io
+
+    calls = []
+
+    class Process:
+        stdout = io.StringIO('collecting rollout\ncomparison complete\n')
+
+        def wait(self):
+            calls.append('wait')
+            return 0
+
+    def launch(command, **kwargs):
+        calls.append(command)
+        assert kwargs['start_new_session'] and kwargs['bufsize'] == 1
+        return Process()
+
+    tree = ast.parse(sources()['update-lr'])
+    helper = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+    scope = dict(REPO_PATH=ROOT, os=os, subprocess=SimpleNamespace(Popen=launch,
+        PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT, CalledProcessError=subprocess.CalledProcessError))
+    exec(compile(ast.Module(body=[helper], type_ignores=[]), '<stream-update-diagnostic>', 'exec'), scope)
+    scope['run_update_diagnostic'](['python', '-m', 'capture'], {})
+    assert calls == [['python', '-m', 'capture'], 'wait']
+    assert 'collecting rollout' in capsys.readouterr().out
+    assert Process.stdout.closed
 
 
 def test_timed_notebook_memory_estimate_accounts_for_replaying_full_market_rows(monkeypatch):

@@ -169,6 +169,21 @@ class GRPOTrainer:
                    f"num_groups={num_groups}, lr={learning_rate}, "
                    f"clip_epsilon={clip_epsilon}, device={device}")
     
+    def set_learning_rate(self, value: float) -> float:
+        """Change only Adam's learning rate, preserving moments and training progress."""
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+            raise ValueError('learning_rate must be a finite positive number')
+        rate = float(value)
+        if not np.isfinite(rate) or rate <= 0:
+            raise ValueError('learning_rate must be a finite positive number')
+        for group in self.optimizer.param_groups:
+            group['lr'] = rate
+        self.learning_rate = rate
+        training_config = self.extra_checkpoint_state.get('training_config')
+        if isinstance(training_config, dict):
+            training_config['lr'] = rate
+        return rate
+
     def _validate_group_advantage_coef(self, value: float) -> float:
         if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
             raise ValueError('group_advantage_coef must be a finite nonnegative number')
@@ -1297,6 +1312,20 @@ class GRPOTrainer:
                 return None
         return value
 
+    @staticmethod
+    def _candidate_with_current_metadata(candidate, extra):
+        """Keep imported Adam's actual LR in metadata without changing its state."""
+        selected = dict(candidate)
+        extra = dict(extra)
+        groups = candidate.get('optimizer_state_dict', {}).get('param_groups', [])
+        if groups:
+            saved_rate = groups[0]['lr']
+            selected['config'] = {**candidate.get('config', {}), 'learning_rate': saved_rate}
+            if isinstance(extra.get('training_config'), dict):
+                extra['training_config'] = {**extra['training_config'], 'lr': saved_rate}
+        selected['extra_state'] = extra
+        return selected
+
     def _consider_profitable_checkpoint(self, metrics, iteration, checkpoint_path, candidate=None):
         evidence = profitable_candidate_evidence(
             metrics, self.profitable_min_round_trips, self.profitable_min_traded_dates)
@@ -1318,8 +1347,7 @@ class GRPOTrainer:
             if candidate is None:
                 self.save_checkpoint(destination, iteration, extra_state=extra)
             else:
-                selected = dict(candidate)
-                selected['extra_state'] = extra
+                selected = self._candidate_with_current_metadata(candidate, extra)
                 torch.save(selected, destination)
         logger.info('Profitable validation candidate: %.6f%%, round_trips=%d, traded_dates=%d '
                     '(validation evidence; independent deployment evaluation still required)',
@@ -1399,8 +1427,7 @@ class GRPOTrainer:
             if best_checkpoint is None:
                 self.save_checkpoint(destination, start_iteration, extra_state=extra)
             else:
-                selected = dict(best_checkpoint)
-                selected['extra_state'] = extra
+                selected = self._candidate_with_current_metadata(best_checkpoint, extra)
                 torch.save(selected, destination)
         logger.info("Preserved initial validation baseline: %.6f%%", best_score)
         return best_score
@@ -1601,11 +1628,13 @@ class GRPOTrainer:
                     if os.path.exists(selected_path):
                         # Reverting parameters must not rewind the actual training budget.
                         steps, updates = self.total_timesteps, self.num_updates
+                        current_learning_rate = self.learning_rate
                         control_state = self.training_control_state
                         control_settings = (self.no_trade_patience, self.no_trade_max_validations,
                                             self.profitable_min_round_trips, self.profitable_min_traded_dates,
                                             self.policy_update_checks, self.rollout_logprob_tolerance, self.kl_probe_samples)
                         self.load_checkpoint(selected_path)
+                        self.set_learning_rate(current_learning_rate)
                         self.total_timesteps, self.num_updates = steps, updates
                         self.training_control_state = control_state
                         (self.no_trade_patience, self.no_trade_max_validations,

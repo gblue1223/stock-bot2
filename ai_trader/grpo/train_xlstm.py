@@ -32,7 +32,8 @@ from ai_trader.grpo.evaluation import (
 )
 from lib.observations import ObservationBuilder, validate_max_stages
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
-from ai_trader.grpo.runtime_precision import precision_metadata
+from ai_trader.grpo.runtime_precision import (precision_metadata, restore_precision,
+                                            set_tf32, snapshot_precision)
 
 
 
@@ -90,6 +91,8 @@ class TrainingConfig:
         self.episodes_per_group = 4
         self.num_groups = 4
         self.lr = 3e-5
+        self.resume_lr = None
+        self.capture_update_bundle = None
         self.gamma = 1.0  # Finite-episode net NAV: do not discount delayed profits.
         self.lambda_gae = 0.95
         self.group_advantage_coef = 1.0
@@ -167,7 +170,8 @@ class TrainingConfig:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = json.load(f)
             for key, value in config.items():
-                if hasattr(self, key):
+                # These are requests for this invocation, never replayed from a saved JSON.
+                if hasattr(self, key) and key not in ('resume_lr', 'capture_update_bundle'):
                     setattr(self, key, value)
             logger.info(f"[OK] Configuration loaded from {config_path}")
         except Exception as e:
@@ -224,6 +228,17 @@ class TrainingConfig:
             errors.append("resume must be a boolean")
         if self.resume and not self.load_policy:
             errors.append("--resume requires --load_policy")
+        if self.resume_lr is not None:
+            if (isinstance(self.resume_lr, bool) or not isinstance(self.resume_lr, (int, float))
+                    or not math.isfinite(self.resume_lr) or self.resume_lr <= 0):
+                errors.append('resume_lr must be finite and positive')
+            if not self.resume:
+                errors.append('resume_lr is valid only with --resume')
+        if self.capture_update_bundle is not None:
+            if not isinstance(self.capture_update_bundle, str) or not self.capture_update_bundle.strip():
+                errors.append('capture_update_bundle must be a nonempty path')
+            if not self.resume or not self.load_policy:
+                errors.append('capture_update_bundle requires --resume and --load_policy')
         for name in ('seq_len', 'episode_steps', 'num_workers', 'episodes_per_group',
                      'num_groups', 'batch_size', 'num_epochs', 'total_timesteps',
                      'evaluation_episodes', 'evaluation_interval', 'evaluation_workers',
@@ -373,12 +388,43 @@ def restore_resume_progress(trainer, config, checkpoint, control_overrides, sign
         trainer.training_control_state = type(trainer.training_control_state)()
         logger.info('Reset no-trade validation history because evaluation conditions or controls changed')
     config.lr = trainer.learning_rate
+    if config.resume_lr is not None:
+        previous_lr = trainer.learning_rate
+        trainer.set_learning_rate(config.resume_lr)
+        config.lr = trainer.learning_rate
+        logger.info('Explicit resume learning rate: %s -> %s; restored Adam moments are preserved',
+                    previous_lr, config.lr)
     config.group_advantage_coef = trainer.group_advantage_coef
     logger.info('Effective resume safeguards: policy_update_checks=%s, rollout_logprob_tolerance=%s, '
                 'kl_probe_samples=%s, no_trade_patience=%s, no_trade_max_validations=%s',
                 config.policy_update_checks, config.rollout_logprob_tolerance, config.kl_probe_samples,
                 config.no_trade_patience, config.no_trade_max_validations)
     return iteration
+
+
+def capture_next_update_bundle(trainer, config):
+    """Collect one real next update without optimizer, validation or checkpoint writes."""
+    from ai_trader.grpo.update_diagnostic import save_update_bundle
+
+    path = Path(config.capture_update_bundle).expanduser()
+    if os.path.lexists(path):
+        raise FileExistsError(f'Update bundle already exists: {path}')
+    path = path.resolve()
+    count = config.episodes_per_group * config.num_groups
+    logger.info('Capturing next %d rollouts for a fixed-policy/Adam learning-rate diagnostic; no training or evaluation', count)
+    episodes = trainer.collect_rollouts(count)
+    if len(episodes) != count:
+        raise RuntimeError(f'Capture requires {count} completed rollouts, received {len(episodes)}')
+    grouped = trainer.group_episodes(episodes)
+    group_advantages = trainer.compute_group_relative_advantages(grouped)
+    ordered_episodes, ordered_advantages = [], []
+    for group_id in sorted(grouped):
+        ordered_episodes.extend(grouped[group_id])
+        ordered_advantages.extend(group_advantages[group_id])
+    saved = save_update_bundle(path, trainer=trainer, episodes=ordered_episodes,
+                               advantages=ordered_advantages, training_config=dict(config.__dict__))
+    logger.info('Update comparison bundle saved: %s', saved or path)
+    return saved or str(path)
 
 
 def evaluate_final_test(policy, config, date_splits, device, final_metrics):
@@ -486,6 +532,10 @@ def main():
     parser.add_argument('--episodes_per_group', type=int, default=None)
     parser.add_argument('--num_groups', type=int, default=None)
     parser.add_argument('--lr', type=float, default=None)
+    parser.add_argument('--resume_lr', type=float, default=None,
+                        help='Explicit positive learning rate after restoring Adam; valid only with --resume')
+    parser.add_argument('--capture_update_bundle', type=str, default=None,
+                        help='Capture the next rollout group and restored policy/Adam for diagnosis, then exit without training')
     parser.add_argument('--gamma', type=float, default=None)
     parser.add_argument('--lambda_gae', type=float, default=None)
     parser.add_argument('--group_advantage_coef', type=float, default=None)
@@ -529,6 +579,7 @@ def main():
     device = "cpu"
     vec_env = ref_env = validation_env = test_env = trainer = None
     validation_envs = []
+    original_precision = None
     try:
         config = TrainingConfig(args.config)
         
@@ -605,10 +656,19 @@ def main():
                 logger.warning(f"Failed to auto-detect/adjust config from load_policy: {e}. Proceeding with manual config.")
 
         config.validate()
+        if config.capture_update_bundle:
+            destination = Path(config.capture_update_bundle).expanduser()
+            if os.path.lexists(destination):
+                raise FileExistsError(f'Update bundle already exists: {destination}')
+            original_precision = snapshot_precision()
+            set_tf32(False)
+            logger.info('Update bundle capture forces FP32 (TF32 disabled): %s',
+                        json.dumps(precision_metadata(), sort_keys=True))
         date_splits = prepare_date_splits(config)
-        os.makedirs(config.output_dir, exist_ok=True)
-        with open(Path(config.output_dir) / 'date_splits.json', 'w', encoding='utf-8') as handle:
-            json.dump(date_splits, handle, ensure_ascii=False, indent=2)
+        if not config.capture_update_bundle:
+            os.makedirs(config.output_dir, exist_ok=True)
+            with open(Path(config.output_dir) / 'date_splits.json', 'w', encoding='utf-8') as handle:
+                json.dump(date_splits, handle, ensure_ascii=False, indent=2)
         device = config.device
         if device == 'cuda' and not torch.cuda.is_available():
             device = 'cpu'
@@ -654,7 +714,7 @@ def main():
             
         ref_env = (vec_env.envs[0] if config.num_workers <= 1
                    else create_environment(config, device, date_splits['train']))
-        for _ in range(min(config.evaluation_workers, config.evaluation_episodes)):
+        for _ in range(0 if config.capture_update_bundle else min(config.evaluation_workers, config.evaluation_episodes)):
             validation_envs.append(create_environment(config, device, date_splits['validation']))
         
         # 정책 모델 생성
@@ -699,8 +759,10 @@ def main():
             
         # 트레이너 생성
         logger.info("[STEP 4/6] Creating trainer...")
-        os.makedirs(config.output_dir, exist_ok=True)
-        tensorboard_dir = os.path.join(config.output_dir, 'tensorboard_logs')
+        tensorboard_dir = None
+        if not config.capture_update_bundle:
+            os.makedirs(config.output_dir, exist_ok=True)
+            tensorboard_dir = os.path.join(config.output_dir, 'tensorboard_logs')
         
         trainer = GRPOTrainer(
             policy=policy,
@@ -755,19 +817,23 @@ def main():
                                   'policy_update_checks', 'rollout_logprob_tolerance', 'kl_probe_samples')
                                  if getattr(args, name) is not None}
             start_iteration = restore_resume_progress(trainer, config, checkpoint, control_overrides, signature)
-            if config.total_timesteps <= trainer.total_timesteps:
+            if not config.capture_update_bundle and config.total_timesteps <= trainer.total_timesteps:
                 raise ValueError("For --resume, total_timesteps must exceed the saved cumulative timesteps")
             trainer.extra_checkpoint_state['training_config'] = dict(config.__dict__)
             logger.info("Resuming iteration=%s, timesteps=%s, updates=%s with saved optimizer",
                         start_iteration, trainer.total_timesteps, trainer.num_updates)
         trainer.extra_checkpoint_state['evaluation_signature'] = signature
         resume_best_checkpoints = (load_resume_best_candidates(
-            checkpoint, config.load_policy, config.output_dir, signature) if config.resume else [])
+            checkpoint, config.load_policy, config.output_dir, signature)
+            if config.resume and not config.capture_update_bundle else [])
         
         # 7. 고정 거래 비용 적용 (커리큘럼 미사용)
         current_cost_rate = config.transaction_cost_rate
         vec_env.env_method('set_transaction_cost_rate', current_cost_rate)
         logger.info(f"[OK] Fixed transaction cost rate applied: {current_cost_rate:.6f}")
+        if config.capture_update_bundle:
+            capture_next_update_bundle(trainer, config)
+            return True
 
         # 훈련 관련 메트릭스 출력
         import math
@@ -829,6 +895,8 @@ def main():
         logger.error(f"Training failed: {e}", exc_info=True)
         return False
     finally:
+        if original_precision is not None:
+            restore_precision(original_precision)
         if trainer is not None and trainer.writer is not None:
             trainer.writer.close()
         if vec_env is not None:

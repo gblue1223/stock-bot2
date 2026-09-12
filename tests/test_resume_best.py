@@ -114,6 +114,35 @@ def test_fine_tuning_starts_an_independent_best(tmp_path):
     assert selected['extra_state']['best_validation_return'] == 1
 
 
+def test_best_revert_keeps_current_learning_rate_and_saves_it(tmp_path):
+    source = checkpoint(2, 10, {})
+    prior_best = checkpoint(5, 8, {})
+    policy = torch.nn.Linear(1, 1, bias=False)
+    policy.load_state_dict(source['policy_state_dict'])
+    trainer = WorseningTrainer(
+        policy, object(), episodes_per_group=1, num_groups=1, observation_schema=SCHEMA,
+        evaluation_callback=lambda current: {'mean_net_return': float(current.weight.item())})
+    trainer.restore_training_progress(source)
+    trainer.extra_checkpoint_state = {'training_config': {'lr': 3e-4}}
+    trainer.set_learning_rate(1e-5)
+    trainer.train(1, start_iteration=10, max_timesteps=11, resume=True,
+                  checkpoint_interval=1, revert_to_best_patience=1,
+                  checkpoint_path=str(tmp_path / 'checkpoint_iter{}.pt'),
+                  resume_best_checkpoints=[prior_best])
+    assert policy.weight.item() == 5  # The imported best really was loaded.
+    assert (trainer.total_timesteps, trainer.num_updates) == (11, 11)
+    assert trainer.learning_rate == trainer.optimizer.param_groups[0]['lr'] == 1e-5
+    saved = torch.load(tmp_path / 'checkpoint_iter11.pt', weights_only=True)
+    assert saved['config']['learning_rate'] == 1e-5
+    assert saved['optimizer_state_dict']['param_groups'][0]['lr'] == 1e-5
+    assert saved['extra_state']['training_config']['lr'] == 1e-5
+    imported = torch.load(tmp_path / 'checkpoint_best.pt', weights_only=True)
+    assert imported['optimizer_state_dict']['param_groups'][0]['lr'] == 3e-4
+    assert imported['config']['learning_rate'] == 3e-4
+    assert imported['extra_state']['training_config']['lr'] == 3e-4
+    assert trainer.extra_checkpoint_state['training_config']['lr'] == 1e-5
+
+
 @pytest.mark.parametrize('difference', ['schema', 'architecture', 'dates', 'lineage_dates', 'fees', 'source_output', 'dataset'])
 def test_unrelated_or_differently_evaluated_best_is_rejected(difference):
     config = {'output_dir': '/run/source', 'extracted_dir': '/data/source',
