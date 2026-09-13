@@ -9,6 +9,8 @@ import numpy as np
 
 from ai_trader.grpo.environments.scalping_env_e2e import GRPOScalpingEnv
 from lib.market_data import chronological_order, validate_feature_columns, PRICE_SCALES, resolve_feature_price_unit
+from lib.market_data import times_to_seconds
+from ai_trader.grpo.entry_pattern import validate_entry_pattern, entry_signal
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,11 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         with (self.extracted_dir / "manifest.json").open(encoding="utf-8") as stream:
             self.manifest_data = json.load(stream)
         metadata = self.manifest_data.get("metadata", {})
+        if self.entry_pattern_config is not None:
+            extracted = validate_entry_pattern(metadata.get('entry_pattern_config'))
+            selection_keys = ('min_buy_notional_krw', 'min_price_return', 'min_window_seconds', 'max_window_seconds')
+            if extracted is None or any(extracted[key] != self.entry_pattern_config[key] for key in selection_keys):
+                raise ValueError('Entry-pattern data missing or selection settings differ; re-extract into a new directory')
         self.feature_columns = validate_feature_columns(metadata.get("feature_columns"), self.expected_features)
         if metadata.get("feature_transform", "raw") != "raw":
             raise ValueError("Only raw episode features are supported; regenerate normalized episodes")
@@ -51,6 +58,9 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
             (ep["file_path"], ep["stock_code"], ep["date"], ep["length"])
             for ep in self.manifest_data.get("episodes", [])
             if self.allowed_dates is None or str(ep["date"]) in self.allowed_dates
+            if self.entry_pattern_config is None or any(
+                end >= self.seq_len - 1 and start < ep['length'] - 1
+                for start, end in ep.get('entry_signal_ranges', []))
         ]
         if not self.valid_keys:
             raise ValueError("No episodes match the requested dates")
@@ -77,7 +87,8 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
         if not full_path.is_relative_to(self.extracted_dir):
             raise ValueError("Episode path escapes extracted_dir")
         stat = full_path.stat()
-        key = (str(full_path), stat.st_mtime_ns, stat.st_size, tuple(self.feature_columns), self.price_unit)
+        key = (str(full_path), stat.st_mtime_ns, stat.st_size, tuple(self.feature_columns), self.price_unit,
+               json.dumps(self.entry_pattern_config, sort_keys=True))
         cls = type(self)
         while cls._episode_cache and cls._episode_cache_bytes > self.cache_max_bytes:
             _, (_, _, _, old_size) = cls._episode_cache.popitem(last=False)
@@ -114,6 +125,23 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                     raise ValueError(f"Execution price/size shape mismatch for {side}")
             if "last_price" not in execution and "현재가" in self.feature_columns:
                 execution["last_price"] = features[:, self.feature_columns.index("현재가")].astype(np.float64) * self.price_scale
+            if self.entry_pattern_config is not None:
+                if 'entry_signal' not in data or 'cumulative_buy_notional_krw' not in data:
+                    raise ValueError('Missing entry-pattern source arrays; re-extract data')
+                if len(set(metadata[:, 1])) != 1 or len(set(metadata[:, 0])) != 1:
+                    raise ValueError('Entry-pattern labels must stay within one stock/date')
+                stored = np.asarray(data['entry_signal'])
+                cumulative = np.asarray(data['cumulative_buy_notional_krw'], dtype=np.float64)
+                if stored.shape != (len(features),) or stored.dtype != np.bool_ or cumulative.shape != stored.shape:
+                    raise ValueError('Invalid entry-pattern array shape/type')
+                # Signals may include pre-extraction-window history, so recompute
+                # only where this file itself provides the entire lookback.
+                times = times_to_seconds(metadata[:, 2])
+                recomputed = entry_signal(times, execution['last_price'], cumulative[order], self.entry_pattern_config)
+                covered = times >= times[0] + self.entry_pattern_config['max_window_seconds']
+                if not np.array_equal(stored[order][covered], recomputed[covered]):
+                    raise ValueError('Stored entry signals disagree with BUY notional and prices')
+                execution['entry_signal'] = stored[order]
         for values in [features, metadata, *execution.values()]:
             values.setflags(write=False)
         size = features.nbytes + metadata.nbytes + sum(x.nbytes for x in execution.values())
@@ -134,7 +162,13 @@ class GRPOScalpingEnvXLSTM(GRPOScalpingEnv):
                 idx = int(options["episode_index"]) if "episode_index" in options else int(self.np_random.integers(len(self.valid_keys)))
                 file_name, stock, date, _ = self.valid_keys[idx]
                 features, metadata, execution = self._load_cached_episode(self.extracted_dir / file_name)
+                if self.entry_pattern_config is not None:
+                    self._full_entry_signal = execution['entry_signal']
+                    self._entry_target_times = times_to_seconds(metadata[:, 2])
+                    self._entry_target_prices = execution['last_price']
                 start, end = self._episode_slice_bounds(metadata)
+                if self.entry_pattern_config is not None:
+                    self._episode_entry_signal = self._full_entry_signal[start:end]
                 self.episode_execution = {name: values[start:end].copy() for name, values in execution.items()}
                 self.raw_accum_trade_value = features[start:end, self.accum_trade_value_index].copy()
                 self.episode_key = {"stock_code": str(stock), "date": str(date), "start_index": start}

@@ -63,7 +63,7 @@ def _bounded_cpu_tensor(value, *, dtype=None):
 
 
 def prepare_rollouts(episodes, advantages, *, action_dim, masked):
-    """Trim unused episode metadata; retain every update input and its numeric precision."""
+    """Retain update inputs and compact entry attribution, without market arrays in metadata."""
     if not isinstance(episodes, (list, tuple)) or not episodes or len(episodes) != len(advantages):
         raise ValueError('Expected a nonempty rollout and one advantage array per episode')
     result, saved_advantages = [], []
@@ -97,6 +97,14 @@ def prepare_rollouts(episodes, advantages, *, action_dim, masked):
             elif not tensor.is_floating_point():
                 raise ValueError(f'Rollout {key} must use a floating point dtype')
             saved[key] = tensor
+        metadata = episode.get('metadata', {})
+        if isinstance(metadata, dict) and 'entry_diagnostics' in metadata:
+            saved['metadata'] = {'entry_diagnostics': portable_metadata(metadata['entry_diagnostics'])}
+            start = metadata.get('episode_start', {})
+            if isinstance(start, dict):
+                saved['metadata']['episode_start'] = portable_metadata({
+                    key: start[key] for key in ('episode_key', 'seed')
+                    if key in start})
         masks = episode.get('action_masks')
         if masked:
             if masks is None:

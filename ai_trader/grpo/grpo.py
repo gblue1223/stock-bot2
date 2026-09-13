@@ -25,6 +25,8 @@ from .policy_update_checks import (check_rollout_likelihood, exact_policy_kl,
                                    restore_optimizer_step, validate_update_check_settings,
                                    RolloutLikelihoodMismatch, exact_kl_from_log_probs)
 from .likelihood_failure import save_likelihood_failure
+from .entry_credit import analyze_entry_credit
+from .entry_pattern import pattern_policy_credit
 import concurrent.futures  # ✅ 병렬 처리용 추가
 
 logger = logging.getLogger(__name__)
@@ -158,6 +160,7 @@ class GRPOTrainer:
         # 훈련 상태
         self.total_timesteps = 0
         self.num_updates = 0
+        self.last_entry_credit_report = None
         
         # 외부 상태 (체크포인트에 함께 저장됨, 예: curriculum cost rate)
         self.extra_checkpoint_state = {}
@@ -841,12 +844,20 @@ class GRPOTrainer:
             all_states, all_actions, np.concatenate(all_raw_gae) if all_raw_gae else None,
             np.concatenate(all_group_components), pre_normalized_advantages, all_advantages,
             all_returns, np.concatenate(all_old_values) if all_old_values else None)
+        self.last_entry_credit_report = analyze_entry_credit(
+            episodes, raw_gae=np.concatenate(all_raw_gae) if all_raw_gae else None,
+            group_component=np.concatenate(all_group_components),
+            pre_normalized=pre_normalized_advantages, normalized=all_advantages,
+            returns=all_returns, cached_values=np.concatenate(all_old_values) if all_old_values else None,
+            gamma=self.gamma, lambda_gae=self.lambda_gae)
         
         # VRAM 보호를 위해 전체 버퍼는 CPU 메모리에 유지합니다.
         states_tensor = torch.from_numpy(all_states).float()
         actions_tensor = torch.from_numpy(all_actions).long()
         old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float()
         advantages_tensor = torch.from_numpy(all_advantages).float()
+        pattern_credit = pattern_policy_credit(episodes)
+        pattern_tensor = torch.from_numpy(pattern_credit).float()
         returns_tensor = torch.from_numpy(all_returns).float()
         likelihood_started = time.perf_counter()
         likelihood = None
@@ -893,6 +904,8 @@ class GRPOTrainer:
         pre_update_stopped = pre_exact_checked = False
         pre_exact_mean = pre_exact_max = 0.0
         pre_exact_samples = 0
+        sampled_kl = 0.0
+        sampled_only_exceedances = exact_only_exceedances = 0
         last_probe_kl = last_minibatch_kl = last_post_max_kl = 0.0
         accepted_probe_kl_sum = accepted_minibatch_kl_sum = 0.0
         post_update_check_seconds = snapshot_seconds = 0.0
@@ -926,33 +939,38 @@ class GRPOTrainer:
                 ratio = torch.exp(log_probs - batch_old_log_probs)
                 log_ratio = log_probs - batch_old_log_probs
                 kl_divergence = ((ratio - 1) - log_ratio).mean()
-                checked_kl = float(kl_divergence.detach())
-                if not np.isfinite(checked_kl):
+                sampled_kl = float(kl_divergence.detach())
+                if not np.isfinite(sampled_kl):
                     raise FloatingPointError('Nonfinite policy KL; update aborted')
-                # Test the policy that would receive this step, without diluting
-                # a recent jump with earlier epochs' near-zero KL estimates.
-                if checked_kl > self.kl_target * 1.5:
+                checked_kl = sampled_kl
+                kl_limit = self.kl_target * 1.5
+                if self.policy_update_checks:
+                    # Reuse this forward's full masked distribution on every
+                    # batch. A chosen-action estimate can overstate or miss a
+                    # change, especially for rare actions in small minibatches.
+                    pre_exact = exact_kl_from_log_probs(
+                        reference_log_probs[batch_indices], action_distribution.detach())
+                    pre_exact_checked = True
+                    pre_exact_mean, pre_exact_max = pre_exact['mean_kl'], pre_exact['max_kl']
+                    pre_exact_samples = pre_exact['num_samples']
+                    checked_kl = pre_exact_mean
+                    sampled_only_exceedances += int(sampled_kl > kl_limit and checked_kl <= kl_limit)
+                    exact_only_exceedances += int(checked_kl > kl_limit and sampled_kl <= kl_limit)
+                    del action_distribution
+                # Use the current batch, without averaging in earlier near-zero
+                # checks. Legacy policies retain their sampled-only guard.
+                if checked_kl > kl_limit:
                     early_stopped = pre_update_stopped = True
                     if self.policy_update_checks:
-                        # Diagnose the exact batch and forward that triggered the
-                        # sampled guard; preserve its existing stopping decision.
-                        pre_exact = exact_kl_from_log_probs(
-                            reference_log_probs[batch_indices], action_distribution.detach())
-                        pre_exact_checked = True
-                        pre_exact_mean, pre_exact_max = pre_exact['mean_kl'], pre_exact['max_kl']
-                        pre_exact_samples = pre_exact['num_samples']
-                        del action_distribution
-                        logger.warning('Policy update %d KL guard stopped before optimizer step: sampled=%.6f '
-                                       '> limit=%.6f; same_batch exact KL mean=%.6f, max=%.6f, samples=%d '
-                                       '(optimizer accepted=%d)', self.num_updates + 1, checked_kl,
-                                       self.kl_target * 1.5, pre_exact_mean, pre_exact_max,
-                                       pre_exact_samples, num_batches)
+                        logger.warning('Policy update %d KL guard stopped before optimizer step: '
+                                       'exact KL mean=%.6f > limit=%.6f; sampled=%.6f, '
+                                       'max_state=%.6f, samples=%d (optimizer accepted=%d)',
+                                       self.num_updates + 1, checked_kl, kl_limit, sampled_kl,
+                                       pre_exact_max, pre_exact_samples, num_batches)
                     else:
-                        logger.warning('Policy update %d KL guard stopped before optimizer step: %.6f > %.6f',
-                                       self.num_updates + 1, checked_kl, self.kl_target * 1.5)
+                        logger.warning('Policy update %d KL guard stopped before optimizer step: sampled=%.6f > %.6f',
+                                       self.num_updates + 1, checked_kl, kl_limit)
                     break
-                if self.policy_update_checks:
-                    del action_distribution
                 
                 # 클리핑되지 않은 목적 함수
                 surr1 = ratio * batch_advantages
@@ -967,6 +985,12 @@ class GRPOTrainer:
                 
                 # 최소값 선택 (보수적 정책 업데이트)
                 policy_loss = -torch.min(surr1, surr2).mean()
+                # A distinct clipped actor objective attributes observed 1-5s
+                # outcomes directly to the BUY decision that caused each fill.
+                # No future labels enter the observation, NAV reward or critic.
+                pattern_batch = pattern_tensor[batch_indices].to(self.device)
+                pattern_loss = -torch.min(ratio * pattern_batch, ratio_clipped * pattern_batch).mean()
+                policy_loss = policy_loss + pattern_loss
                 
                 # 6. 가치 손실 계산 (MSE)
                 if self.use_gae:
@@ -1079,6 +1103,8 @@ class GRPOTrainer:
         # 평균 메트릭 계산
         update_metrics = {
             'policy_loss': total_policy_loss / max(1, num_batches),
+            'entry_pattern/credited_buy_decisions': int(np.count_nonzero(pattern_credit)),
+            'entry_pattern/mean_credit': float(np.mean(pattern_credit)),
             'value_loss': total_value_loss / max(1, num_batches),
             'entropy': total_entropy / max(1, num_batches),
             'kl_divergence': total_kl_divergence / max(1, num_batches),
@@ -1096,10 +1122,13 @@ class GRPOTrainer:
             'kl_probe_samples': len(probe_indices),
             'post_update_kl_early_stopped': int(post_update_stopped),
             'pre_update_kl_early_stopped': int(pre_update_stopped),
+            'pre_update_kl_uses_exact': int(self.policy_update_checks),
             'pre_update_exact_kl_checked': int(pre_exact_checked),
             'pre_update_minibatch_exact_kl': pre_exact_mean,
             'pre_update_minibatch_max_state_kl': pre_exact_max,
             'pre_update_minibatch_samples': pre_exact_samples,
+            'pre_update_sampled_only_exceedances': sampled_only_exceedances,
+            'pre_update_exact_only_exceedances': exact_only_exceedances,
             'last_post_update_probe_kl': last_probe_kl,
             'last_post_update_minibatch_kl': last_minibatch_kl,
             'last_post_update_max_state_kl': last_post_max_kl,
@@ -1109,6 +1138,7 @@ class GRPOTrainer:
             'rollback_snapshot_seconds': snapshot_seconds,
             'kl_early_stopped': int(early_stopped),
             'last_checked_kl': checked_kl,
+            'last_sampled_kl': sampled_kl,
             'preparation_seconds': preparation_seconds,
             'optimization_seconds': time.perf_counter() - optimization_started,
             'return_target_mean': float(all_returns.mean()),
@@ -1129,14 +1159,17 @@ class GRPOTrainer:
         # slashes form the same TensorBoard hierarchy as nested diagnostics.
         update_metrics.update({f'learning_signal/{key}': value
                                for key, value in self._numeric_metric_leaves(learning_signal)})
+        update_metrics.update({f'entry_credit/{key}': value
+                               for key, value in self.last_entry_credit_report['metrics'].items()})
         
         self.num_updates += 1
         if self.policy_update_checks:
             logger.info('Policy update %d checks: optimizer accepted=%d, attempted=%d, rejected=%d | '
                         'likelihood_max_abs_error=%.8g | last_attempt exact KL fixed_probe=%.6f, minibatch=%.6f '
-                        '(limit=%.6f, fixed_samples=%d)', self.num_updates, num_batches, attempted_steps,
+                        '(limit=%.6f, fixed_samples=%d) | pre_guard=exact, sampled_only_exceedances=%d, '
+                        'exact_only_exceedances=%d', self.num_updates, num_batches, attempted_steps,
                         rejected_steps, likelihood['max_abs_error'], last_probe_kl, last_minibatch_kl,
-                        self.kl_target * 1.5, len(probe_indices))
+                        self.kl_target * 1.5, len(probe_indices), sampled_only_exceedances, exact_only_exceedances)
         
         logger.debug(f"Policy updated: policy_loss={update_metrics['policy_loss']:.4f}, "
                     f"value_loss={update_metrics['value_loss']:.4f}, "
@@ -1275,6 +1308,22 @@ class GRPOTrainer:
         
         return advantages.astype(np.float32), returns.astype(np.float32)
     
+    def _record_entry_credit(self, iteration, checkpoint_path=None):
+        """Keep observed entry outcomes beside the exact pre-update learning signal."""
+        report = self.last_entry_credit_report
+        if report is None or not checkpoint_path:
+            return
+        directory = os.path.join(os.path.dirname(checkpoint_path.format(iteration)),
+                                 'diagnostics', 'entry_credit')
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f'iteration_{iteration:06d}.json')
+        payload = {'iteration': iteration, 'num_updates': self.num_updates,
+                   'total_timesteps': self.total_timesteps, 'report': report}
+        with open(path + '.tmp', 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+        os.replace(path + '.tmp', path)
+        logger.info('Entry credit diagnostics saved: %s', path)
+
     def _record_validation_metrics(self, metrics, iteration, checkpoint_path=None, label=None):
         """Persist the current evaluation even when it ties or loses to best."""
         if checkpoint_path:
@@ -1556,6 +1605,7 @@ class GRPOTrainer:
             
             # 5. 메트릭 로깅
             phase_started = time.perf_counter()
+            self._record_entry_credit(iteration + 1, checkpoint_path)
             if self.writer:
                 self._log_metrics(iteration, episodes, grouped_episodes, update_metrics)
             phase_seconds['diagnostics'] = time.perf_counter() - phase_started

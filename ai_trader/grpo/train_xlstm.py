@@ -3,7 +3,7 @@
 xLSTM 기반 GRPO 훈련 스크립트 (train_xlstm.py)
 
 재활용 가능 데이터 추출기(data_extractor.py)와 scalping_env_xlstm.py를 사용하여
-5단계 분할 매매 및 1~5초 급등 패턴/손절 훈련을 수행합니다.
+설정에 따라 과거 매수 체결대금/상승률로 진입을 제한하고 체결 후 1~5초 패턴을 학습합니다.
 """
 
 import os
@@ -73,8 +73,9 @@ class TrainingConfig:
         self.db_path = None
         self.extracted_dir = 'data/extracted_episodes_v2'
         self.table_name = 'datasets'
-        self.seq_len = 1024
-        self.features = 27
+        self.seq_len = 2048
+        self.entry_pattern_config = None  # Legacy NAV-only runs; the new example/Colab preset enables this.
+        self.features = 29
         self.episode_steps = 300
         self.account_observations = True
         self.execution_observations = True
@@ -188,6 +189,10 @@ class TrainingConfig:
             logger.error(f"Failed to save configuration: {e}", exc_info=True)
 
     def validate(self):
+        from ai_trader.grpo.entry_pattern import validate_entry_pattern
+        self.entry_pattern_config = validate_entry_pattern(self.entry_pattern_config)
+        if self.entry_pattern_config is not None and not self.execution_action_mask:
+            raise ValueError('entry_pattern_config requires execution_action_mask=True')
         errors = []
         validate_max_stages(self.max_stages)
         if not isinstance(self.selection_require_liquidation, bool):
@@ -278,6 +283,7 @@ def create_environment(config: TrainingConfig, device: str, allowed_dates=None, 
             account_observations=config.account_observations,
             execution_observations=config.execution_observations,
             execution_action_mask=config.execution_action_mask,
+            entry_pattern_config=config.entry_pattern_config,
             liquidation_max_steps=config.liquidation_max_steps,
             decision_interval_seconds=config.decision_interval_seconds,
             episode_duration_seconds=config.episode_duration_seconds,
@@ -476,6 +482,8 @@ def main():
     
     # 기타 인자들
     parser.add_argument('--seq_len', type=int, default=None)
+    parser.add_argument('--entry_pattern_config', type=json.loads, default=None,
+                        help='JSON entry pattern selection/target settings; use --config for normal runs')
     parser.add_argument('--features', type=int, default=None)
     parser.add_argument('--episode_steps', type=int, default=None)
     parser.add_argument('--num_workers', type=int, default=None, help='Number of parallel environment workers')
@@ -610,6 +618,15 @@ def main():
                 saved_schema = checkpoint.get('observation_schema', {})
                 saved_config = {**checkpoint.get('config', {}),
                                 **checkpoint.get('extra_state', {}).get('training_config', {})}
+                if config.resume:
+                    from ai_trader.grpo.entry_pattern import validate_entry_pattern
+                    saved_pattern = validate_entry_pattern(saved_config.get('entry_pattern_config'))
+                    requested_pattern = validate_entry_pattern(config.entry_pattern_config)
+                    if requested_pattern is not None and requested_pattern != saved_pattern:
+                        raise ValueError('Cannot change entry-pattern objective on resume; start a new run')
+                    config.entry_pattern_config = saved_pattern
+                    if args.seq_len is None and saved_schema.get('seq_len') is not None:
+                        config.seq_len = saved_schema['seq_len']
                 if args.account_observations is None:
                     config.account_observations = saved_schema.get('version') in (3, 4)
                 if args.execution_observations is None:
@@ -653,6 +670,8 @@ def main():
                 else:
                     logger.info("[CHECKPOINT DETECT] GRU checkpoint detected. Only CNN shapes will be auto-matched. RNN/FC will use config settings.")
             except Exception as e:
+                if config.resume:
+                    raise
                 logger.warning(f"Failed to auto-detect/adjust config from load_policy: {e}. Proceeding with manual config.")
 
         config.validate()
@@ -676,6 +695,8 @@ def main():
             
         logger.info(f"[OK] Using device: {device}")
         logger.info('Runtime precision: %s', json.dumps(precision_metadata(), sort_keys=True))
+        logger.info('Entry-pattern selection/actor objective: %s; seq_len=%s',
+                    json.dumps(config.entry_pattern_config, sort_keys=True), config.seq_len)
         random.seed(config.training_seed)
         np.random.seed(config.training_seed)
         torch.manual_seed(config.training_seed)

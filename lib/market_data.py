@@ -80,11 +80,52 @@ def canonical_feature_columns(expected_features: int = 27) -> list[str]:
     from lib.normalization import FEATURE_NAMES
     if expected_features == 27:
         return list(FEATURE_NAMES)
+    if expected_features == 29:
+        return list(FEATURE_NAMES) + ["시초가", "시초가대비등락률"]
     if expected_features == 28:
         return ["종목명_scalar", "시간_sin", "시간_cos", "시간_scalar",
                 "등락률", "누적거래대금", "거래회전율", "체결강도"] + [
                     f"{side}대기금액{i}" for side in ("매도", "매수") for i in range(1, 11)]
     raise ValueError(f"No registered feature schema with {expected_features} columns")
+
+
+def add_opening_price_features(frame):
+    """Add causal opening references to one chronologically sorted stock/day.
+
+    Prefer a reported 시초가/시가. Otherwise use the first positive price in
+    09:00:00.xxx (the opening second), never a later sample or premarket price.
+    Zero means the opening price has not yet become available.
+    """
+    import pandas as pd
+
+    result = frame.copy()
+    seconds = times_to_seconds(result['시간'])
+    if not np.isfinite(seconds).all() or np.any(np.diff(seconds) < 0):
+        raise ValueError('Opening prices require valid chronological timestamps')
+    for key in ('종목코드', '날짜'):
+        if key in result and result[key].nunique(dropna=False) != 1:
+            raise ValueError('Opening prices require a single stock/date')
+    prices = pd.to_numeric(result['현재가'], errors='coerce').to_numpy(dtype=float)
+    candidates = np.full(len(result), np.nan)
+    for name in ('시초가', '시가'):
+        if name in result:
+            values = pd.to_numeric(result[name], errors='coerce').to_numpy(dtype=float)
+            valid = np.isnan(candidates) & np.isfinite(values) & (values > 0)
+            candidates[valid] = values[valid]
+    opening_tick = (seconds >= 32400) & (seconds < 32401) & np.isfinite(prices) & (prices > 0)
+    candidates[np.isnan(candidates) & opening_tick] = prices[np.isnan(candidates) & opening_tick]
+    candidates[seconds < 32400] = np.nan
+    known = np.flatnonzero(np.isfinite(candidates))
+    opening = np.zeros(len(result))
+    if len(known):
+        opening[known[0]:] = candidates[known[0]]
+    result['시초가'] = opening
+    prices = pd.Series(prices).ffill().to_numpy()
+    returns = np.zeros(len(result))
+    valid = (opening > 0) & np.isfinite(prices) & (prices > 0)
+    returns[valid] = (prices[valid] / opening[valid] - 1) * 100
+    result['시초가대비등락률'] = returns
+    return result
 
 
 def validate_feature_columns(columns, expected_features: int | None = None) -> list[str]:

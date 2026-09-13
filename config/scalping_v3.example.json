@@ -1,8 +1,20 @@
 {
-  "extracted_dir": "data/extracted_episodes",
+  "extracted_dir": "data/extracted_episodes_entry_pattern",
   "output_dir": "models/scalping_v3",
-  "features": 27,
-  "seq_len": 120,
+  "features": 29,
+  "seq_len": 2048,
+  "entry_pattern_config": {
+    "min_buy_notional_krw": 3000000000.0,
+    "min_price_return": 0.01,
+    "min_window_seconds": 5.0,
+    "max_window_seconds": 60.0,
+    "target_min_seconds": 1.0,
+    "target_max_seconds": 5.0,
+    "policy_coef": 1.0
+  },
+  "execution_action_mask": true,
+  "decision_interval_seconds": 1.0,
+  "episode_duration_seconds": 300.0,
   "episode_steps": 300,
   "rolling_window_size": 120,
   "rolling_min_samples": 30,

@@ -151,10 +151,10 @@ def test_return_priority_notebook_uses_new_schema_width_and_preserves_old_resume
     exec(compile(cells['profile-functions'], str(notebook), 'exec'), scope)
     defaults = vars(TrainingConfig()).copy()
     assert defaults['account_observations'] and defaults['liquidation_max_steps'] == 300
-    assert scope['model_obs_dim'](defaults) == 63
-    assert scope['model_obs_dim']({**defaults, 'execution_observations': False}) == 53
+    assert scope['model_obs_dim'](defaults) == 65
+    assert scope['model_obs_dim']({**defaults, 'execution_observations': False}) == 55
     assert scope['model_obs_dim']({**defaults, 'account_observations': False,
-                                   'execution_observations': False}) == 42
+                                   'execution_observations': False}) == 44
     profile = scope['a100_profile'](40, 38, 50, 12)
     assert profile['account_observations']
     assert scope['estimated_host_gib'](profile) < 35

@@ -1,5 +1,6 @@
-"""Compare one frozen GRPO update at different learning rates; never export a model."""
+"""Compare one frozen GRPO update; optionally export candidates for separate validation."""
 import argparse
+from copy import deepcopy
 import gc
 import hashlib
 import io
@@ -17,7 +18,8 @@ from .likelihood_failure import portable_metadata, runtime_metadata
 from .policy_update_checks import clone_state_to_cpu, exact_kl_from_log_probs, exact_policy_kl
 from .runtime_precision import precision_metadata, restore_precision, set_tf32
 from .update_diagnostic import (BUNDLE_FORMAT, BUNDLE_VERSION, TRAINER_FIELDS, bounded_rollout_batches,
-                                prepare_rollouts, restore_rng, snapshot_rng, verify_rollout_likelihood)
+                                atomic_save_exclusive, prepare_rollouts, restore_rng, snapshot_rng,
+                                verify_rollout_likelihood)
 
 
 DEFAULT_LEARNING_RATES = (3e-5, 1e-5, 3e-6)
@@ -103,15 +105,105 @@ def _guard_reason(metrics):
     if metrics.get('post_update_kl_early_stopped'):
         return 'post_step_exact_kl_rollback'
     if metrics.get('pre_update_kl_early_stopped'):
+        if metrics.get('pre_update_kl_uses_exact'):
+            return 'pre_step_exact_kl'
         return 'pre_step_sampled_kl'
     return 'completed_configured_epochs'
 
 
-def run_diagnostics(bundle_path, *, learning_rates=DEFAULT_LEARNING_RATES, device='auto'):
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _prepare_exports(bundle_path, source_checkpoint, export_dir, rates):
+    """Validate every destination and source before any optimizer update starts."""
+    from .local_check_inputs import validate_bundle_source
+
+    directory = Path(export_dir).expanduser().resolve()
+    if directory.exists() and not directory.is_dir():
+        raise NotADirectoryError(f'Candidate export directory is not a directory: {directory}')
+    paths = [directory / f'lr_{index:02d}_{rate:.12g}.pt' for index, rate in enumerate(rates)]
+    for path in paths:
+        if os.path.lexists(path):
+            raise FileExistsError(f'Candidate checkpoint already exists: {path}')
+    source_path = Path(source_checkpoint).expanduser().resolve()
+    verification = validate_bundle_source(bundle_path, source_path)
+    source = torch.load(source_path, map_location='cpu', weights_only=True)
+    # Retain source metadata only; each variant already owns its policy/Adam copy.
+    metadata = {
+        'training_config': portable_metadata(source['extra_state']['training_config']),
+        'date_splits': deepcopy(verification['date_splits']),
+        'observation_schema': deepcopy(source['observation_schema']),
+        'iteration': source['iteration'], 'num_updates': source['num_updates'],
+        'total_timesteps': source['total_timesteps'],
+    }
+    provenance = {
+        'source_checkpoint': str(source_path), 'source_checkpoint_sha256': _sha256_file(source_path),
+        'bundle': str(Path(bundle_path).resolve()), 'bundle_sha256': _sha256_file(bundle_path),
+        'export_dir': str(directory), 'source_verification': verification,
+    }
+    return paths, metadata, provenance
+
+
+def _export_candidate(path, *, trainer, bundle, source, provenance, variant, index):
+    """Save the actual accepted/rolled-back final policy without inherited scores."""
+    config = deepcopy(source['training_config'])
+    hyperparameters = {name: getattr(trainer, name) for name in TRAINER_FIELDS}
+    for name, value in hyperparameters.items():
+        config[{'learning_rate': 'lr', 'clip_epsilon': 'clip'}.get(name, name)] = value
+    # Invocation requests are not properties of the resulting evaluation policy.
+    config['resume_lr'] = None
+    config['capture_update_bundle'] = None
+    calls = trainer.num_updates - bundle['progress']['num_updates']
+    if calls != 1:
+        raise ValueError('Candidate export requires exactly one completed diagnostic update call')
+    export_provenance = {
+        'source_checkpoint': provenance['source_checkpoint'],
+        'source_checkpoint_sha256': provenance['source_checkpoint_sha256'],
+        'bundle': provenance['bundle'], 'bundle_sha256': provenance['bundle_sha256'],
+        'variant_index': index, 'learning_rate': trainer.learning_rate,
+        'source_iteration': source['iteration'], 'source_num_updates': source['num_updates'],
+        'source_total_timesteps': source['total_timesteps'],
+        'bundle_num_updates': bundle['progress']['num_updates'],
+        'bundle_total_timesteps': bundle['progress']['total_timesteps'],
+        'completed_update_calls': calls, 'guard_reason': variant['guard_reason'],
+        'optimizer_accepted_steps': variant['metrics']['optimizer_accepted_steps'],
+        'optimizer_attempted_steps': variant['metrics']['optimizer_attempted_steps'],
+        'optimizer_rejected_steps': variant['metrics']['optimizer_rejected_steps'],
+        'full_rollout_kl': variant['full_rollout_kl'], 'runtime': runtime_metadata(trainer.policy),
+        'candidate_validation_performed': False, 'inherited_validation_scores': False,
+    }
+    payload = {
+        'checkpoint_kind': 'fixed_rollout_evaluation_candidate', 'format_version': 1,
+        'evaluation_only': True, 'resumable': False,
+        'iteration': source['iteration'] + calls, 'num_updates': trainer.num_updates,
+        'total_timesteps': trainer.total_timesteps,
+        'policy_state_dict': clone_state_to_cpu(getattr(trainer.policy, 'module', trainer.policy).state_dict()),
+        'observation_schema': deepcopy(source['observation_schema']),
+        'config': portable_metadata(hyperparameters),
+        'extra_state': {'training_config': portable_metadata(config),
+                        'date_splits': deepcopy(source['date_splits']),
+                        'export_provenance': portable_metadata(export_provenance)},
+    }
+    # No source optimizer/control/best/validation state is copied into an evaluation candidate.
+    saved = atomic_save_exclusive(path, payload)
+    logger.info('Evaluation-only candidate saved: %s (LR %.9g, accepted optimizer steps %d)',
+                saved, trainer.learning_rate, export_provenance['optimizer_accepted_steps'])
+    return saved
+
+
+def run_diagnostics(bundle_path, *, learning_rates=DEFAULT_LEARNING_RATES, device='auto',
+                    source_checkpoint=None, export_dir=None):
     """Replay independently; restore the caller's precision and RNG even on failure."""
     from .grpo import GRPOTrainer
 
     rates = _rates(learning_rates)
+    if (source_checkpoint is None) != (export_dir is None):
+        raise ValueError('source_checkpoint and export_dir must be provided together')
     if device not in ('auto', 'cpu', 'cuda'):
         raise ValueError('device must be auto, cpu or cuda')
     selected_device = ('cuda' if torch.cuda.is_available() else 'cpu') if device == 'auto' else device
@@ -122,9 +214,13 @@ def run_diagnostics(bundle_path, *, learning_rates=DEFAULT_LEARNING_RATES, devic
     report = None
     try:
         set_tf32(False)
+        export_paths = source = export_provenance = None
+        if export_dir is not None:
+            export_paths, source, export_provenance = _prepare_exports(bundle_path, source_checkpoint, export_dir, rates)
         bundle = _load_bundle(bundle_path)
         parameters = bundle['trainer_hyperparameters']
-        numpy_episodes = [{key: tensor.numpy() for key, tensor in episode.items()} for episode in bundle['episodes']]
+        numpy_episodes = [{key: value.numpy() if isinstance(value, torch.Tensor) else deepcopy(value)
+                           for key, value in episode.items()} for episode in bundle['episodes']]
         numpy_advantages = [tensor.numpy() for tensor in bundle['advantages']]
         replay_rng = bundle['rng_state']
         cuda_rng_notice = None
@@ -149,12 +245,18 @@ def run_diagnostics(bundle_path, *, learning_rates=DEFAULT_LEARNING_RATES, devic
             'cross_runtime_notice': 'Different hardware or PyTorch versions can change numeric results; compare variants within this run.',
             'variants': [],
         }
+        if export_provenance is not None:
+            report.update(export_provenance)
+            report['purpose'] = ('Update stability comparison with evaluation-only policy candidates for separate validation; '
+                                 'candidate export is not a deployment or profitability qualification.')
         reference = None
-        for rate in rates:
+        for index, rate in enumerate(rates):
             logger.info('Replaying fixed update at LR %.9g (%d samples, batch size %d)',
                         rate, report['sample_count'], report['batch_size'])
             variant_started = time.perf_counter()
             variant = {'learning_rate': rate, 'status': 'error', 'metrics': None, 'full_rollout_kl': None}
+            if export_paths is not None:
+                variant.update(candidate_checkpoint=None, candidate_sha256=None)
             try:
                 policy = _policy_for_bundle(bundle, selected_device)
                 trainer = GRPOTrainer(policy=policy, env=None, device=selected_device,
@@ -189,6 +291,13 @@ def run_diagnostics(bundle_path, *, learning_rates=DEFAULT_LEARNING_RATES, devic
                     policy, bundle['episodes'], reference, batch_size=parameters['batch_size'],
                     device=selected_device, threshold=parameters['kl_target'] * 1.5)
                 variant['full_rollout_kl_seconds'] = time.perf_counter() - kl_started
+                if export_paths is not None:
+                    saved_candidate = _export_candidate(
+                        export_paths[index], trainer=trainer, bundle=bundle, source=source,
+                        provenance=export_provenance, variant=variant, index=index)
+                    variant['candidate_checkpoint'] = saved_candidate
+                    report['model_exported'] = True
+                    variant['candidate_sha256'] = _sha256_file(saved_candidate)
             except Exception as exc:
                 variant['status'] = 'error'
                 variant['error'] = {'type': type(exc).__name__, 'message': str(exc)}
@@ -237,13 +346,20 @@ def main(argv=None):
     parser.add_argument('--output', required=True)
     parser.add_argument('--learning-rates', nargs='+', type=float, default=list(DEFAULT_LEARNING_RATES))
     parser.add_argument('--device', choices=('auto', 'cpu', 'cuda'), default='auto')
+    parser.add_argument('--source-checkpoint', help='Original training checkpoint required to verify exported candidate lineage')
+    parser.add_argument('--export-dir', help='Optional directory for new evaluation-only candidate checkpoints')
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     if Path(args.bundle).resolve() == Path(args.output).resolve():
         parser.error('--output must differ from the input bundle')
     if Path(args.output).exists():
         parser.error('--output already exists; choose a new report path')
-    report = run_diagnostics(args.bundle, learning_rates=args.learning_rates, device=args.device)
+    if bool(args.source_checkpoint) != bool(args.export_dir):
+        parser.error('--source-checkpoint and --export-dir must be supplied together')
+    if args.source_checkpoint and Path(args.source_checkpoint).resolve() == Path(args.output).resolve():
+        parser.error('--output must differ from the source checkpoint')
+    report = run_diagnostics(args.bundle, learning_rates=args.learning_rates, device=args.device,
+                             source_checkpoint=args.source_checkpoint, export_dir=args.export_dir)
     path = write_report_exclusive(args.output, report)
     print(f'Learning-rate update diagnostic report: {path}')
     return 0 if report['all_variants_succeeded'] else 1

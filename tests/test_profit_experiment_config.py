@@ -34,7 +34,7 @@ def test_training_defaults_enable_cost_observations_without_combining_other_expe
     builder = ObservationBuilder([f'feature_{i}' for i in range(config.features)],
                                  account_observations=config.account_observations,
                                  execution_observations=config.execution_observations)
-    assert builder.obs_dim == 63
+    assert builder.obs_dim == 65
 
 
 @pytest.mark.parametrize('field', ['decision_interval_seconds', 'episode_duration_seconds', 'group_advantage_coef'])

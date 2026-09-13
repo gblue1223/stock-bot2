@@ -7,6 +7,7 @@
 - 수집한 모든 관측·행동·실행 마스크를 CPU에 유지하고 미니배치 단위로 학습 forward를 다시 실행한다. 수집 당시 선택 행동의 log probability와 비교해 최대 절대 오차가 허용값보다 크면 optimizer를 실행하기 전에 오류로 중단한다.
 - 검사 중에는 실제 학습 모드와 gradient checkpointing 경로를 사용한다. 학습 forward가 BatchNorm 등의 버퍼를 변경하면 오류로 처리하고 버퍼를 복원한다.
 - 원정책의 전체 행동 log probability는 작은 `관측 수 × 행동 수` CPU 배열로 저장한다. 별도 GPU 참조 모델은 만들지 않는다.
+- optimizer 실행 전에는 현재 미니배치의 전체 행동 분포로 정확한 `KL(원정책 || 현재 정책)`의 평균을 계산해 `kl_target * 1.5`와 비교한다. 이미 수행한 학습 forward의 분포를 재사용하므로 추가 모델 forward는 없다. 선택된 행동만으로 추정한 sampled KL은 작은 배치에서 과대·과소 추정될 수 있어, 검사가 활성화된 경우 진단값으로만 기록한다.
 - optimizer 실행 후 새 forward로 현재 미니배치와 고정 관측 표본의 `KL(원정책 || 새 정책)`을 계산한다. 각 관측에서 세 행동을 모두 합산하고, 각각의 표본 평균을 기존 `kl_target * 1.5` 한계와 비교한다. 고정 표본은 전체 상태 공간을 보장하는 검사가 아니다.
 - 한계를 넘은 단계는 직전 모델 가중치·버퍼·Adam 상태를 함께 복원하고 해당 회차의 나머지 업데이트를 중단한다. 실패한 단계를 승인된 optimizer 실행 횟수와 평균 손실에 포함하지 않는다. 앞서 승인된 단계는 유지한다.
 - 비정상 값이나 검사 예외도 업데이트 후 복원 경로를 거친다. 학습률이나 거래 보상은 이 기능이 자동 변경하지 않는다.
@@ -15,12 +16,16 @@
 
 | 설정 | 새 학습 `TrainingConfig` 기본값 | 주 Colab 노트북 기본값 | 의미 |
 |---|---:|---:|---|
-| `policy_update_checks` | `True` | `True` | 업데이트 전 확률 일치 및 업데이트 후 KL 검사 |
+| `policy_update_checks` | `True` | `True` | 수집·학습 확률 일치 및 업데이트 전후 정확한 KL 검사 |
 | `rollout_logprob_tolerance` | `0.001` | `0.001` | 수집·학습 log probability의 최대 절대 오차 허용값 |
 | `kl_probe_samples` | `32` | `32` | 각 업데이트 후 추가 검사하는 고정 관측 표본 수 |
 | `no_trade_max_validations` | `0` | `4` | 확률 변화와 무관한 연속 무거래 검증 상한, 0은 비활성 |
 
 직접 `GRPOTrainer`를 사용하는 기존 커스텀 정책과의 호환을 위해 생성자의 `policy_update_checks` 기본값은 `False`다. 검사 활성화 정책은 `evaluate_actions_with_distribution()`을 제공해야 한다. xLSTM 정책은 이 메서드를 제공하며 관측 스키마나 가중치 크기는 변경되지 않는다.
+
+검사를 끈 기존 정책은 sampled KL 중단을 유지한다. 검사를 켰는데 전체 행동 분포가 없거나 유효하지 않으면 기존과 같이 오류로 중단한다. 정확한 KL로의 변경에는 새 CLI나 하이퍼파라미터가 필요 없으며, `policy_update_checks=True`인 기존 체크포인트에도 코드 갱신 후 적용된다. 실행 후 고정 표본·미니배치 검사와 Adam 복원, 기존 KL 한도는 유지된다.
+
+업데이트 지표 `pre_update_kl_uses_exact`는 실제 사전 중단 기준을 표시한다. `last_checked_kl`은 그 기준의 마지막 값이며, `last_sampled_kl`은 선택 행동 기반 추정값이다. `pre_update_minibatch_exact_kl`은 마지막 사전 검사의 정확한 평균이고 `pre_update_exact_kl_checked`는 계산 여부를 뜻한다. `pre_update_sampled_only_exceedances`는 sampled만 한도를 초과한 배치 수, `pre_update_exact_only_exceedances`는 정확한 KL만 한도를 초과한 배치 수다. `kl_divergence`는 호환성을 위해 수락된 배치의 기존 sampled KL 평균을 유지한다.
 
 기존 `no_trade_patience=3`도 유지한다. 이는 수익 비개선과 매수 확률 비증가를 함께 보는 기존 조건이다. 새 `no_trade_max_validations`는 검증된 무거래를 첫 검증부터 세며, 매수 확률이 상승하거나 확률 진단이 없어도 무체결·수익 0·완전 청산이 확인되면 센다. 실제 거래 발생이나 불완전한 증거는 연속 기록을 초기화한다. 두 조건이 동시에 충족되면 기존 `no_trade_collapse` 사유를 우선하고, 새 상한만 충족하면 `no_trade_limit`로 종료한다.
 

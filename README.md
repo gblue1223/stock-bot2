@@ -4,6 +4,33 @@
 
 ## 실행
 
+새 학습 예제와 Colab 기본 설정은 `seq_len=2048`이며, **같은 과거 5~60초 구간에서 매수 방향 체결대금 30억 원 이상 + 현재가 1% 이상 상승**한 시점만 진입 후보로 사용합니다. 관측 길이는 2048개 시장 행이고 2048초를 뜻하지 않습니다. 에피소드 시작점은 후보 중에서 선택하며, 이후에도 조건을 충족하지 않는 시점의 매수 행동을 차단합니다. 매도·보유 및 비용을 포함한 순수익 학습은 유지합니다.
+
+매수 체결 후 **1~5초(양 끝 포함)** 안에 실제 현재가가 해당 체결가 이상인지를 별도 PPO 정책 학습 신호로 사용합니다. 성공은 +1, 실패는 -1이며, 부분체결은 각 체결의 가격·시각으로 평가한 뒤 매수 결정별 체결 수량으로 가중 평균합니다. 이 신호는 매수 결정의 정책 손실에만 `policy_coef` 배율로 더합니다. NAV 보상과 가치함수 목표는 변경하지 않습니다. 미래 가격은 결과 라벨에만 사용하며 관측·매수 조건·에피소드 선정에는 사용하지 않습니다. 5초 후까지 데이터가 없거나 1~5초 구간에 관측이 없으면 미확정으로 제외합니다. 성공은 체결가 회복 여부이며 비용 차감 순이익과는 별도로 기록합니다.
+
+원본의 `거래량`은 사용자 확인에 따라 **음수=매도 체결, 음수가 아닌 값=매수 체결**입니다. 음수가 하나도 없는 데이터도 모두 매수로 처리하며, 0은 매수금액에 영향을 주지 않습니다. `signed_volume_positive_buy` 추출 옵션은 `누적거래량`이 실제 증가한 행에서만 양수 체결량 × 원화 현재가를 합산합니다. 누적거래량이 그대로인 호가·거래원 갱신 행은 제외하고, 증가량이 체결량 절댓값과 다르면 해당 에피소드를 거부합니다. 전체 `누적거래대금`과 `매수대기금액`은 이 계산에 사용하지 않습니다. 첫 원본 행 이전의 체결은 추정하지 않습니다.
+
+기존 NPZ에는 필요한 체결 방향 정보가 없으므로 **새 디렉터리로 재추출한 뒤 새 학습을 시작**합니다. 예:
+
+```powershell
+python -m ai_trader.grpo.data_extractor --db "C:/Users/user/Workspace/datasets@raw/datasets_all.duckdb" --output_dir data/extracted_episodes_entry_pattern --seq_len 2048 --features 29 --max_steps 300 --price-unit krw --time-start 90000000 --time-end 110000000 --entry-pattern-config config/scalping_v3.example.json --buy-notional-source signed_volume_positive_buy
+python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
+```
+
+별도 원천에 실제 누적 매수 체결대금이 있으면 `--buy-notional-source cumulative_buy_notional --buy-notional-column 컬럼명 --buy-notional-scale 원화환산배율`을 사용할 수 있습니다. 설정은 manifest·체크포인트에 저장하고, 다른 필터로 추출한 데이터나 기존 무필터 NPZ는 새 학습에서 거부합니다. 검증·백테스트도 같은 과거 조건을 적용하며 `entry_pattern`에 성공·실패·미확정 수량과 성공률을 기록합니다. 이는 조건부 성과이며 전체 시장 대상 성과를 뜻하지 않습니다.
+
+이전 실험 재현용 설정은 `entry_pattern_config=null`로 NAV 전용 학습을 유지할 수 있습니다. 재개 시에는 저장된 설정과 관측 길이를 복원하며, 새 조건이나 2048 길이로 바꾸려면 새 학습을 사용합니다.
+
+새 학습의 시장 feature는 29개입니다. 기존 27개 뒤에 `시초가`와 `시초가대비등락률`을 추가했으며, 매수를 포함한 모든 행동 판단에 사용합니다. 원본 DB의 양수 `시초가`/`시가`를 우선 사용하고, 없으면 같은 종목·거래일의 **09:00:00초(밀리초 포함) 첫 유효 현재가**를 사용합니다. 둘 다 없으면 `missing_opening_price` 사유로 해당 에피소드를 제외합니다. 시초가가 알려지기 전에는 0을 사용하며 미래 값으로 역채움하지 않습니다. 10시 이후만 추출하거나 에피소드를 중간에서 시작해도 당일 시초가를 유지합니다.
+
+`시초가`의 단위는 `현재가`와 같습니다. 관측 생성 시 현재가와 같은 로그·표준화 기준을 적용하고, `시초가대비등락률 = (현재가 / 시초가 - 1) × 100`은 100으로 나눠 전달하므로 시초가와의 가격 관계가 정규화 후에도 남습니다. 기본 v4 관측은 65차원입니다. 실시간 입력도 체크포인트의 컬럼 순서대로 당일 시초가와 등락률을 제공해야 합니다. `lib.market_data.add_opening_price_features`는 시간순으로 정렬한 단일 종목·거래일 DataFrame에 같은 규칙을 적용합니다.
+
+기존 27·28개 feature 스키마와 체크포인트는 유지합니다. 시초가를 사용하려면 **원본 DB에서 새 디렉터리로 재추출한 뒤 새 모델을 학습**해야 합니다. 기존 체크포인트에 feature 두 개를 붙여 이어서 학습할 수는 없습니다. 기존 모델 재개 시 저장된 feature 수와 기존 데이터를 사용하세요.
+
+```powershell
+python -m ai_trader.grpo.data_extractor --db "D:/path/to/datasets_raw.duckdb" --output_dir data/extracted_episodes_opening --seq_len 120 --features 29 --max_steps 300 --price-unit krw
+```
+
 Python 3.10 이상을 사용합니다. 현재 회귀 검사는 Python 3.12 / PyTorch 2.8 CPU에서 실행했습니다. 아래 명령은 프로젝트 루트에서 해당 가상환경을 활성화한 후 실행합니다.
 
 ```powershell
@@ -12,7 +39,7 @@ python -m pytest --basetemp .test_artifacts/pytest-manual
 python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
 ```
 
-예제 설정은 비교적 작은 모델과 120틱 관측으로 시작합니다. 최적 수익을 보장하는 설정은 아닙니다. `seq_len`과 `episode_steps`는 이벤트 개수이고, `max_holding_seconds`는 실제 초입니다. 기존 기본값처럼 3000틱의 겹치는 관측창을 많이 수집하면 RAM 사용량이 커지므로 모델·배치·rollout 크기를 함께 조정해야 합니다.
+예제 설정은 비교적 작은 모델과 2048틱 관측으로 시작합니다. 최적 수익을 보장하는 설정은 아닙니다. `seq_len`과 `episode_steps`는 이벤트 개수이고, `max_holding_seconds`는 실제 초입니다. 기존 기본값처럼 3000틱의 겹치는 관측창을 많이 수집하면 RAM 사용량이 커지므로 모델·배치·rollout 크기를 함께 조정해야 합니다.
 
 훈련은 거래일을 시간순으로 train/validation/test에 분리합니다(기본 60/20/20, 최소 3일). 설정의 `train_end_date`, `validation_end_date`로 경계를 지정하거나 `embargo_dates`로 경계 뒤 거래일을 제외할 수 있습니다. 한 에피소드는 하나의 종목·거래일 안에 있으므로 관측창과 보유 구간이 다른 분할로 넘어가지 않습니다.
 
@@ -31,17 +58,19 @@ python -m ai_trader.grpo.train_xlstm --config config/scalping_v3.example.json
 
 [`ai_trader/grpo/colab_train_xlstm_return_priority.ipynb`](ai_trader/grpo/colab_train_xlstm_return_priority.ipynb)를 사용합니다. 수정된 프로젝트 코드가 포함된 Git revision 또는 업로드한 소스 폴더가 필요합니다. 노트북만 교체하고 이전 코드를 clone하면 수정된 학습기를 사용할 수 없습니다.
 
-관측 길이 1024, CNN/mLSTM/FC 256/512/512로 시작합니다. 기본 `timed_gae_only` 실험은 1초 판단 간격, 에피소드 시간 상한 300초, `group_advantage_coef=0`, `lambda_gae=0.95`를 사용합니다. A100 40GB의 배치 상한은 16, 80GB는 32이며 실제 역전파 사전 점검에서 메모리가 부족하면 줄입니다. 회당 rollout은 16개이고 여유 RAM 16GiB 미만에서는 8개로 축소합니다. worker는 CPU와 RAM에 맞춰 최대 4/8개, 캐시는 worker당 128MiB로 제한합니다. GAE 및 TensorBoard 추론도 `batch_size` 이하로 나누어 GPU에 전송합니다.
+관측 길이 2048, CNN/mLSTM/FC 256/512/512로 시작합니다. 기본 `timed_gae_only` 실험은 1초 판단 간격, 에피소드 시간 상한 300초, `group_advantage_coef=0`, `lambda_gae=0.95`를 사용합니다. A100 40GB의 배치 상한은 16, 80GB는 32이며 실제 역전파 사전 점검에서 메모리가 부족하면 줄입니다. 회당 rollout은 16개이고 여유 RAM 16GiB 미만에서는 8개로 축소합니다. worker는 CPU와 RAM에 맞춰 최대 4/8개, 캐시는 worker당 128MiB로 제한합니다. GAE 및 TensorBoard 추론도 `batch_size` 이하로 나누어 GPU에 전송합니다.
 
 `MODE='new'`와 새 `RUN_NAME`이 기본입니다. 재개는 `MODE='resume'`와 `LOAD_POLICY`를 명시하며 관측·체결·학습 설정을 복원합니다. 초기 목표는 1,000,000 정책 스텝이고 재개할 때는 누적 목표를 늘립니다. `ENABLE_TF32`는 사전 점검과 실제 학습 프로세스에 함께 적용하며 AMP/BF16은 사용하지 않습니다.
 
-기본 `policy_update_checks=True`는 수집·학습 확률 일치와 optimizer 실행 직후 전체 행동 KL을 검사하고, 한계를 넘은 단계의 가중치와 Adam 상태를 복원합니다. `no_trade_max_validations=4`는 매수 확률 변화와 무관하게 연속 무거래 검증을 제한합니다. 5번 설정 셀의 `DIAGNOSTIC_CHECKPOINT`에 기존 학습 가중치 경로를 입력하면 7번 GPU 점검 셀에서 별도로 검사합니다. 설정·재개 호환성과 실제 검증 범위는 [업데이트 검사 안내](SCALPING_UPDATE_CHECKS_2026-09-12.md)를 참고하세요.
+기본 `policy_update_checks=True`는 수집·학습 확률 일치와 optimizer 실행 전후 전체 행동 KL을 검사하고, 한계를 넘은 단계의 가중치와 Adam 상태를 복원합니다. 실행 전에는 현재 미니배치의 정확한 KL로 중단 여부를 판단하고, 선택 행동으로 추정한 sampled KL은 별도 진단값으로 기록합니다. `no_trade_max_validations=4`는 매수 확률 변화와 무관하게 연속 무거래 검증을 제한합니다. 5번 설정 셀의 `DIAGNOSTIC_CHECKPOINT`에 기존 학습 가중치 경로를 입력하면 7번 GPU 점검 셀에서 별도로 검사합니다. 설정·재개 호환성과 실제 검증 범위는 [업데이트 검사 안내](SCALPING_UPDATE_CHECKS_2026-09-12.md)를 참고하세요.
 
 Drive에 `colab_config.json`, 소스·manifest 해시와 GPU 점검 결과가 담긴 `colab_run.json`, 학습 로그와 회당 체크포인트를 저장합니다. 끝의 평가 셀에서 순수익·실현손익·합성 체결·미청산 수량을 확인할 수 있고, 선택적인 체결 스트레스 검사는 validation에만 적용합니다. 실제 A100의 최대 메모리와 학습 속도는 Colab 사전 점검 및 실제 학습에서 확인해야 합니다.
 
 5번 설정 셀의 `ENABLE_TF32`는 재개 시에도 현재 선택이 우선하며, 실제 정밀도 설정을 시작 로그에 기록합니다. 학습 중 확률 불일치가 발생하면 실패 미니배치와 당시 가중치를 `diagnostics/`에 저장합니다. Colab의 선택적 진단 셀 또는 `python -m ai_trader.grpo.diagnose_likelihood`로 동일 입력의 TF32 ON/OFF를 비교할 수 있습니다. [실패 자료 진단 안내](SCALPING_LIKELIHOOD_DIAGNOSTICS_2026-09-12.md)를 참고하세요.
 
 재개 학습률은 5번 셀의 `RESUME_LR`(0이면 저장된 LR 유지), CLI의 `--resume_lr`로 명시적으로 변경합니다. Adam 상태를 유지하며, 선택적 7-2번 셀은 같은 rollout·가중치·Adam·난수 상태에서 세 학습률을 비교하고 전체 rollout KL을 기록합니다. [학습률 비교 안내](SCALPING_LEARNING_RATE_DIAGNOSTICS_2026-09-12.md)를 참고하세요.
+
+로컬에서는 `python -m ai_trader.grpo.local_checks --checkpoint <체크포인트> --extracted-dir <동일 데이터>`로 전체 회귀 검사 → FP32 rollout 캡처 → LR 비교 및 후보 저장 → 원본과 후보들의 동일 조건 validation 수익 비교를 순차 실행할 수 있습니다. [로컬 자동 검사 안내](LOCAL_CHECKS.md)를 참고하세요.
 
 ## 무거래 원인 진단
 
@@ -169,14 +198,14 @@ python -m ai_trader.grpo.backtest --policy models/scalping_v3/checkpoints/checkp
 새 추출은 숫자 시간·동일 시각의 이벤트 순번을 보존하며, 모델 특징과 원화 가격/주식 수 실행 배열을 분리합니다.
 
 ```powershell
-python -m ai_trader.grpo.data_extractor --db "D:/path/to/datasets_raw.duckdb" --output_dir data/extracted_episodes_v2 --seq_len 120 --features 27 --max_steps 300 --price-unit krw
+python -m ai_trader.grpo.data_extractor --db "D:/path/to/datasets_raw.duckdb" --output_dir data/extracted_episodes_opening --seq_len 120 --features 29 --max_steps 300 --price-unit krw
 ```
 
 분할 매수 단계 수는 학습 CLI의 `--max_stages`(또는 `--max-stages`)로 설정합니다. 허용 범위는 1~5이며 기본값은 **1**입니다. 1이면 초기 자금과 가용 현금 한도에서 한 번 매수하고 매도 신호에 보유 전량을 주문합니다. 5이면 매수 주문당 초기 자금의 최대 1/5을 사용하고, 매도 신호에 가장 오래된 단계부터 정리합니다. 부분 체결·수수료·호가 수량에 따라 실제 투자 비중과 청산 시점은 달라집니다.
 
 ```powershell
-python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --max_stages 1 --output_dir models/scalping_single
-python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --max_stages 5 --output_dir models/scalping_five
+python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_opening --max_stages 1 --output_dir models/scalping_single
+python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_opening --max_stages 5 --output_dir models/scalping_five
 ```
 
 CLI 값은 JSON 설정의 `max_stages`보다 우선합니다. `--max_trades_per_episode`는 별도의 거래 횟수 제한입니다. 관측값은 5개 슬롯을 예약하고 미사용 슬롯을 0으로 채우므로 27개 시장 특징 기준 42차원을 유지합니다. 분할 수는 체크포인트 관측 스키마와 학습 설정에 기록되며, 추론·백테스트는 저장된 값을 복원합니다. 기존 v2 5분할 체크포인트는 그대로 추론할 수 있지만, CLI로 이어서 학습하려면 `--max_stages 5`를 명시해야 합니다. 다른 분할 수의 체크포인트 로딩은 거부되므로 변경 시 새 학습을 시작하세요. 원시 에피소드는 다시 추출할 필요가 없습니다.
@@ -186,7 +215,7 @@ Colab 노트북의 새 학습도 기본 1단계이며 설정 셀의 `MAX_STAGES`
 호가를 보존한 원본 DB에서 A100 노트북용 오전 9~11시 데이터를 직접 만들 수도 있습니다. 대기금액 컬럼이 없으면 원본 호가×수량으로 계산하고, 실제 호가·수량은 별도 실행 배열로 저장합니다. 중간 DB 전체를 복제할 필요가 없습니다.
 
 ```powershell
-python -m ai_trader.grpo.data_extractor --db "D:/path/to/raw_with_orderbook.duckdb" --output_dir data/extracted_episodes_v2 --seq_len 1024 --features 27 --max_steps 300 --price-unit krw --time-start 90000000 --time-end 110000000 --workers 4 --threads 2 --memory-limit 3GB --compression-level 1
+python -m ai_trader.grpo.data_extractor --db "D:/path/to/raw_with_orderbook.duckdb" --output_dir data/extracted_episodes_opening --seq_len 1024 --features 29 --max_steps 300 --price-unit krw --time-start 90000000 --time-end 110000000 --workers 4 --threads 2 --memory-limit 3GB --compression-level 1
 ```
 
 `--workers`는 병렬 에피소드 처리 수입니다. `--executor process`는 Python 문자열 처리도 여러 CPU 프로세스로 나눕니다. 이때 DuckDB의 `--memory-limit`은 프로세스마다 적용되므로, 예를 들어 `--workers 4 --executor process --memory-limit 1GB`는 DB 버퍼만 최대 약 4GB이며 worker별 Pandas/NumPy 배열 메모리가 추가로 필요합니다. 기본 thread 모드에서는 DB 버퍼를 공유합니다. `--compression-level 1`은 압축 시간을 줄이며 NPZ 형식은 같습니다. `seq_len`은 추출 대상의 최소 길이를 결정하고, `max_steps`는 실행 설정 기록용이며 파일에는 해당 시간 구간 전체를 저장합니다.
@@ -244,7 +273,7 @@ action, probability, info = engine.predict(
 BC는 호환되는 스키마와 학습 날짜 이력이 있는 GRU teacher만 받습니다. 현재 5분할 포지션 규격은 시장 피처 + 15채널입니다. 데이터의 train 날짜만 사용하고 teacher의 학습·선택 날짜가 holdout에 섞이면 거부합니다. fast 경로도 동일한 forward/관측을 사용하며 지원되지 않던 TorchScript 단계를 제거했습니다.
 
 ```powershell
-python -m ai_trader.grpo.pretrain_behavior_cloning --teacher_policy models/teacher.pt --extracted_dir data/extracted_episodes_v2 --output_path models/pretrain/xlstm.pt
+python -m ai_trader.grpo.pretrain_behavior_cloning --teacher_policy models/teacher.pt --extracted_dir data/extracted_episodes_opening --output_path models/pretrain/xlstm.pt
 ```
 
 스키마나 날짜 이력을 모르는 구 teacher는 사용할 수 없습니다. BC 포지션 예제는 보이는 과거 가격에서 만든 가상 상태이며, 실제 체결 데이터로 만든 매매 성과가 아닙니다.
@@ -261,7 +290,7 @@ python -m ai_trader.grpo.pretrain_behavior_cloning --teacher_policy models/teach
 현재 CLI와 A100 노트북(`colab_train_xlstm_return_priority.ipynb`)은 비용을 반영한 검증 순수익률을 우선합니다. 기본 모델은 CNN 256 / xLSTM 512 / FC 512, `seq_len=1024`, `max_stages=1`, `total_timesteps=1000000`, `gamma=1.0`, 검증 64회입니다. 큰 모델이 더 높은 수익률을 보장하지는 않으며 기존 모델과 같은 검증 조건으로 비교해야 합니다. 모델 폭은 메모리 부족 때문에 자동 축소하지 않고 GPU 점검에서 미니배치를 줄입니다.
 
 ```powershell
-python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_v2 --output_dir models/scalping_return_priority --max_stages 1
+python -m ai_trader.grpo.train_xlstm --extracted_dir data/extracted_episodes_opening --output_dir models/scalping_return_priority --max_stages 1
 ```
 
 새 학습은 실제 호가가 있는 데이터를 요구합니다. 거래 보너스나 무매매 페널티로 거래를 강요하지 않고, 수수료·세금·슬리피지를 그대로 반영합니다. 최고 모델은 `validation.mean_net_return`로 고르되 기본 `selection_require_liquidation=True`에 따라 검증 중 미청산 물량이 남은 후보는 제외합니다. 적격 후보가 없으면 최종 모델 확정을 실패로 보고하고 반복별 체크포인트는 진단용으로 남깁니다. 수익률 0%인 무매매보다 낮은 모델도 후보 중 최고일 수 있으므로 양의 순수익 여부를 별도로 확인해야 합니다.

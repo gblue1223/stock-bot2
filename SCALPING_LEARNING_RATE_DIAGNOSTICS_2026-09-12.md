@@ -47,7 +47,7 @@ JSON의 주요 필드는 다음과 같다.
 | 필드 | 의미 |
 |---|---|
 | `variants[].metrics.optimizer_accepted_steps / optimizer_attempted_steps / optimizer_rejected_steps` | 허용·시도·rollback된 optimizer step 수 |
-| `variants[].guard_reason` | 전체 epoch 완료, 사전 sampled KL 중단, 사후 exact KL rollback, 실행 오류 구분 |
+| `variants[].guard_reason` | 전체 epoch 완료, 사전 exact KL 중단(`pre_step_exact_kl`), 기존 사전 sampled KL 중단, 사후 exact KL rollback, 실행 오류 구분 |
 | `variants[].full_rollout_kl.mean_kl / max_kl / quantiles` | 업데이트 후 전체 관측의 exact KL 평균·최대·분위수 |
 | `variants[].full_rollout_kl.fraction_over_threshold` | 개별 관측 KL이 기준을 넘은 비율 |
 | `capture_to_replay_reference_kl` | 캡처 당시와 비교 환경의 시작 분포 차이 |

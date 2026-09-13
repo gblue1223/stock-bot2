@@ -32,7 +32,7 @@ def helpers():
     return namespace
 
 
-@pytest.mark.parametrize('name', NOTEBOOK_NAMES)
+@pytest.mark.parametrize('name', (*NOTEBOOK_NAMES, 'colab_train_xlstm_entry_pattern_2048.ipynb'))
 def test_notebook_and_embedded_runner_are_valid_python(name, monkeypatch):
     monkeypatch.setitem(globals(), 'NOTEBOOK', ROOT / 'ai_trader/grpo' / name)
     notebook = json.loads(NOTEBOOK.read_text(encoding='utf-8'))
@@ -75,7 +75,7 @@ def test_profile_respects_host_ram_and_cpu(vram, free, ram, cpus, batch, max_wor
     assert 1 <= profile['num_workers'] <= max_workers
     assert profile['episodes_per_group'] * profile['num_groups'] == episodes
     assert namespace['estimated_host_gib'](profile) <= .70 * ram
-    assert profile['seq_len'] == 1024 and profile['rnn_hidden_dim'] == 512
+    assert profile['seq_len'] == 2048 and profile['rnn_hidden_dim'] == 512
 
 
 @pytest.mark.parametrize('hardware', [(10, 9, 50, 4), (40, 2, 50, 4), (40, 38, 3, 4),
@@ -271,7 +271,7 @@ def test_return_priority_notebook_enables_new_observations_and_liquidation_tail(
     config = default_config_namespace()['CONFIG']
     assert config['account_observations'] is True
     assert config['execution_observations'] is True
-    assert helpers()['model_obs_dim'](config) == 63
+    assert helpers()['model_obs_dim'](config) == 65
     assert config['liquidation_max_steps'] == 300
     assert 1 < config['evaluation_workers'] <= config['num_workers']
     assert config['lambda_gae'] == .95

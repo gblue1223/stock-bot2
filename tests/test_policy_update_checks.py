@@ -248,14 +248,22 @@ def test_exact_kl_uses_reference_direction_and_zero_probability_mask_support():
     assert result['mean_kl'] == pytest.approx(.8 * np.log(2) + .2 * np.log(1 / 3), abs=1e-7)
 
 
-def test_sampled_guard_reports_exact_kl_for_the_triggering_batch_without_an_extra_forward(monkeypatch, caplog):
+@pytest.mark.parametrize('checks', [True, False])
+def test_rare_buy_sampled_excess_uses_exact_guard_when_available_and_legacy_fallback_otherwise(monkeypatch, checks):
     monkeypatch.setattr(np.random, 'permutation', lambda n: np.arange(n))
-    policy = CheckedPolicy()
+
+    class LegacyPolicy(CheckedPolicy):
+        evaluate_actions_with_distribution = None
+
+        def evaluate_actions(self, states, actions, action_masks=None):
+            return CheckedPolicy.evaluate_actions_with_distribution(self, states, actions, action_masks)[:3]
+
+    policy = CheckedPolicy() if checks else LegacyPolicy()
     with torch.no_grad():
         policy.actor.weight.zero_()
         policy.actor.bias.copy_(torch.tensor([np.log(.99), np.log(.01), 0.]))
     data = episode(policy, 2, np.tile([True, True, False], (2, 1)))
-    trainer = GRPOTrainer(policy, object(), policy_update_checks=True, batch_size=1,
+    trainer = GRPOTrainer(policy, object(), policy_update_checks=checks, batch_size=1,
                           num_epochs=1, kl_probe_samples=2, kl_target=.01)
     original_step = trainer.optimizer.step
 
@@ -269,17 +277,72 @@ def test_sampled_guard_reports_exact_kl_for_the_triggering_batch_without_an_extr
     policy.calls.clear()
     metrics = trainer.update_policy([data], [np.zeros(2)])
     expected = .99 * np.log(.99 / .988) + .01 * np.log(.01 / .012)
-    assert metrics['optimizer_steps'] == metrics['optimizer_attempted_steps'] == 1
+    assert metrics['last_sampled_kl'] == pytest.approx(.2 - np.log(1.2), abs=1e-7)
+    assert metrics['last_sampled_kl'] > .015 > expected
+    assert metrics['optimizer_steps'] == metrics['optimizer_attempted_steps'] == (2 if checks else 1)
     assert metrics['optimizer_rejected_steps'] == 0
-    assert metrics['pre_update_kl_early_stopped'] == metrics['pre_update_exact_kl_checked'] == 1
+    assert metrics['pre_update_kl_early_stopped'] == int(not checks)
+    assert metrics['pre_update_kl_uses_exact'] == metrics['pre_update_exact_kl_checked'] == int(checks)
     assert metrics['post_update_kl_early_stopped'] == 0
-    assert metrics['last_checked_kl'] > .015
-    assert metrics['pre_update_minibatch_exact_kl'] == pytest.approx(expected, abs=1e-7)
-    assert metrics['pre_update_minibatch_max_state_kl'] == pytest.approx(expected, abs=1e-7)
-    assert metrics['pre_update_minibatch_samples'] == 1
-    # Two preflight, two optimizer forwards, two post-step probe forwards.
-    assert len(policy.calls) == 6
-    assert 'same_batch exact KL' in caplog.text
+    assert metrics['pre_update_exact_only_exceedances'] == 0
+    assert metrics['pre_update_sampled_only_exceedances'] == int(checks)
+    if checks:
+        assert metrics['last_checked_kl'] == pytest.approx(expected, abs=1e-7)
+        assert metrics['pre_update_minibatch_exact_kl'] == pytest.approx(expected, abs=1e-7)
+        assert metrics['pre_update_minibatch_max_state_kl'] == pytest.approx(expected, abs=1e-7)
+        assert metrics['pre_update_minibatch_samples'] == 1
+        # Two preflight, two main, four post-step probe forwards; no extra pre-guard forward.
+        assert len(policy.calls) == 8
+    else:
+        assert metrics['last_checked_kl'] == metrics['last_sampled_kl']
+        assert metrics['pre_update_minibatch_exact_kl'] == metrics['pre_update_minibatch_samples'] == 0
+        assert len(policy.calls) == 2  # A legacy policy needs neither distribution API nor pre/post probes.
+    assert all(size == 1 for size, _, _ in policy.calls)
+
+
+def test_exact_pre_guard_stops_when_sampled_kl_underestimates_a_new_minibatch(monkeypatch):
+    monkeypatch.setattr(np.random, 'permutation', lambda n: np.arange(n))
+    policy = CheckedPolicy()
+    with torch.no_grad():
+        policy.actor.weight.zero_()
+        policy.actor.bias.copy_(torch.tensor([np.log(.99), np.log(.01), 0.]))
+    masks = np.array([[True, False, False], [True, True, False]])
+    data = episode(policy, 2, masks)
+    # A common HOLD draw does not reveal the tenfold increase in rare BUY probability.
+    data['actions'][:] = 0
+    with torch.no_grad():
+        logs, _, _ = policy.evaluate_actions(torch.from_numpy(data['states']),
+                                             torch.from_numpy(data['actions']), torch.from_numpy(masks))
+    data['log_probs'] = logs.numpy().copy()
+    trainer = GRPOTrainer(policy, object(), policy_update_checks=True, batch_size=1,
+                          num_epochs=1, kl_probe_samples=1, kl_target=.01)
+    original_step = trainer.optimizer.step
+    accepted = []
+
+    def drift_outside_first_hold_only_batch(*args, **kwargs):
+        original_step(*args, **kwargs)
+        with torch.no_grad():
+            policy.actor.weight.zero_()
+            policy.actor.bias.copy_(torch.tensor([np.log(.9), np.log(.1), 0.]))
+        accepted.append(snapshot_optimizer_step(policy, trainer.optimizer))
+
+    trainer.optimizer.step = drift_outside_first_hold_only_batch
+    policy.calls.clear()
+    metrics = trainer.update_policy([data], [np.zeros(2)])
+    expected = .99 * np.log(.99 / .9) + .01 * np.log(.01 / .1)
+    sampled = .9 / .99 - 1 - np.log(.9 / .99)
+    assert metrics['last_sampled_kl'] == pytest.approx(sampled, abs=1e-7)
+    assert metrics['last_checked_kl'] == pytest.approx(expected, abs=1e-7)
+    assert metrics['last_sampled_kl'] < .015 < metrics['last_checked_kl']
+    assert metrics['pre_update_kl_early_stopped'] == metrics['pre_update_kl_uses_exact'] == 1
+    assert metrics['pre_update_exact_only_exceedances'] == 1
+    assert metrics['pre_update_sampled_only_exceedances'] == 0
+    assert metrics['post_update_kl_early_stopped'] == metrics['optimizer_rejected_steps'] == 0
+    assert metrics['optimizer_accepted_steps'] == metrics['optimizer_attempted_steps'] == len(accepted) == 1
+    assert metrics['last_post_update_probe_kl'] == metrics['last_post_update_minibatch_kl'] == 0
+    assert_state_equal(accepted[0], snapshot_optimizer_step(policy, trainer.optimizer))
+    # Two preflight, two main, one post-step forward. No second optimizer step or extra pre-guard forward.
+    assert len(policy.calls) == 5 and all(size == 1 for size, _, _ in policy.calls)
 
 
 def test_failure_bundle_io_error_preserves_original_mismatch_and_optimizer(monkeypatch, tmp_path, caplog):

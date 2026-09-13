@@ -15,6 +15,7 @@ from lib.market_data import parse_time_seconds, times_to_seconds
 from lib.observations import ObservationBuilder, validate_max_stages
 from lib.action_masks import executable_action_mask
 from .execution import ExecutionSimulator
+from ai_trader.grpo.entry_pattern import validate_entry_pattern, fill_target
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,11 @@ class GRPOScalpingEnv(gym.Env):
                  execution_config=None, allowed_dates=None, price_scale=1.0, max_stages=1,
                  account_observations=False, liquidation_max_steps=0,
                  execution_observations=False, decision_interval_seconds=0.0,
-                 episode_duration_seconds=0.0, execution_action_mask=False):
+                 episode_duration_seconds=0.0, execution_action_mask=False, entry_pattern_config=None):
         super().__init__()
+        self.entry_pattern_config = validate_entry_pattern(entry_pattern_config)
+        if self.entry_pattern_config is not None and not execution_action_mask:
+            raise ValueError('entry_pattern_config requires execution_action_mask=True')
         self.max_stages = validate_max_stages(max_stages)
         if not isinstance(execution_action_mask, (bool, np.bool_)):
             raise ValueError('execution_action_mask must be a boolean')
@@ -151,6 +155,8 @@ class GRPOScalpingEnv(gym.Env):
             self._connect_db()
 
     def _init_metadata_from_db(self):
+        if self.entry_pattern_config is not None:
+            raise ValueError('Entry-pattern training requires newly extracted NPZ data with entry signals')
         self._connect_db()
         self.feature_columns = self._get_feature_columns()
         self.return_rate_index = self.feature_columns.index('등락률') if '등락률' in self.feature_columns else None
@@ -164,7 +170,8 @@ class GRPOScalpingEnv(gym.Env):
         columns = canonical_feature_columns(self.expected_features)
         schema = self.conn.execute(f'DESCRIBE "{self.table_name}"').fetchdf()
         self._db_columns = schema['column_name'].tolist()
-        if all(c in self._db_columns for c in columns):
+        required = set(columns) - {'시초가', '시초가대비등락률'}
+        if required <= set(self._db_columns):
             return columns
         raise ValueError('DB must contain the explicit canonical feature schema; extract/version data first')
 
@@ -185,6 +192,11 @@ class GRPOScalpingEnv(gym.Env):
             f'SELECT * FROM "{self.table_name}" WHERE 종목코드=? AND 날짜=? '
             f'ORDER BY TRY_CAST("시간" AS DOUBLE){tie}', [str(stock), date]).fetchdf()
         # Forward-only filling; never copy a later observation to an earlier event.
+        if '시초가' in self.feature_columns:
+            from lib.market_data import add_opening_price_features
+            df = add_opening_price_features(df)
+            if not (df['시초가'] > 0).any():
+                raise ValueError('missing_opening_price: supply 시가/시초가 or a 09:00:00 tick')
         features = df[self.feature_columns].ffill().fillna(0).to_numpy(dtype=np.float32)
         metadata = df[['종목코드', '날짜', '시간']].to_numpy()
         from lib.market_data import execution_arrays
@@ -207,7 +219,7 @@ class GRPOScalpingEnv(gym.Env):
             needed = (self.seq_len + self.max_episode_steps + self.liquidation_max_steps
                       if self.max_episode_steps is not None else length)
             max_start = max(0, length - needed)
-            start = int(options['start_index']) if 'start_index' in options else int(self.np_random.integers(max_start + 1))
+            start = self._choose_episode_start(max_start)
             if not 0 <= start <= max_start:
                 raise ValueError('Requested start_index is outside the episode')
             return start, min(length, start + needed)
@@ -238,12 +250,27 @@ class GRPOScalpingEnv(gym.Env):
             else:
                 hi = candidate - 1
         max_start = lo
-        start = int(options['start_index']) if 'start_index' in options else int(self.np_random.integers(max_start + 1))
+        start = self._choose_episode_start(max_start)
         if not 0 <= start <= max_start:
             raise ValueError('Requested start_index leaves insufficient policy time/history and liquidation tail')
         index = decision_end(start)
         end = min(length, index + self.liquidation_max_steps + 1)
         return start, end
+
+    def _choose_episode_start(self, max_start):
+        options = self._reset_options
+        if self.entry_pattern_config is None:
+            return int(options['start_index']) if 'start_index' in options else int(self.np_random.integers(max_start + 1))
+        candidates = np.flatnonzero(self._full_entry_signal[self.seq_len - 1:self.seq_len + max_start])
+        if not len(candidates):
+            raise ValueError('No qualifying entry leaves enough observation/policy history in this episode')
+        start = int(options['start_index']) if 'start_index' in options else int(self.np_random.choice(candidates))
+        if start not in candidates:
+            raise ValueError('Requested start_index does not satisfy the entry-pattern gate')
+        return start
+
+    def _entry_allowed(self):
+        return self.entry_pattern_config is None or bool(self._episode_entry_signal[self.current_step])
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -285,6 +312,11 @@ class GRPOScalpingEnv(gym.Env):
         self.buy_action_outcomes = dict.fromkeys((
             'submitted', 'risk_exit_active', 'signal_exit_active', 'max_stages', 'max_trades',
             'pending_buy', 'insufficient_budget_for_one_share'), 0)
+        self._buy_decisions = []
+        self._pattern_fills = []
+        if self.entry_pattern_config is not None:
+            self.buy_action_outcomes['entry_signal_not_met'] = 0
+        self._entry_order_decisions = {}
         self._exit_requested, self._done = False, False
         self._exit_reason = None
         self._entry_exit_reasons = {}
@@ -432,6 +464,8 @@ class GRPOScalpingEnv(gym.Env):
         book = fill.book_price if fill.book_price is not None else fill.price
         top = fill.top_quote if fill.top_quote is not None else book
         if fill.side == 'buy':
+            if self.entry_pattern_config is not None:
+                self._pattern_fills.append((fill.order_id, fill.timestamp, fill.price, fill.quantity))
             fee = value * self.buy_fee_rate
             self.cash -= value + fee
             self.total_entry_fees += fee
@@ -539,7 +573,10 @@ class GRPOScalpingEnv(gym.Env):
 
     def action_masks(self):
         """Return authoritative policy eligibility at the current decision."""
-        return executable_action_mask(self.action_mask_state(), self.max_stages)
+        mask = executable_action_mask(self.action_mask_state(), self.max_stages)
+        if not self._entry_allowed():
+            mask[1] = False
+        return mask
 
     def _request_exit(self, reason, timestamp):
         if self._exit_reason is None:
@@ -626,6 +663,9 @@ class GRPOScalpingEnv(gym.Env):
             raise RuntimeError('reset() required after episode end')
         if not self.action_space.contains(action):
             raise ValueError('invalid action')
+        decision_index = len(self.episode_rewards)
+        entry_order_id = None
+        buy_outcome = None
         now = self.current_time_seconds
         next_index = self.current_step + 1
         horizon = len(self.episode_rewards) + 1 >= self.decision_steps
@@ -638,14 +678,18 @@ class GRPOScalpingEnv(gym.Env):
             self._request_exit('risk_exit_retry', now)
             if action == 1:
                 self.buy_action_outcomes['risk_exit_active'] += 1
+                buy_outcome = 'risk_exit_active'
         elif self._signal_exit_order_id is not None:
             self._request_stage_exit(now)
             if action == 1:
                 self.buy_action_outcomes['signal_exit_active'] += 1
+                buy_outcome = 'signal_exit_active'
         elif action == 1:
             open_order_ids = {st['order_id'] for st in self.stages} | {o.order_id for o in self._pending('buy')}
             within_limit = self.max_trades_per_episode is None or len(self.episode_trades) < self.max_trades_per_episode
-            if len(open_order_ids) >= self.max_stages:
+            if not self._entry_allowed():
+                outcome = 'entry_signal_not_met'
+            elif len(open_order_ids) >= self.max_stages:
                 outcome = 'max_stages'
             elif not within_limit:
                 outcome = 'max_trades'
@@ -655,15 +699,22 @@ class GRPOScalpingEnv(gym.Env):
                 budget, expected = self._buy_budget_and_unit_cost()
                 qty = int(budget / expected)
                 if qty > 0:
-                    self.simulator.submit('buy', qty, now)
+                    order = self.simulator.submit('buy', qty, now)
+                    entry_order_id = int(order.order_id)
+                    self._entry_order_decisions[entry_order_id] = decision_index
                     outcome = 'submitted'
                 else:
                     outcome = 'insufficient_budget_for_one_share'
             # Exactly one outcome per BUY decision; guards retain their original priority.
             self.buy_action_outcomes[outcome] += 1
+            buy_outcome = outcome
         elif action == 2 and self.stages and not self._pending('sell'):
             self._signal_exit_order_id = self.stages[0]['order_id']
             self._request_stage_exit(now)
+        if action == 1:
+            self._buy_decisions.append({'decision_index': decision_index,
+                                        'entry_order_id': entry_order_id,
+                                        'outcome': buy_outcome})
         target_time = now + self.decision_interval_seconds
         fills = []
         while True:
@@ -722,6 +773,74 @@ class GRPOScalpingEnv(gym.Env):
         observation = np.zeros(self.observation_space.shape, np.float32) if self._done else self._get_current_observation()
         return observation, float(reward), bool(terminated), bool(truncated), info
 
+    def _calculate_entry_diagnostics(self, fragments_by_entry):
+        """Attribute existing fill accounting to the policy decision that submitted a BUY.
+
+        Amounts are in the account's price/cash unit, not return percentages.
+        Realized costs cover sold quantities only; entry_fees also include open lots.
+        """
+        stages_by_entry = {}
+        for stage in self.stages:
+            stages_by_entry.setdefault(stage['order_id'], []).append(stage)
+        entries = []
+        for order in self.simulator.orders:
+            if order.side != 'buy' or order.order_id not in self._entry_order_decisions:
+                continue
+            fragments = fragments_by_entry.get(order.order_id, [])
+            stages = stages_by_entry.get(order.order_id, [])
+            sold = int(sum(trade['quantity'] for trade in fragments))
+            matched_entry_fees = float(sum(trade['entry_fee'] for trade in fragments))
+            exit_fees = float(sum(trade['exit_fee'] for trade in fragments))
+            matched_fees = matched_entry_fees + exit_fees
+            net_pnl = float(sum(trade['net_pnl'] for trade in fragments))
+            attribution = {name: float(sum(trade[name] for trade in fragments))
+                           for name in ('mid_price_pnl', 'spread_cost', 'depth_cost', 'slippage_cost')}
+            residual = net_pnl - (attribution['mid_price_pnl'] - attribution['spread_cost']
+                                  - attribution['depth_cost'] - attribution['slippage_cost'] - matched_fees)
+            fallback_reason = fragments[0]['exit_reason'] if fragments else (
+                'unfilled' if order.filled_quantity == 0 else 'unrealized')
+            entries.append({
+                'entry_order_id': int(order.order_id),
+                'decision_index': self._entry_order_decisions[order.order_id],
+                'submitted_quantity': int(order.quantity), 'filled_quantity': int(order.filled_quantity),
+                'sold_quantity': sold, 'open_quantity': int(sum(stage['quantity'] for stage in stages)),
+                'order_status': order.status,
+                'complete': bool(order.filled_quantity > 0 and sold == order.filled_quantity and not order.active),
+                'net_pnl': net_pnl, **attribution, 'matched_fees': matched_fees,
+                'pnl_attribution_residual': float(residual),
+                'entry_fees': matched_entry_fees + float(sum(stage['entry_fees'] for stage in stages)),
+                'exit_fees': exit_fees,
+                'quantity_weighted_holding_time': (
+                    float(sum(trade['holding_share_seconds'] for trade in fragments)) / sold if sold else 0.0),
+                'exit_reason': self._entry_exit_reasons.get(order.order_id, fallback_reason),
+            })
+        return {'version': 1, 'decision_count': len(self.episode_rewards),
+                'buy_decisions': [decision.copy() for decision in self._buy_decisions], 'entries': entries}
+
+    def _entry_pattern_report(self):
+        credits = np.zeros(len(self.episode_rewards), dtype=np.float64)
+        quantities = np.zeros(len(credits), dtype=np.float64)
+        success = failure = censored = 0
+        for order_id, timestamp, price, quantity in self._pattern_fills:
+            target = fill_target(self._entry_target_times, self._entry_target_prices,
+                                 timestamp, price, self.entry_pattern_config)
+            if target is None:
+                censored += quantity
+                continue
+            decision = self._entry_order_decisions[order_id]
+            credits[decision] += target * quantity
+            quantities[decision] += quantity
+            if target > 0:
+                success += quantity
+            else:
+                failure += quantity
+        credits = np.divide(credits, quantities, out=np.zeros_like(credits), where=quantities > 0)
+        credits *= self.entry_pattern_config['policy_coef']
+        return {'config': self.entry_pattern_config.copy(), 'policy_credit': credits.tolist(),
+                'success_quantity': success, 'failure_quantity': failure, 'censored_quantity': censored,
+                'labeled_buy_decisions': int(np.count_nonzero(quantities)),
+                'success_rate': success / (success + failure) if success + failure else None}
+
     def _calculate_episode_metadata(self):
         net_return = (self.equity - self.initial_cash) / self.initial_cash * 100
         trades = self.episode_trades
@@ -770,6 +889,7 @@ class GRPOScalpingEnv(gym.Env):
                                                      for trade in matching) / reason_quantity if reason_quantity else 0.0),
             })
         return {
+            **({'entry_pattern': self._entry_pattern_report()} if self.entry_pattern_config is not None else {}),
             'total_return': float(net_return), 'net_return': float(net_return),
             'realized_net_pnl': float(self.realized_net_pnl),
             'gross_realized_pnl': float(sum(t['quantity'] * (t['exit_price'] - t['entry_price']) for t in trades)),
@@ -792,6 +912,7 @@ class GRPOScalpingEnv(gym.Env):
             'sharpe_ratio_kind': 'unannualized_event_nav_changes',
             'loss_holding_violations': self.loss_holding_violations,
             'buy_action_outcomes': self.buy_action_outcomes.copy(),
+            'entry_diagnostics': self._calculate_entry_diagnostics(fragments_by_entry),
             'open_quantity': self.quantity,
             'max_open_holding_seconds': max((self.current_time_seconds - s['entry_time_seconds'] for s in self.stages), default=0.0),
             'liquidation_complete': self.quantity == 0,

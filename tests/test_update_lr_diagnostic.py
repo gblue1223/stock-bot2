@@ -3,13 +3,16 @@ import hashlib
 import io
 import json
 import random
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
 import zipfile
 
 import numpy as np
 import pytest
 import torch
 
-from ai_trader.grpo.diagnose_update_lr import main, run_diagnostics, write_report_exclusive
+from ai_trader.grpo.diagnose_update_lr import _guard_reason, main, run_diagnostics, write_report_exclusive
 from ai_trader.grpo.grpo import GRPOTrainer
 from ai_trader.grpo.policies.scalping_policy_xlstm import GRPOPolicyE2EXLSTM
 from ai_trader.grpo.policy_update_checks import RolloutLikelihoodMismatch, clone_state_to_cpu
@@ -39,6 +42,21 @@ def assert_tree_equal(left, right):
             assert_tree_equal(a, b)
     else:
         assert left == right
+
+
+@pytest.mark.parametrize('metrics,reason', [
+    ({'pre_update_kl_early_stopped': 1, 'pre_update_kl_uses_exact': 1}, 'pre_step_exact_kl'),
+    ({'pre_update_kl_early_stopped': 1, 'pre_update_kl_uses_exact': 0}, 'pre_step_sampled_kl'),
+    # Older diagnostics calculated exact KL only after the sampled guard stopped.
+    ({'pre_update_kl_early_stopped': 1, 'pre_update_exact_kl_checked': 1,
+      'policy_update_checks_enabled': 1}, 'pre_step_sampled_kl'),
+    ({}, 'completed_configured_epochs'),
+    ({'pre_update_kl_early_stopped': 0, 'pre_update_kl_uses_exact': 1}, 'completed_configured_epochs'),
+    ({'post_update_kl_early_stopped': 1, 'pre_update_kl_early_stopped': 1,
+      'pre_update_kl_uses_exact': 1}, 'post_step_exact_kl_rollback'),
+])
+def test_guard_reason_distinguishes_active_exact_guard_from_legacy_diagnostic_only(metrics, reason):
+    assert _guard_reason(metrics) == reason
 
 
 def fixed_rollout(device='cpu'):
@@ -267,3 +285,207 @@ def test_exclusive_publish_rejects_racing_destination(tmp_path, monkeypatch):
         atomic_save_exclusive(destination, {'input': torch.ones(3)})
     assert destination.read_bytes() == b'other writer'
     assert list(tmp_path.glob('*.tmp')) == []
+
+
+def export_fixture(tmp_path, *, kl_target=None):
+    from ai_trader.grpo.train_xlstm import TrainingConfig
+    from ai_trader.grpo.update_diagnostic import TRAINER_FIELDS
+    from lib.observations import ObservationBuilder
+
+    trainer, episodes, advantages = fixed_rollout('cpu')
+    if kl_target is not None:
+        trainer.kl_target = kl_target
+    config = TrainingConfig()
+    config.seq_len, config.features = 8, 27
+    config.cnn_channels, config.rnn_hidden_dim, config.hidden_dim = 4, 4, 8
+    config.checkpoint_segments = 2
+    config.rolling_window_size, config.rolling_min_samples = 4, 2
+    for name in TRAINER_FIELDS:
+        setattr(config, {'learning_rate': 'lr', 'clip_epsilon': 'clip'}.get(name, name), getattr(trainer, name))
+    schema = ObservationBuilder([f'feature_{index}' for index in range(27)], seq_len=8,
+                                rolling_window_size=4, rolling_min_samples=2,
+                                account_observations=True, execution_observations=True).schema
+    trainer.observation_schema = schema
+    dates = {'train': ['20240101', '20240102'], 'validation': ['20240103', '20240104'],
+             'test': ['20240105', '20240106']}
+    source = {'iteration': 19, 'num_updates': 19, 'total_timesteps': trainer.total_timesteps,
+              'policy_state_dict': clone_state_to_cpu(trainer.policy.state_dict()),
+              'optimizer_state_dict': clone_state_to_cpu(trainer.optimizer.state_dict()),
+              'observation_schema': schema, 'config': {name: getattr(trainer, name) for name in TRAINER_FIELDS},
+              'best_validation_return': 999., 'training_control_state': {'old_score': 999.},
+              'extra_state': {'training_config': deepcopy(config.__dict__), 'date_splits': dates,
+                              'best_validation_metrics': {'mean_net_return': 999.},
+                              'validation_return': 999.}}
+    source_path = tmp_path / 'source.pt'
+    torch.save(source, source_path)
+    trainer.total_timesteps += sum(len(episode['states']) for episode in episodes)
+    bundle_path = tmp_path / 'fixed.pt'
+    save_update_bundle(bundle_path, trainer=trainer, episodes=episodes, advantages=advantages,
+                       training_config=deepcopy(config.__dict__))
+    return source_path, bundle_path, source
+
+
+def test_exported_candidates_are_actual_final_policies_with_clean_evaluation_lineage(tmp_path, monkeypatch):
+    source_path, bundle_path, source = export_fixture(tmp_path)
+    initial_hashes = [hashlib.sha256(path.read_bytes()).hexdigest() for path in (source_path, bundle_path)]
+    original_update = GRPOTrainer.update_policy
+    actual_final_states = []
+
+    def record_final(trainer, episodes, advantages):
+        result = original_update(trainer, episodes, advantages)
+        actual_final_states.append(clone_state_to_cpu(trainer.policy.state_dict()))
+        return result
+
+    monkeypatch.setattr(GRPOTrainer, 'update_policy', record_final)
+    export_dir = tmp_path / 'candidates'
+    report = run_diagnostics(bundle_path, learning_rates=[3e-5, 1e-5, 3e-6], device='cpu',
+                              source_checkpoint=source_path, export_dir=export_dir)
+    assert report['all_variants_succeeded'] and report['model_exported']
+    assert report['holdout_evaluated'] is False
+    assert report['precision_restored'] and report['rng_restored']
+    assert report['source_checkpoint'] == str(source_path.resolve())
+    assert report['source_checkpoint_sha256'] == initial_hashes[0]
+    assert report['bundle_sha256'] == initial_hashes[1]
+    for index, variant in enumerate(report['variants']):
+        path = Path(variant['candidate_checkpoint'])
+        assert path.parent == export_dir.resolve() and path.name.startswith(f'lr_{index:02d}_')
+        assert variant['candidate_sha256'] == hashlib.sha256(path.read_bytes()).hexdigest()
+        candidate = torch.load(path, map_location='cpu', weights_only=True)
+        assert candidate['evaluation_only'] is True and candidate['resumable'] is False
+        assert candidate['checkpoint_kind'] == 'fixed_rollout_evaluation_candidate'
+        assert_tree_equal(candidate['policy_state_dict'], actual_final_states[index])
+        assert candidate['num_updates'] == candidate['iteration'] == 20
+        assert candidate['total_timesteps'] == source['total_timesteps'] + 8
+        assert candidate['config']['learning_rate'] == variant['learning_rate']
+        assert candidate['extra_state']['training_config']['lr'] == variant['learning_rate']
+        assert candidate['observation_schema'] == source['observation_schema']
+        assert candidate['extra_state']['date_splits'] == source['extra_state']['date_splits']
+        assert set(candidate['extra_state']) == {'training_config', 'date_splits', 'export_provenance'}
+        assert not {'best_validation_return', 'training_control_state', 'optimizer_state_dict'} & candidate.keys()
+        provenance = candidate['extra_state']['export_provenance']
+        assert provenance['source_checkpoint_sha256'] == initial_hashes[0]
+        assert provenance['bundle_sha256'] == initial_hashes[1]
+        assert provenance['optimizer_accepted_steps'] == variant['metrics']['optimizer_accepted_steps']
+        assert provenance['inherited_validation_scores'] is False
+        assert provenance['candidate_validation_performed'] is False
+        assert not torch.equal(candidate['policy_state_dict']['policy_head.weight'], source['policy_state_dict']['policy_head.weight'])
+    assert [hashlib.sha256(path.read_bytes()).hexdigest() for path in (source_path, bundle_path)] == initial_hashes
+
+
+def test_exported_candidate_can_be_read_by_existing_validation_and_cannot_resume(tmp_path, monkeypatch):
+    from ai_trader.grpo import diagnose_xlstm
+    from ai_trader.grpo.train_xlstm import TrainingConfig, create_policy
+
+    source_path, bundle_path, source = export_fixture(tmp_path)
+    report = run_diagnostics(bundle_path, learning_rates=[1e-5], device='cpu',
+                              source_checkpoint=source_path, export_dir=tmp_path / 'candidates')
+    path = report['variants'][0]['candidate_checkpoint']
+    candidate = torch.load(path, weights_only=True, map_location='cpu')
+    observed = {}
+    fake_env = SimpleNamespace(observation_space=SimpleNamespace(shape=(8, 63)),
+                               observation_schema=source['observation_schema'],
+                               valid_keys=[('fixture', 'path', date) for date in source['extra_state']['date_splits']['validation']],
+                               close=lambda: observed.update(closed=True))
+
+    def environment(config, device, allowed_dates):
+        observed.update(lr=config.lr, dates=allowed_dates)
+        return fake_env
+
+    def evaluate(policy, env, **kwargs):
+        assert_tree_equal(policy.state_dict(), candidate['policy_state_dict'])
+        return {'num_episodes': kwargs['num_episodes'], 'mean_net_return': 0.0}
+
+    monkeypatch.setattr(diagnose_xlstm, '_training_factories', lambda: (TrainingConfig, environment, create_policy))
+    monkeypatch.setattr(diagnose_xlstm, 'evaluate_policy', evaluate)
+    validation = diagnose_xlstm.run_diagnostics(path, split='validation', episodes=2, device='cpu', extracted_dir=tmp_path)
+    assert observed['closed'] and observed['lr'] == 1e-5
+    assert observed['dates'] == source['extra_state']['date_splits']['validation']
+    assert validation['checkpoint_iteration'] == 20
+    trainer, _, _ = fixed_rollout('cpu')
+    with pytest.raises(ValueError, match='optimizer_state_dict'):
+        trainer.restore_training_progress(candidate)
+
+
+def test_export_collision_is_rejected_before_any_update(tmp_path, monkeypatch):
+    source_path, bundle_path, _ = export_fixture(tmp_path)
+    directory = tmp_path / 'candidates'
+    directory.mkdir()
+    collision = directory / 'lr_01_1e-05.pt'
+    collision.write_bytes(b'existing evidence')
+    monkeypatch.setattr(GRPOTrainer, 'update_policy', lambda *args: pytest.fail('Update must not start on a destination collision'))
+    with pytest.raises(FileExistsError, match='already exists'):
+        run_diagnostics(bundle_path, learning_rates=[3e-5, 1e-5], device='cpu',
+                          source_checkpoint=source_path, export_dir=directory)
+    assert list(directory.iterdir()) == [collision]
+    assert collision.read_bytes() == b'existing evidence'
+
+
+def test_failed_update_or_full_kl_does_not_export_that_variant(tmp_path, monkeypatch):
+    from ai_trader.grpo import diagnose_update_lr
+
+    source_path, bundle_path, _ = export_fixture(tmp_path)
+    original_update, original_kl = GRPOTrainer.update_policy, diagnose_update_lr._full_kl
+    updates, checks = [], []
+
+    def update(trainer, episodes, advantages):
+        updates.append(trainer.learning_rate)
+        if len(updates) == 1:
+            raise FloatingPointError('controlled update failure')
+        return original_update(trainer, episodes, advantages)
+
+    def full_kl(*args, **kwargs):
+        checks.append(True)
+        if len(checks) == 1:
+            raise FloatingPointError('controlled full rollout KL failure')
+        return original_kl(*args, **kwargs)
+
+    monkeypatch.setattr(GRPOTrainer, 'update_policy', update)
+    monkeypatch.setattr(diagnose_update_lr, '_full_kl', full_kl)
+    directory = tmp_path / 'candidates'
+    report = run_diagnostics(bundle_path, learning_rates=[3e-5, 1e-5, 3e-6], device='cpu',
+                              source_checkpoint=source_path, export_dir=directory)
+    assert [variant['status'] for variant in report['variants']] == ['error', 'error', 'ok']
+    assert report['model_exported'] and not report['all_variants_succeeded']
+    assert all(variant['candidate_checkpoint'] is None for variant in report['variants'][:2])
+    assert [path.name for path in directory.iterdir()] == ['lr_02_3e-06.pt']
+
+
+def test_wrong_export_source_is_rejected_before_updates(tmp_path, monkeypatch):
+    source_path, bundle_path, source = export_fixture(tmp_path)
+    source['policy_state_dict']['policy_head.weight'].add_(1)
+    torch.save(source, source_path)
+    monkeypatch.setattr(GRPOTrainer, 'update_policy', lambda *args: pytest.fail('Wrong source must fail before update'))
+    with pytest.raises(ValueError, match='policy_state_dict'):
+        run_diagnostics(bundle_path, device='cpu', source_checkpoint=source_path, export_dir=tmp_path / 'candidates')
+    assert not (tmp_path / 'candidates').exists()
+
+
+def test_export_options_are_paired_and_cli_emits_candidate_paths(tmp_path):
+    source_path, bundle_path, _ = export_fixture(tmp_path)
+    with pytest.raises(ValueError, match='provided together'):
+        run_diagnostics(bundle_path, device='cpu', source_checkpoint=source_path)
+    with pytest.raises(ValueError, match='provided together'):
+        run_diagnostics(bundle_path, device='cpu', export_dir=tmp_path / 'candidates')
+    with pytest.raises(SystemExit):
+        main(['--bundle', str(bundle_path), '--output', str(tmp_path / 'missing.json'), '--export-dir', str(tmp_path / 'candidates')])
+    output = tmp_path / 'report.json'
+    assert main(['--bundle', str(bundle_path), '--output', str(output), '--device', 'cpu',
+                  '--learning-rates', '0.00001', '--source-checkpoint', str(source_path),
+                  '--export-dir', str(tmp_path / 'candidates')]) == 0
+    report = json.loads(output.read_text(encoding='utf-8'))
+    assert report['model_exported'] and Path(report['variants'][0]['candidate_checkpoint']).is_file()
+
+
+def test_poststep_rejection_exports_the_restored_final_weights_and_records_zero_accepted_steps(tmp_path):
+    source_path, bundle_path, source = export_fixture(tmp_path, kl_target=1e-6)
+    report = run_diagnostics(bundle_path, learning_rates=[.1], device='cpu',
+                              source_checkpoint=source_path, export_dir=tmp_path / 'candidates')
+    variant = report['variants'][0]
+    assert variant['status'] == 'ok' and variant['guard_reason'] == 'post_step_exact_kl_rollback'
+    assert variant['metrics']['optimizer_rejected_steps'] == 1
+    assert variant['metrics']['optimizer_accepted_steps'] == 0
+    candidate = torch.load(variant['candidate_checkpoint'], map_location='cpu', weights_only=True)
+    assert_tree_equal(candidate['policy_state_dict'], source['policy_state_dict'])
+    assert candidate['extra_state']['export_provenance']['optimizer_accepted_steps'] == 0
+    assert candidate['extra_state']['export_provenance']['optimizer_rejected_steps'] == 1
+    assert candidate['extra_state']['export_provenance']['completed_update_calls'] == 1

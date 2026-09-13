@@ -79,6 +79,11 @@ class ObservationBuilder:
                         + (len(ACCOUNT_FIELDS) if self.account_observations else 0)
                         + (len(EXECUTION_FIELDS) if self.execution_observations else 0))
         self.log_indices = [i for i, name in enumerate(self.feature_columns) if name in LOGSTD_FEATURES]
+        self.opening_index = self.feature_columns.index('시초가') if '시초가' in self.feature_columns else None
+        if self.opening_index is not None:
+            if '현재가' not in self.feature_columns or '시초가대비등락률' not in self.feature_columns:
+                raise ValueError('Opening observations require 현재가 and 시초가대비등락률')
+            self.log_indices.append(self.opening_index)
 
     @property
     def schema(self) -> dict:
@@ -89,7 +94,8 @@ class ObservationBuilder:
                 "seq_len": self.seq_len, "rolling_window_size": self.rolling_window_size,
                 "rolling_min_samples": self.rolling_min_samples,
                 "max_holding_seconds": self.max_holding_seconds, "max_stages": self.max_stages,
-                "stage_fields": list(STAGE_FIELDS), "normalization": NORMALIZATION,
+                "stage_fields": list(STAGE_FIELDS), "normalization": (
+                    'causal_window_log_zscore_opening_v1' if self.opening_index is not None else NORMALIZATION),
                 "feature_price_unit": self.feature_price_unit}
         if self.account_observations:
             schema.update(account_fields=list(ACCOUNT_FIELDS), account_normalization=ACCOUNT_NORMALIZATION)
@@ -136,7 +142,17 @@ class ObservationBuilder:
             mean = stats_rows.mean(axis=0)
             std = stats_rows.std(axis=0)
             std = np.where(std < 1e-6, 1.0, std)
+            if self.opening_index is not None:
+                # Express the fixed opening price on the same scale as current
+                # prices instead of erasing it with its own constant statistics.
+                price_index = self.feature_columns.index('현재가')
+                mean[self.opening_index] = mean[price_index]
+                std[self.opening_index] = std[price_index]
             transformed = (transformed - mean) / std
+        if self.opening_index is not None:
+            transformed[rows[:, self.opening_index] <= 0, self.opening_index] = 0
+            rate_index = self.feature_columns.index('시초가대비등락률')
+            transformed[:, rate_index] = rows[:, rate_index] / 100.0
         result = transformed.astype(np.float32)
         if not np.isfinite(result).all():
             raise ValueError("Normalized observation exceeds finite float32 range")

@@ -25,7 +25,7 @@ _TRADE_DIAGNOSTICS = ('round_trip_count', 'round_trip_win_rate',
                       'total_entry_fees', 'total_exit_fees', 'total_fees', 'gross_realized_pnl',
                       *_PNL_COMPONENTS, *_TIME_DIAGNOSTICS,
                       'subsecond_exit_quantity_ratio', 'subsecond_round_trip_ratio',
-                      'attribution_reference_kind',
+                      'attribution_reference_kind', 'entry_pattern',
                       *(f'exit_{reason}_{metric}' for reason in _EXIT_REASONS
                         for metric in ('round_trip_count', 'quantity', 'net_pnl', 'holding_seconds')))
 
@@ -114,6 +114,12 @@ def _additional_metrics(episodes):
         return result if all(value is not None for value in result) else None
 
     result = {}
+    reports = [episode.get('entry_pattern') for episode in episodes]
+    if all(report is not None for report in reports):
+        totals = {key: int(sum(report[key] for report in reports)) for key in
+                  ('success_quantity', 'failure_quantity', 'censored_quantity', 'labeled_buy_decisions')}
+        labeled = totals['success_quantity'] + totals['failure_quantity']
+        result['entry_pattern'] = {**totals, 'success_rate': totals['success_quantity'] / labeled if labeled else None}
     for count_key, rate_key in (('round_trip_count', 'round_trip_win_rate'),
                                 ('fill_count', 'fill_win_rate')):
         counts, rates = values(count_key), values(rate_key)
@@ -288,7 +294,7 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                     for key in ('num_trades', 'max_drawdown', 'avg_holding_time',
                                 'open_quantity', 'realized_net_pnl', *_ORDER_METRICS,
                                 *[name for name in _TRADE_DIAGNOSTICS
-                                  if name not in ('round_trips', 'liquidation_stop_reason', 'attribution_reference_kind')]):
+                                  if name not in ('round_trips', 'liquidation_stop_reason', 'attribution_reference_kind', 'entry_pattern')]):
                         if episode.get(key) is not None and not np.isfinite(episode[key]):
                             raise ValueError(f"Evaluation requires finite episode {key}")
                     episode['net_return'] = float(value)
@@ -384,6 +390,7 @@ def evaluation_signature(config: dict, date_splits: dict, observation_schema: di
         'liquidation_max_steps': 0,  # Historical checkpoints had no liquidation tail.
         'decision_interval_seconds': 0.0, 'episode_duration_seconds': 0.0,
         'execution_action_mask': False,
+        'entry_pattern_config': None,
         'max_trades_per_episode': None, 'base_price': 100000.0, 'price_scale': 1.0,
         'execution_config': {'order_latency_ms': 100, 'cancel_latency_ms': 50,
                              'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
@@ -436,6 +443,8 @@ def compatible_resume_best(candidate: dict, source: dict, current_signature: dic
         # Before liquidation tails existed, version-1 signatures omitted the
         # setting. They remain compatible only with the historical disabled tail.
         if signature.get('version') == 1 and isinstance(signature.get('settings'), dict):
+            if 'entry_pattern_config' not in signature['settings'] and config.get('entry_pattern_config') is None:
+                signature['settings']['entry_pattern_config'] = None
             for name in ('liquidation_max_steps', 'decision_interval_seconds', 'episode_duration_seconds',
                          'execution_action_mask'):
                 if name not in signature['settings'] and config.get(name, 0) == 0:

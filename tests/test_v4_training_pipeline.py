@@ -1,4 +1,4 @@
-"""Exercise the real 63-channel replay, cached rollout, update and evaluation pipeline."""
+"""Exercise replay, cached rollout, update and evaluation with opening prices."""
 import json
 
 import numpy as np
@@ -15,11 +15,13 @@ from lib.market_data import canonical_feature_columns
 @pytest.mark.parametrize('device', ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA unavailable'))])
 def test_v4_timed_rollout_update_and_batched_validation(tmp_path, device):
-    columns = canonical_feature_columns()
+    columns = canonical_feature_columns(29)
     rows = 80
     price = 100. + np.arange(rows) * .03
     features = np.zeros((rows, len(columns)), np.float32)
     features[:, columns.index('현재가')] = price
+    features[:, columns.index('시초가')] = price[0]
+    features[:, columns.index('시초가대비등락률')] = (price / price[0] - 1) * 100
     features[:, columns.index('누적거래대금')] = np.arange(rows) * 1000
     metadata = np.array([['TEST', '20260908', str(90000000 + i * 250)] for i in range(rows)])
     np.savez(tmp_path / 'episode.npz', features=features, metadata=metadata,
@@ -57,7 +59,7 @@ def test_v4_timed_rollout_update_and_batched_validation(tmp_path, device):
                               policy_update_checks=True, kl_probe_samples=4)
         episodes = trainer.collect_rollouts(4)
         assert len(episodes) == 4
-        assert all(ep['states'].shape == (4, 8, 63) for ep in episodes)
+        assert all(ep['states'].shape == (4, 8, 65) for ep in episodes)
         for ep in episodes:
             assert ep['metadata']['policy_duration_seconds'] == 2.
             assert ep['metadata']['market_steps_taken'] >= 8
