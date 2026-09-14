@@ -126,7 +126,8 @@ def main(argv=None):
         'entry_attribution_complete', 'missing_episode_count', 'sample_count',
         'entry_count', 'complete_entry_count', 'action/buy/sample_count',
         'action/buy/normalized_advantage_mean', 'outcome/profitable/sample_count',
-        'outcome/profitable/normalized_advantage_negative_count', 'outcome/loss/sample_count')}
+        'outcome/profitable/normalized_advantage_negative_count',
+        'outcome/profitable/initial_actor_signal_negative_count', 'outcome/loss/sample_count')}
     print('Entry credit: ' + json.dumps(summary, ensure_ascii=False), flush=True)
     print(f'Entry credit report saved: {destination}', flush=True)
     return 0

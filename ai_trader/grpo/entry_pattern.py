@@ -16,7 +16,7 @@ DEFAULT_ENTRY_PATTERN = {
     'target_min_seconds': 1.0,
     'target_max_seconds': 5.0,
     'policy_coef': 1.0,
-    'target_mode': 'realized_net',
+    'target_mode': 'short_horizon_net',
 }
 
 
@@ -49,8 +49,8 @@ def validate_entry_pattern(config):
     result = {**DEFAULT_ENTRY_PATTERN, **config}
     # Old saved configurations must retain their original learning objective.
     result['target_mode'] = config.get('target_mode', 'legacy_price')
-    if result['target_mode'] not in ('realized_net', 'legacy_price'):
-        raise ValueError('entry_pattern_config.target_mode must be realized_net or legacy_price')
+    if result['target_mode'] not in ('short_horizon_net', 'realized_net', 'legacy_price'):
+        raise ValueError('entry_pattern_config.target_mode must be short_horizon_net, realized_net or legacy_price')
     for key, value in result.items():
         if key == 'target_mode':
             continue
@@ -122,7 +122,7 @@ after this fill. Require data through the entire horizon even for early hits.
 
 
 def pattern_policy_credit(episodes):
-    """Separate PPO auxiliary signal; NAV rewards/critic targets stay unchanged."""
+    """Fill-attributed PPO signal; NAV rewards/critic targets stay unchanged."""
     result = []
     for ep in episodes:
         actions = np.asarray(ep['actions'])
@@ -135,3 +135,31 @@ def pattern_policy_credit(episodes):
                 raise ValueError('Invalid entry pattern policy credit')
         result.append(credit)
     return np.concatenate(result)
+
+
+def pattern_actor_signals(episodes, normalized_advantages):
+    """Route new-mode BUY to its own outcome, including zero for unknown fills.
+
+    Old modes remain additive. With policy_coef=0 all modes retain NAV-only
+    actor training. Do not normalize the trade-local credit against other
+    trades: that would allow a profitable entry's sign to flip again.
+    """
+    episodes = list(episodes)
+    credit = pattern_policy_credit(episodes)
+    base = np.asarray(normalized_advantages, dtype=np.float32).copy()
+    if base.shape != credit.shape or not np.isfinite(base).all():
+        raise ValueError('Invalid normalized entry actor advantages')
+    local = np.zeros(len(base), dtype=bool)
+    offset = 0
+    for episode in episodes:
+        actions = np.asarray(episode['actions'])
+        report = episode.get('metadata', {}).get('entry_pattern')
+        if report is not None and report.get('config') is not None:
+            cfg = validate_entry_pattern(report['config'])
+            if cfg['target_mode'] == 'short_horizon_net' and cfg['policy_coef'] > 0:
+                local[offset:offset + len(actions)] = actions == 1
+            if cfg['policy_coef'] == 0 and np.any(credit[offset:offset + len(actions)]):
+                raise ValueError('Disabled entry objective must have zero policy credit')
+        offset += len(actions)
+    base[local] = 0.
+    return base, credit, local

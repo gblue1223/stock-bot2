@@ -11,7 +11,7 @@
     "target_min_seconds": 1.0,
     "target_max_seconds": 5.0,
     "policy_coef": 1.0,
-    "target_mode": "realized_net"
+    "target_mode": "short_horizon_net"
   },
   "execution_action_mask": true,
   "decision_interval_seconds": 1.0,

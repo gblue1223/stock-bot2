@@ -105,6 +105,8 @@ def prepare_rollouts(episodes, advantages, *, action_dim, masked):
                 saved['metadata']['episode_start'] = portable_metadata({
                     key: start[key] for key in ('episode_key', 'seed')
                     if key in start})
+        if isinstance(metadata, dict) and metadata.get('entry_pattern') is not None:
+            saved.setdefault('metadata', {})['entry_pattern'] = portable_metadata(metadata['entry_pattern'])
         masks = episode.get('action_masks')
         if masked:
             if masks is None:

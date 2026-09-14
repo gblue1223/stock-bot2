@@ -855,21 +855,32 @@ class GRPOScalpingEnv(gym.Env):
             net_pnl = float(sum(t['net_pnl'] for t in trades)) if closed else None
             target = float(np.sign(net_pnl)) if closed else None
             legacy = order['legacy_credit'] / order['legacy_quantity'] if order['legacy_quantity'] else None
-            if self.entry_pattern_config['target_mode'] == 'realized_net':
+            horizon_complete = order['legacy_quantity'] == order['quantity']
+            # Every actual fill must reach its own execution price in [1, 5]s.
+            # This is a price-observation window, not a forced liquidation time.
+            # Require the complete window and complete order PnL before labeling.
+            joint_target = None
+            if closed and horizon_complete:
+                joint_target = -1.0 if target < 0 or legacy < 1.0 else target
+            mode = self.entry_pattern_config['target_mode']
+            if mode in ('realized_net', 'short_horizon_net'):
+                policy_target = joint_target if mode == 'short_horizon_net' else target
                 quantity = order['quantity']
-                if target is None:
+                if policy_target is None:
                     censored += quantity
                 else:
                     decision = self._entry_order_decisions[order_id]
-                    credits[decision] += target * quantity
+                    credits[decision] += policy_target * quantity
                     quantities[decision] += quantity
-                    success += quantity if target > 0 else 0
-                    failure += quantity if target < 0 else 0
-                    neutral += quantity if target == 0 else 0
+                    success += quantity if policy_target > 0 else 0
+                    failure += quantity if policy_target < 0 else 0
+                    neutral += quantity if policy_target == 0 else 0
             details.append({'entry_order_id': order_id, 'quantity': order['quantity'],
                             'closed': closed, 'net_pnl': net_pnl, 'net_target': target,
                             'legacy_credit': legacy,
-                            'legacy_label_complete': order['legacy_quantity'] == order['quantity']})
+                            'legacy_label_complete': horizon_complete,
+                            'short_horizon_net_target': joint_target,
+                            'short_horizon_success': legacy == 1.0 if horizon_complete else None})
         positive = [d for d in details if d['closed'] and d['legacy_label_complete']
                     and d['legacy_credit'] is not None and d['legacy_credit'] > 0]
         credits = np.divide(credits, quantities, out=np.zeros_like(credits), where=quantities > 0)

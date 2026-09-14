@@ -11,6 +11,8 @@ from numbers import Integral, Real
 
 import numpy as np
 
+from .entry_pattern import pattern_actor_signals
+
 
 _MONEY_FIELDS = (
     'net_pnl', 'mid_price_pnl', 'spread_cost', 'depth_cost', 'slippage_cost',
@@ -21,7 +23,8 @@ _SIGNAL_FIELDS = (
     'raw_gae', 'group_component', 'pre_normalized_advantage', 'normalized_advantage',
     'return_target', 'cached_value', 'critic_target_error', 'immediate_reward',
     'bootstrap_value_delta', 'immediate_td_error', 'future_td_trace',
-    'gae_trace_consistency_residual',
+    'gae_trace_consistency_residual', 'actor_base_advantage',
+    'entry_pattern_credit', 'initial_actor_signal',
 )
 
 
@@ -186,6 +189,12 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
         'return_target': _vector(returns, length, 'returns'),
         'cached_value': _vector(cached_values, length, 'cached_values', optional=True),
     }
+    if length:
+        base, credit, local = pattern_actor_signals(episodes, arrays['normalized_advantage'])
+    else:
+        base, credit, local = np.empty(0), np.empty(0), np.zeros(0, dtype=bool)
+    arrays.update(actor_base_advantage=base, entry_pattern_credit=credit,
+                  initial_actor_signal=base + credit)
     action_rows = {name: [] for name in ('hold', 'buy', 'sell')}
     entries, buy_decisions = [], []
     available_episodes = 0
@@ -196,6 +205,7 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
             global_index = offset + index
             signal = {name: float(values[global_index]) if values is not None else None
                       for name, values in arrays.items()}
+            signal['trade_local_actor'] = bool(local[global_index])
             signal.update(immediate_reward=float(rewards[index]), critic_target_error=None,
                           bootstrap_value_delta=None, immediate_td_error=None,
                           future_td_trace=None, gae_trace_consistency_residual=None)
@@ -282,13 +292,20 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
         metrics.update({f'outcome/{outcome}/{key}': value for key, value in summary.items()})
         metrics.update({f'outcome/{outcome}/exit_reason/{reason}/entry_count': count
                         for reason, count in reasons.items()})
-    return {
+    report = {
         'version': 1,
         'scope': ('Observed rollout entry outcomes and frozen actor/critic targets; not counterfactual '
                   'profit, updated-policy performance, or the shared-network gradient. Incomplete '
                   'entry PnL covers sold quantity only. Entry PnL is money; rewards and GAE use the '
-                  'training reward units. Zero summary values require their availability/count flags.'),
+                  'training reward units. initial_actor_signal is the selected-action coefficient '
+                  'at ratio=1 before PPO clipping, entropy and shared critic gradients. '
+                  'Zero summary values require their availability/count flags.'),
         'gamma': gamma, 'lambda_gae': lambda_gae, 'metrics': metrics,
         'availability': availability, 'action_summary': action_summary,
         'outcome_summary': outcome_summary, 'entries': entries, 'buy_decisions': buy_decisions,
     }
+    if any(ep.get('metadata', {}).get('entry_pattern') is not None for ep in episodes):
+        report['entry_pattern_episodes'] = [
+            {'episode_key': ep.get('metadata', {}).get('episode_key'),
+             'entry_pattern': ep.get('metadata', {}).get('entry_pattern')} for ep in episodes]
+    return report

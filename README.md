@@ -6,13 +6,27 @@
 
 새 학습 예제와 Colab 기본 설정은 `seq_len=2048`이며, **같은 과거 5~60초 구간에서 매수 방향 체결대금 30억 원 이상 + 현재가 1% 이상 상승**한 시점만 진입 후보로 사용합니다. 관측 길이는 2048개 시장 행이고 2048초를 뜻하지 않습니다. 에피소드 시작점은 후보 중에서 선택하며, 이후에도 조건을 충족하지 않는 시점의 매수 행동을 차단합니다. 매도·보유 및 비용을 포함한 순수익 학습은 유지합니다.
 
-새 실험의 기본 보조 목표 `entry_pattern_config.target_mode="realized_net"`은 매수 주문의 실제 체결 수량을 전부 청산한 뒤, 체결가격·수수료·세금을 반영한 순손익이 양수이면 +1, 음수이면 -1, 정확히 0이면 0을 매수 결정에 연결합니다. 부분 청산 손익을 모두 합산하고, 미청산 수량이나 활성 매수 주문이 남으면 미확정으로 제외합니다. NAV 보상과 가치함수 목표는 유지하며, 보조 신호는 `policy_coef` 배율로 정책 손실에 더합니다.
+새 실험의 기본 목표 `entry_pattern_config.target_mode="short_horizon_net"`은 두 조건을 함께 평가합니다. 매수 주문의 모든 실제 체결 건에서 **체결 후 1~5초의 최고 현재가가 해당 체결가 이상**이고, 주문 전체를 청산한 **비용 차감 순손익이 양수**이면 +1입니다. 가격 조건 실패 또는 순손실이면 -1, 가격 조건 성공과 순손익 0이면 0입니다. 부분 체결마다 실제 시각·가격으로 판정하고 부분 청산 손익은 주문 단위로 합산합니다. 스프레드·호가 깊이·슬리피지는 실제 체결가에, 수수료·세금은 순손익에 반영합니다. 1~5초는 상승 확인 구간이며 강제 매도 시한이 아닙니다.
 
-기존 1~5초 최고 현재가가 매수 체결가 이상인지 보는 기준은 `target_mode="legacy_price"`로 재현합니다. `target_mode`가 없는 기존 설정·체크포인트도 이 모드를 유지합니다. 새 목표에서도 기존 가격 라벨과 실제 완료 거래 순손익을 함께 기록하여, 가격 라벨 성공 중 실제 수익 거래 비율과 순손익을 비교합니다. `policy_coef=0`은 진입 필터를 유지한 NAV 전용 대조 실험입니다. 미래 가격과 청산 결과는 학습 라벨에만 사용하며 관측·매수 조건·에피소드 선정에는 사용하지 않습니다.
+새 모드의 BUY 정책 손실은 기존 정규화 GAE 대신 해당 주문의 신호 × `policy_coef`를 사용합니다. 따라서 이후 거래 결과나 배치 평균 때문에 성공 매수 신호의 부호가 바뀌지 않습니다. 미체결·미청산·활성 매수 주문·전체 5초 관측 부족은 BUY 신호를 0으로 보류합니다. HOLD/SELL의 기존 actor 신호와 NAV 보상·가치함수 목표는 유지합니다. 공유 신경망·가치 손실·엔트로피 때문에 개별 업데이트 후 매수 확률 상승까지 보장하는 것은 아닙니다.
 
-Colab 설정 셀의 `ENTRY_TARGET`은 `realized_net`, `legacy_price`, `nav_only`를 지원합니다. 기본은 20,000 steps, 매 iteration 검증 16개인 단기 실험입니다. 같은 SEED·데이터·EXPERIMENT와 서로 다른 RUN_NAME으로 비교하고, 시드 42/142/242에서 확인한 후보를 더 많은 검증 구간으로 평가하세요. 새 목표는 `MODE='new'`로 시작하며 resume/finetune은 저장된 목표를 복원합니다. 기존 entry-pattern TAR는 진입 조건이 같으면 재사용할 수 있습니다.
+기존 순손익 보조 목표는 `target_mode="realized_net"`, 가격만 보는 보조 목표는 `target_mode="legacy_price"`로 재현합니다. 두 모드는 기존 GAE에 신호를 더하는 동작을 유지하며, `target_mode`가 없는 기존 설정·체크포인트도 `legacy_price`를 유지합니다. `policy_coef=0`은 모든 행동에 기존 NAV actor 신호를 사용하는 대조 실험입니다. 미래 가격과 청산 결과는 학습 라벨에만 사용하며 관측·매수 조건·에피소드 선정에는 사용하지 않습니다.
+
+Colab 설정 셀의 `ENTRY_TARGET`은 `short_horizon_net`(기본), `realized_net`, `legacy_price`, `nav_only`를 지원합니다. 기본은 20,000 steps, 매 iteration 검증 16개인 단기 실험입니다. 같은 SEED·데이터·EXPERIMENT와 서로 다른 RUN_NAME으로 비교하고, 시드 42/142/242에서 확인한 후보를 더 많은 검증 구간으로 평가하세요. 새 목표는 `MODE='new'`로 시작하며 resume/finetune은 저장된 목표를 복원합니다. 기존 entry-pattern TAR는 진입 조건이 같으면 재사용할 수 있습니다.
+
+거래별 진단에는 `normalized_advantage`(기존 NAV 신호), `actor_base_advantage`(BUY 교체 후 기존 신호), `entry_pattern_credit`, `initial_actor_signal`(두 actor 신호의 합), `trade_local_actor`를 기록합니다. 합은 ratio=1이고 클리핑 적용 전인 시점의 계수입니다. `entry_pattern.orders`의 `short_horizon_success`와 `short_horizon_net_target`으로 수익이 났어도 단기 목표에 실패한 거래를 구분합니다.
 
 검증 JSON/TensorBoard에는 `entry_signal_steps`, `buy_allowed_steps`, `mean_buy_probability_when_allowed`, `buy_action_rate_when_allowed`를 기록합니다. 패턴 기회 부족, 실행 조건에 의한 제한, 허용된 상태에서의 정책 HOLD 선택을 구분하는 지표입니다. 거래별 기존 라벨과 실제 손익 대조는 `checkpoints/diagnostics/entry_credit/iteration_*.json`의 `report.entry_pattern_episodes`와 검증 JSON의 에피소드별 `entry_pattern.orders`에서 확인합니다. 단기 테스트 통과나 높은 라벨 성공률만으로 수익성을 확정하지 않습니다.
+
+### A100 런타임 측정과 배치 선택
+
+Colab 설정 셀에서 `GPU_AUTOTUNE=True`를 사용하면 첫 롤아웃의 최대 256개 관측으로 학습 경로를 비교합니다. A100 40GB는 배치 16/32/64, 80GB는 32/64/128 및 현재 배치가 후보입니다. 복사한 정책·Adam에 실제 손실, 역전파, optimizer, 설정된 likelihood/KL 검사를 실행하며, 원본 가중치·Adam·난수·학습 횟수는 보존합니다. 완료한 업데이트의 처리량으로 선택하고 OOM, 메모리 예산 초과, 수치 검사 실패, 조기 중단 후보는 제외합니다. 모두 실패하면 오류로 중단합니다. 최초 비교 시간이 추가되며 제한된 표본 측정은 전체 학습의 메모리·속도·수익성을 보장하지 않습니다.
+
+`CHECKPOINT_SEGMENTS=0`은 활성값 재계산을 비활성화합니다. 기본 16은 유지하며, `COMPARE_NO_CHECKPOINT=True`일 때 선택된 배치에서 0도 비교합니다. 분할 수와 속도·메모리 관계는 단조롭지 않으므로 실측으로 결정합니다. 재현 실험에서는 `GPU_AUTOTUNE=False`, `UPDATE_BATCH_SIZE`와 `CHECKPOINT_SEGMENTS`를 고정하세요. 자동 선택은 배치와 optimizer step 수를 바꾸며, resume에서도 현재 노트북의 런타임 옵션을 사용합니다.
+
+CLI에서는 JSON 설정의 `gpu_tuning` 또는 `--gpu_tuning`을 사용합니다. 예: `{"batch_sizes":[32,64,128],"checkpoint_segments":[16,0],"samples":256,"warmup_samples":8,"max_memory_fraction":0.8}`. `gpu_tuning=null`이면 자동 비교를 끕니다. `max_memory_fraction`은 후보의 최대 reserved VRAM을 GPU 전체 용량과 비교하는 제외 기준이며, 할당 전에 메모리를 제한하는 기능은 아닙니다.
+
+선택 결과는 `checkpoints/gpu_tuning.json`과 체크포인트 `extra_state.training_config`에 기록합니다. `training_config.json`은 시작 요청 설정입니다. `checkpoints/diagnostics/runtime/iteration_*.json` 및 TensorBoard `runtime/`에는 학습 프로세스의 단계별 시간, 처리량, allocated/reserved VRAM 최대치를 저장합니다. CPU 실행은 GPU 수치를 만들지 않습니다. 업데이트 처리량의 samples는 입력 관측 수(epochs 중복 제외), 튜닝 처리량은 실제 비교 epochs를 포함한 관측 처리 수입니다. 기존 `rollback_snapshot_seconds`, `post_update_check_seconds` 및 추가 `minibatch_transfer_seconds`로 검사·복사 비용을 분리할 수 있습니다.
 
 원본의 `거래량`은 사용자 확인에 따라 **음수=매도 체결, 음수가 아닌 값=매수 체결**입니다. 음수가 하나도 없는 데이터도 모두 매수로 처리하며, 0은 매수금액에 영향을 주지 않습니다. `signed_volume_positive_buy` 추출 옵션은 `누적거래량`이 실제 증가한 행에서만 양수 체결량 × 원화 현재가를 합산합니다. 누적거래량이 그대로인 호가·거래원 갱신 행은 제외하고, 증가량이 체결량 절댓값과 다르면 해당 에피소드를 거부합니다. 전체 `누적거래대금`과 `매수대기금액`은 이 계산에 사용하지 않습니다. 첫 원본 행 이전의 체결은 추정하지 않습니다.
 

@@ -117,6 +117,7 @@ class TrainingConfig:
         self.revert_patience = 0
         self.num_workers = 4
         self.checkpoint_segments = 16  # Gradient checkpointing: 시퀀스 분할 수 (메모리 절약)
+        self.gpu_tuning = None  # Opt-in bounded CUDA throughput comparison on the first rollout.
         self.num_epochs = 2            # Number of epochs per policy update
         self.use_gae = True
         self.train_end_date = None
@@ -189,6 +190,8 @@ class TrainingConfig:
             logger.error(f"Failed to save configuration: {e}", exc_info=True)
 
     def validate(self):
+        from ai_trader.grpo.gpu_tuning import validate_gpu_tuning
+        self.gpu_tuning = validate_gpu_tuning(self.gpu_tuning)
         from ai_trader.grpo.entry_pattern import validate_entry_pattern
         self.entry_pattern_config = validate_entry_pattern(self.entry_pattern_config)
         if self.entry_pattern_config is not None and not self.execution_action_mask:
@@ -201,7 +204,7 @@ class TrainingConfig:
             errors.append('execution_action_mask must be a boolean')
         if not isinstance(self.policy_update_checks, bool):
             errors.append('policy_update_checks must be a boolean')
-        for name, minimum in (('no_trade_patience', 0), ('no_trade_max_validations', 0),
+        for name, minimum in (('checkpoint_segments', 0), ('no_trade_patience', 0), ('no_trade_max_validations', 0),
                               ('kl_probe_samples', 1), ('profitable_min_round_trips', 1),
                               ('profitable_min_traded_dates', 1)):
             value = getattr(self, name)
@@ -527,7 +530,9 @@ def main():
                         help='xLSTM hidden size (default:128, large:256, xlarge:512)')
     parser.add_argument('--checkpoint_segments', type=int, default=None,
                         help='Gradient checkpointing: number of segments to split the RNN sequence into. '
-                             'Higher = less VRAM but slower (default: 16)')
+                             '0 disables recomputation; positive counts require benchmarking (default: 16)')
+    parser.add_argument('--gpu_tuning', type=json.loads, default=None,
+                        help='JSON CUDA throughput tuning settings; null disables (also accepted in config)')
     parser.add_argument('--vram_preset', choices=['small', 'medium', 'large', 'xlarge'], default=None,
                         help=(
                             'VRAM 사용량 프리셋 (개별 옵션보다 우선 적용).\n'
@@ -819,6 +824,7 @@ def main():
             policy_update_checks=config.policy_update_checks,
             rollout_logprob_tolerance=config.rollout_logprob_tolerance,
             kl_probe_samples=config.kl_probe_samples,
+            gpu_tuning=config.gpu_tuning,
         )
         trainer.extra_checkpoint_state = {'date_splits': date_splits,
                                           'training_config': dict(config.__dict__)}

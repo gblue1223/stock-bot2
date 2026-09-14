@@ -104,8 +104,8 @@ class mLSTMLayer(nn.Module):
     Gradient Checkpointing:
     시퀀스를 checkpoint_segments 개의 세그먼트로 나누어,
     세그먼트 경계의 state(C, n)만 보관하고 내부 중간결과는
-    backward 시 재계산합니다. 이를 통해 VRAM 사용량을
-    O(seq_len)에서 O(seq_len / checkpoint_segments)로 줄입니다.
+    backward 시 재계산합니다. 경계 상태와 재계산 구간 모두 메모리를
+    사용하므로 최적 분할 수는 실측해야 합니다. 0이면 체크포인팅을 끕니다.
     """
     def __init__(
         self, input_size: int, hidden_size: int,
@@ -116,6 +116,8 @@ class mLSTMLayer(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        if isinstance(checkpoint_segments, bool) or not isinstance(checkpoint_segments, int) or checkpoint_segments < 0:
+            raise ValueError('checkpoint_segments must be a nonnegative integer (0 disables checkpointing)')
         self.checkpoint_segments = checkpoint_segments
         
         self.cells = nn.ModuleList([
@@ -171,7 +173,7 @@ class mLSTMLayer(nn.Module):
             else:
                 C, n = raw_state
 
-            if self.training and torch.is_grad_enabled() and seq_len > 1:
+            if self.training and torch.is_grad_enabled() and seq_len > 1 and self.checkpoint_segments > 0:
                 # --- Gradient Checkpointing 모드 ---
                 num_segs = min(self.checkpoint_segments, seq_len)
                 seg_size = max(1, (seq_len + num_segs - 1) // num_segs)
@@ -198,7 +200,7 @@ class mLSTMLayer(nn.Module):
                 
                 layer_output = torch.cat(all_outputs, dim=1)
             else:
-                # --- 추론 모드: checkpointing 불필요 ---
+                # Direct recurrence: inference or explicitly disabled checkpointing.
                 layer_output_list = []
                 state = (C, n)
                 for t in range(seq_len):

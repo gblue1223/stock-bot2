@@ -26,7 +26,9 @@ from .policy_update_checks import (check_rollout_likelihood, exact_policy_kl,
                                    RolloutLikelihoodMismatch, exact_kl_from_log_probs)
 from .likelihood_failure import save_likelihood_failure
 from .entry_credit import analyze_entry_credit
-from .entry_pattern import pattern_policy_credit
+from .entry_pattern import pattern_actor_signals
+from .gpu_runtime import PhaseMeasurement
+from .gpu_tuning import validate_gpu_tuning, tune_update
 import concurrent.futures  # ✅ 병렬 처리용 추가
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,7 @@ class GRPOTrainer:
         policy_update_checks: bool = False,
         rollout_logprob_tolerance: float = 1e-3,
         kl_probe_samples: int = 32,
+        gpu_tuning: Optional[Dict[str, Any]] = None,
     ):
         self.policy = policy
         
@@ -106,6 +109,8 @@ class GRPOTrainer:
             self.env = env
             
         self.device = device
+        self.gpu_tuning = validate_gpu_tuning(gpu_tuning)
+        self._gpu_tuning_done = False
         
         # 정책을 디바이스로 이동
         self.policy.to(device)
@@ -855,8 +860,8 @@ class GRPOTrainer:
         states_tensor = torch.from_numpy(all_states).float()
         actions_tensor = torch.from_numpy(all_actions).long()
         old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float()
-        advantages_tensor = torch.from_numpy(all_advantages).float()
-        pattern_credit = pattern_policy_credit(episodes)
+        actor_base, pattern_credit, trade_local_buys = pattern_actor_signals(episodes, all_advantages)
+        advantages_tensor = torch.from_numpy(actor_base).float()
         pattern_tensor = torch.from_numpy(pattern_credit).float()
         returns_tensor = torch.from_numpy(all_returns).float()
         likelihood_started = time.perf_counter()
@@ -908,7 +913,7 @@ class GRPOTrainer:
         sampled_only_exceedances = exact_only_exceedances = 0
         last_probe_kl = last_minibatch_kl = last_post_max_kl = 0.0
         accepted_probe_kl_sum = accepted_minibatch_kl_sum = 0.0
-        post_update_check_seconds = snapshot_seconds = 0.0
+        post_update_check_seconds = snapshot_seconds = transfer_seconds = 0.0
         
         for epoch in range(num_epochs):
             # 데이터 셔플
@@ -919,11 +924,13 @@ class GRPOTrainer:
                 batch_indices = indices[start_idx:end_idx]
                 
                 # 미니 배치 데이터 슬라이싱 후 GPU 메모리로 이동 (VRAM 폭발 방지)
+                transfer_started = time.perf_counter()
                 batch_states = states_tensor[batch_indices].to(self.device)
                 batch_actions = actions_tensor[batch_indices].long().to(self.device)
                 batch_old_log_probs = old_log_probs_tensor[batch_indices].to(self.device)
                 batch_advantages = advantages_tensor[batch_indices].to(self.device)
                 batch_returns = returns_tensor[batch_indices].to(self.device)
+                transfer_seconds += time.perf_counter() - transfer_started
                 
                 # 4. 정책 평가
                 batch_mask_kwargs = self._mask_kwargs(all_action_masks[batch_indices] if all_action_masks is not None else None)
@@ -985,8 +992,8 @@ class GRPOTrainer:
                 
                 # 최소값 선택 (보수적 정책 업데이트)
                 policy_loss = -torch.min(surr1, surr2).mean()
-                # Attribute the configured entry outcome to its BUY decision.
-                # No future labels enter the observation, NAV reward or critic.
+                # New-mode BUY base advantage is zero: only its own joint
+                # horizon/net outcome enters the actor. Legacy modes are additive.
                 pattern_batch = pattern_tensor[batch_indices].to(self.device)
                 pattern_loss = -torch.min(ratio * pattern_batch, ratio_clipped * pattern_batch).mean()
                 policy_loss = policy_loss + pattern_loss
@@ -1135,6 +1142,7 @@ class GRPOTrainer:
             'accepted_post_update_minibatch_kl_mean': accepted_minibatch_kl_sum / max(1, num_batches),
             'post_update_check_seconds': post_update_check_seconds,
             'rollback_snapshot_seconds': snapshot_seconds,
+            'minibatch_transfer_seconds': transfer_seconds,
             'kl_early_stopped': int(early_stopped),
             'last_checked_kl': checked_kl,
             'last_sampled_kl': sampled_kl,
@@ -1146,6 +1154,7 @@ class GRPOTrainer:
         pattern_reports = [ep.get('metadata', {}).get('entry_pattern') for ep in episodes]
         pattern_reports = [report for report in pattern_reports if report is not None]
         if pattern_reports:
+            update_metrics['entry_pattern/trade_local_buy_decisions'] = int(trade_local_buys.sum())
             self.last_entry_credit_report['entry_pattern_episodes'] = [
                 {'episode_key': ep.get('metadata', {}).get('episode_key'),
                  'entry_pattern': ep.get('metadata', {}).get('entry_pattern')} for ep in episodes]
@@ -1360,6 +1369,53 @@ class GRPOTrainer:
                                        metrics, max(0, iteration - 1))
             self.writer.flush()
 
+    def _tune_gpu_runtime(self, episodes, advantages, checkpoint_path):
+        if self._gpu_tuning_done or self.gpu_tuning is None:
+            return
+        if torch.device(self.device).type != 'cuda':
+            logger.info('GPU tuning skipped on CPU; configured batch size is retained')
+            self._gpu_tuning_done = True
+            return
+        report = tune_update(self, episodes, advantages, self.gpu_tuning)
+        selected = report['selected']
+        self.batch_size = selected['batch_size']
+        if hasattr(self.policy, 'xlstm'):
+            self.policy.xlstm.checkpoint_segments = selected['checkpoint_segments']
+        self.extra_checkpoint_state['gpu_tuning_report'] = report
+        config = self.extra_checkpoint_state.get('training_config')
+        if isinstance(config, dict):
+            config.update(selected)
+        if checkpoint_path:
+            directory = os.path.dirname(checkpoint_path.format(0))
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, 'gpu_tuning.json')
+            with open(path + '.tmp', 'w', encoding='utf-8') as handle:
+                json.dump(report, handle, indent=2, allow_nan=False)
+            os.replace(path + '.tmp', path)
+        self._gpu_tuning_done = True
+        logger.info('GPU tuning selected batch_size=%d, checkpoint_segments=%d; '
+                    'batch changes optimizer step count, not a profitability result',
+                    selected['batch_size'], selected['checkpoint_segments'])
+
+    def _record_runtime_phases(self, phases, iteration, checkpoint_path):
+        for name, metrics in phases.items():
+            logger.info('Runtime phase %s: %s', name, json.dumps(metrics, sort_keys=True))
+            if self.writer:
+                self._write_scalar_metrics(f'runtime/{name}', metrics, iteration - 1)
+        if checkpoint_path:
+            directory = os.path.join(os.path.dirname(checkpoint_path.format(iteration)), 'diagnostics', 'runtime')
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, f'iteration_{iteration:06d}.json')
+            payload = {'iteration': iteration, 'pid': os.getpid(), 'device': str(self.device),
+                       'device_name': (torch.cuda.get_device_name(self.device)
+                                       if torch.device(self.device).type == 'cuda' else 'cpu'),
+                       'batch_size': self.batch_size,
+                       'checkpoint_segments': getattr(getattr(self.policy, 'xlstm', None), 'checkpoint_segments', None),
+                       'phases': phases}
+            with open(path + '.tmp', 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, indent=2, allow_nan=False)
+            os.replace(path + '.tmp', path)
+
     def _validation_selection_score(self, metrics):
         """Rank realized validation returns; incomplete liquidation is ineligible."""
         value = finite_number(metrics.get('mean_net_return'))
@@ -1569,6 +1625,7 @@ class GRPOTrainer:
             iteration_start_time = time.time()
             phase_started = time.perf_counter()
             phase_seconds = {}
+            phase_resources = {}
             # Episode lengths can be shorter than the configured maximum. A
             # timestep budget must use observed steps, not a fixed episode cap.
             if max_timesteps is not None:
@@ -1586,8 +1643,10 @@ class GRPOTrainer:
                     break
             num_episodes = min(episodes_per_iteration, remaining_episodes)
             previous_timesteps = self.total_timesteps
-            episodes = self.collect_rollouts(num_episodes)
-            phase_seconds['rollout'] = time.perf_counter() - phase_started
+            with PhaseMeasurement(self.device) as resource:
+                episodes = self.collect_rollouts(num_episodes)
+            phase_resources['rollout'] = resource.throughput(self.total_timesteps - previous_timesteps)
+            phase_seconds['rollout'] = resource.metrics['seconds']
             if not episodes:
                 raise RuntimeError("Rollout collection returned no completed episodes")
             if max_timesteps is not None and self.total_timesteps <= previous_timesteps:
@@ -1614,9 +1673,16 @@ class GRPOTrainer:
                 all_advantages.extend(group_advantages[group_id])
             
             phase_seconds['grouping'] = time.perf_counter() - phase_started
+            if self.gpu_tuning is not None and not self._gpu_tuning_done:
+                phase_started = time.perf_counter()
+                self._tune_gpu_runtime(all_episodes, all_advantages, checkpoint_path)
+                phase_seconds['gpu_tuning'] = time.perf_counter() - phase_started
             phase_started = time.perf_counter()
-            update_metrics = self.update_policy(all_episodes, all_advantages)
-            phase_seconds['update'] = time.perf_counter() - phase_started
+            with PhaseMeasurement(self.device) as resource:
+                update_metrics = self.update_policy(all_episodes, all_advantages)
+            phase_resources['update'] = resource.throughput(self.total_timesteps - previous_timesteps)
+            phase_resources['update']['optimizer_steps'] = update_metrics.get('optimizer_steps', 0)
+            phase_seconds['update'] = resource.metrics['seconds']
             last_completed_iteration = iteration + 1
             
             # 5. 메트릭 로깅
@@ -1651,7 +1717,10 @@ class GRPOTrainer:
                      (max_timesteps and self.total_timesteps >= max_timesteps))):
                 phase_started = time.perf_counter()
                 logger.info('Starting validation for iteration %d...', iteration + 1)
-                validation_metrics = self.evaluation_callback(self.policy)
+                with PhaseMeasurement(self.device) as resource:
+                    validation_metrics = self.evaluation_callback(self.policy)
+                steps = (validation_metrics.get('diagnostics') or {}).get('steps')
+                phase_resources['validation'] = resource.throughput(steps) if steps is not None else resource.metrics
                 score = self._validation_selection_score(validation_metrics)
                 improved = score is not None and score > best_validation_return
                 stop_for_no_trade = self.training_control_state.observe(
@@ -1725,6 +1794,7 @@ class GRPOTrainer:
                 for name, seconds in phase_seconds.items():
                     self.writer.add_scalar(f'timing/{name}_seconds', seconds, iteration)
                 self.writer.flush()
+            self._record_runtime_phases(phase_resources, iteration + 1, checkpoint_path)
             logger.info('Phase seconds: %s', ', '.join(
                 f'{name}={seconds:.1f}' for name, seconds in phase_seconds.items()))
             if on_iteration_end:

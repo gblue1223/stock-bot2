@@ -224,6 +224,11 @@ def test_xlstm_rollout_update_and_evaluation_with_entry_patterns(tmp_path):
         trainer._record_entry_credit(1, str(tmp_path / 'checkpoints' / 'checkpoint_iter{}.pt'))
         saved = json.loads((tmp_path / 'checkpoints/diagnostics/entry_credit/iteration_000001.json').read_text(encoding='utf-8'))
         assert saved['report']['entry_pattern_episodes'][0]['entry_pattern']['orders']
+        assert saved['report']['entries']
+        for entry in saved['report']['entries']:
+            assert entry['trade_local_actor']
+            assert entry['actor_base_advantage'] == 0.
+            assert entry['initial_actor_signal'] == entry['entry_pattern_credit']
         result = evaluate_policy(policy, validation, num_episodes=2, seed=42, device='cpu')
         assert result['entry_pattern']['labeled_buy_decisions'] > 0
         assert result['entry_pattern']['success_rate'] is not None
@@ -246,7 +251,8 @@ def test_old_signatures_remain_legacy_and_new_objective_invalidates_best():
 def test_legacy_config_keeps_old_target_and_zero_coefficient_allows_ablation():
     old = {k: v for k, v in CFG.items() if k != 'target_mode'}
     assert validate_entry_pattern(old)['target_mode'] == 'legacy_price'
-    assert validate_entry_pattern(CFG)['target_mode'] == 'realized_net'
+    assert validate_entry_pattern(CFG)['target_mode'] == 'short_horizon_net'
+    assert validate_entry_pattern({**CFG, 'target_mode': 'realized_net'})['target_mode'] == 'realized_net'
     assert validate_entry_pattern({**CFG, 'policy_coef': 0})['policy_coef'] == 0
     with pytest.raises(ValueError, match='target_mode'):
         validate_entry_pattern({**CFG, 'target_mode': 'future_oracle'})
@@ -305,11 +311,12 @@ def test_actual_execution_fees_flip_credit_even_when_legacy_price_target_succeed
     ([2.], False, False, 0.),      # open quantity remains unknown
     ([2., 3.], True, True, 0.),   # a still-active BUY may fill again
 ])
-def test_net_target_aggregates_all_exits_and_censors_open_orders(net_pnls, closed, active, expected):
+@pytest.mark.parametrize('mode', ['short_horizon_net', 'realized_net'])
+def test_net_target_aggregates_all_exits_and_censors_open_orders(net_pnls, closed, active, expected, mode):
     from types import SimpleNamespace
     from ai_trader.grpo.environments.scalping_env_e2e import GRPOScalpingEnv
     env = object.__new__(GRPOScalpingEnv)
-    env.entry_pattern_config = CFG
+    env.entry_pattern_config = {**CFG, 'target_mode': mode}
     env.episode_rewards = [0., 0., 0.]
     env._pattern_fills = [(7, 0., 100., 10), (7, .1, 100., 10)]
     env._entry_order_decisions = {7: 0}
