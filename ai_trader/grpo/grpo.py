@@ -985,8 +985,7 @@ class GRPOTrainer:
                 
                 # 최소값 선택 (보수적 정책 업데이트)
                 policy_loss = -torch.min(surr1, surr2).mean()
-                # A distinct clipped actor objective attributes observed 1-5s
-                # outcomes directly to the BUY decision that caused each fill.
+                # Attribute the configured entry outcome to its BUY decision.
                 # No future labels enter the observation, NAV reward or critic.
                 pattern_batch = pattern_tensor[batch_indices].to(self.device)
                 pattern_loss = -torch.min(ratio * pattern_batch, ratio_clipped * pattern_batch).mean()
@@ -1144,6 +1143,23 @@ class GRPOTrainer:
             'return_target_mean': float(all_returns.mean()),
             'return_target_std': float(all_returns.std()),
         }
+        pattern_reports = [ep.get('metadata', {}).get('entry_pattern') for ep in episodes]
+        pattern_reports = [report for report in pattern_reports if report is not None]
+        if pattern_reports:
+            self.last_entry_credit_report['entry_pattern_episodes'] = [
+                {'episode_key': ep.get('metadata', {}).get('episode_key'),
+                 'entry_pattern': ep.get('metadata', {}).get('entry_pattern')} for ep in episodes]
+            for key in ('success_quantity', 'failure_quantity', 'neutral_quantity', 'censored_quantity',
+                        'labeled_buy_decisions', 'legacy_positive_closed_orders',
+                        'legacy_positive_profitable_orders', 'legacy_positive_net_pnl'):
+                if all(key in report for report in pattern_reports):
+                    update_metrics[f'entry_pattern/{key}'] = sum(report[key] for report in pattern_reports)
+            logger.info('Entry pattern outcomes: positive_quantity=%s, negative_quantity=%s, censored_quantity=%s | '
+                        'legacy_positive_closed=%s, profitable=%s, net_pnl=%s',
+                        *(update_metrics.get(f'entry_pattern/{key}', 'unknown') for key in (
+                            'success_quantity', 'failure_quantity', 'censored_quantity',
+                            'legacy_positive_closed_orders', 'legacy_positive_profitable_orders',
+                            'legacy_positive_net_pnl')))
         if all_old_values:
             old_values = np.concatenate(all_old_values)
             variance = float(all_returns.var())
@@ -1657,6 +1673,12 @@ class GRPOTrainer:
                             validation_metrics.get('round_trip_count', 'unknown'),
                             validation_metrics.get('no_trade_episode_fraction', 'unknown'),
                             validation_metrics.get('profitable_with_trades', 'unknown'), score is not None)
+                entry_diagnostics = validation_metrics.get('diagnostics') or {}
+                logger.info('Validation entry opportunities: signal_steps=%s, buy_allowed_steps=%s | '
+                            'BUY probability when allowed=%s, BUY action rate when allowed=%s',
+                            *(entry_diagnostics.get(key, 'unknown') for key in (
+                                'entry_signal_steps', 'buy_allowed_steps', 'mean_buy_probability_when_allowed',
+                                'buy_action_rate_when_allowed')))
                 if improved:
                     best_validation_return = score
                     no_improve_count = 0

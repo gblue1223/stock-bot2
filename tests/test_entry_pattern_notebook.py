@@ -36,16 +36,22 @@ def config():
             'execution_action_mask': True}
 
 
-def test_default_config_executes_and_keeps_requested_contract():
+@pytest.mark.parametrize('target', ['realized_net', 'legacy_price', 'nav_only'])
+def test_default_config_executes_and_keeps_requested_contract(target):
     ns = scope()
     ns.update(Path=Path, json=json, TrainingConfig=TrainingConfig,
               torch=SimpleNamespace(cuda=SimpleNamespace(mem_get_info=lambda: (38 * 1024**3, 40 * 1024**3))),
               VRAM_GIB=40, CPU_COUNT=12, available_ram_gib=lambda: 50,
               LOCAL_DATA_DIR=Path('/unused/data'), MANIFEST_SHA256='test', manifest=dataset())
-    exec(compile(sources()['config'], 'config', 'exec'), ns)
+    source = sources()['config'].replace("ENTRY_TARGET = 'realized_net'", f"ENTRY_TARGET = '{target}'")
+    exec(compile(source, 'config', 'exec'), ns)
     assert ns['MODE'] == 'new' and not ns['LOAD_POLICY']
     assert ns['CONFIG']['seq_len'] == 2048
-    assert ns['CONFIG']['entry_pattern_config'] == DEFAULT_ENTRY_PATTERN
+    assert ns['CONFIG']['entry_pattern_config'] == {**DEFAULT_ENTRY_PATTERN,
+        'target_mode': 'legacy_price' if target == 'legacy_price' else 'realized_net',
+        'policy_coef': 0. if target == 'nav_only' else 1.}
+    assert ns['CONFIG']['total_timesteps'] == 20_000
+    assert ns['CONFIG']['evaluation_interval'] == 1
     assert ns['CONFIG']['decision_interval_seconds'] == 1
     assert ns['ENTRY_DATA_SUMMARY']['qualifying_episodes'] == 1
 

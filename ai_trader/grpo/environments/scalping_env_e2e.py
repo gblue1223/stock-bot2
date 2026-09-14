@@ -272,6 +272,10 @@ class GRPOScalpingEnv(gym.Env):
     def _entry_allowed(self):
         return self.entry_pattern_config is None or bool(self._episode_entry_signal[self.current_step])
 
+    def entry_signal_active(self):
+        """Causal pattern gate, independent of cash/position/execution restrictions."""
+        return self._entry_allowed() if self.entry_pattern_config is not None else None
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._reset_options = dict(options or {})
@@ -820,26 +824,64 @@ class GRPOScalpingEnv(gym.Env):
     def _entry_pattern_report(self):
         credits = np.zeros(len(self.episode_rewards), dtype=np.float64)
         quantities = np.zeros(len(credits), dtype=np.float64)
-        success = failure = censored = 0
+        success = failure = censored = neutral = 0
+        orders = {}
         for order_id, timestamp, price, quantity in self._pattern_fills:
+            order = orders.setdefault(order_id, {'quantity': 0, 'legacy_credit': 0., 'legacy_quantity': 0})
+            order['quantity'] += quantity
             target = fill_target(self._entry_target_times, self._entry_target_prices,
                                  timestamp, price, self.entry_pattern_config)
-            if target is None:
-                censored += quantity
-                continue
-            decision = self._entry_order_decisions[order_id]
-            credits[decision] += target * quantity
-            quantities[decision] += quantity
-            if target > 0:
-                success += quantity
-            else:
-                failure += quantity
+            if target is not None:
+                order['legacy_credit'] += target * quantity
+                order['legacy_quantity'] += quantity
+            if self.entry_pattern_config['target_mode'] == 'legacy_price':
+                if target is None:
+                    censored += quantity
+                    continue
+                decision = self._entry_order_decisions[order_id]
+                credits[decision] += target * quantity
+                quantities[decision] += quantity
+                success += quantity if target > 0 else 0
+                failure += quantity if target < 0 else 0
+
+        fragments = {}
+        for trade in self.episode_trades:
+            fragments.setdefault(trade['entry_order_id'], []).append(trade)
+        active = {order.order_id for order in self.simulator.orders if order.active}
+        details = []
+        for order_id, order in orders.items():
+            trades = fragments.get(order_id, [])
+            closed = order_id not in active and sum(t['quantity'] for t in trades) == order['quantity']
+            net_pnl = float(sum(t['net_pnl'] for t in trades)) if closed else None
+            target = float(np.sign(net_pnl)) if closed else None
+            legacy = order['legacy_credit'] / order['legacy_quantity'] if order['legacy_quantity'] else None
+            if self.entry_pattern_config['target_mode'] == 'realized_net':
+                quantity = order['quantity']
+                if target is None:
+                    censored += quantity
+                else:
+                    decision = self._entry_order_decisions[order_id]
+                    credits[decision] += target * quantity
+                    quantities[decision] += quantity
+                    success += quantity if target > 0 else 0
+                    failure += quantity if target < 0 else 0
+                    neutral += quantity if target == 0 else 0
+            details.append({'entry_order_id': order_id, 'quantity': order['quantity'],
+                            'closed': closed, 'net_pnl': net_pnl, 'net_target': target,
+                            'legacy_credit': legacy,
+                            'legacy_label_complete': order['legacy_quantity'] == order['quantity']})
+        positive = [d for d in details if d['closed'] and d['legacy_label_complete']
+                    and d['legacy_credit'] is not None and d['legacy_credit'] > 0]
         credits = np.divide(credits, quantities, out=np.zeros_like(credits), where=quantities > 0)
         credits *= self.entry_pattern_config['policy_coef']
         return {'config': self.entry_pattern_config.copy(), 'policy_credit': credits.tolist(),
                 'success_quantity': success, 'failure_quantity': failure, 'censored_quantity': censored,
+                'neutral_quantity': neutral, 'orders': details,
+                'legacy_positive_closed_orders': len(positive),
+                'legacy_positive_profitable_orders': sum(d['net_pnl'] > 0 for d in positive),
+                'legacy_positive_net_pnl': sum(d['net_pnl'] for d in positive),
                 'labeled_buy_decisions': int(np.count_nonzero(quantities)),
-                'success_rate': success / (success + failure) if success + failure else None}
+                'success_rate': success / (success + failure + neutral) if success + failure + neutral else None}
 
     def _calculate_episode_metadata(self):
         net_return = (self.equity - self.initial_cash) / self.initial_cash * 100

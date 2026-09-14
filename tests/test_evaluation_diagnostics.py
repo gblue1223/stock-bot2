@@ -109,3 +109,40 @@ def test_diagnostic_failure_restores_policy_mode():
     with pytest.raises(RuntimeError, match='max_steps'):
         evaluate_policy(policy, ReportingEnv(), num_episodes=1, max_steps=1)
     assert policy.training
+
+
+def test_entry_opportunities_distinguish_pattern_gate_from_executable_buy():
+    class OpportunityEnv(ReportingEnv):
+        execution_action_mask = True
+
+        def entry_signal_active(self):
+            return self.steps < 2
+
+        def action_masks(self):
+            # First step has a signal but execution/cash/position prevents BUY.
+            return np.array([True, self.steps == 1, False])
+
+    class OpportunityPolicy(torch.nn.Module):
+        execution_action_mask = True
+
+        def get_action_with_probabilities(self, obs, deterministic, action_masks):
+            buy = action_masks[:, 1].float() * .25
+            probabilities = torch.stack([1 - buy, buy, buy * 0], dim=-1)
+            return probabilities.argmax(-1), buy * 0, probabilities
+
+    policy = OpportunityPolicy()
+    single = evaluate_policy(policy, OpportunityEnv(), num_episodes=2)
+    batch = evaluate_policy(policy, [OpportunityEnv(), OpportunityEnv()], num_episodes=2)
+    assert single == batch
+    d = single['diagnostics']
+    assert d['entry_signal_steps'] == 4
+    assert d['buy_allowed_steps'] == 2
+    assert d['buy_allowed_fraction'] == pytest.approx(1 / 3)
+    assert d['mean_buy_probability_when_allowed'] == .25
+    assert d['mean_action_probabilities']['buy'] == pytest.approx(.25 / 3)
+    assert d['buy_action_rate_when_allowed'] == 0
+    assert d['episodes'][0]['buy_allowed_steps'] == 1
+    unknown = evaluate_policy(BuyPolicy(), ReportingEnv(), num_episodes=1)['diagnostics']
+    assert unknown['buy_mask_known_steps'] == 0
+    assert unknown['buy_allowed_fraction'] is None
+    assert unknown['mean_buy_probability_when_allowed'] is None

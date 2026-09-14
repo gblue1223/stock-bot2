@@ -16,6 +16,7 @@ DEFAULT_ENTRY_PATTERN = {
     'target_min_seconds': 1.0,
     'target_max_seconds': 5.0,
     'policy_coef': 1.0,
+    'target_mode': 'realized_net',
 }
 
 
@@ -46,8 +47,15 @@ def validate_entry_pattern(config):
     if not isinstance(config, dict) or set(config) - set(DEFAULT_ENTRY_PATTERN):
         raise ValueError('Invalid entry_pattern_config keys')
     result = {**DEFAULT_ENTRY_PATTERN, **config}
+    # Old saved configurations must retain their original learning objective.
+    result['target_mode'] = config.get('target_mode', 'legacy_price')
+    if result['target_mode'] not in ('realized_net', 'legacy_price'):
+        raise ValueError('entry_pattern_config.target_mode must be realized_net or legacy_price')
     for key, value in result.items():
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+        if key == 'target_mode':
+            continue
+        if (isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value)
+                or (value < 0 if key == 'policy_coef' else value <= 0)):
             raise ValueError(f'entry_pattern_config.{key} must be finite and positive')
     if not 5 <= result['min_window_seconds'] <= result['max_window_seconds'] <= 60:
         raise ValueError('Entry selection windows must lie in [5, 60] seconds')

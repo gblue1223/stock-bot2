@@ -10,7 +10,8 @@
     "max_window_seconds": 60.0,
     "target_min_seconds": 1.0,
     "target_max_seconds": 5.0,
-    "policy_coef": 1.0
+    "policy_coef": 1.0,
+    "target_mode": "realized_net"
   },
   "execution_action_mask": true,
   "decision_interval_seconds": 1.0,

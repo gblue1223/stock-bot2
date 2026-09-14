@@ -149,9 +149,9 @@ def test_extraction_sampling_masks_fill_labels_and_nav_accounting(tmp_path):
                 break
         ep = info['episode']
         assert sum(rewards) == pytest.approx(ep['net_return'])
-        assert ep['entry_pattern']['policy_credit'][0] == 1
+        assert ep['entry_pattern']['policy_credit'][0] == np.sign(ep['realized_net_pnl'])
         assert ep['entry_pattern']['labeled_buy_decisions'] == 1
-        assert ep['entry_pattern']['success_quantity'] > 0
+        assert ep['entry_pattern']['orders'][0]['net_pnl'] == pytest.approx(ep['realized_net_pnl'])
         # The signal has expired by this late part of the same file.
         env.current_step = len(env.episode_data) - 1
         env._episode_entry_signal = np.zeros(len(env.episode_data), dtype=bool)
@@ -221,6 +221,9 @@ def test_xlstm_rollout_update_and_evaluation_with_entry_patterns(tmp_path):
         metrics = trainer.update_policy(episodes, [np.zeros(len(ep['rewards']), np.float32) for ep in episodes])
         assert metrics['optimizer_steps'] > 0
         assert metrics['entry_pattern/credited_buy_decisions'] > 0
+        trainer._record_entry_credit(1, str(tmp_path / 'checkpoints' / 'checkpoint_iter{}.pt'))
+        saved = json.loads((tmp_path / 'checkpoints/diagnostics/entry_credit/iteration_000001.json').read_text(encoding='utf-8'))
+        assert saved['report']['entry_pattern_episodes'][0]['entry_pattern']['orders']
         result = evaluate_policy(policy, validation, num_episodes=2, seed=42, device='cpu')
         assert result['entry_pattern']['labeled_buy_decisions'] > 0
         assert result['entry_pattern']['success_rate'] is not None
@@ -238,3 +241,92 @@ def test_old_signatures_remain_legacy_and_new_objective_invalidates_best():
     changed = evaluation_signature({**old['extra_state']['training_config'], 'entry_pattern_config': CFG},
                                    signature['date_splits'], signature['observation_schema'])
     assert not compatible_resume_best(old, old, changed)
+
+
+def test_legacy_config_keeps_old_target_and_zero_coefficient_allows_ablation():
+    old = {k: v for k, v in CFG.items() if k != 'target_mode'}
+    assert validate_entry_pattern(old)['target_mode'] == 'legacy_price'
+    assert validate_entry_pattern(CFG)['target_mode'] == 'realized_net'
+    assert validate_entry_pattern({**CFG, 'policy_coef': 0})['policy_coef'] == 0
+    with pytest.raises(ValueError, match='target_mode'):
+        validate_entry_pattern({**CFG, 'target_mode': 'future_oracle'})
+
+
+def test_legacy_pattern_best_migrates_without_changing_its_objective():
+    from test_profit_experiment_config import legacy_best_checkpoint
+    from ai_trader.grpo.evaluation import compatible_resume_best, evaluation_signature
+    checkpoint, signature = legacy_best_checkpoint()
+    config = checkpoint['extra_state']['training_config']
+    config['entry_pattern_config'] = {k: v for k, v in CFG.items() if k != 'target_mode'}
+    saved = evaluation_signature(config, signature['date_splits'], signature['observation_schema'])
+    saved['settings']['entry_pattern_config'].pop('target_mode')
+    checkpoint['extra_state']['evaluation_signature'] = saved
+    current = evaluation_signature(config, signature['date_splits'], signature['observation_schema'])
+    assert compatible_resume_best(checkpoint, checkpoint, current)
+    changed = evaluation_signature({**config, 'entry_pattern_config': CFG},
+                                   signature['date_splits'], signature['observation_schema'])
+    assert not compatible_resume_best(checkpoint, checkpoint, changed)
+
+
+def test_actual_execution_fees_flip_credit_even_when_legacy_price_target_succeeds(tmp_path):
+    output = extract_pattern(tmp_path)
+    outcomes = []
+    for fee in (0., .01):
+        config = TrainingConfig()
+        config.__dict__.update(extracted_dir=str(output), seq_len=2, features=29, episode_steps=10,
+            liquidation_max_steps=2, decision_interval_seconds=1, episode_duration_seconds=10,
+            rolling_window_size=2, rolling_min_samples=1, entry_pattern_config=CFG,
+            initial_cash=1000., transaction_cost_rate=fee, sell_tax_rate=0,
+            execution_config={'order_latency_ms': 0, 'slippage_bps': 0, 'spread_bps': 0})
+        env = create_environment(config, 'cpu')
+        try:
+            env.reset(options={'episode_index': 0, 'start_index': 4})
+            rewards = []
+            for action in [1, 0, 2] + [0] * 12:
+                _, reward, done, truncated, info = env.step(action)
+                rewards.append(reward)
+                if done or truncated:
+                    break
+            episode = info['episode']
+            assert sum(rewards) == pytest.approx(episode['net_return'])
+            report = episode['entry_pattern']
+            assert report['orders'][0]['legacy_credit'] == 1
+            assert report['orders'][0]['net_pnl'] == pytest.approx(episode['realized_net_pnl'])
+            outcomes.append(report['policy_credit'][0])
+        finally:
+            env.close()
+    assert outcomes == [1., -1.]
+
+
+@pytest.mark.parametrize('net_pnls,closed,active,expected', [
+    ([2., -3.], True, False, -1.),  # profitable partial exit cannot hide aggregate loss
+    ([2., 3.], True, False, 1.),
+    ([2., -2.], True, False, 0.),
+    ([2.], False, False, 0.),      # open quantity remains unknown
+    ([2., 3.], True, True, 0.),   # a still-active BUY may fill again
+])
+def test_net_target_aggregates_all_exits_and_censors_open_orders(net_pnls, closed, active, expected):
+    from types import SimpleNamespace
+    from ai_trader.grpo.environments.scalping_env_e2e import GRPOScalpingEnv
+    env = object.__new__(GRPOScalpingEnv)
+    env.entry_pattern_config = CFG
+    env.episode_rewards = [0., 0., 0.]
+    env._pattern_fills = [(7, 0., 100., 10), (7, .1, 100., 10)]
+    env._entry_order_decisions = {7: 0}
+    env._entry_target_times = np.arange(7.)
+    env._entry_target_prices = np.full(7, 100.)  # old label says success at break-even last price
+    env.simulator = SimpleNamespace(orders=[SimpleNamespace(order_id=7, active=active)])
+    env.episode_trades = [{'entry_order_id': 7, 'quantity': 10, 'net_pnl': pnl} for pnl in net_pnls]
+    report = env._entry_pattern_report()
+    assert report['policy_credit'] == [expected, 0., 0.]
+    assert report['censored_quantity'] == (0 if closed and not active else 20)
+    assert report['labeled_buy_decisions'] == int(closed and not active)
+    if closed and not active:
+        assert report['legacy_positive_closed_orders'] == 1
+        assert report['legacy_positive_profitable_orders'] == int(sum(net_pnls) > 0)
+        assert report['legacy_positive_net_pnl'] == sum(net_pnls)
+        assert report['neutral_quantity'] == (20 if expected == 0 else 0)
+    json.dumps(report, allow_nan=False)
+    # A resumed legacy run retains exactly the old positive training credit.
+    env.entry_pattern_config = {**CFG, 'target_mode': 'legacy_price'}
+    assert env._entry_pattern_report()['policy_credit'] == [1., 0., 0.]

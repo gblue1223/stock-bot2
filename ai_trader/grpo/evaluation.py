@@ -8,6 +8,8 @@ from typing import Iterable, Optional
 import numpy as np
 import torch
 
+from .entry_pattern import validate_entry_pattern
+
 
 _ORDER_METRICS = ('submitted_orders', 'submitted_quantity', 'filled_quantity',
                   'partial_orders', 'cancelled_orders', 'expired_orders')
@@ -39,9 +41,22 @@ class _ActionDiagnostics:
         self.counts = Counter(dict.fromkeys(('hold', 'buy', 'sell'), 0))
         self.probability_steps = 0
         self.probability_sum = self.probability_max = None
+        self.opportunities = Counter()
+        self.allowed_buy_probability_sum = 0.0
 
-    def record(self, action, probabilities):
+    def record(self, action, probabilities, buy_allowed=None, entry_signal=None):
         self.counts[_action_name(action)] += 1
+        if entry_signal is not None:
+            self.opportunities['entry_signal_known_steps'] += 1
+            self.opportunities['entry_signal_steps'] += int(entry_signal)
+        if buy_allowed is not None:
+            self.opportunities['buy_mask_known_steps'] += 1
+            self.opportunities['buy_allowed_steps'] += int(buy_allowed)
+            if buy_allowed:
+                self.opportunities['buy_actions_when_allowed'] += int(action == 1)
+                if probabilities is not None:
+                    self.opportunities['buy_allowed_probability_steps'] += 1
+                    self.allowed_buy_probability_sum += float(probabilities[1])
         if probabilities is not None:
             if self.probability_sum is None:
                 self.probability_sum = np.zeros_like(probabilities, dtype=np.float64)
@@ -52,6 +67,8 @@ class _ActionDiagnostics:
 
     def merge(self, other):
         self.counts.update(other.counts)
+        self.opportunities.update(other.opportunities)
+        self.allowed_buy_probability_sum += other.allowed_buy_probability_sum
         if other.probability_steps:
             if self.probability_sum is None:
                 self.probability_sum = other.probability_sum.copy()
@@ -63,7 +80,18 @@ class _ActionDiagnostics:
 
     def summary(self):
         steps = sum(self.counts.values())
+        counts = self.opportunities
+        allowed = counts['buy_allowed_steps']
         return {
+            **{key: counts[key] for key in ('entry_signal_known_steps', 'entry_signal_steps',
+               'buy_mask_known_steps', 'buy_allowed_steps', 'buy_actions_when_allowed',
+               'buy_allowed_probability_steps')},
+            'entry_signal_fraction': (counts['entry_signal_steps'] / counts['entry_signal_known_steps']
+                                      if counts['entry_signal_known_steps'] else None),
+            'buy_allowed_fraction': allowed / counts['buy_mask_known_steps'] if counts['buy_mask_known_steps'] else None,
+            'buy_action_rate_when_allowed': counts['buy_actions_when_allowed'] / allowed if allowed else None,
+            'mean_buy_probability_when_allowed': (self.allowed_buy_probability_sum / counts['buy_allowed_probability_steps']
+                                                  if counts['buy_allowed_probability_steps'] else None),
             'steps': steps,
             'action_counts': dict(self.counts),
             'action_rates': {key: value / steps if steps else 0.0
@@ -118,8 +146,15 @@ def _additional_metrics(episodes):
     if all(report is not None for report in reports):
         totals = {key: int(sum(report[key] for report in reports)) for key in
                   ('success_quantity', 'failure_quantity', 'censored_quantity', 'labeled_buy_decisions')}
-        labeled = totals['success_quantity'] + totals['failure_quantity']
+        for key in ('neutral_quantity', 'legacy_positive_closed_orders', 'legacy_positive_profitable_orders',
+                    'legacy_positive_net_pnl'):
+            totals[key] = (sum(report[key] for report in reports)
+                           if all(key in report for report in reports) else None)
+        labeled = totals['success_quantity'] + totals['failure_quantity'] + (totals['neutral_quantity'] or 0)
         result['entry_pattern'] = {**totals, 'success_rate': totals['success_quantity'] / labeled if labeled else None}
+        positive = totals['legacy_positive_closed_orders']
+        result['entry_pattern']['legacy_positive_profit_rate'] = (
+            totals['legacy_positive_profitable_orders'] / positive if positive else None)
     for count_key, rate_key in (('round_trip_count', 'round_trip_win_rate'),
                                 ('fill_count', 'fill_win_rate')):
         counts, rates = values(count_key), values(rate_key)
@@ -252,13 +287,13 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                 tensor = torch.as_tensor(np.stack([slot['obs'] for _, slot in active]),
                                          dtype=torch.float32, device=device)
                 mask_kwargs = {}
+                action_masks = None
                 if getattr(policy, 'execution_action_mask', False):
                     if not all(getattr(slot['environment'], 'execution_action_mask', False)
                                for _, slot in active):
                         raise ValueError('Masked policy evaluation requires enabled environment action masks')
-                    mask_kwargs['action_masks'] = torch.as_tensor(
-                        np.stack([slot['environment'].action_masks() for _, slot in active]),
-                        dtype=torch.bool, device=device)
+                    action_masks = np.stack([slot['environment'].action_masks() for _, slot in active])
+                    mask_kwargs['action_masks'] = torch.as_tensor(action_masks, dtype=torch.bool, device=device)
                 probabilities = None
                 if collect_diagnostics and callable(probability_action):
                     actions, _, probabilities = probability_action(tensor, deterministic=True, **mask_kwargs)
@@ -279,7 +314,10 @@ def evaluate_policy(policy, env, num_episodes: int = 8, seed: int = 42,
                 for row, (slot_index, slot) in enumerate(active):
                     action_index = int(actions[row])
                     if collect_diagnostics:
-                        slot['actions'].record(action_index, None if probabilities is None else probabilities[row])
+                        entry_signal = getattr(slot['environment'], 'entry_signal_active', None)
+                        slot['actions'].record(action_index, None if probabilities is None else probabilities[row],
+                                               buy_allowed=None if action_masks is None else bool(action_masks[row, 1]),
+                                               entry_signal=entry_signal() if callable(entry_signal) else None)
                     obs, _, terminated, truncated, info = slot['environment'].step(action_index)
                     slot['steps'] += 1
                     if not (terminated or truncated):
@@ -396,11 +434,13 @@ def evaluation_signature(config: dict, date_splits: dict, observation_schema: di
                              'order_ttl_seconds': 2, 'spread_bps': 10, 'slippage_bps': 2,
                              'fallback_depth': 100, 'require_order_book': False},
     }
+    settings = {key: config.get(key, default) for key, default in defaults.items()}
+    settings['entry_pattern_config'] = validate_entry_pattern(settings['entry_pattern_config'])
     return deepcopy({
         'version': 1,
         'observation_schema': observation_schema,
         'date_splits': date_splits,
-        'settings': {key: config.get(key, default) for key, default in defaults.items()},
+        'settings': settings,
         'deterministic': True,
         'metric': 'mean_net_return',
     })
@@ -445,6 +485,12 @@ def compatible_resume_best(candidate: dict, source: dict, current_signature: dic
         if signature.get('version') == 1 and isinstance(signature.get('settings'), dict):
             if 'entry_pattern_config' not in signature['settings'] and config.get('entry_pattern_config') is None:
                 signature['settings']['entry_pattern_config'] = None
+            if signature['settings'].get('entry_pattern_config') is not None:
+                try:
+                    signature['settings']['entry_pattern_config'] = validate_entry_pattern(
+                        signature['settings']['entry_pattern_config'])
+                except ValueError:
+                    return False
             for name in ('liquidation_max_steps', 'decision_interval_seconds', 'episode_duration_seconds',
                          'execution_action_mask'):
                 if name not in signature['settings'] and config.get(name, 0) == 0:
