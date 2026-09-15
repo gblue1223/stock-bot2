@@ -229,9 +229,14 @@ def test_xlstm_rollout_update_and_evaluation_with_entry_patterns(tmp_path):
             assert entry['trade_local_actor']
             assert entry['actor_base_advantage'] == 0.
             assert entry['initial_actor_signal'] == entry['entry_pattern_credit']
+        assert saved['report']['holding_decisions']
+        for row in saved['report']['holding_decisions']:
+            assert row['actor_base_advantage'] == 0.
+            assert row['initial_actor_signal'] == row['exit_policy_credit']
         result = evaluate_policy(policy, validation, num_episodes=2, seed=42, device='cpu')
         assert result['entry_pattern']['labeled_buy_decisions'] > 0
         assert result['entry_pattern']['success_rate'] is not None
+        assert 'exit_target_summary' in result['entry_pattern']
     finally:
         vector.close()
         validation.close()
@@ -251,7 +256,7 @@ def test_old_signatures_remain_legacy_and_new_objective_invalidates_best():
 def test_legacy_config_keeps_old_target_and_zero_coefficient_allows_ablation():
     old = {k: v for k, v in CFG.items() if k != 'target_mode'}
     assert validate_entry_pattern(old)['target_mode'] == 'legacy_price'
-    assert validate_entry_pattern(CFG)['target_mode'] == 'short_horizon_net'
+    assert validate_entry_pattern(CFG)['target_mode'] == 'short_horizon_trade'
     assert validate_entry_pattern({**CFG, 'target_mode': 'realized_net'})['target_mode'] == 'realized_net'
     assert validate_entry_pattern({**CFG, 'policy_coef': 0})['policy_coef'] == 0
     with pytest.raises(ValueError, match='target_mode'):

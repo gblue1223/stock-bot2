@@ -199,6 +199,26 @@ class ExecutionSimulator:
         bid = self.snapshot.bids[0][0] if self.snapshot.bids else self.snapshot.last_price * (1 - self.config.spread_bps / 20000)
         return self.execution_price(bid, 'sell')
 
+    def quoted_sell_proceeds(self, quantity, sell_fee_rate):
+        """Value all shares at fresh remaining bids without consuming liquidity.
+
+        Includes depth, slippage, tick rounding and sell fees. This is a quote
+        estimate, not a guaranteed next-event fill or a latency simulation.
+        Return None when the entire inventory cannot be valued from this book.
+        """
+        snapshot = self.snapshot
+        if snapshot is None or (snapshot.quote_timestamp is not None and
+                snapshot.timestamp - snapshot.quote_timestamp > self.config.max_quote_age_seconds):
+            return None
+        remaining, proceeds = quantity, 0.0
+        for price, _ in snapshot.bids:
+            qty = min(remaining, self._remaining['sell'].get(price, 0))
+            proceeds += qty * self.execution_price(price, 'sell') * (1 - sell_fee_rate)
+            remaining -= qty
+            if remaining == 0:
+                return float(proceeds)
+        return None
+
     def process(self, snapshot, *, cash_available=math.inf, sell_available=math.inf,
                 buy_fee_rate=0.0, sell_fee_rate=0.0):
         self._set_snapshot(snapshot)

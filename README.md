@@ -6,17 +6,25 @@
 
 새 학습 예제와 Colab 기본 설정은 `seq_len=2048`이며, **같은 과거 5~60초 구간에서 매수 방향 체결대금 30억 원 이상 + 현재가 1% 이상 상승**한 시점만 진입 후보로 사용합니다. 관측 길이는 2048개 시장 행이고 2048초를 뜻하지 않습니다. 에피소드 시작점은 후보 중에서 선택하며, 이후에도 조건을 충족하지 않는 시점의 매수 행동을 차단합니다. 매도·보유 및 비용을 포함한 순수익 학습은 유지합니다.
 
-새 실험의 기본 목표 `entry_pattern_config.target_mode="short_horizon_net"`은 두 조건을 함께 평가합니다. 매수 주문의 모든 실제 체결 건에서 **체결 후 1~5초의 최고 현재가가 해당 체결가 이상**이고, 주문 전체를 청산한 **비용 차감 순손익이 양수**이면 +1입니다. 가격 조건 실패 또는 순손실이면 -1, 가격 조건 성공과 순손익 0이면 0입니다. 부분 체결마다 실제 시각·가격으로 판정하고 부분 청산 손익은 주문 단위로 합산합니다. 스프레드·호가 깊이·슬리피지는 실제 체결가에, 수수료·세금은 순손익에 반영합니다. 1~5초는 상승 확인 구간이며 강제 매도 시한이 아닙니다.
+새 실험의 기본 목표 `entry_pattern_config.target_mode="short_horizon_trade"`는 BUY와 보유 중 HOLD/SELL을 분리해 학습합니다. BUY는 두 조건을 함께 평가합니다. 매수 주문의 모든 실제 체결 건에서 **체결 후 1~5초의 최고 현재가가 해당 체결가 이상**이고, 주문 전체를 청산한 **비용 차감 순손익이 양수**이면 +1입니다. 가격 조건 실패 또는 순손실이면 -1, 가격 조건 성공과 순손익 0이면 0입니다. 부분 체결마다 실제 시각·가격으로 판정하고 부분 청산 손익은 주문 단위로 합산합니다. 스프레드·호가 깊이·슬리피지는 실제 체결가에, 수수료·세금은 순손익에 반영합니다. 1~5초는 상승 확인 구간이며 강제 매도 시한이 아닙니다.
 
-새 모드의 BUY 정책 손실은 기존 정규화 GAE 대신 해당 주문의 신호 × `policy_coef`를 사용합니다. 따라서 이후 거래 결과나 배치 평균 때문에 성공 매수 신호의 부호가 바뀌지 않습니다. 미체결·미청산·활성 매수 주문·전체 5초 관측 부족은 BUY 신호를 0으로 보류합니다. HOLD/SELL의 기존 actor 신호와 NAV 보상·가치함수 목표는 유지합니다. 공유 신경망·가치 손실·엔트로피 때문에 개별 업데이트 후 매수 확률 상승까지 보장하는 것은 아닙니다.
+새 모드의 BUY 정책 손실은 기존 정규화 GAE 대신 해당 주문의 신호 × `policy_coef`를 사용합니다. 따라서 이후 거래 결과나 배치 평균 때문에 성공 매수 신호의 부호가 바뀌지 않습니다. 미체결·미청산·활성 매수 주문·전체 5초 관측 부족은 BUY 신호를 0으로 보류합니다. NAV 보상·가치함수 목표는 유지하며, 보유 중 HOLD/SELL에는 아래 별도 actor 신호를 적용합니다. 공유 신경망·가치 손실·엔트로피 때문에 개별 업데이트 후 매수 확률 상승까지 보장하는 것은 아닙니다.
 
-기존 순손익 보조 목표는 `target_mode="realized_net"`, 가격만 보는 보조 목표는 `target_mode="legacy_price"`로 재현합니다. 두 모드는 기존 GAE에 신호를 더하는 동작을 유지하며, `target_mode`가 없는 기존 설정·체크포인트도 `legacy_price`를 유지합니다. `policy_coef=0`은 모든 행동에 기존 NAV actor 신호를 사용하는 대조 실험입니다. 미래 가격과 청산 결과는 학습 라벨에만 사용하며 관측·매수 조건·에피소드 선정에는 사용하지 않습니다.
+보유 중 자유롭게 HOLD/SELL을 선택할 수 있을 때, 최초 실제 체결로부터 1초 미만은 HOLD를, 1~5초에는 현재 호가 기준 전량 청산 추정 순손익이 양수이면 SELL(그 외 HOLD)을, 5초 이상은 손익과 무관하게 SELL을 선호하도록 학습합니다. 선호 행동을 선택하면 +1, 반대는 -1이며 `policy_coef`를 곱해 기존 정규화 GAE를 대체합니다. 손실 거래의 매도라는 이유로 필요한 청산 행동이 억제되지 않도록 하는 명시적 학습 기준입니다. 최적 매도 시점을 증명하거나 미래 수익을 예측한 라벨은 아닙니다.
 
-Colab 설정 셀의 `ENTRY_TARGET`은 `short_horizon_net`(기본), `realized_net`, `legacy_price`, `nav_only`를 지원합니다. 기본은 20,000 steps, 매 iteration 검증 16개인 단기 실험입니다. 같은 SEED·데이터·EXPERIMENT와 서로 다른 RUN_NAME으로 비교하고, 시드 42/142/242에서 확인한 후보를 더 많은 검증 구간으로 평가하세요. 새 목표는 `MODE='new'`로 시작하며 resume/finetune은 저장된 목표를 복원합니다. 기존 entry-pattern TAR는 진입 조건이 같으면 재사용할 수 있습니다.
+추정 순손익은 현재 잔여 매수호가를 전량 소진하는 가격·슬리피지·틱 반올림·매도 수수료/세금에서 해당 FIFO 단계의 실제 매수 원가·수수료를 뺀 값입니다. 1~5초 중 호가가 오래됐거나 전량 잔량이 부족하면 판정을 보류합니다. 추가 매수가 진행 중인 상태도 보류하며, 손절·진행 중인 매도 때문에 강제된 HOLD는 제외합니다. 5초 이후에는 시간만으로 청산 시도를 선호합니다. 이는 즉시 체결을 보장하는 값이 아닙니다. 행동 마스크·리스크 타이머·실제 주문은 바꾸지 않으므로 정책이 HOLD를 선택하거나 주문 지연·잔량 부족이 발생하면 5초를 넘어 보유할 수 있습니다.
 
-거래별 진단에는 `normalized_advantage`(기존 NAV 신호), `actor_base_advantage`(BUY 교체 후 기존 신호), `entry_pattern_credit`, `initial_actor_signal`(두 actor 신호의 합), `trade_local_actor`를 기록합니다. 합은 ratio=1이고 클리핑 적용 전인 시점의 계수입니다. `entry_pattern.orders`의 `short_horizon_success`와 `short_horizon_net_target`으로 수익이 났어도 단기 목표에 실패한 거래를 구분합니다.
+이전 BUY 전용 `short_horizon_net`은 HOLD/SELL의 기존 GAE를 유지합니다. 기존 순손익 보조 목표는 `target_mode="realized_net"`, 가격만 보는 보조 목표는 `target_mode="legacy_price"`로 재현합니다. 두 모드는 기존 GAE에 신호를 더하는 동작을 유지하며, `target_mode`가 없는 기존 설정·체크포인트도 `legacy_price`를 유지합니다. `policy_coef=0`은 모든 행동에 기존 NAV actor 신호를 사용하는 대조 실험입니다. 미래 가격과 청산 결과는 학습 라벨에만 사용하며 관측·매수 조건·에피소드 선정에는 사용하지 않습니다.
+
+Colab 설정 셀의 `ENTRY_TARGET`은 `short_horizon_trade`(기본), `short_horizon_net`, `realized_net`, `legacy_price`, `nav_only`를 지원합니다. 기본은 20,000 steps, 매 iteration 검증 16개인 단기 실험입니다. 같은 SEED·데이터·EXPERIMENT와 서로 다른 RUN_NAME으로 비교하고, 시드 42/142/242에서 확인한 후보를 더 많은 검증 구간으로 평가하세요. 새 목표는 `MODE='new'`로 시작하며 resume/finetune은 저장된 목표를 복원합니다. 기존 entry-pattern TAR는 진입 조건이 같으면 재사용할 수 있습니다.
+
+거래별 진단에는 `normalized_advantage`(기존 NAV 신호), `actor_base_advantage`(BUY 교체 후 기존 신호), `entry_pattern_credit`, `exit_policy_credit`, `initial_actor_signal`(기존·매수·보유/매도 actor 신호의 합), `trade_local_actor`를 기록합니다. 합은 ratio=1이고 클리핑 적용 전인 시점의 계수입니다. `entry_pattern.orders`의 `short_horizon_success`와 `short_horizon_net_target`으로 수익이 났어도 단기 목표에 실패한 거래를 구분합니다.
 
 검증 JSON/TensorBoard에는 `entry_signal_steps`, `buy_allowed_steps`, `mean_buy_probability_when_allowed`, `buy_action_rate_when_allowed`를 기록합니다. 패턴 기회 부족, 실행 조건에 의한 제한, 허용된 상태에서의 정책 HOLD 선택을 구분하는 지표입니다. 거래별 기존 라벨과 실제 손익 대조는 `checkpoints/diagnostics/entry_credit/iteration_*.json`의 `report.entry_pattern_episodes`와 검증 JSON의 에피소드별 `entry_pattern.orders`에서 확인합니다. 단기 테스트 통과나 높은 라벨 성공률만으로 수익성을 확정하지 않습니다.
+
+`report.holding_decisions`는 보유 시각·청산 추정 순손익·선호 행동·선택 행동·기존 GAE·최종 actor 신호를 연결합니다. `holding_action_summary`는 강제 HOLD와 구분된 HOLD/SELL 요약입니다. 검증의 `entry_pattern.exit_target_summary`와 학습 로그의 `Exit targets`에서 선호 SELL 수, 실제 SELL 선택 수, 5초 이후 HOLD 수, 기준 일치율을 확인합니다.
+
+Git 소스를 갱신해도 이미 열려 있는 Colab 셀은 바뀌지 않습니다. 최신 ipynb를 새로 열고 `MODE='new'`, `ENTRY_TARGET='short_horizon_trade'`, 빈 `LOAD_POLICY`, 새 `RUN_NAME`으로 실행하세요. 기존 entry-pattern 데이터는 그대로 사용할 수 있습니다. 소스 준비 셀의 REVISION 기본값은 `dev-tf-rl`이며 특정 커밋을 고정할 때는 40자리 전체 해시를 사용합니다.
 
 ### A100 런타임 측정과 배치 선택
 

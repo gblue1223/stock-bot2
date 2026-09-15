@@ -59,6 +59,9 @@ def sample_rollouts(episodes, advantages, limit):
             item['metadata']['entry_pattern'] = {'policy_credit': list(pattern['policy_credit'][:count])}
             if 'config' in pattern:
                 item['metadata']['entry_pattern']['config'] = copy.deepcopy(pattern['config'])
+            for key in ('exit_policy_credit', 'exit_policy_mask'):
+                if key in pattern:
+                    item['metadata']['entry_pattern'][key] = list(pattern[key][:count])
         sampled.append(item)
         grouped.append(np.array(advantage[:count], copy=True))
         limit -= count

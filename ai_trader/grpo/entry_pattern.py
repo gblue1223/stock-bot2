@@ -16,7 +16,7 @@ DEFAULT_ENTRY_PATTERN = {
     'target_min_seconds': 1.0,
     'target_max_seconds': 5.0,
     'policy_coef': 1.0,
-    'target_mode': 'short_horizon_net',
+    'target_mode': 'short_horizon_trade',
 }
 
 
@@ -49,8 +49,8 @@ def validate_entry_pattern(config):
     result = {**DEFAULT_ENTRY_PATTERN, **config}
     # Old saved configurations must retain their original learning objective.
     result['target_mode'] = config.get('target_mode', 'legacy_price')
-    if result['target_mode'] not in ('short_horizon_net', 'realized_net', 'legacy_price'):
-        raise ValueError('entry_pattern_config.target_mode must be short_horizon_net, realized_net or legacy_price')
+    if result['target_mode'] not in ('short_horizon_trade', 'short_horizon_net', 'realized_net', 'legacy_price'):
+        raise ValueError('entry_pattern_config.target_mode must be short_horizon_trade, short_horizon_net, realized_net or legacy_price')
     for key, value in result.items():
         if key == 'target_mode':
             continue
@@ -137,15 +137,38 @@ def pattern_policy_credit(episodes):
     return np.concatenate(result)
 
 
+def exit_policy_signals(episodes):
+    """Return aligned position-only credits and masks; fail on stale captures."""
+    credits, masks = [], []
+    for episode in episodes:
+        actions = np.asarray(episode['actions'])
+        report = episode.get('metadata', {}).get('entry_pattern')
+        credit, mask = np.zeros(len(actions), np.float32), np.zeros(len(actions), bool)
+        if report is not None and report.get('config', {}).get('target_mode') == 'short_horizon_trade':
+            if 'exit_policy_credit' not in report or 'exit_policy_mask' not in report:
+                raise ValueError('short_horizon_trade requires exit policy metadata; collect new rollouts')
+            credit = np.asarray(report['exit_policy_credit'], dtype=np.float32)
+            mask = np.asarray(report['exit_policy_mask'])
+            if (credit.shape != actions.shape or mask.shape != actions.shape or mask.dtype.kind != 'b'
+                    or not np.isfinite(credit).all() or np.any(mask & (actions == 1))
+                    or np.any(credit[~mask] != 0)):
+                raise ValueError('Invalid exit policy credit/mask')
+        credits.append(credit)
+        masks.append(mask)
+    return np.concatenate(credits), np.concatenate(masks)
+
+
 def pattern_actor_signals(episodes, normalized_advantages):
-    """Route new-mode BUY to its own outcome, including zero for unknown fills.
+    """Route BUY to its outcome and new-mode held HOLD/SELL to exit preferences.
 
     Old modes remain additive. With policy_coef=0 all modes retain NAV-only
-    actor training. Do not normalize the trade-local credit against other
+    actor training. Unknown fills/exit quotes have zero credit. Do not normalize the trade-local credit against other
     trades: that would allow a profitable entry's sign to flip again.
     """
     episodes = list(episodes)
     credit = pattern_policy_credit(episodes)
+    exit_credit, exit_mask = exit_policy_signals(episodes)
+    credit = credit + exit_credit
     base = np.asarray(normalized_advantages, dtype=np.float32).copy()
     if base.shape != credit.shape or not np.isfinite(base).all():
         raise ValueError('Invalid normalized entry actor advantages')
@@ -156,8 +179,8 @@ def pattern_actor_signals(episodes, normalized_advantages):
         report = episode.get('metadata', {}).get('entry_pattern')
         if report is not None and report.get('config') is not None:
             cfg = validate_entry_pattern(report['config'])
-            if cfg['target_mode'] == 'short_horizon_net' and cfg['policy_coef'] > 0:
-                local[offset:offset + len(actions)] = actions == 1
+            if cfg['target_mode'] in ('short_horizon_net', 'short_horizon_trade') and cfg['policy_coef'] > 0:
+                local[offset:offset + len(actions)] = (actions == 1) | exit_mask[offset:offset + len(actions)]
             if cfg['policy_coef'] == 0 and np.any(credit[offset:offset + len(actions)]):
                 raise ValueError('Disabled entry objective must have zero policy credit')
         offset += len(actions)

@@ -860,7 +860,7 @@ class GRPOTrainer:
         states_tensor = torch.from_numpy(all_states).float()
         actions_tensor = torch.from_numpy(all_actions).long()
         old_log_probs_tensor = torch.from_numpy(all_old_log_probs).float()
-        actor_base, pattern_credit, trade_local_buys = pattern_actor_signals(episodes, all_advantages)
+        actor_base, pattern_credit, trade_local_actions = pattern_actor_signals(episodes, all_advantages)
         advantages_tensor = torch.from_numpy(actor_base).float()
         pattern_tensor = torch.from_numpy(pattern_credit).float()
         returns_tensor = torch.from_numpy(all_returns).float()
@@ -992,8 +992,8 @@ class GRPOTrainer:
                 
                 # 최소값 선택 (보수적 정책 업데이트)
                 policy_loss = -torch.min(surr1, surr2).mean()
-                # New-mode BUY base advantage is zero: only its own joint
-                # horizon/net outcome enters the actor. Legacy modes are additive.
+                # Routed BUY/HOLD/SELL base advantages are zero: only the entry
+                # outcome or exit preference enters the actor. Legacy modes are additive.
                 pattern_batch = pattern_tensor[batch_indices].to(self.device)
                 pattern_loss = -torch.min(ratio * pattern_batch, ratio_clipped * pattern_batch).mean()
                 policy_loss = policy_loss + pattern_loss
@@ -1109,7 +1109,8 @@ class GRPOTrainer:
         # 평균 메트릭 계산
         update_metrics = {
             'policy_loss': total_policy_loss / max(1, num_batches),
-            'entry_pattern/credited_buy_decisions': int(np.count_nonzero(pattern_credit)),
+            'entry_pattern/credited_buy_decisions': int(np.count_nonzero(pattern_credit[all_actions == 1])),
+            'entry_pattern/credited_exit_decisions': int(np.count_nonzero(pattern_credit[all_actions != 1])),
             'entry_pattern/mean_credit': float(np.mean(pattern_credit)),
             'value_loss': total_value_loss / max(1, num_batches),
             'entropy': total_entropy / max(1, num_batches),
@@ -1154,7 +1155,15 @@ class GRPOTrainer:
         pattern_reports = [ep.get('metadata', {}).get('entry_pattern') for ep in episodes]
         pattern_reports = [report for report in pattern_reports if report is not None]
         if pattern_reports:
-            update_metrics['entry_pattern/trade_local_buy_decisions'] = int(trade_local_buys.sum())
+            update_metrics['entry_pattern/trade_local_buy_decisions'] = int((trade_local_actions & (all_actions == 1)).sum())
+            update_metrics['entry_pattern/trade_local_exit_decisions'] = int((trade_local_actions & (all_actions != 1)).sum())
+            exit_summaries = [r['exit_target_summary'] for r in pattern_reports if 'exit_target_summary' in r]
+            if exit_summaries:
+                for key in exit_summaries[0]:
+                    update_metrics[f'exit_target/{key}'] = sum(s[key] for s in exit_summaries)
+                logger.info('Exit targets: labeled=%d, preferred SELL=%d, selected SELL=%d, overdue HOLD=%d',
+                            *(update_metrics[f'exit_target/{key}'] for key in (
+                                'labeled_count', 'preferred_sell_count', 'selected_sell_count', 'overdue_hold_count')))
             self.last_entry_credit_report['entry_pattern_episodes'] = [
                 {'episode_key': ep.get('metadata', {}).get('episode_key'),
                  'entry_pattern': ep.get('metadata', {}).get('entry_pattern')} for ep in episodes]

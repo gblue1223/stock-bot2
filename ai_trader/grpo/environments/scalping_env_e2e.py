@@ -16,6 +16,7 @@ from lib.observations import ObservationBuilder, validate_max_stages
 from lib.action_masks import executable_action_mask
 from .execution import ExecutionSimulator
 from ai_trader.grpo.entry_pattern import validate_entry_pattern, fill_target
+from ai_trader.grpo.exit_credit import exit_preference
 
 logger = logging.getLogger(__name__)
 
@@ -318,6 +319,7 @@ class GRPOScalpingEnv(gym.Env):
             'pending_buy', 'insufficient_budget_for_one_share'), 0)
         self._buy_decisions = []
         self._pattern_fills = []
+        self._exit_decisions = []
         if self.entry_pattern_config is not None:
             self.buy_action_outcomes['entry_signal_not_met'] = 0
         self._entry_order_decisions = {}
@@ -662,12 +664,59 @@ class GRPOScalpingEnv(gym.Env):
                 and not any(stage['order_id'] == self._signal_exit_order_id for stage in self.stages)):
             self._signal_exit_order_id = None
 
+    def _capture_exit_decision(self, action, decision_index):
+        """Record only free HOLD/SELL choices while a FIFO stage is held.
+
+        Forced risk/pending-exit HOLDs are excluded. The preference changes no
+        observation, action mask, order, fill, NAV reward or controller deadline.
+        """
+        cfg = self.entry_pattern_config
+        if (cfg is None or cfg['target_mode'] != 'short_horizon_trade'
+                or action not in (0, 2) or not self.stages or not self.action_masks()[2]):
+            return
+        stage = self.stages[0]
+        age = self.current_time_seconds - stage['entry_time_seconds']
+        proceeds = self.simulator.quoted_sell_proceeds(stage['quantity'], self.sell_fee_rate)
+        basis = stage['quantity'] * stage['entry_price'] + stage['entry_fees']
+        net = None if proceeds is None else proceeds - basis
+        if self._pending('buy'):
+            desired, reason = None, 'pending_buy'
+        else:
+            desired, reason = exit_preference(age, net, cfg)
+        self._exit_decisions.append({
+            'decision_index': decision_index, 'action': int(action),
+            'entry_order_id': stage['order_id'], 'quantity': stage['quantity'],
+            'age_seconds': float(age), 'quoted_net_pnl': net,
+            'desired_action': desired, 'reason': reason,
+            'target': 0.0 if desired is None else (1.0 if action == desired else -1.0)})
+
+    def _exit_pattern_report(self):
+        credits = np.zeros(len(self.episode_rewards), dtype=np.float64)
+        mask = np.zeros(len(credits), dtype=bool)
+        decisions = self._exit_decisions
+        for row in decisions:
+            index = row['decision_index']
+            credits[index] = row['target'] * self.entry_pattern_config['policy_coef']
+            mask[index] = True
+        labeled = [row for row in decisions if row['desired_action'] is not None]
+        return {'exit_policy_credit': credits.tolist(), 'exit_policy_mask': mask.tolist(),
+                'exit_decisions': decisions,
+                'exit_target_summary': {
+                    'decision_count': len(decisions), 'labeled_count': len(labeled),
+                    'censored_count': len(decisions) - len(labeled),
+                    'preferred_sell_count': sum(row['desired_action'] == 2 for row in labeled),
+                    'selected_sell_count': sum(row['action'] == 2 for row in decisions),
+                    'agreement_count': sum(row['action'] == row['desired_action'] for row in labeled),
+                    'overdue_hold_count': sum(row['reason'] == 'horizon_elapsed' and row['action'] == 0
+                                              for row in decisions)}}
+
     def step(self, action):
         if self._done:
             raise RuntimeError('reset() required after episode end')
         if not self.action_space.contains(action):
             raise ValueError('invalid action')
         decision_index = len(self.episode_rewards)
+        self._capture_exit_decision(action, decision_index)
         entry_order_id = None
         buy_outcome = None
         now = self.current_time_seconds
@@ -863,8 +912,8 @@ class GRPOScalpingEnv(gym.Env):
             if closed and horizon_complete:
                 joint_target = -1.0 if target < 0 or legacy < 1.0 else target
             mode = self.entry_pattern_config['target_mode']
-            if mode in ('realized_net', 'short_horizon_net'):
-                policy_target = joint_target if mode == 'short_horizon_net' else target
+            if mode in ('realized_net', 'short_horizon_net', 'short_horizon_trade'):
+                policy_target = target if mode == 'realized_net' else joint_target
                 quantity = order['quantity']
                 if policy_target is None:
                     censored += quantity
@@ -885,7 +934,8 @@ class GRPOScalpingEnv(gym.Env):
                     and d['legacy_credit'] is not None and d['legacy_credit'] > 0]
         credits = np.divide(credits, quantities, out=np.zeros_like(credits), where=quantities > 0)
         credits *= self.entry_pattern_config['policy_coef']
-        return {'config': self.entry_pattern_config.copy(), 'policy_credit': credits.tolist(),
+        return {**(self._exit_pattern_report() if self.entry_pattern_config['target_mode'] == 'short_horizon_trade' else {}),
+                'config': self.entry_pattern_config.copy(), 'policy_credit': credits.tolist(),
                 'success_quantity': success, 'failure_quantity': failure, 'censored_quantity': censored,
                 'neutral_quantity': neutral, 'orders': details,
                 'legacy_positive_closed_orders': len(positive),

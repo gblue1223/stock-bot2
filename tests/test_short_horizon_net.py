@@ -14,7 +14,7 @@ from ai_trader.grpo.gpu_tuning import sample_rollouts
 from test_grpo_memory_batches import RecordingPolicy
 
 
-CFG = dict(DEFAULT_ENTRY_PATTERN)
+CFG = {**DEFAULT_ENTRY_PATTERN, 'target_mode': 'short_horizon_net'}
 
 
 def report_for(prices, *, times=None, pnl=5., fills=None, sold=None, active=False):

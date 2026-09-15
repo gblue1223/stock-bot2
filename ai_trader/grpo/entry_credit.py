@@ -11,7 +11,7 @@ from numbers import Integral, Real
 
 import numpy as np
 
-from .entry_pattern import pattern_actor_signals
+from .entry_pattern import pattern_actor_signals, pattern_policy_credit, exit_policy_signals
 
 
 _MONEY_FIELDS = (
@@ -24,7 +24,7 @@ _SIGNAL_FIELDS = (
     'return_target', 'cached_value', 'critic_target_error', 'immediate_reward',
     'bootstrap_value_delta', 'immediate_td_error', 'future_td_trace',
     'gae_trace_consistency_residual', 'actor_base_advantage',
-    'entry_pattern_credit', 'initial_actor_signal',
+    'entry_pattern_credit', 'exit_policy_credit', 'initial_actor_signal',
 )
 
 
@@ -191,12 +191,15 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
     }
     if length:
         base, credit, local = pattern_actor_signals(episodes, arrays['normalized_advantage'])
+        buy_credit = pattern_policy_credit(episodes)
+        exit_credit, _ = exit_policy_signals(episodes)
     else:
         base, credit, local = np.empty(0), np.empty(0), np.zeros(0, dtype=bool)
-    arrays.update(actor_base_advantage=base, entry_pattern_credit=credit,
+        buy_credit, exit_credit = np.empty(0), np.empty(0)
+    arrays.update(actor_base_advantage=base, entry_pattern_credit=buy_credit, exit_policy_credit=exit_credit,
                   initial_actor_signal=base + credit)
     action_rows = {name: [] for name in ('hold', 'buy', 'sell')}
-    entries, buy_decisions = [], []
+    entries, buy_decisions, holding_decisions = [], [], []
     available_episodes = 0
     offset = 0
     for episode_index, (episode, (actions, rewards, dones)) in enumerate(zip(episodes, episode_arrays)):
@@ -223,6 +226,15 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
             signals.append(signal)
             action_rows[('hold', 'buy', 'sell')[int(action)]].append(signal)
         metadata = episode.get('metadata')
+        if isinstance(metadata, Mapping):
+            pattern = metadata.get('entry_pattern') or {}
+            for decision in pattern.get('exit_decisions', []):
+                index = decision['decision_index']
+                if not 0 <= index < len(actions) or decision['action'] != actions[index]:
+                    raise ValueError('entry credit: invalid holding decision index/action')
+                holding_decisions.append({**decision, 'episode_index': episode_index,
+                                          'episode_key': _episode_key(metadata),
+                                          'global_decision_index': offset + index, **signals[index]})
         if isinstance(metadata, Mapping) and 'entry_diagnostics' in metadata:
             decisions, traced_entries = _trace_entries(metadata['entry_diagnostics'], actions)
             available_episodes += 1
@@ -267,6 +279,11 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
                    complete_entry_count=sum(row['complete'] for row in entries),
                    partial_fill_entry_count=sum(row['partial_entry_fill'] for row in entries))
     action_summary = {action: _summary(rows) for action, rows in action_rows.items()}
+    holding_action_summary = {
+        name: _summary([row for row in holding_decisions if row['action'] == action])
+        for name, action in (('hold', 0), ('sell', 2))}
+    for action, summary in holding_action_summary.items():
+        metrics.update({f'holding_action/{action}/{key}': value for key, value in summary.items()})
     for action, summary in action_summary.items():
         metrics.update({f'action/{action}/{key}': value for key, value in summary.items()})
     outcome_summary = {}
@@ -303,6 +320,7 @@ def analyze_entry_credit(episodes, *, raw_gae, group_component, pre_normalized,
         'gamma': gamma, 'lambda_gae': lambda_gae, 'metrics': metrics,
         'availability': availability, 'action_summary': action_summary,
         'outcome_summary': outcome_summary, 'entries': entries, 'buy_decisions': buy_decisions,
+        'holding_decisions': holding_decisions, 'holding_action_summary': holding_action_summary,
     }
     if any(ep.get('metadata', {}).get('entry_pattern') is not None for ep in episodes):
         report['entry_pattern_episodes'] = [

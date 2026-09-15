@@ -155,6 +155,12 @@ def _additional_metrics(episodes):
         positive = totals['legacy_positive_closed_orders']
         result['entry_pattern']['legacy_positive_profit_rate'] = (
             totals['legacy_positive_profitable_orders'] / positive if positive else None)
+        if all('exit_target_summary' in report for report in reports):
+            summary = {key: sum(report['exit_target_summary'][key] for report in reports)
+                       for key in reports[0]['exit_target_summary']}
+            summary['agreement_rate'] = (summary['agreement_count'] / summary['labeled_count']
+                                         if summary['labeled_count'] else None)
+            result['entry_pattern']['exit_target_summary'] = summary
     for count_key, rate_key in (('round_trip_count', 'round_trip_win_rate'),
                                 ('fill_count', 'fill_win_rate')):
         counts, rates = values(count_key), values(rate_key)
